@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use std::pin::Pin;
 use tokio_util::sync::CancellationToken;
 
+pub mod anthropic;
 pub mod openai;
 pub mod sse;
 
