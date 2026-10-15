@@ -86,6 +86,31 @@ impl Viewport {
         }
     }
 
+    /// Una página arriba (las filas visibles; mínimo 1).
+    pub fn page_up(&mut self) {
+        self.scroll_up(self.rows.max(1));
+    }
+
+    /// Una página abajo (las filas visibles; mínimo 1).
+    pub fn page_down(&mut self) {
+        self.scroll_down(self.rows.max(1));
+    }
+
+    /// Media página arriba (mínimo 1 fila).
+    pub fn half_page_up(&mut self) {
+        self.scroll_up((self.rows / 2).max(1));
+    }
+
+    /// Media página abajo (mínimo 1 fila).
+    pub fn half_page_down(&mut self) {
+        self.scroll_down((self.rows / 2).max(1));
+    }
+
+    /// Al principio (deja de seguir el final si no cabe todo).
+    pub fn to_top(&mut self) {
+        self.scroll_up(usize::MAX);
+    }
+
     /// Primera fila visible.
     pub fn top(&self) -> usize {
         self.top
@@ -172,6 +197,27 @@ mod tests {
     fn handles_empty_and_zero_rows() {
         assert_eq!(vp(0, 10).window(), 0..0);
         assert_eq!(vp(3, 0).window(), 3..3);
+    }
+
+    #[test]
+    fn page_helpers_move_by_rows() {
+        let mut v = vp(100, 10);
+        v.page_up();
+        assert_eq!(v.window(), 80..90);
+        v.half_page_up();
+        assert_eq!(v.window(), 75..85);
+        v.half_page_down();
+        v.page_down();
+        assert!(v.is_following());
+        v.to_top();
+        assert_eq!(v.window(), 0..10);
+    }
+
+    #[test]
+    fn page_with_zero_rows_still_moves() {
+        let mut v = vp(100, 0);
+        v.page_up();
+        assert_eq!(v.top(), 99);
     }
 
     #[test]

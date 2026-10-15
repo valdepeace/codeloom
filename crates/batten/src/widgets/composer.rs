@@ -6,17 +6,37 @@ use ratatui::layout::Rect;
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
+/// Composer con foco (borde de acento y cursor).
 pub fn render(frame: &mut Frame, area: Rect, composer: &Composer, theme: &Theme) {
+    render_focused(frame, area, composer, true, theme);
+}
+
+/// Composer; sin foco, borde atenuado y sin cursor.
+pub fn render_focused(
+    frame: &mut Frame,
+    area: Rect,
+    composer: &Composer,
+    focused: bool,
+    theme: &Theme,
+) {
+    let border = if focused {
+        StyleToken::Accent
+    } else {
+        StyleToken::Dim
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .title("prompt")
-        .border_style(theme.style(StyleToken::Muted));
+        .border_style(theme.style(border));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let text = Paragraph::new(composer.text().to_string()).style(theme.style(StyleToken::Default));
     frame.render_widget(text, inner);
 
+    if !focused {
+        return;
+    }
     let (row, col) = composer.cursor_row_col();
     if (row as u16) < inner.height && (col as u16) < inner.width {
         frame.set_cursor_position((inner.x + col as u16, inner.y + row as u16));
@@ -81,6 +101,21 @@ mod tests {
             .unwrap();
         let pos = term.backend_mut().get_cursor_position().unwrap();
         assert_eq!((pos.x, pos.y), (2, 2));
+    }
+
+    #[test]
+    fn border_shows_focus() {
+        use ratatui::style::Color;
+        let c = Composer::new();
+        for (focused, color) in [
+            (true, Color::Rgb(0, 212, 255)),
+            (false, Color::Indexed(240)),
+        ] {
+            let mut term = Terminal::new(TestBackend::new(20, 3)).unwrap();
+            term.draw(|f| render_focused(f, f.area(), &c, focused, &Theme::test()))
+                .unwrap();
+            assert_eq!(term.backend().buffer()[(0, 0)].fg, color);
+        }
     }
 
     #[test]
