@@ -1,4 +1,5 @@
 pub mod dispatch;
+pub mod stop;
 
 use crate::config::CodeLoomConfig;
 use crate::error::Result;
@@ -63,6 +64,7 @@ impl AgentLoop {
         self.bus.publish(LiveEvent::MessageAdded(user.clone()));
         history.push(user);
 
+        let system = crate::config::context::load_context_files(&self.cwd).join("\n\n");
         let ctx = ToolCtx {
             cwd: self.cwd.clone(),
             permission: self.permission.clone(),
@@ -72,12 +74,12 @@ impl AgentLoop {
 
         loop {
             steps += 1;
-            if steps > self.config.max_steps {
+            if crate::agent::stop::should_stop(&history, steps, self.config.max_steps) {
                 break;
             }
             let req = ProviderRequest {
                 model: self.config.model.clone(),
-                system: String::new(),
+                system: system.clone(),
                 messages: history.clone(),
                 tools: self.tools.specs(),
                 temperature: 0.0,
@@ -129,8 +131,32 @@ impl AgentLoop {
                 break;
             }
 
+            let mut allowed = Vec::new();
+            for (id, name, input) in tool_calls {
+                let req = crate::permission::PermissionRequest {
+                    tool: name.clone(),
+                    action: "run".into(),
+                    detail: input.to_string(),
+                };
+                match self.permission.check(req).await {
+                    crate::permission::Decision::Allow => allowed.push((id, name, input)),
+                    crate::permission::Decision::Deny => {
+                        let tr = Message::new(
+                            Role::Tool,
+                            vec![ContentPart::ToolResult {
+                                call_id: id,
+                                content: "permission denied".into(),
+                                is_error: true,
+                            }],
+                        );
+                        self.store.append_message(session, &tr).await?;
+                        self.bus.publish(LiveEvent::MessageAdded(tr.clone()));
+                        history.push(tr);
+                    }
+                }
+            }
             let results =
-                dispatch::execute_tools(&self.tools, ctx.clone(), tool_calls, cancel.clone()).await;
+                dispatch::execute_tools(&self.tools, ctx.clone(), allowed, cancel.clone()).await;
             for (id, out) in results {
                 let tr = Message::new(
                     Role::Tool,
@@ -271,5 +297,64 @@ mod tests {
         assert_eq!(outcome.final_text, "done");
         let msgs = store.messages(sid).await.unwrap();
         assert!(msgs.iter().any(|m| m.role == Role::Tool));
+    }
+
+    #[tokio::test]
+    async fn denied_tool_stops_and_is_recorded() {
+        let scripts = vec![
+            vec![
+                StreamChunk::ToolCallComplete {
+                    id: "c1".into(),
+                    name: "noop".into(),
+                    input: serde_json::json!({}),
+                },
+                StreamChunk::Done(FinishReason::ToolCalls),
+            ],
+            vec![
+                StreamChunk::TextDelta("after".into()),
+                StreamChunk::Done(FinishReason::Stop),
+            ],
+        ];
+        let provider = Arc::new(QueueProvider {
+            scripts: Mutex::new(scripts.into()),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SqliteStore::open(dir.path().join("d.db").to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+        let sid = store.create_session("/p").await.unwrap();
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(Noop));
+        let cfg = CodeLoomConfig {
+            provider: crate::config::ProviderConfig {
+                kind: crate::config::ProviderKind::OpenAiCompat,
+                base_url: "http://x".into(),
+                api_key_env: "K".into(),
+            },
+            model: "m".into(),
+            max_steps: 5,
+        };
+        let agent = AgentLoop::new(
+            provider,
+            store.clone(),
+            Arc::new(tools),
+            EventBus::new(64),
+            Arc::new(crate::permission::PermissionService::with_responder(
+                Box::new(crate::permission::DenyAll),
+            )),
+            cfg,
+            dir.path().to_path_buf(),
+        );
+        let _ = agent
+            .run(sid, "hi".into(), CancellationToken::new())
+            .await
+            .unwrap();
+        let msgs = store.messages(sid).await.unwrap();
+        assert!(msgs.iter().any(|m| m
+            .parts
+            .iter()
+            .any(|p| matches!(p, ContentPart::ToolResult { is_error: true, .. }))));
     }
 }

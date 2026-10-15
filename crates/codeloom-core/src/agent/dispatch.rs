@@ -123,4 +123,69 @@ mod tests {
         assert_eq!(res[0].1.content, "a");
         assert!(res[2].1.is_error);
     }
+
+    struct ExclusiveEcho;
+    #[async_trait]
+    impl Tool for ExclusiveEcho {
+        fn name(&self) -> &str {
+            "exclusive_echo"
+        }
+        fn description(&self) -> &str {
+            "e"
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object"})
+        }
+        fn execution_mode(&self, _i: &serde_json::Value) -> ExecutionMode {
+            ExecutionMode::Exclusive
+        }
+        async fn run(
+            &self,
+            _c: ToolCtx,
+            i: serde_json::Value,
+            _x: CancellationToken,
+        ) -> crate::error::Result<ToolOutput> {
+            Ok(ToolOutput::ok(i["v"].as_str().unwrap_or_default()))
+        }
+    }
+
+    #[tokio::test]
+    async fn exclusive_calls_serialize_but_all_run() {
+        let mut r = ToolRegistry::new();
+        r.register(Arc::new(Echo));
+        r.register(Arc::new(ExclusiveEcho));
+        let ctx = ToolCtx {
+            cwd: ".".into(),
+            permission: Arc::new(PermissionService::allow_all()),
+        };
+        let calls = vec![
+            (
+                "c1".to_string(),
+                "echo".to_string(),
+                serde_json::json!({"v":"a"}),
+            ),
+            (
+                "c2".to_string(),
+                "exclusive_echo".to_string(),
+                serde_json::json!({"v":"b"}),
+            ),
+            (
+                "c3".to_string(),
+                "exclusive_echo".to_string(),
+                serde_json::json!({"v":"c"}),
+            ),
+            (
+                "c4".to_string(),
+                "echo".to_string(),
+                serde_json::json!({"v":"d"}),
+            ),
+        ];
+        let mut res = execute_tools(&r, ctx, calls, CancellationToken::new()).await;
+        res.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(res.len(), 4);
+        assert_eq!(res[0].1.content, "a");
+        assert_eq!(res[1].1.content, "b");
+        assert_eq!(res[2].1.content, "c");
+        assert_eq!(res[3].1.content, "d");
+    }
 }

@@ -62,6 +62,30 @@ pub trait Provider: Send + Sync {
     ) -> Result<ProviderStream>;
 }
 
+pub async fn stream_with_retry(
+    provider: &dyn Provider,
+    req: ProviderRequest,
+    cancel: CancellationToken,
+    max_retries: u32,
+) -> Result<ProviderStream> {
+    let mut attempt = 0u32;
+    loop {
+        match provider.stream(req.clone(), cancel.clone()).await {
+            Ok(s) => return Ok(s),
+            Err(e) if attempt < max_retries => {
+                let backoff = std::time::Duration::from_millis(250 * 2u64.pow(attempt));
+                tracing::warn!("provider retry {attempt}: {e}");
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff) => {}
+                    _ = cancel.cancelled() => return Err(crate::error::CoreError::Cancelled),
+                }
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod testutil {
     use super::*;
@@ -123,5 +147,59 @@ mod tests {
             got.push(c);
         }
         assert_eq!(got.len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    struct FlakyProvider {
+        attempts: AtomicU32,
+        fail_times: u32,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for FlakyProvider {
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                tool_use: true,
+                reasoning: false,
+                streaming: true,
+            }
+        }
+        async fn stream(
+            &self,
+            _req: ProviderRequest,
+            _cancel: CancellationToken,
+        ) -> Result<ProviderStream> {
+            let n = self.attempts.fetch_add(1, Ordering::SeqCst);
+            if n < self.fail_times {
+                return Err(crate::error::CoreError::Provider(format!("boom {n}")));
+            }
+            Ok(Box::pin(futures::stream::iter(vec![StreamChunk::Done(
+                FinishReason::Stop,
+            )])))
+        }
+    }
+
+    #[tokio::test]
+    async fn retries_until_success() {
+        let p = FlakyProvider {
+            attempts: AtomicU32::new(0),
+            fail_times: 2,
+        };
+        let req = ProviderRequest {
+            model: "m".into(),
+            system: String::new(),
+            messages: vec![],
+            tools: vec![],
+            temperature: 0.0,
+            max_tokens: 16,
+        };
+        let res = stream_with_retry(&p, req, CancellationToken::new(), 2).await;
+        assert!(res.is_ok());
+        assert_eq!(p.attempts.load(Ordering::SeqCst), 3);
     }
 }
