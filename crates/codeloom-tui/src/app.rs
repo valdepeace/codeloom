@@ -1,9 +1,18 @@
+use crate::permission_flow::{dialog_for, PermissionReply};
 use codeloom_core::event::LiveEvent;
+use codeloom_core::permission::{Decision, PermissionRequest};
+use std::collections::VecDeque;
 
 #[derive(Default, Clone)]
 pub struct TranscriptItem {
     pub role: &'static str,
     pub text: String,
+}
+
+/// Petición de permiso en pantalla, con su canal de respuesta.
+pub struct PendingPermission {
+    pub dialog: batten::state::PermissionDialog,
+    reply: PermissionReply,
 }
 
 pub struct App {
@@ -16,6 +25,12 @@ pub struct App {
     pub model: String,
     pub theme: batten::widgets::Theme,
     pub changes: batten::state::FileChanges,
+    /// Diálogo de permiso abierto, si hay.
+    pub permission: Option<PendingPermission>,
+    /// Peticiones esperando a que se cierre la actual.
+    permission_queue: VecDeque<(PermissionRequest, PermissionReply)>,
+    /// `true` cuando se acaba de abrir un diálogo y falta lanzar su efecto.
+    pub fx_pending: bool,
 }
 
 impl Default for App {
@@ -36,6 +51,9 @@ impl App {
             model: String::new(),
             theme: batten::widgets::Theme::default_dark(),
             changes: batten::state::FileChanges::new(),
+            permission: None,
+            permission_queue: VecDeque::new(),
+            fx_pending: false,
         }
     }
 
@@ -44,6 +62,33 @@ impl App {
             cwd: cwd.into(),
             model: model.into(),
             ..Self::new()
+        }
+    }
+
+    /// Encola una petición; si no hay diálogo abierto, la muestra ya.
+    pub fn enqueue_permission(&mut self, req: PermissionRequest, reply: PermissionReply) {
+        self.permission_queue.push_back((req, reply));
+        self.open_next_permission();
+    }
+
+    /// Responde al diálogo abierto y pasa al siguiente de la cola.
+    pub fn resolve_permission(&mut self, decision: Decision) {
+        if let Some(p) = self.permission.take() {
+            let _ = p.reply.send(decision);
+        }
+        self.open_next_permission();
+    }
+
+    fn open_next_permission(&mut self) {
+        if self.permission.is_some() {
+            return;
+        }
+        if let Some((req, reply)) = self.permission_queue.pop_front() {
+            self.permission = Some(PendingPermission {
+                dialog: dialog_for(&req),
+                reply,
+            });
+            self.fx_pending = true;
         }
     }
 

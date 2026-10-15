@@ -404,6 +404,7 @@ dependencies = [
  "codeloom-core",
  "crossterm",
  "ratatui",
+ "serde_json",
  "tokio",
 ]
 

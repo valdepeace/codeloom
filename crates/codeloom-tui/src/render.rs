@@ -80,6 +80,10 @@ pub fn render(frame: &mut Frame, app: &App) {
     }
 
     draw_composer(frame, rows[2], app);
+
+    if let Some(p) = &app.permission {
+        batten::widgets::permission::render(frame, area, &p.dialog, &app.theme);
+    }
 }
 
 #[cfg(test)]
@@ -142,5 +146,23 @@ mod tests {
         let content = buffer_of(&app, 120, 40);
         assert!(content.contains("ficheros modificados"));
         assert!(content.contains("src/main.rs"));
+    }
+
+    #[test]
+    fn shows_permission_dialog_on_top() {
+        let mut app = App::new();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        app.enqueue_permission(
+            codeloom_core::permission::PermissionRequest {
+                tool: "bash".into(),
+                action: "run".into(),
+                detail: r#"{"command":"cargo test"}"#.into(),
+            },
+            tx,
+        );
+        let content = buffer_of(&app, 120, 40);
+        assert!(content.contains("Permiso"));
+        assert!(content.contains("cargo test"));
+        assert!(content.contains("Denegar"));
     }
 }

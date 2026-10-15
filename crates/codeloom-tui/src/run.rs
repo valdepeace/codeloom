@@ -31,6 +31,16 @@ impl Drop for RawGuard {
 /// Traduce una tecla a una accion sobre la app. Devuelve el prompt a enviar
 /// cuando el usuario pulsa Enter con texto.
 pub fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Option<String> {
+    if code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL) {
+        app.should_quit = true;
+        return None;
+    }
+    if let Some(p) = app.permission.as_mut() {
+        if let Some(d) = crate::permission_flow::permission_key(&mut p.dialog, code) {
+            app.resolve_permission(d);
+        }
+        return None;
+    }
     match code {
         KeyCode::Esc => {
             app.should_quit = true;
@@ -94,15 +104,36 @@ pub async fn run(
     mut app: App,
     prompt_tx: tokio::sync::mpsc::Sender<String>,
     mut bus_rx: tokio::sync::broadcast::Receiver<codeloom_core::event::LiveEvent>,
+    mut perm_rx: tokio::sync::mpsc::Receiver<(
+        codeloom_core::permission::PermissionRequest,
+        crate::permission_flow::PermissionReply,
+    )>,
 ) -> std::io::Result<()> {
     let _guard = RawGuard::enter()?;
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend)?;
+    let mut fx: Option<batten::widgets::fx::Effect> = None;
     while !app.should_quit {
         while let Ok(ev) = bus_rx.try_recv() {
             app.apply(ev);
         }
-        terminal.draw(|f| render(f, &app))?;
+        while let Ok((req, reply)) = perm_rx.try_recv() {
+            app.enqueue_permission(req, reply);
+        }
+        if std::mem::take(&mut app.fx_pending) {
+            fx = Some(batten::widgets::fx::dialog_open(&app.theme));
+        }
+        terminal.draw(|f| {
+            render(f, &app);
+            if let (Some(e), Some(_)) = (fx.as_mut(), app.permission.as_ref()) {
+                let area = batten::widgets::permission::area(f.area());
+                e.process(
+                    batten::widgets::fx::FxDuration::from_millis(50),
+                    f.buffer_mut(),
+                    area,
+                );
+            }
+        })?;
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
@@ -119,6 +150,59 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn open_dialog(
+        app: &mut App,
+    ) -> tokio::sync::oneshot::Receiver<codeloom_core::permission::Decision> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.enqueue_permission(
+            codeloom_core::permission::PermissionRequest {
+                tool: "bash".into(),
+                action: "run".into(),
+                detail: r#"{"command":"ls"}"#.into(),
+            },
+            tx,
+        );
+        rx
+    }
+
+    #[test]
+    fn dialog_captures_keys_and_answers() {
+        use codeloom_core::permission::Decision;
+        let mut app = App::new();
+        let mut rx = open_dialog(&mut app);
+        assert!(app.fx_pending);
+        handle_key(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
+        assert_eq!(app.composer.text(), "");
+        assert!(app.permission.is_none());
+        assert_eq!(rx.try_recv().unwrap(), Decision::Allow);
+    }
+
+    #[test]
+    fn esc_denies_without_quitting_and_ctrl_c_still_quits() {
+        use codeloom_core::permission::Decision;
+        let mut app = App::new();
+        let mut rx = open_dialog(&mut app);
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!app.should_quit);
+        assert_eq!(rx.try_recv().unwrap(), Decision::Deny);
+        let _rx2 = open_dialog(&mut app);
+        handle_key(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn queued_requests_are_answered_in_order() {
+        use codeloom_core::permission::Decision;
+        let mut app = App::new();
+        let mut first = open_dialog(&mut app);
+        let mut second = open_dialog(&mut app);
+        handle_key(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
+        assert!(app.permission.is_some());
+        handle_key(&mut app, KeyCode::Char('s'), KeyModifiers::NONE);
+        assert_eq!(first.try_recv().unwrap(), Decision::Deny);
+        assert_eq!(second.try_recv().unwrap(), Decision::AllowSession);
+    }
 
     #[test]
     fn ctrl_c_quits() {
