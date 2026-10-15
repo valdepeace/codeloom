@@ -1,15 +1,18 @@
 //! Demo del transcript con una línea de cada tipo.
 
 use crate::demo::Demo;
-use batten::state::{Line, LineKind, Transcript, Viewport};
+use batten::state::{Line, LineKind, Selection, Transcript, Viewport};
 use batten::widgets::{transcript, Theme};
 use ratatui::crossterm::event::KeyCode;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 pub struct TranscriptDemo {
     transcript: Transcript,
     viewport: Viewport,
+    selection: Option<Selection>,
+    copied: Option<String>,
 }
 
 impl TranscriptDemo {
@@ -39,6 +42,8 @@ impl TranscriptDemo {
         Self {
             transcript,
             viewport: Viewport::new(),
+            selection: None,
+            copied: None,
         }
     }
 }
@@ -49,15 +54,53 @@ impl Demo for TranscriptDemo {
     }
 
     fn hint(&self) -> &str {
-        "↓/↑: scroll · g/G: inicio/fin"
+        "↓/↑: scroll · g/G · v: seleccionar · j/k: extender · y: copiar"
     }
 
     fn render(&mut self, f: &mut Frame, area: Rect, theme: &Theme) {
-        transcript::render(f, area, &self.transcript, &mut self.viewport, theme);
+        let [body, status] =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
+        transcript::render_with_selection(
+            f,
+            body,
+            &self.transcript,
+            &mut self.viewport,
+            self.selection.as_ref(),
+            theme,
+        );
+        let msg = match (&self.copied, &self.selection) {
+            (Some(text), _) => format!("copiado: {}", text.replace('\n', " ⏎ ")),
+            (None, Some(s)) => format!("seleccionadas {} líneas · y: copiar", s.range().count()),
+            (None, None) => "v: seleccionar".into(),
+        };
+        f.render_widget(Paragraph::new(msg).style(theme.styles.muted), status);
     }
 
     fn handle_key(&mut self, code: KeyCode) -> bool {
+        let len = self.transcript.len();
+        if let Some(mut s) = self.selection {
+            match code {
+                KeyCode::Up | KeyCode::Char('k') => s.extend(-1, len),
+                KeyCode::Down | KeyCode::Char('j') => s.extend(1, len),
+                KeyCode::Char('y') => {
+                    self.copied = Some(s.text(&self.transcript));
+                    self.selection = None;
+                    return true;
+                }
+                KeyCode::Char('v') => {
+                    self.selection = None;
+                    return true;
+                }
+                _ => return false,
+            }
+            self.selection = Some(s);
+            return true;
+        }
         match code {
+            KeyCode::Char('v') if len > 0 => {
+                self.copied = None;
+                self.selection = Some(Selection::at(len - 1));
+            }
             KeyCode::Down => self.viewport.scroll_down(1),
             KeyCode::Up => self.viewport.scroll_up(1),
             KeyCode::Char('g') => self.viewport.scroll_up(usize::MAX),
@@ -83,5 +126,20 @@ mod tests {
         let top = d.viewport.window();
         assert_ne!(bottom, top);
         assert_eq!(top.start, 0);
+    }
+
+    #[test]
+    fn select_extend_and_copy() {
+        // 10 líneas de tipos variados + 30 de relleno (0..29): v selecciona la
+        // última y k extiende a la penúltima.
+        let mut d = TranscriptDemo::new();
+        d.handle_key(KeyCode::Char('v'));
+        d.handle_key(KeyCode::Char('k'));
+        d.handle_key(KeyCode::Char('y'));
+        assert!(d.selection.is_none());
+        assert_eq!(
+            d.copied.as_deref(),
+            Some("línea de relleno 28\nlínea de relleno 29")
+        );
     }
 }
