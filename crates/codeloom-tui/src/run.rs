@@ -31,6 +31,30 @@ impl Drop for RawGuard {
 
 /// Teclas con el foco en el transcript (como Crush).
 fn transcript_key(app: &mut App, code: KeyCode) {
+    let len = app.transcript().len();
+    if let Some(mut s) = app.selection {
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => s.extend(-1, len),
+            KeyCode::Down | KeyCode::Char('j') => s.extend(1, len),
+            KeyCode::Char('y') | KeyCode::Char('c') => {
+                app.status = format!("copiado ({} líneas)", s.range().count());
+                app.clipboard = Some(s.text(&app.transcript()));
+                app.selection = None;
+                return;
+            }
+            KeyCode::Esc | KeyCode::Char('v') => {
+                app.selection = None;
+                return;
+            }
+            _ => return,
+        }
+        app.selection = Some(s);
+        return;
+    }
+    if code == KeyCode::Char('v') && len > 0 {
+        app.selection = Some(batten::state::Selection::at(len - 1));
+        return;
+    }
     let vp = &mut app.viewport;
     match code {
         KeyCode::Up | KeyCode::Char('k') => vp.scroll_up(1),
@@ -159,6 +183,12 @@ pub async fn run(
         }
         if std::mem::take(&mut app.fx_pending) {
             fx = Some(batten::widgets::fx::dialog_open(&app.theme));
+        }
+        if let Some(text) = app.clipboard.take() {
+            use std::io::Write;
+            let mut out = std::io::stdout();
+            let _ = out.write_all(crate::clipboard::osc52(&text).as_bytes());
+            let _ = out.flush();
         }
         terminal.draw(|f| {
             render(f, &mut app);
@@ -320,6 +350,29 @@ mod tests {
         handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
         handle_key(&mut app, KeyCode::Up, KeyModifiers::NONE);
         assert_eq!(app.composer.text(), "hola");
+    }
+
+    #[test]
+    fn select_extend_copy_and_escape() {
+        let mut app = App::new();
+        for s in ["uno", "dos", "tres"] {
+            app.items.push(crate::app::TranscriptItem {
+                role: "you",
+                text: s.into(),
+            });
+        }
+        handle_key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('v'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+        assert_eq!(app.clipboard.as_deref(), Some("dos\ntres"));
+        assert!(app.selection.is_none());
+        handle_key(&mut app, KeyCode::Char('v'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.selection.is_none());
+        assert_eq!(app.focus, Focus::Transcript);
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.focus, Focus::Composer);
     }
 
     #[test]

@@ -36,6 +36,10 @@ pub struct App {
     /// Scroll del transcript (sigue el final salvo que el usuario suba).
     pub viewport: batten::state::Viewport,
     pub focus: Focus,
+    /// Líneas seleccionadas del transcript, si hay.
+    pub selection: Option<batten::state::Selection>,
+    /// Texto pendiente de enviar al portapapeles (lo consume el bucle).
+    pub clipboard: Option<String>,
     /// Diálogo de permiso abierto, si hay.
     pub permission: Option<PendingPermission>,
     /// Peticiones esperando a que se cierre la actual.
@@ -64,6 +68,8 @@ impl App {
             changes: batten::state::FileChanges::new(),
             viewport: batten::state::Viewport::new(),
             focus: Focus::Composer,
+            selection: None,
+            clipboard: None,
             permission: None,
             permission_queue: VecDeque::new(),
             fx_pending: false,
