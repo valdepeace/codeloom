@@ -68,12 +68,7 @@ impl App {
         if self.input.trim().is_empty() {
             return None;
         }
-        let text = std::mem::take(&mut self.input);
-        self.items.push(TranscriptItem {
-            role: "you",
-            text: text.clone(),
-        });
-        Some(text)
+        Some(std::mem::take(&mut self.input))
     }
 }
 
@@ -98,5 +93,18 @@ mod tests {
         assert_eq!(app.submit(), Some("hi".to_string()));
         assert!(app.input.is_empty());
         assert_eq!(app.submit(), None);
+    }
+
+    #[test]
+    fn user_line_comes_from_the_event_not_from_submit() {
+        let mut app = App::new();
+        app.push_char('h');
+        app.push_char('i');
+        assert_eq!(app.submit(), Some("hi".to_string()));
+        assert!(app.items.iter().all(|i| i.role != "you"));
+        app.apply(codeloom_core::event::LiveEvent::MessageAdded(
+            codeloom_core::message::Message::user("hi"),
+        ));
+        assert_eq!(app.items.iter().filter(|i| i.role == "you").count(), 1);
     }
 }
