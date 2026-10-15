@@ -18,6 +18,10 @@ fn main() -> std::io::Result<()> {
     let mut last_tick = Instant::now();
     let started = Instant::now();
 
+    let mut side = batten::state::Sidebar::with_logo("batten");
+    side.push_section("state", vec!["working".into()]);
+    side.push_section("model", vec!["mock".into()]);
+
     loop {
         // ---- "Eventos" falsos, por tiempo ----
         if scenario == "basic" {
@@ -55,16 +59,29 @@ fn main() -> std::io::Result<()> {
                 ratatui::layout::Constraint::Length(3),
             ])
             .split(area);
+            let (main, side_area) = if area.width >= 80 {
+                let cols = ratatui::layout::Layout::horizontal([
+                    ratatui::layout::Constraint::Min(1),
+                    ratatui::layout::Constraint::Length(30),
+                ])
+                .split(rows[0]);
+                (cols[0], Some(cols[1]))
+            } else {
+                (rows[0], None)
+            };
             if scenario == "tools" {
                 let top = ratatui::layout::Layout::vertical([
                     ratatui::layout::Constraint::Length(2),
                     ratatui::layout::Constraint::Min(1),
                 ])
-                .split(rows[0]);
+                .split(main);
                 widgets::tool_item::render(f, top[0], &tool, &anim, &theme);
                 widgets::transcript::render(f, top[1], &transcript, &viewport, &theme);
             } else {
-                widgets::transcript::render(f, rows[0], &transcript, &viewport, &theme);
+                widgets::transcript::render(f, main, &transcript, &viewport, &theme);
+            }
+            if let Some(sa) = side_area {
+                batten::widgets::sidebar::render(f, sa, &side, &theme);
             }
             widgets::composer::render(f, rows[1], &composer, &theme);
         })?;
