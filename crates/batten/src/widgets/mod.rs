@@ -15,6 +15,7 @@ pub mod key_help;
 pub mod link;
 pub mod logo;
 pub mod panel;
+pub mod permission;
 #[cfg(feature = "termprofile")]
 pub mod profile;
 pub mod progress;
