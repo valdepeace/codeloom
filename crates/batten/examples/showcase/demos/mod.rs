@@ -2,6 +2,7 @@
 
 mod chat;
 mod composer;
+mod file_changes;
 mod logo;
 mod sidebar;
 mod spinner;
@@ -22,6 +23,7 @@ pub fn catalog() -> Vec<Box<dyn Demo>> {
         Box::new(sidebar::SidebarDemo::new()),
         Box::new(theme::ThemeDemo::new()),
         Box::new(chat::ChatDemo::new()),
+        Box::new(file_changes::FileChangesDemo::new()),
     ]
 }
 
