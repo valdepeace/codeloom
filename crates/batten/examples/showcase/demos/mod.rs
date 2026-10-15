@@ -11,6 +11,7 @@ mod progress;
 mod rule;
 mod sidebar;
 mod spinner;
+mod spinners;
 mod status;
 mod theme;
 mod toast;
@@ -38,6 +39,7 @@ pub fn catalog() -> Vec<Box<dyn Demo>> {
         Box::new(progress::ProgressDemo::new()),
         Box::new(panel::PanelDemo::new()),
         Box::new(toast::ToastDemo::new()),
+        Box::new(spinners::SpinnersDemo::new()),
     ]
 }
 
