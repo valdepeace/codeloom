@@ -1,0 +1,15 @@
+[package]
+name = "batten"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ratatui = "0.30"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+unicode-width = "0.2"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
