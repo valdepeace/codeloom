@@ -9,6 +9,8 @@ pub mod file_changes;
 pub mod fx;
 mod gradient;
 pub mod key_help;
+#[cfg(feature = "links")]
+pub mod link;
 pub mod logo;
 pub mod panel;
 pub mod progress;
