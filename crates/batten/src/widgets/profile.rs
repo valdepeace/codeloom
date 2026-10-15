@@ -38,6 +38,9 @@ impl Theme {
             logo_field: a(s.logo_field),
             scrollbar: a(s.scrollbar),
             border: a(s.border),
+            diff_insert: a(s.diff_insert),
+            diff_delete: a(s.diff_delete),
+            diff_hunk: a(s.diff_hunk),
         };
         let extensions = self
             .extensions

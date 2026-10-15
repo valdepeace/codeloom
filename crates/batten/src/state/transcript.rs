@@ -41,6 +41,9 @@ pub enum StyleToken {
     LogoField,
     Scrollbar,
     Border,
+    DiffInsert,
+    DiffDelete,
+    DiffHunk,
 }
 
 /// Rango con estilo, como offsets sobre el texto plano de una linea.

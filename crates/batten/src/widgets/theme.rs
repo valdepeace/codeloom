@@ -60,6 +60,9 @@ pub struct Styles {
     pub logo_field: Style,
     pub scrollbar: Style,
     pub border: Style,
+    pub diff_insert: Style,
+    pub diff_delete: Style,
+    pub diff_hunk: Style,
 }
 
 impl Default for Styles {
@@ -94,6 +97,9 @@ impl Default for Styles {
             logo_field: Style::default().fg(Color::Indexed(238)),
             scrollbar: Style::default().fg(Color::Indexed(240)),
             border: Style::default().fg(Color::Indexed(240)),
+            diff_insert: Style::default().fg(Color::Green),
+            diff_delete: Style::default().fg(Color::Red),
+            diff_hunk: Style::default().fg(Color::Cyan),
         }
     }
 }
@@ -216,6 +222,9 @@ impl Theme {
             StyleToken::LogoField => s.logo_field,
             StyleToken::Scrollbar => s.scrollbar,
             StyleToken::Border => s.border,
+            StyleToken::DiffInsert => s.diff_insert,
+            StyleToken::DiffDelete => s.diff_delete,
+            StyleToken::DiffHunk => s.diff_hunk,
         })
     }
 
@@ -247,6 +256,9 @@ impl Theme {
             "logo_field" => s.logo_field = style,
             "scrollbar" => s.scrollbar = style,
             "border" => s.border = style,
+            "diff_insert" => s.diff_insert = style,
+            "diff_delete" => s.diff_delete = style,
+            "diff_hunk" => s.diff_hunk = style,
             _ => return false,
         }
         true
@@ -280,6 +292,9 @@ fn token_to_key(t: StyleToken) -> &'static str {
         StyleToken::LogoField => "logo_field",
         StyleToken::Scrollbar => "scrollbar",
         StyleToken::Border => "border",
+        StyleToken::DiffInsert => "diff_insert",
+        StyleToken::DiffDelete => "diff_delete",
+        StyleToken::DiffHunk => "diff_hunk",
     }
 }
 
@@ -398,5 +413,14 @@ mod tests {
         assert_eq!(th.style(StyleToken::Border).fg, Some(Color::Indexed(240)));
         let th = Theme::from_toml("[styles]\nborder = \"magenta\"\n").unwrap();
         assert_eq!(th.style(StyleToken::Border).fg, Some(Color::Magenta));
+    }
+
+    #[test]
+    fn diff_tokens_resolve_and_override() {
+        let th = Theme::test();
+        assert_eq!(th.style(StyleToken::DiffInsert).fg, Some(Color::Green));
+        assert_eq!(th.style(StyleToken::DiffHunk).fg, Some(Color::Cyan));
+        let th = Theme::from_toml("[styles]\ndiff_delete = \"magenta\"\n").unwrap();
+        assert_eq!(th.style(StyleToken::DiffDelete).fg, Some(Color::Magenta));
     }
 }

@@ -4,6 +4,7 @@
 pub mod ansi;
 pub mod chip;
 pub mod composer;
+pub mod diff;
 pub mod file_changes;
 #[cfg(feature = "fx")]
 pub mod fx;
