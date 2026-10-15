@@ -4,12 +4,23 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["fx", "ansi", "links", "termprofile"]
+fx = ["dep:tachyonfx"]
+ansi = ["dep:ansi-to-tui"]
+links = ["dep:hyperrat"]
+termprofile = ["dep:termprofile"]
+
 [dependencies]
 ratatui = "0.30"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 unicode-width = "0.2"
 thiserror = "2"
+tachyonfx = { version = "0.25", optional = true }
+ansi-to-tui = { version = "8", optional = true }
+hyperrat = { version = "0.1.3", optional = true }
+termprofile = { version = "0.2", optional = true, features = ["convert", "ratatui"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -3,6 +3,8 @@
 pub mod chip;
 pub mod composer;
 pub mod file_changes;
+#[cfg(feature = "fx")]
+pub mod fx;
 mod gradient;
 pub mod key_help;
 pub mod logo;
