@@ -4,6 +4,7 @@ pub mod chip;
 pub mod composer;
 pub mod file_changes;
 mod gradient;
+pub mod key_help;
 pub mod logo;
 pub mod rule;
 pub mod scrollbar;
@@ -17,6 +18,7 @@ pub mod transcript;
 
 pub use chip::chip;
 pub use composer::render as render_composer;
+pub use key_help::key_help;
 pub use rule::rule;
 pub use spinner::{Anim, Animatable, FRAME_INTERVAL};
 pub use theme::{Glyphs, Styles, Theme, ThemeError};
