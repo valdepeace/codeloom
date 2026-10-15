@@ -1,6 +1,7 @@
 //! Catálogo de demos del showcase.
 
 mod spinner;
+mod tool_item;
 mod transcript;
 
 use crate::demo::Demo;
@@ -9,6 +10,7 @@ use crate::demo::Demo;
 pub fn catalog() -> Vec<Box<dyn Demo>> {
     vec![
         Box::new(transcript::TranscriptDemo::new()),
+        Box::new(tool_item::ToolItemDemo::new()),
         Box::new(spinner::SpinnerDemo::new()),
     ]
 }
