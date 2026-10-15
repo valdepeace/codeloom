@@ -850,6 +850,7 @@ En `demos/composer.rs`, `mod tests`, añade:
     #[test]
     fn up_recalls_history() {
         let mut d = ComposerDemo::new();
+        d.composer.set_text("");
         for c in "hey".chars() {
             d.handle_key(KeyCode::Char(c));
         }
