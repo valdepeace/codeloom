@@ -489,6 +489,7 @@ impl History {
     }
 
     /// Hacia delante (↓). Al pasar del final devuelve el borrador y termina.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<&str> {
         match self.index {
             None => None,
