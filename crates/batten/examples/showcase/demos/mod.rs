@@ -1,0 +1,46 @@
+//! Catálogo de demos del showcase.
+
+mod spinner;
+
+use crate::demo::Demo;
+
+/// Todos los demos, en el orden del índice.
+pub fn catalog() -> Vec<Box<dyn Demo>> {
+    vec![Box::new(spinner::SpinnerDemo::new())]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use batten::widgets::{Anim, Theme};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    #[test]
+    fn catalog_titles_are_unique() {
+        let cat = catalog();
+        assert!(!cat.is_empty());
+        let mut titles: Vec<&str> = cat.iter().map(|d| d.title()).collect();
+        let n = titles.len();
+        titles.sort_unstable();
+        titles.dedup();
+        assert_eq!(titles.len(), n, "títulos repetidos");
+    }
+
+    #[test]
+    fn every_demo_renders_without_panicking() {
+        let anim = Anim::new();
+        for mut demo in catalog() {
+            for (w, h) in [(0u16, 0u16), (1, 1), (40, 10), (120, 40)] {
+                demo.tick(&anim);
+                let backend = TestBackend::new(w, h);
+                let mut term = Terminal::new(backend).unwrap();
+                term.draw(|f| {
+                    let area = f.area();
+                    demo.render(f, area, &Theme::test());
+                })
+                .unwrap();
+            }
+        }
+    }
+}

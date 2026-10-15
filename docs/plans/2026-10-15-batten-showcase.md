@@ -101,15 +101,37 @@ pub struct Showcase {
 mod tests {
     use super::*;
 
-    fn find(show: &Showcase, title: &str) -> usize {
-        (0..show.len())
-            .find(|&i| show.title_at(i) == Some(title))
-            .expect("demo presente")
+    /// Demo vacía para tests de navegación, independientes del catálogo real.
+    struct Dummy(&'static str);
+
+    const NAMES: [&str; 8] = ["a", "b", "c", "d", "e", "f", "g", "h"];
+
+    impl Demo for Dummy {
+        fn title(&self) -> &str {
+            self.0
+        }
+        fn hint(&self) -> &str {
+            ""
+        }
+        fn render(
+            &mut self,
+            _f: &mut ratatui::Frame,
+            _a: ratatui::layout::Rect,
+            _t: &batten::widgets::Theme,
+        ) {
+        }
+    }
+
+    fn dummy_show(n: usize) -> Showcase {
+        let demos: Vec<Box<dyn Demo>> = (0..n)
+            .map(|i| Box::new(Dummy(NAMES[i])) as Box<dyn Demo>)
+            .collect();
+        Showcase::with_demos(demos)
     }
 
     #[test]
     fn navigation_clamps_and_resets_focus() {
-        let mut show = Showcase::new();
+        let mut show = dummy_show(5);
         assert_eq!(show.selected(), 0);
         show.prev();
         assert_eq!(show.selected(), 0); // clamp arriba
@@ -170,7 +192,7 @@ mod tests {
 
     #[test]
     fn arrows_move_selection_in_index_focus() {
-        let mut show = Showcase::new();
+        let mut show = dummy_show(3);
         route(&mut show, KeyEventKind::Press, KeyCode::Down, KeyModifiers::NONE);
         assert_eq!(show.selected(), 1);
         route(&mut show, KeyEventKind::Press, KeyCode::Up, KeyModifiers::NONE);
@@ -282,6 +304,14 @@ impl Showcase {
 
     pub fn title_at(&self, i: usize) -> Option<&str> {
         self.demos.get(i).map(|d| d.title())
+    }
+
+    /// Pista de teclas del demo activo.
+    pub fn current_hint(&self) -> &str {
+        self.demos
+            .get(self.selected)
+            .map(|d| d.hint())
+            .unwrap_or("")
     }
 
     pub fn selected(&self) -> usize {
@@ -538,8 +568,8 @@ fn draw_index(f: &mut Frame, area: Rect, show: &Showcase, theme: &Theme) {
 fn draw_header(f: &mut Frame, area: Rect, show: &Showcase, theme: &Theme) {
     let title = show.title_at(show.selected()).unwrap_or("");
     let hint = match show.focus() {
-        Focus::Index => "Tab: foco · ↓/↑: widget · q: salir",
-        Focus::Demo => "Tab/Esc: volver al índice · q: tecla del widget",
+        Focus::Index => "Tab: foco · ↓/↑: widget · q: salir".to_string(),
+        Focus::Demo => format!("{} · Tab/Esc: índice", show.current_hint()),
     };
     let lines = vec![
         Line::styled(
