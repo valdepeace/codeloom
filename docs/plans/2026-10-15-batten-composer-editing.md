@@ -557,7 +557,7 @@ En `crates/batten/src/widgets/composer.rs`, `mod tests`, añade:
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| render(f, f.area(), &c, &Theme::test()))
             .unwrap();
-        let pos = term.backend().get_cursor_position().unwrap();
+        let pos = term.backend_mut().get_cursor_position().unwrap();
         assert_eq!((pos.x, pos.y), (3, 1)); // borde(1) + "hi"(2), fila 1
     }
 
@@ -569,7 +569,7 @@ En `crates/batten/src/widgets/composer.rs`, `mod tests`, añade:
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| render(f, f.area(), &c, &Theme::test()))
             .unwrap();
-        let pos = term.backend().get_cursor_position().unwrap();
+        let pos = term.backend_mut().get_cursor_position().unwrap();
         assert_eq!((pos.x, pos.y), (2, 2));
     }
 
