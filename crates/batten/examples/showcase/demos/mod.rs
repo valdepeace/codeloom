@@ -1,12 +1,16 @@
 //! Catálogo de demos del showcase.
 
 mod spinner;
+mod transcript;
 
 use crate::demo::Demo;
 
 /// Todos los demos, en el orden del índice.
 pub fn catalog() -> Vec<Box<dyn Demo>> {
-    vec![Box::new(spinner::SpinnerDemo::new())]
+    vec![
+        Box::new(transcript::TranscriptDemo::new()),
+        Box::new(spinner::SpinnerDemo::new()),
+    ]
 }
 
 #[cfg(test)]
