@@ -8,7 +8,8 @@ pub struct TranscriptItem {
 
 pub struct App {
     pub items: Vec<TranscriptItem>,
-    pub input: String,
+    pub composer: batten::state::Composer,
+    pub history: batten::state::History,
     pub status: String,
     pub should_quit: bool,
     pub cwd: String,
@@ -27,7 +28,8 @@ impl App {
     pub fn new() -> Self {
         Self {
             items: Vec::new(),
-            input: String::new(),
+            composer: batten::state::Composer::new(),
+            history: batten::state::History::new(),
             status: "ready".into(),
             should_quit: false,
             cwd: String::new(),
@@ -84,16 +86,63 @@ impl App {
     }
 
     pub fn push_char(&mut self, c: char) {
-        self.input.push(c);
+        self.composer.insert_char(c);
+        self.history.reset();
+    }
+    pub fn newline(&mut self) {
+        self.composer.newline();
+        self.history.reset();
     }
     pub fn backspace(&mut self) {
-        self.input.pop();
+        self.composer.backspace();
+        self.history.reset();
     }
-    pub fn submit(&mut self) -> Option<String> {
-        if self.input.trim().is_empty() {
-            return None;
+    pub fn delete(&mut self) {
+        self.composer.delete();
+        self.history.reset();
+    }
+    pub fn move_left(&mut self) {
+        self.composer.move_left();
+    }
+    pub fn move_right(&mut self) {
+        self.composer.move_right();
+    }
+    pub fn move_home(&mut self) {
+        self.composer.move_home();
+    }
+    pub fn move_end(&mut self) {
+        self.composer.move_end();
+    }
+
+    /// ↑: cursor si hay varias líneas; si no, historial.
+    pub fn up(&mut self) {
+        if !self.history.is_browsing() && self.composer.lines() > 1 {
+            self.composer.move_up();
+            return;
         }
-        Some(std::mem::take(&mut self.input))
+        let current = self.composer.text().to_string();
+        if let Some(prev) = self.history.prev(&current) {
+            let prev = prev.to_string();
+            self.composer.set_text(&prev);
+        }
+    }
+
+    /// ↓: historial si se está navegando; si no, cursor.
+    pub fn down(&mut self) {
+        if !self.history.is_browsing() {
+            self.composer.move_down();
+            return;
+        }
+        if let Some(next) = self.history.next() {
+            let next = next.to_string();
+            self.composer.set_text(&next);
+        }
+    }
+
+    pub fn submit(&mut self) -> Option<String> {
+        let text = self.composer.submit()?;
+        self.history.push(text.clone());
+        Some(text)
     }
 
     /// Construye el sidebar de batten con la marca y las secciones de sesión.
@@ -122,12 +171,12 @@ mod tests {
     }
 
     #[test]
-    fn submit_clears_input() {
+    fn submit_clears_composer() {
         let mut app = App::new();
         app.push_char('h');
         app.push_char('i');
         assert_eq!(app.submit(), Some("hi".to_string()));
-        assert!(app.input.is_empty());
+        assert!(app.composer.is_empty());
         assert_eq!(app.submit(), None);
     }
 

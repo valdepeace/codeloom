@@ -41,9 +41,7 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_composer(frame: &mut Frame, area: Rect, app: &App) {
-    let composer = Paragraph::new(app.input.as_str())
-        .block(Block::default().borders(Borders::ALL).title("prompt"));
-    frame.render_widget(composer, area);
+    batten::widgets::composer::render(frame, area, &app.composer, &app.theme);
 }
 
 pub fn render(frame: &mut Frame, app: &App) {

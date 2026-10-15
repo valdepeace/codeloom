@@ -45,6 +45,38 @@ pub fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Option<St
             None
         }
         KeyCode::Enter => app.submit(),
+        KeyCode::Char('j') if mods.contains(KeyModifiers::CONTROL) => {
+            app.newline();
+            None
+        }
+        KeyCode::Delete => {
+            app.delete();
+            None
+        }
+        KeyCode::Left => {
+            app.move_left();
+            None
+        }
+        KeyCode::Right => {
+            app.move_right();
+            None
+        }
+        KeyCode::Home => {
+            app.move_home();
+            None
+        }
+        KeyCode::End => {
+            app.move_end();
+            None
+        }
+        KeyCode::Up => {
+            app.up();
+            None
+        }
+        KeyCode::Down => {
+            app.down();
+            None
+        }
         KeyCode::Backspace => {
             app.backspace();
             None
@@ -121,5 +153,35 @@ mod tests {
             Some("hi".to_string())
         );
         assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn ctrl_j_adds_a_line_and_enter_sends() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('j'), KeyModifiers::CONTROL);
+        handle_key(&mut app, KeyCode::Char('b'), KeyModifiers::NONE);
+        assert_eq!(app.composer.text(), "a\nb");
+        let sent = handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(sent, Some("a\nb".to_string()));
+    }
+
+    #[test]
+    fn up_recalls_history_when_single_line() {
+        let mut app = App::new();
+        for c in "hola".chars() {
+            handle_key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.composer.text(), "hola");
+    }
+
+    #[test]
+    fn up_moves_the_cursor_when_multiline() {
+        let mut app = App::new();
+        app.composer.set_text("uno\ndos");
+        handle_key(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.composer.cursor_row_col().0, 0);
     }
 }
