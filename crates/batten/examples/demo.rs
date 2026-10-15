@@ -2,8 +2,34 @@
 //! Uso: `cargo run -p batten --example demo -- basic`
 use batten::state::{Composer, Line, LineKind, ToolItem, Transcript, Viewport};
 use batten::widgets::{self, Anim, Theme, FRAME_INTERVAL};
-use ratatui::crossterm::event::{self, Event, KeyCode};
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use std::time::{Duration, Instant};
+
+/// Aplica una tecla. Solo cuenta la pulsación: en Windows llegan también
+/// `Release`/`Repeat`, y actuar sobre ellos duplicaría cada carácter.
+/// Devuelve `true` si hay que salir.
+fn handle_key(
+    kind: KeyEventKind,
+    code: KeyCode,
+    composer: &mut Composer,
+    transcript: &mut Transcript,
+) -> bool {
+    if kind != KeyEventKind::Press {
+        return false;
+    }
+    match code {
+        KeyCode::Esc | KeyCode::Char('q') => return true,
+        KeyCode::Enter => {
+            if let Some(text) = composer.submit() {
+                transcript.push(Line::new(LineKind::User, text));
+            }
+        }
+        KeyCode::Backspace => composer.backspace(),
+        KeyCode::Char(c) => composer.push_char(c),
+        _ => {}
+    }
+    false
+}
 
 fn main() -> std::io::Result<()> {
     let scenario = std::env::args().nth(1).unwrap_or_else(|| "basic".into());
@@ -88,16 +114,8 @@ fn main() -> std::io::Result<()> {
 
         if event::poll(Duration::from_millis(16))? {
             if let Event::Key(k) = event::read()? {
-                match k.code {
-                    KeyCode::Esc | KeyCode::Char('q') => break,
-                    KeyCode::Enter => {
-                        if let Some(text) = composer.submit() {
-                            transcript.push(Line::new(LineKind::User, text));
-                        }
-                    }
-                    KeyCode::Backspace => composer.backspace(),
-                    KeyCode::Char(c) => composer.push_char(c),
-                    _ => {}
+                if handle_key(k.kind, k.code, &mut composer, &mut transcript) {
+                    break;
                 }
             }
         }
@@ -105,4 +123,43 @@ fn main() -> std::io::Result<()> {
 
     ratatui::restore();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::crossterm::event::KeyEventKind;
+
+    #[test]
+    fn release_events_do_not_type() {
+        let mut c = Composer::new();
+        let mut t = Transcript::new();
+        let quit = handle_key(KeyEventKind::Release, KeyCode::Char('a'), &mut c, &mut t);
+        assert!(!quit);
+        assert!(c.is_empty());
+        assert!(t.is_empty());
+    }
+
+    #[test]
+    fn press_events_type_and_submit() {
+        let mut c = Composer::new();
+        let mut t = Transcript::new();
+        handle_key(KeyEventKind::Press, KeyCode::Char('h'), &mut c, &mut t);
+        handle_key(KeyEventKind::Press, KeyCode::Char('i'), &mut c, &mut t);
+        handle_key(KeyEventKind::Press, KeyCode::Enter, &mut c, &mut t);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.line(0).unwrap().plain(), "hi");
+    }
+
+    #[test]
+    fn esc_quits() {
+        let mut c = Composer::new();
+        let mut t = Transcript::new();
+        assert!(handle_key(
+            KeyEventKind::Press,
+            KeyCode::Esc,
+            &mut c,
+            &mut t
+        ));
+    }
 }
