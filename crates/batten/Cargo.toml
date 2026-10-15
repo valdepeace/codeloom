@@ -12,7 +12,7 @@ links = ["dep:hyperrat"]
 termprofile = ["dep:termprofile"]
 
 [dependencies]
-ratatui = "0.30"
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 unicode-width = "0.2"

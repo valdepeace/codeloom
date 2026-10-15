@@ -72,24 +72,28 @@ fn render_line(line: &Line, theme: &Theme) -> Vec<TLine<'static>> {
     vec![TLine::from(spans)]
 }
 
+/// Pinta el transcript. Una sola geometría (filas tras el wrap) alimenta el
+/// pintado, el scroll y la scrollbar; la fija en `viewport`.
 pub fn render(
     frame: &mut Frame,
     area: Rect,
     transcript: &Transcript,
-    viewport: &crate::state::Viewport,
+    viewport: &mut crate::state::Viewport,
     theme: &Theme,
 ) {
-    let rows = area.height as usize;
-    let range = viewport.window(transcript.len(), rows);
-    let mut lines: Vec<TLine> = Vec::new();
-    for i in range {
-        if let Some(line) = transcript.line(i) {
-            lines.extend(render_line(line, theme));
-        }
+    if area.width == 0 || area.height == 0 {
+        return;
     }
-
-    // Barra a la derecha cuando hay más líneas que filas visibles.
-    let overflow = transcript.len() > rows && area.width >= 2;
+    let rows = area.height as usize;
+    // ponytail: se compone todo el historial en cada frame; cachear por línea
+    // si se nota en conversaciones largas.
+    let lines: Vec<TLine> = (0..transcript.len())
+        .filter_map(|i| transcript.line(i))
+        .flat_map(|l| render_line(l, theme))
+        .collect();
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let full = para.line_count(area.width);
+    let overflow = full > rows && area.width >= 2;
     let text_area = if overflow {
         Rect {
             width: area.width - 1,
@@ -98,19 +102,22 @@ pub fn render(
     } else {
         area
     };
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), text_area);
+    let total = if overflow {
+        para.line_count(text_area.width)
+    } else {
+        full
+    };
+    viewport.set_geometry(total, rows);
+    // ponytail: `Paragraph::scroll` usa u16; más de 65535 filas se quedan en el tope.
+    let top = u16::try_from(viewport.top()).unwrap_or(u16::MAX);
+    frame.render_widget(para.scroll((top, 0)), text_area);
     if overflow {
         let bar = Rect {
             x: area.x + area.width - 1,
             width: 1,
             ..area
         };
-        crate::widgets::scrollbar::render(
-            frame,
-            bar,
-            viewport.scroll(transcript.len(), rows),
-            theme,
-        );
+        crate::widgets::scrollbar::render(frame, bar, viewport.scroll(), theme);
     }
 }
 
@@ -121,11 +128,10 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    fn buffer(transcript: &Transcript, w: u16, h: u16) -> String {
+    fn draw(transcript: &Transcript, vp: &mut Viewport, w: u16, h: u16) -> String {
         let backend = TestBackend::new(w, h);
         let mut term = Terminal::new(backend).unwrap();
-        let vp = Viewport::new();
-        term.draw(|f| render(f, f.area(), transcript, &vp, &Theme::test()))
+        term.draw(|f| render(f, f.area(), transcript, vp, &Theme::test()))
             .unwrap();
         term.backend()
             .buffer()
@@ -133,6 +139,10 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect()
+    }
+
+    fn buffer(transcript: &Transcript, w: u16, h: u16) -> String {
+        draw(transcript, &mut Viewport::new(), w, h)
     }
 
     #[test]
@@ -207,5 +217,47 @@ mod tests {
         t.push(Line::new(LineKind::Assistant, "hi"));
         let out = buffer(&t, 20, 5);
         assert!(!out.contains('\u{2551}') && !out.contains('\u{2588}'));
+    }
+
+    #[test]
+    fn wrapped_lines_count_as_rows_when_following() {
+        let mut t = Transcript::new();
+        t.push(Line::new(LineKind::User, "inicio"));
+        t.push(Line::new(LineKind::Assistant, "palabra ".repeat(20)));
+        t.push(Line::new(LineKind::Assistant, "fin"));
+        let out = buffer(&t, 20, 3);
+        assert!(out.contains("fin"), "la última línea debe verse");
+        assert!(!out.contains("inicio"));
+    }
+
+    #[test]
+    fn reading_up_keeps_the_view_while_content_grows() {
+        let mut t = Transcript::new();
+        for i in 0..50 {
+            t.push(Line::new(LineKind::Assistant, format!("line {i:02}")));
+        }
+        let mut vp = Viewport::new();
+        draw(&t, &mut vp, 30, 5);
+        vp.scroll_up(10);
+        let before = draw(&t, &mut vp, 30, 5);
+        for i in 50..70 {
+            t.push(Line::new(LineKind::Assistant, format!("line {i:02}")));
+        }
+        let after = draw(&t, &mut vp, 30, 5);
+        assert!(before.contains("line 35"));
+        assert!(after.contains("line 35"));
+        assert!(!after.contains("line 69"));
+    }
+
+    #[test]
+    fn following_shows_new_content() {
+        let mut t = Transcript::new();
+        for i in 0..50 {
+            t.push(Line::new(LineKind::Assistant, format!("line {i:02}")));
+        }
+        let mut vp = Viewport::new();
+        draw(&t, &mut vp, 30, 5);
+        t.push(Line::new(LineKind::Assistant, "nueva"));
+        assert!(draw(&t, &mut vp, 30, 5).contains("nueva"));
     }
 }

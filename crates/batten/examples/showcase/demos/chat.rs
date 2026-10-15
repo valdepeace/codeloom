@@ -77,7 +77,7 @@ impl Demo for ChatDemo {
         ])
         .split(body);
         tool_item::render(f, rows[0], &self.tool, &self.anim, theme);
-        transcript::render(f, rows[1], &self.transcript, &self.viewport, theme);
+        transcript::render(f, rows[1], &self.transcript, &mut self.viewport, theme);
         composer::render(f, rows[2], &self.composer, theme);
         if let Some(s) = side {
             sidebar::render(f, s, &self.sidebar, theme);

@@ -1,7 +1,10 @@
+//! Estado de scroll en filas visuales (no líneas lógicas). El widget fija la
+//! geometría al pintar (`set_geometry`); las teclas mueven `top`.
+
 use std::ops::Range;
 
-/// Posición de scroll para pintar una barra: el `offset` es la primera línea
-/// visible, `content` el total de líneas y `viewport` las filas visibles.
+/// Posición de scroll para pintar una barra: el `offset` es la primera fila
+/// visible, `content` el total de filas y `viewport` las filas visibles.
 /// Puro (sin ratatui): el widget lo traduce a su `ScrollbarState`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Scroll {
@@ -10,18 +13,23 @@ pub struct Scroll {
     pub viewport: usize,
 }
 
-/// Estado de scroll del transcript. Por defecto sigue el final (lo mas nuevo).
+/// Scroll del transcript. Por defecto sigue el final; si el usuario sube,
+/// `top` queda fijo aunque llegue contenido nuevo.
 #[derive(Debug, Clone, Copy)]
 pub struct Viewport {
-    scroll: usize,
-    follow_bottom: bool,
+    top: usize,
+    follow: bool,
+    total: usize,
+    rows: usize,
 }
 
 impl Default for Viewport {
     fn default() -> Self {
         Self {
-            scroll: 0,
-            follow_bottom: true,
+            top: 0,
+            follow: true,
+            total: 0,
+            rows: 0,
         }
     }
 }
@@ -31,47 +39,69 @@ impl Viewport {
         Self::default()
     }
 
-    pub fn follow_bottom(&mut self) {
-        self.follow_bottom = true;
-        self.scroll = 0;
-    }
-
-    /// Sube `n` lineas desde abajo (rompe el seguir-el-final).
-    pub fn scroll_up(&mut self, n: usize) {
-        self.scroll = self.scroll.saturating_add(n);
-        self.follow_bottom = false;
-    }
-
-    /// Baja `n` lineas; al llegar abajo se reanuda el seguir-el-final.
-    pub fn scroll_down(&mut self, n: usize) {
-        self.scroll = self.scroll.saturating_sub(n);
-        if self.scroll == 0 {
-            self.follow_bottom = true;
-        }
-    }
-
-    /// Rango `[start, end)` de lineas visibles.
-    pub fn window(&self, total: usize, rows: usize) -> Range<usize> {
-        if rows == 0 {
-            return total..total;
-        }
-        let rows = rows.min(total.max(1));
-        if self.follow_bottom {
-            total.saturating_sub(rows)..total
+    /// Lo llama el widget al pintar: filas totales del contenido y visibles.
+    pub fn set_geometry(&mut self, total: usize, rows: usize) {
+        self.total = total;
+        self.rows = rows;
+        // ponytail: en un resize solo se acota `top`; no se conserva la línea
+        // que había arriba. Anclar a línea lógica si molesta.
+        self.top = if self.follow {
+            self.max_top()
         } else {
-            let max_start = total.saturating_sub(rows);
-            let start = max_start.saturating_sub(self.scroll.min(max_start));
-            start..(start + rows).min(total)
+            self.top.min(self.max_top())
+        };
+    }
+
+    fn max_top(&self) -> usize {
+        self.total.saturating_sub(self.rows)
+    }
+
+    /// Vuelve al final y lo sigue.
+    pub fn follow_bottom(&mut self) {
+        self.follow = true;
+        self.top = self.max_top();
+    }
+
+    pub fn is_following(&self) -> bool {
+        self.follow
+    }
+
+    /// Sube `n` filas y deja de seguir el final. Si todo cabe, no hace nada.
+    pub fn scroll_up(&mut self, n: usize) {
+        if self.max_top() == 0 {
+            return;
+        }
+        if self.follow {
+            self.top = self.max_top();
+        }
+        self.follow = false;
+        self.top = self.top.saturating_sub(n);
+    }
+
+    /// Baja `n` filas; al llegar al final vuelve a seguirlo.
+    pub fn scroll_down(&mut self, n: usize) {
+        self.top = self.top.saturating_add(n).min(self.max_top());
+        if self.top >= self.max_top() {
+            self.follow = true;
         }
     }
 
-    /// Posición de scroll para pintar una barra, derivada de `window`.
-    pub fn scroll(&self, total: usize, rows: usize) -> Scroll {
-        let start = self.window(total, rows).start;
+    /// Primera fila visible.
+    pub fn top(&self) -> usize {
+        self.top
+    }
+
+    /// Filas visibles `[top, top + rows)` acotadas al total.
+    pub fn window(&self) -> Range<usize> {
+        self.top..(self.top + self.rows).min(self.total)
+    }
+
+    /// Posición para la scrollbar.
+    pub fn scroll(&self) -> Scroll {
         Scroll {
-            offset: start,
-            content: total,
-            viewport: rows,
+            offset: self.top,
+            content: self.total,
+            viewport: self.rows,
         }
     }
 }
@@ -80,60 +110,79 @@ impl Viewport {
 mod tests {
     use super::*;
 
+    fn vp(total: usize, rows: usize) -> Viewport {
+        let mut v = Viewport::new();
+        v.set_geometry(total, rows);
+        v
+    }
+
     #[test]
     fn follows_bottom_by_default() {
-        let vp = Viewport::new();
-        assert_eq!(vp.window(100, 10), 90..100);
+        assert_eq!(vp(100, 10).window(), 90..100);
     }
 
     #[test]
-    fn scrolling_up_breaks_follow_and_clamps() {
-        let mut vp = Viewport::new();
-        vp.scroll_up(25);
-        assert!(!vp.follow_bottom);
-        assert_eq!(vp.window(100, 10), 65..75);
-        vp.scroll_up(10_000);
-        assert_eq!(vp.window(100, 10), 0..10);
+    fn scroll_up_breaks_follow_and_clamps() {
+        let mut v = vp(100, 10);
+        v.scroll_up(25);
+        assert!(!v.is_following());
+        assert_eq!(v.window(), 65..75);
+        v.scroll_up(10_000);
+        assert_eq!(v.window(), 0..10);
     }
 
     #[test]
-    fn reclaiming_bottom_resumes_follow() {
-        let mut vp = Viewport::new();
-        vp.scroll_up(20);
-        vp.follow_bottom();
-        assert_eq!(vp.window(100, 10), 90..100);
+    fn reading_position_is_kept_when_content_grows() {
+        let mut v = vp(100, 10);
+        v.scroll_up(25);
+        v.set_geometry(150, 10);
+        assert_eq!(v.window(), 65..75);
+        let mut following = vp(100, 10);
+        following.set_geometry(150, 10);
+        assert_eq!(following.window(), 140..150);
     }
 
     #[test]
-    fn handles_empty_and_tiny() {
-        let vp = Viewport::new();
-        assert_eq!(vp.window(0, 10), 0..0);
-        assert_eq!(vp.window(3, 0), 3..3);
+    fn scrolling_down_to_the_end_resumes_follow() {
+        let mut v = vp(100, 10);
+        v.scroll_up(5);
+        v.scroll_down(5);
+        assert!(v.is_following());
+        v.set_geometry(120, 10);
+        assert_eq!(v.window(), 110..120);
     }
 
     #[test]
-    fn scroll_reports_position_and_lengths() {
-        let vp = Viewport::new();
-        let s = vp.scroll(100, 10);
-        assert_eq!(s.content, 100);
-        assert_eq!(s.viewport, 10);
-        assert_eq!(s.offset, 90);
+    fn content_that_fits_never_breaks_follow() {
+        let mut v = vp(3, 10);
+        v.scroll_up(1);
+        assert!(v.is_following());
+        assert_eq!(v.window(), 0..3);
     }
 
     #[test]
-    fn scroll_offset_follows_the_window() {
-        let mut vp = Viewport::new();
-        assert_eq!(vp.scroll(100, 10).offset, 90);
-        vp.scroll_up(25);
-        assert_eq!(vp.scroll(100, 10).offset, 65);
+    fn resize_clamps_top() {
+        let mut v = vp(100, 10);
+        v.scroll_up(5);
+        v.set_geometry(100, 50);
+        assert_eq!(v.window(), 50..100);
     }
 
     #[test]
-    fn scroll_handles_empty() {
-        let vp = Viewport::new();
-        let s = vp.scroll(0, 10);
-        assert_eq!(s.content, 0);
-        assert_eq!(s.viewport, 10);
-        assert_eq!(s.offset, 0);
+    fn handles_empty_and_zero_rows() {
+        assert_eq!(vp(0, 10).window(), 0..0);
+        assert_eq!(vp(3, 0).window(), 3..3);
+    }
+
+    #[test]
+    fn scroll_reports_geometry() {
+        assert_eq!(
+            vp(100, 10).scroll(),
+            Scroll {
+                offset: 90,
+                content: 100,
+                viewport: 10
+            }
+        );
     }
 }

@@ -53,7 +53,7 @@ impl Demo for TranscriptDemo {
     }
 
     fn render(&mut self, f: &mut Frame, area: Rect, theme: &Theme) {
-        transcript::render(f, area, &self.transcript, &self.viewport, theme);
+        transcript::render(f, area, &self.transcript, &mut self.viewport, theme);
     }
 
     fn handle_key(&mut self, code: KeyCode) -> bool {
@@ -76,10 +76,11 @@ mod tests {
     #[test]
     fn scroll_changes_the_window() {
         let mut d = TranscriptDemo::new();
+        d.viewport.set_geometry(d.transcript.len(), 5);
         d.handle_key(KeyCode::Char('G')); // al final
-        let bottom = d.viewport.window(d.transcript.len(), 5);
+        let bottom = d.viewport.window();
         d.handle_key(KeyCode::Char('g')); // al principio
-        let top = d.viewport.window(d.transcript.len(), 5);
+        let top = d.viewport.window();
         assert_ne!(bottom, top);
         assert_eq!(top.start, 0);
     }
