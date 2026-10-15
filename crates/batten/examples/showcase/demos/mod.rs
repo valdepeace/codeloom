@@ -2,6 +2,7 @@
 
 mod composer;
 mod logo;
+mod sidebar;
 mod spinner;
 mod tool_item;
 mod transcript;
@@ -16,6 +17,7 @@ pub fn catalog() -> Vec<Box<dyn Demo>> {
         Box::new(composer::ComposerDemo::new()),
         Box::new(spinner::SpinnerDemo::new()),
         Box::new(logo::LogoDemo::new()),
+        Box::new(sidebar::SidebarDemo::new()),
     ]
 }
 
