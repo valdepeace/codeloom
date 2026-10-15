@@ -1,12 +1,16 @@
 //! Catálogo de demos del showcase.
 
+mod ansi;
 mod chat;
 mod chip;
 mod composer;
 mod file_changes;
+mod fx;
 mod key_help;
+mod links;
 mod logo;
 mod panel;
+mod profile;
 mod progress;
 mod rule;
 mod sidebar;
@@ -40,6 +44,10 @@ pub fn catalog() -> Vec<Box<dyn Demo>> {
         Box::new(panel::PanelDemo::new()),
         Box::new(toast::ToastDemo::new()),
         Box::new(spinners::SpinnersDemo::new()),
+        Box::new(fx::FxDemo::new()),
+        Box::new(ansi::AnsiDemo::new()),
+        Box::new(links::LinksDemo::new()),
+        Box::new(profile::ProfileDemo::new()),
     ]
 }
 
