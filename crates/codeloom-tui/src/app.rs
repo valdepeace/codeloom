@@ -25,6 +25,8 @@ pub struct App {
     pub model: String,
     pub theme: batten::widgets::Theme,
     pub changes: batten::state::FileChanges,
+    /// Scroll del transcript (sigue el final salvo que el usuario suba).
+    pub viewport: batten::state::Viewport,
     /// Diálogo de permiso abierto, si hay.
     pub permission: Option<PendingPermission>,
     /// Peticiones esperando a que se cierre la actual.
@@ -51,6 +53,7 @@ impl App {
             model: String::new(),
             theme: batten::widgets::Theme::default_dark(),
             changes: batten::state::FileChanges::new(),
+            viewport: batten::state::Viewport::new(),
             permission: None,
             permission_queue: VecDeque::new(),
             fx_pending: false,
@@ -188,6 +191,23 @@ impl App {
         let text = self.composer.submit()?;
         self.history.push(text.clone());
         Some(text)
+    }
+
+    /// Transcript de batten a partir de los items (una línea por línea de texto).
+    pub fn transcript(&self) -> batten::state::Transcript {
+        use batten::state::{Line, LineKind, Transcript};
+        let mut t = Transcript::new();
+        for item in &self.items {
+            let kind = if item.role == "you" {
+                LineKind::User
+            } else {
+                LineKind::Assistant
+            };
+            for l in item.text.lines() {
+                t.push(Line::new(kind, l));
+            }
+        }
+        t
     }
 
     /// Construye el sidebar de batten con la marca y las secciones de sesión.

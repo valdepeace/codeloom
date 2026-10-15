@@ -54,7 +54,21 @@ pub fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Option<St
             app.should_quit = true;
             None
         }
-        KeyCode::Enter => app.submit(),
+        KeyCode::Enter => {
+            let sent = app.submit();
+            if sent.is_some() {
+                app.viewport.follow_bottom();
+            }
+            sent
+        }
+        KeyCode::PageUp => {
+            app.viewport.scroll_up(10);
+            None
+        }
+        KeyCode::PageDown => {
+            app.viewport.scroll_down(10);
+            None
+        }
         KeyCode::Char('j') if mods.contains(KeyModifiers::CONTROL) => {
             app.newline();
             None
@@ -124,7 +138,7 @@ pub async fn run(
             fx = Some(batten::widgets::fx::dialog_open(&app.theme));
         }
         terminal.draw(|f| {
-            render(f, &app);
+            render(f, &mut app);
             if let (Some(e), Some(_)) = (fx.as_mut(), app.permission.as_ref()) {
                 let area = batten::widgets::permission::area(f.area());
                 e.process(

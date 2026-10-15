@@ -2,7 +2,7 @@ use crate::app::App;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 /// Por debajo de este ancho la barra lateral se oculta (modo compacto).
@@ -17,34 +17,19 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) {
-    let body: Vec<Line> = app
-        .items
-        .iter()
-        .flat_map(|item| {
-            let prefix = if item.role == "you" {
-                "you: "
-            } else {
-                "CodeLoom: "
-            };
-            item.text
-                .lines()
-                .map(move |l| Line::from(format!("{prefix}{l}")))
-        })
-        .collect();
-    frame.render_widget(
-        Paragraph::new(body)
-            .block(Block::default().borders(Borders::TOP))
-            .wrap(Wrap { trim: false }),
-        area,
-    );
+fn draw_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
+    let block = Block::default().borders(Borders::TOP);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let t = app.transcript();
+    batten::widgets::transcript::render(frame, inner, &t, &mut app.viewport, &app.theme);
 }
 
 fn draw_composer(frame: &mut Frame, area: Rect, app: &App) {
     batten::widgets::composer::render(frame, area, &app.composer, &app.theme);
 }
 
-pub fn render(frame: &mut Frame, app: &App) {
+pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     let rows = Layout::vertical([
         Constraint::Length(1),
@@ -93,7 +78,7 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    fn buffer_of(app: &App, w: u16, h: u16) -> String {
+    fn buffer_of(app: &mut App, w: u16, h: u16) -> String {
         let backend = TestBackend::new(w, h);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| render(f, app)).unwrap();
@@ -113,7 +98,7 @@ mod tests {
             text: "hello".into(),
         });
         app.push_char('x');
-        let content = buffer_of(&app, 40, 10);
+        let content = buffer_of(&mut app, 40, 10);
         assert!(content.contains("hello"));
         assert!(content.contains('x'));
         assert!(content.contains("CodeLoom"));
@@ -121,15 +106,15 @@ mod tests {
 
     #[test]
     fn hides_sidebar_when_narrow() {
-        let app = App::with_context("/proj", "m");
-        let content = buffer_of(&app, 60, 20);
+        let mut app = App::with_context("/proj", "m");
+        let content = buffer_of(&mut app, 60, 20);
         assert!(!content.contains("subagentes"));
     }
 
     #[test]
     fn shows_sidebar_when_wide() {
-        let app = App::with_context("/proj", "mistral-nemo");
-        let content = buffer_of(&app, 120, 40);
+        let mut app = App::with_context("/proj", "mistral-nemo");
+        let content = buffer_of(&mut app, 120, 40);
         assert!(content.contains("mistral-nemo"));
         assert!(content.contains("subagentes"));
         assert!(content.contains('█'));
@@ -143,7 +128,7 @@ mod tests {
             added: 3,
             removed: 1,
         });
-        let content = buffer_of(&app, 120, 40);
+        let content = buffer_of(&mut app, 120, 40);
         assert!(content.contains("ficheros modificados"));
         assert!(content.contains("src/main.rs"));
     }
@@ -160,9 +145,42 @@ mod tests {
             },
             tx,
         );
-        let content = buffer_of(&app, 120, 40);
+        let content = buffer_of(&mut app, 120, 40);
         assert!(content.contains("Permiso"));
         assert!(content.contains("cargo test"));
         assert!(content.contains("Denegar"));
+    }
+
+    fn chatty_app() -> App {
+        let mut app = App::new();
+        for i in 0..60 {
+            app.items.push(TranscriptItem {
+                role: "you",
+                text: format!("msg-{i:02}"),
+            });
+        }
+        app
+    }
+
+    #[test]
+    fn newest_messages_are_visible_when_overflowing() {
+        let mut app = chatty_app();
+        let content = buffer_of(&mut app, 60, 20);
+        assert!(content.contains("msg-59"));
+        assert!(!content.contains("msg-00"));
+    }
+
+    #[test]
+    fn page_up_scrolls_back_and_stops_following() {
+        let mut app = chatty_app();
+        buffer_of(&mut app, 60, 20);
+        crate::run::handle_key(
+            &mut app,
+            crossterm::event::KeyCode::PageUp,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let content = buffer_of(&mut app, 60, 20);
+        assert!(!app.viewport.is_following());
+        assert!(!content.contains("msg-59"));
     }
 }
