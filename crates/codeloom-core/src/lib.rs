@@ -1,5 +1,6 @@
 //! Engine (provider-agnostic) for CodeLoom.
 
+pub mod agent;
 pub mod config;
 pub mod error;
 pub mod event;
