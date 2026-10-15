@@ -86,12 +86,12 @@ impl Wordmark {
 }
 ```
 
-- **Tabla de glifos**: `A-Z`, `0-9`, `espacio`, `.`, `-`, `_`, `/`, `:`. Cada
-  glifo es arte de bloques (`█ ▀ ▄ ░` y huecos). Anchuras por glifo pueden
-  diferir (p. ej. `I` estrecha); el ancho total es la suma + 1 columna de
-  separación entre glifos.
-- `Wordmark::new` pasa `name` a mayúsculas y, por cada carácter, pega su glifo
-  con una columna de separación. Carácter fuera de la tabla -> glifo de espacio.
+- **Tabla de glifos**: `A-Z`, `0-9`, `espacio`, `.`, `-`, `_`, `/`, `:`. Fuente
+  de **3 columnas × 5 filas**; cada glifo ocupa exactamente 3 columnas (los
+  glifos estrechos llevan relleno incorporado).
+- `Wordmark::new` pasa `name` a mayúsculas y **pega los glifos sin columna de
+  separación** (denso: `"CODELOOM"` = 24 columnas, cabe en la columna de 30 del
+  sidebar). Carácter fuera de la tabla -> glifo de espacio.
 - La rejilla por celda (`rows()[r]`, columna `c`) es **la superficie que el
   futuro animador tocará**; no cambia la API al animar.
 
@@ -142,8 +142,9 @@ pub fn render(frame: &mut Frame, area: Rect, sidebar: &Sidebar, theme: &Theme);
 
 - `Block` con borde izquierdo; se calcula el `inner`.
 - `const LOGO_MIN_HEIGHT: usize = FONT_ROWS + 2;` (wordmark + una línea en
-  blanco). Si hay `logo` y `inner.height >= LOGO_MIN_HEIGHT`, se pinta
-  `logo::render`; si no, `logo::compact(name, inner.width, theme)`.
+  blanco). Si hay `logo` y `inner.height >= LOGO_MIN_HEIGHT` **y el wordmark
+  cabe** (`wordmark.width() <= inner.width`), se pinta `logo::render`; si no,
+  `logo::compact(name, inner.width, theme)`.
 - A continuación, por cada `Section`: el título (estilo `Heading`) y sus líneas
   (estilo `Default`), seguidas de una línea en blanco.
 - Las líneas que exceden la anchura se truncan por **anchura de display**
