@@ -150,7 +150,8 @@ impl AgentLoop {
                     detail: input.to_string(),
                 };
                 match self.permission.check(req).await {
-                    crate::permission::Decision::Allow => allowed.push((id, name, input)),
+                    crate::permission::Decision::Allow
+                    | crate::permission::Decision::AllowSession => allowed.push((id, name, input)),
                     crate::permission::Decision::Deny => {
                         let tr = Message::new(
                             Role::Tool,

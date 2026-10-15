@@ -12,6 +12,8 @@ pub struct PermissionRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
     Allow,
+    /// Permitir y no volver a preguntar por este `tool:action` en la sesión.
+    AllowSession,
     Deny,
 }
 
@@ -68,7 +70,12 @@ impl PermissionService {
         {
             return Decision::Allow;
         }
-        self.responder.decide(&req).await
+        let decision = self.responder.decide(&req).await;
+        if decision == Decision::AllowSession {
+            self.grant_persistent(&req.tool, &req.action).await;
+            return Decision::Allow;
+        }
+        decision
     }
     pub async fn grant_persistent(&self, tool: &str, action: &str) {
         self.persistent.lock().await.insert(Self::key(tool, action));
@@ -105,5 +112,24 @@ mod tests {
         svc.grant_persistent("bash", "run").await;
         assert_eq!(svc.check(req("bash", "run")).await, Decision::Allow);
         assert_eq!(svc.check(req("bash", "other")).await, Decision::Deny);
+    }
+
+    struct SessionOnce(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait]
+    impl PermissionResponder for SessionOnce {
+        async fn decide(&self, _req: &PermissionRequest) -> Decision {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Decision::AllowSession
+        }
+    }
+
+    #[tokio::test]
+    async fn allow_session_persists_for_the_same_tool_action() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let svc = PermissionService::with_responder(Box::new(SessionOnce(calls.clone())));
+        assert_eq!(svc.check(req("bash", "run")).await, Decision::Allow);
+        assert_eq!(svc.check(req("bash", "run")).await, Decision::Allow);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }
