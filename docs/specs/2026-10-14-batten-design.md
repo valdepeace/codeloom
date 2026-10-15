@@ -57,8 +57,8 @@ batten/                 (crate general, publicable)
       markdown.rs       render con pulldown-cmark
       logo.rs           wordmark reutilizable
     lib.rs
-  examples/             binarios de ejemplo (no se publican)
-    demo.rs             escenarios por argumento
+  examples/             ejemplos (no se publican)
+    showcase/           storybook navegable de widgets (main.rs multi-archivo)
 docs/specs/…            este documento
 ```
 
@@ -137,10 +137,10 @@ proveedores ni permisos dentro del crate.
 
 ## 7. Demo y tests
 
-- **`examples/demo.rs`** con escenarios por argumento: `basic` (streaming),
-  `tools` (pending→running→success / error, colapsable), `todos`
-  (vacía→in_progress→completed), `states` (permiso, cancelado, error, spinner).
-  Usa **la misma API** que consumirá CodeLoom → es el *harness* de integración.
+- **`examples/showcase/`**: storybook navegable (índice + demo por widget +
+  pantalla `chat`), sin back. Usa **la misma API** que consumirá CodeLoom → es el
+  *harness* de integración. Ver
+  `docs/specs/2026-10-15-batten-showcase-design.md`.
 - **Tests**: `state` unitarios (sin backend); `widgets` con `TestBackend` y
   `Theme::test()`; `theme` parseo de TOML parcial → estilos resueltos. Headless.
 

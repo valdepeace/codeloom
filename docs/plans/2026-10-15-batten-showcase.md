@@ -700,7 +700,6 @@ use ratatui::Frame;
 pub struct TranscriptDemo {
     transcript: Transcript,
     viewport: Viewport,
-    rows: usize,
 }
 
 impl TranscriptDemo {
@@ -723,7 +722,6 @@ impl TranscriptDemo {
         Self {
             transcript,
             viewport: Viewport::new(),
-            rows: 10,
         }
     }
 }
@@ -738,13 +736,12 @@ impl Demo for TranscriptDemo {
     }
 
     fn render(&mut self, f: &mut Frame, area: Rect, theme: &Theme) {
-        self.rows = area.height as usize;
         transcript::render(f, area, &self.transcript, &self.viewport, theme);
     }
 
     fn handle_key(&mut self, code: KeyCode) -> bool {
         match code {
-            KeyCode::Down => self.viewport.scroll_down(1, self.transcript.len(), self.rows),
+            KeyCode::Down => self.viewport.scroll_down(1),
             KeyCode::Up => self.viewport.scroll_up(1),
             KeyCode::Char('g') => self.viewport.scroll_up(usize::MAX),
             KeyCode::Char('G') => self.viewport.follow_bottom(),
@@ -1515,7 +1512,6 @@ pub struct ChatDemo {
     anim: Anim,
     started: bool,
     elapsed_frames: u32,
-    rows: usize,
 }
 
 impl ChatDemo {
@@ -1536,7 +1532,6 @@ impl ChatDemo {
             anim: Anim::new(),
             started: true,
             elapsed_frames: 0,
-            rows: 10,
         }
     }
 }
@@ -1563,7 +1558,6 @@ impl Demo for ChatDemo {
     }
 
     fn render(&mut self, f: &mut Frame, area: Rect, theme: &Theme) {
-        self.rows = area.height as usize;
         let wide = area.width >= 60;
         let (body, side) = if wide {
             let cols =
@@ -1596,7 +1590,7 @@ impl Demo for ChatDemo {
                 }
             }
             KeyCode::Backspace => self.composer.backspace(),
-            KeyCode::Down => self.viewport.scroll_down(1, self.transcript.len(), self.rows),
+            KeyCode::Down => self.viewport.scroll_down(1),
             KeyCode::Up => self.viewport.scroll_up(1),
             KeyCode::Char(c) => self.composer.push_char(c),
             _ => return false,
