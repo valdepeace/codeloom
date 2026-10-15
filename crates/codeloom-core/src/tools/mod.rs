@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+pub mod bash;
+pub mod edit;
 pub mod glob;
 pub mod grep;
 pub mod view;
