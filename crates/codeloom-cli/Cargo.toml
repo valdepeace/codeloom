@@ -13,3 +13,14 @@ name = "codeloom"
 path = "src/main.rs"
 
 [dependencies]
+codeloom-core = { path = "../codeloom-core" }
+codeloom-tui = { path = "../codeloom-tui" }
+tokio.workspace = true
+tokio-util.workspace = true
+anyhow.workspace = true
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+
+[dev-dependencies]
+wiremock = "0.6"
+tempfile = "3"
