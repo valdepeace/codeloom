@@ -55,6 +55,9 @@ pub struct Styles {
     pub todo_in_progress: Style,
     pub todo_completed: Style,
     pub accent: Style,
+    pub accent_from: Style,
+    pub accent_to: Style,
+    pub logo_field: Style,
 }
 
 impl Default for Styles {
@@ -84,6 +87,9 @@ impl Default for Styles {
             todo_in_progress: Style::default().fg(Color::Green),
             todo_completed: Style::default().fg(Color::Green),
             accent: Style::default().fg(Color::Rgb(0, 212, 255)),
+            accent_from: Style::default().fg(Color::Rgb(0, 212, 255)),
+            accent_to: Style::default().fg(Color::Rgb(124, 92, 255)),
+            logo_field: Style::default().fg(Color::Indexed(238)),
         }
     }
 }
@@ -201,6 +207,9 @@ impl Theme {
             StyleToken::TodoInProgress => s.todo_in_progress,
             StyleToken::TodoCompleted => s.todo_completed,
             StyleToken::Accent => s.accent,
+            StyleToken::AccentFrom => s.accent_from,
+            StyleToken::AccentTo => s.accent_to,
+            StyleToken::LogoField => s.logo_field,
         })
     }
 
@@ -227,6 +236,9 @@ impl Theme {
             "todo_in_progress" => s.todo_in_progress = style,
             "todo_completed" => s.todo_completed = style,
             "accent" => s.accent = style,
+            "accent_from" => s.accent_from = style,
+            "accent_to" => s.accent_to = style,
+            "logo_field" => s.logo_field = style,
             _ => return false,
         }
         true
@@ -255,6 +267,9 @@ fn token_to_key(t: StyleToken) -> &'static str {
         StyleToken::TodoInProgress => "todo_in_progress",
         StyleToken::TodoCompleted => "todo_completed",
         StyleToken::Accent => "accent",
+        StyleToken::AccentFrom => "accent_from",
+        StyleToken::AccentTo => "accent_to",
+        StyleToken::LogoField => "logo_field",
     }
 }
 
@@ -331,5 +346,28 @@ mod tests {
     #[test]
     fn invalid_color_is_an_error() {
         assert!(Theme::from_toml("[styles]\nerror = \"not-a-color\"\n").is_err());
+    }
+
+    #[test]
+    fn accent_gradient_tokens_resolve() {
+        let th = Theme::test();
+        assert_eq!(
+            th.style(StyleToken::AccentFrom).fg,
+            Some(Color::Rgb(0, 212, 255))
+        );
+        assert_eq!(
+            th.style(StyleToken::AccentTo).fg,
+            Some(Color::Rgb(124, 92, 255))
+        );
+        assert_eq!(
+            th.style(StyleToken::LogoField).fg,
+            Some(Color::Indexed(238))
+        );
+    }
+
+    #[test]
+    fn accent_tokens_can_be_overridden() {
+        let th = Theme::from_toml("[styles]\naccent_from = \"magenta\"\n").unwrap();
+        assert_eq!(th.style(StyleToken::AccentFrom).fg, Some(Color::Magenta));
     }
 }
