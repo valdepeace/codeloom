@@ -4,6 +4,7 @@
 mod app;
 mod demo;
 mod demos;
+mod prompt_keys;
 
 use app::{route, Action, Focus, Showcase};
 use batten::widgets::{Anim, Theme, FRAME_INTERVAL};

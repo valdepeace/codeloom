@@ -150,7 +150,7 @@ pub fn route(show: &mut Showcase, kind: KeyEventKind, code: KeyCode, mods: KeyMo
             }
             other => {
                 if let Some(d) = show.current() {
-                    d.handle_key(other);
+                    d.handle_key_event(other, mods);
                 }
                 Action::None
             }
@@ -308,5 +308,41 @@ mod tests {
             KeyModifiers::NONE,
         );
         assert_eq!(show.selected(), 0);
+    }
+
+    struct Rec(std::rc::Rc<std::cell::Cell<Option<KeyModifiers>>>);
+
+    impl Demo for Rec {
+        fn title(&self) -> &str {
+            "rec"
+        }
+        fn hint(&self) -> &str {
+            ""
+        }
+        fn render(
+            &mut self,
+            _f: &mut ratatui::Frame,
+            _a: ratatui::layout::Rect,
+            _t: &batten::widgets::Theme,
+        ) {
+        }
+        fn handle_key_event(&mut self, _code: KeyCode, mods: KeyModifiers) -> bool {
+            self.0.set(Some(mods));
+            true
+        }
+    }
+
+    #[test]
+    fn route_passes_modifiers_to_the_demo() {
+        let seen = std::rc::Rc::new(std::cell::Cell::new(None));
+        let mut show = Showcase::with_demos(vec![Box::new(Rec(seen.clone()))]);
+        show.focus_demo_for_test();
+        route(
+            &mut show,
+            KeyEventKind::Press,
+            KeyCode::Char('j'),
+            KeyModifiers::CONTROL,
+        );
+        assert_eq!(seen.get(), Some(KeyModifiers::CONTROL));
     }
 }

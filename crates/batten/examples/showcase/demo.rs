@@ -1,7 +1,7 @@
 //! Una demo del showcase: un widget (o composición) autónomo.
 
 use batten::widgets::{Anim, Theme};
-use ratatui::crossterm::event::KeyCode;
+use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::Frame;
 
@@ -17,5 +17,9 @@ pub trait Demo {
     /// Procesa una tecla. En v0 el valor de retorno se ignora.
     fn handle_key(&mut self, _code: KeyCode) -> bool {
         false
+    }
+    /// Tecla con modificadores. Por defecto los ignora y llama a `handle_key`.
+    fn handle_key_event(&mut self, code: KeyCode, _mods: KeyModifiers) -> bool {
+        self.handle_key(code)
     }
 }
