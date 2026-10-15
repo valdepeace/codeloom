@@ -9,3 +9,4 @@ codeloom-core = { path = "../codeloom-core" }
 ratatui = "0.30"
 crossterm = "0.29"
 tokio.workspace = true
+async-trait.workspace = true
