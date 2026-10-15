@@ -12,6 +12,7 @@
 |---|---|
 | Diseño base (crates, concurrencia, turn/step, tools, permisos) | `2026-10-13-loom-design.md` |
 | Carga en caliente de MCP y skills | `2026-10-14-loom-mcp-skills-hot-reload.md` |
+| Profile de agentes y comunicación A2A | `2026-10-15-loom-agent-profile-a2a.md` |
 | Entrada por voz al prompt | `2026-10-14-loom-voice-prompt-input.md` |
 | Resumen del último turno | `2026-10-14-loom-turn-summary.md` |
 | Hub de decisiones (jevalan) | `2026-10-14-loom-decision-hub-jevalan.md` |
@@ -248,6 +249,7 @@ implementado.
 | Hub de decisiones (jevalan) | borrador | `...-decision-hub-jevalan.md` | P1/P0 |
 | Capa estática de señales/decisiones | borrador | `...-static-decision-signals.md` | P0 |
 | Puerta única de descubrimiento (tools/skills/MCP) | idea | `...-tool-skill-discovery.md` | — |
+| Profile de agentes y comunicación A2A | idea | `...-agent-profile-a2a.md` | — |
 | Gauntlet Loop (+ control §4.1) | borrador | `...-gauntlet-loop.md` | P3 |
 | Skills (ponytail/superpowers) | borrador | `...-skills-ponytail-superpowers.md` | — |
 | KPIs y compresión | idea | `...-kpis-prompt-compression.md` | P2/P4 |
