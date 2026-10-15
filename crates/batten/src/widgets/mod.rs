@@ -2,6 +2,7 @@
 
 #[cfg(feature = "ansi")]
 pub mod ansi;
+pub mod button;
 pub mod chip;
 pub mod composer;
 pub mod diff;
@@ -29,6 +30,7 @@ pub mod tone;
 pub mod tool_item;
 pub mod transcript;
 
+pub use button::{button, button_row};
 pub use chip::chip;
 pub use composer::render as render_composer;
 pub use key_help::key_help;
