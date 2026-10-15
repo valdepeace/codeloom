@@ -1,5 +1,6 @@
 //! Catálogo de demos del showcase.
 
+mod chat;
 mod composer;
 mod logo;
 mod sidebar;
@@ -20,6 +21,7 @@ pub fn catalog() -> Vec<Box<dyn Demo>> {
         Box::new(logo::LogoDemo::new()),
         Box::new(sidebar::SidebarDemo::new()),
         Box::new(theme::ThemeDemo::new()),
+        Box::new(chat::ChatDemo::new()),
     ]
 }
 
