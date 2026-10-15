@@ -3,7 +3,7 @@ use clap::Parser;
 use codeloom_core::agent::AgentLoop;
 use codeloom_core::config::{CodeLoomConfig, ProviderKind};
 use codeloom_core::event::EventBus;
-use codeloom_core::permission::PermissionService;
+use codeloom_core::permission::{DenyAll, PermissionService};
 use codeloom_core::provider::anthropic::AnthropicProvider;
 use codeloom_core::provider::openai::OpenAiCompatProvider;
 use codeloom_core::provider::Provider;
@@ -15,6 +15,7 @@ use codeloom_core::tools::glob::GlobTool;
 use codeloom_core::tools::grep::GrepTool;
 use codeloom_core::tools::view::ViewTool;
 use codeloom_core::tools::ToolRegistry;
+use codeloom_tui::widgets::permission::UiPermissionResponder;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -77,7 +78,17 @@ async fn main() -> Result<()> {
 
     let bus = EventBus::new(1024);
     let bus_rx = bus.subscribe();
-    let permission = Arc::new(PermissionService::allow_all());
+    let (perm_tx, perm_rx) = tokio::sync::mpsc::channel(8);
+    let permission = Arc::new(if cli.print.is_some() {
+        // ponytail: `-p` no es interactivo; sin `--yolo` se deniega todo.
+        if cli.yolo {
+            PermissionService::allow_all()
+        } else {
+            PermissionService::with_responder(Box::new(DenyAll))
+        }
+    } else {
+        PermissionService::with_responder(Box::new(UiPermissionResponder::new(perm_tx, cli.yolo)))
+    });
     let agent = Arc::new(AgentLoop::new(
         provider,
         store,
@@ -94,7 +105,6 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let _ = cli.yolo;
     let (prompt_tx, mut prompt_rx) = tokio::sync::mpsc::channel::<String>(8);
     let agent_task = agent.clone();
     tokio::spawn(async move {
@@ -109,6 +119,7 @@ async fn main() -> Result<()> {
         codeloom_tui::app::App::with_context(cwd_label, model_label),
         prompt_tx,
         bus_rx,
+        perm_rx,
     )
     .await?;
     Ok(())
