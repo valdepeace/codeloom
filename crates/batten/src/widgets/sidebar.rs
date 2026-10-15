@@ -2,12 +2,12 @@
 
 use crate::state::{Sidebar, StyleToken};
 use crate::widgets::logo::{self, Wordmark, FONT_ROWS};
+use crate::widgets::text::truncate;
 use crate::widgets::Theme;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Altura mínima para el wordmark de bloques (wordmark + una línea en blanco).
 pub const LOGO_MIN_HEIGHT: usize = FONT_ROWS + 2;
@@ -46,25 +46,6 @@ pub fn render(frame: &mut Frame, area: Rect, sidebar: &Sidebar, theme: &Theme) {
     }
 
     frame.render_widget(Paragraph::new(lines), inner);
-}
-
-/// Trunca por anchura de display reservando una columna para `…`.
-fn truncate(s: &str, max: usize) -> String {
-    if s.width() <= max {
-        return s.to_string();
-    }
-    let mut out = String::new();
-    let mut w = 0;
-    for c in s.chars() {
-        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
-        if w + cw > max.saturating_sub(1) {
-            break;
-        }
-        out.push(c);
-        w += cw;
-    }
-    out.push('…');
-    out
 }
 
 #[cfg(test)]

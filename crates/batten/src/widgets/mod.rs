@@ -1,11 +1,13 @@
 //! Widgets ratatui y tema. Sin crossterm.
 
 pub mod composer;
+pub mod file_changes;
 mod gradient;
 pub mod logo;
 pub mod scrollbar;
 pub mod sidebar;
 pub mod spinner;
+mod text;
 pub mod theme;
 pub mod tool_item;
 pub mod transcript;
