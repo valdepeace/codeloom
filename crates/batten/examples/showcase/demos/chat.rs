@@ -50,6 +50,7 @@ pub struct ChatDemo {
     anim: Anim,
     paused: bool,
     wait: u32,
+    focus_transcript: bool,
 }
 
 impl ChatDemo {
@@ -69,6 +70,7 @@ impl ChatDemo {
             anim: Anim::new(),
             paused: false,
             wait: 0,
+            focus_transcript: false,
         }
     }
 
@@ -159,7 +161,7 @@ impl Demo for ChatDemo {
     }
 
     fn hint(&self) -> &str {
-        "Enter: turno · F6: con permiso · F2 reinicia · F3 pausa · F4 paso · PgUp/PgDn"
+        "Enter: turno · F6: permiso · F5: foco chat (j/k u/d g/G) · F2 reinicia · F3 pausa · F4 paso"
     }
 
     fn tick(&mut self, anim: &Anim) {
@@ -193,7 +195,7 @@ impl Demo for ChatDemo {
         }
         let view = self.view();
         transcript::render(f, rows[1], &view, &mut self.viewport, theme);
-        composer::render(f, rows[2], &self.composer, theme);
+        composer::render_focused(f, rows[2], &self.composer, !self.focus_transcript, theme);
         if let Some(s) = side {
             sidebar::render(f, s, &self.sidebar, theme);
         }
@@ -229,6 +231,25 @@ impl Demo for ChatDemo {
             };
             if let Some(c) = choice {
                 self.resolve(c);
+            }
+            return true;
+        }
+        if code == KeyCode::F(5) {
+            self.focus_transcript = !self.focus_transcript;
+            return true;
+        }
+        if self.focus_transcript {
+            let vp = &mut self.viewport;
+            match code {
+                KeyCode::Up | KeyCode::Char('k') => vp.scroll_up(1),
+                KeyCode::Down | KeyCode::Char('j') => vp.scroll_down(1),
+                KeyCode::Char('u') => vp.half_page_up(),
+                KeyCode::Char('d') => vp.half_page_down(),
+                KeyCode::PageUp | KeyCode::Char('b') => vp.page_up(),
+                KeyCode::PageDown | KeyCode::Char('f') | KeyCode::Char(' ') => vp.page_down(),
+                KeyCode::Home | KeyCode::Char('g') => vp.to_top(),
+                KeyCode::End | KeyCode::Char('G') => vp.follow_bottom(),
+                _ => return false,
             }
             return true;
         }
@@ -285,6 +306,19 @@ mod tests {
         assert_eq!(d.transcript.len(), 2);
         assert_eq!(d.transcript.line(1).unwrap().plain(), ANSWER);
         assert_eq!(d.tool.as_ref().unwrap().status(), ToolStatus::Success);
+    }
+
+    #[test]
+    fn f5_focuses_the_transcript_and_letters_scroll() {
+        let mut d = ChatDemo::new();
+        d.viewport.set_geometry(100, 10);
+        d.handle_key(KeyCode::F(5));
+        d.handle_key(KeyCode::Char('k'));
+        assert_eq!(d.composer.text(), "");
+        assert!(!d.viewport.is_following());
+        d.handle_key(KeyCode::F(5));
+        d.handle_key(KeyCode::Char('k'));
+        assert_eq!(d.composer.text(), "k");
     }
 
     #[test]
