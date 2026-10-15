@@ -29,6 +29,7 @@ pub struct AgentLoop {
     permission: Arc<PermissionService>,
     config: CodeLoomConfig,
     cwd: PathBuf,
+    changes: crate::agent::changes::ChangeTracker,
 }
 
 impl AgentLoop {
@@ -48,6 +49,7 @@ impl AgentLoop {
             bus,
             permission,
             config,
+            changes: crate::agent::changes::ChangeTracker::detect(cwd.clone()),
             cwd,
         }
     }
@@ -164,9 +166,30 @@ impl AgentLoop {
                     }
                 }
             }
+            let mut by_id: std::collections::HashMap<String, (String, serde_json::Value)> =
+                std::collections::HashMap::new();
+            for (id, name, input) in &allowed {
+                by_id.insert(id.clone(), (name.clone(), input.clone()));
+            }
+
             let results =
                 dispatch::execute_tools(&self.tools, ctx.clone(), allowed, cancel.clone()).await;
             for (id, out) in results {
+                if !out.is_error {
+                    if let Some((name, input)) = by_id.get(&id) {
+                        if name == "edit" {
+                            let path = input["path"].as_str().unwrap_or_default();
+                            let old = input["old"].as_str().unwrap_or_default();
+                            let new = input["new"].as_str().unwrap_or_default();
+                            let (added, removed) = self.changes.numbers(path, old, new);
+                            self.bus.publish(LiveEvent::FileDiff {
+                                path: path.to_string(),
+                                added,
+                                removed,
+                            });
+                        }
+                    }
+                }
                 let tr = Message::new(
                     Role::Tool,
                     vec![ContentPart::ToolResult {
@@ -408,5 +431,77 @@ mod tests {
                 reason: FinishReason::Error
             }
         ))));
+    }
+
+    #[tokio::test]
+    async fn edit_publishes_a_file_diff() {
+        let scripts = vec![
+            vec![
+                StreamChunk::ToolCallComplete {
+                    id: "c1".into(),
+                    name: "edit".into(),
+                    input: serde_json::json!({"path":"a.txt","old":"world","new":"rust"}),
+                },
+                StreamChunk::Done(FinishReason::ToolCalls),
+            ],
+            vec![
+                StreamChunk::TextDelta("done".into()),
+                StreamChunk::Done(FinishReason::Stop),
+            ],
+        ];
+        let provider = Arc::new(QueueProvider {
+            scripts: Mutex::new(scripts.into()),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hello world").unwrap();
+
+        let store = Arc::new(
+            SqliteStore::open(dir.path().join("l.db").to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+        let sid = store.create_session("/p").await.unwrap();
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(crate::tools::edit::EditTool));
+
+        let cfg = CodeLoomConfig {
+            provider: crate::config::ProviderConfig {
+                kind: crate::config::ProviderKind::OpenAiCompat,
+                base_url: "http://x".into(),
+                api_key_env: "K".into(),
+            },
+            model: "m".into(),
+            max_steps: 5,
+        };
+        let bus = EventBus::new(64);
+        let mut rx = bus.subscribe();
+        let agent = AgentLoop::new(
+            provider,
+            store.clone(),
+            Arc::new(tools),
+            bus,
+            Arc::new(PermissionService::allow_all()),
+            cfg,
+            dir.path().to_path_buf(),
+        );
+
+        agent
+            .run(sid, "hi".into(), CancellationToken::new())
+            .await
+            .unwrap();
+
+        let mut found = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let LiveEvent::FileDiff {
+                path,
+                added,
+                removed,
+            } = ev
+            {
+                found = Some((path, added, removed));
+            }
+        }
+        assert_eq!(found, Some(("a.txt".to_string(), 1, 1)));
     }
 }
