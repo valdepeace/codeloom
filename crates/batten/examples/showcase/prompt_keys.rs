@@ -4,7 +4,6 @@
 use batten::state::{Composer, History};
 use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 
-#[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
     /// La tecla no es del composer.
@@ -16,7 +15,6 @@ pub enum Outcome {
 }
 
 /// Aplica una tecla al composer y su historial.
-#[allow(dead_code)]
 pub fn apply(c: &mut Composer, h: &mut History, code: KeyCode, mods: KeyModifiers) -> Outcome {
     let ctrl = mods.contains(KeyModifiers::CONTROL);
     match code {

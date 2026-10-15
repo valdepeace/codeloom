@@ -1,9 +1,10 @@
 //! Demo del composer: edición con cursor e historial.
 
 use crate::demo::Demo;
+use crate::prompt_keys::{apply, Outcome};
 use batten::state::{Composer, History};
 use batten::widgets::{composer, Theme};
-use ratatui::crossterm::event::KeyCode;
+use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
@@ -33,7 +34,7 @@ impl Demo for ComposerDemo {
     }
 
     fn hint(&self) -> &str {
-        "←/→/Home/End: cursor · ↑/↓: historial · Enter: enviar"
+        "escribe · Ctrl+J salto · Enter envía · ↑↓ historial/cursor"
     }
 
     fn render(&mut self, f: &mut Frame, area: Rect, theme: &Theme) {
@@ -48,45 +49,18 @@ impl Demo for ComposerDemo {
     }
 
     fn handle_key(&mut self, code: KeyCode) -> bool {
-        match code {
-            KeyCode::Enter => {
-                if let Some(text) = self.composer.submit() {
-                    self.history.push(text.clone());
-                    self.sent.push(text);
-                }
+        self.handle_key_event(code, KeyModifiers::NONE)
+    }
+
+    fn handle_key_event(&mut self, code: KeyCode, mods: KeyModifiers) -> bool {
+        match apply(&mut self.composer, &mut self.history, code, mods) {
+            Outcome::Submitted(text) => {
+                self.sent.push(text);
+                true
             }
-            KeyCode::Backspace => {
-                self.composer.backspace();
-                self.history.reset();
-            }
-            KeyCode::Delete => {
-                self.composer.delete();
-                self.history.reset();
-            }
-            KeyCode::Left => self.composer.move_left(),
-            KeyCode::Right => self.composer.move_right(),
-            KeyCode::Home => self.composer.move_home(),
-            KeyCode::End => self.composer.move_end(),
-            KeyCode::Up => {
-                let current = self.composer.text().to_string();
-                if let Some(prev) = self.history.prev(&current) {
-                    let prev = prev.to_string();
-                    self.composer.set_text(&prev);
-                }
-            }
-            KeyCode::Down => {
-                if let Some(next) = self.history.next() {
-                    let next = next.to_string();
-                    self.composer.set_text(&next);
-                }
-            }
-            KeyCode::Char(c) => {
-                self.composer.insert_char(c);
-                self.history.reset();
-            }
-            _ => return false,
+            Outcome::Edited => true,
+            Outcome::Ignored => false,
         }
-        true
     }
 }
 

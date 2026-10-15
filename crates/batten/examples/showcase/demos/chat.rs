@@ -2,12 +2,13 @@
 //! (tool + respuesta por deltas) y turno con permiso.
 
 use crate::demo::Demo;
+use crate::prompt_keys::{apply, Outcome};
 use batten::state::{
-    Composer, Line, LineKind, PermissionBody, PermissionChoice, PermissionDialog, Sidebar, Stream,
-    ToolItem, Transcript, Viewport,
+    Composer, History, Line, LineKind, PermissionBody, PermissionChoice, PermissionDialog, Sidebar,
+    Stream, ToolItem, Transcript, Viewport,
 };
 use batten::widgets::{composer, permission, sidebar, tool_item, transcript, Anim, Theme};
-use ratatui::crossterm::event::KeyCode;
+use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::Frame;
 use std::collections::VecDeque;
@@ -42,6 +43,7 @@ pub struct ChatDemo {
     transcript: Transcript,
     viewport: Viewport,
     composer: Composer,
+    history: History,
     sidebar: Sidebar,
     tool: Option<ToolItem>,
     stream: Stream,
@@ -62,6 +64,7 @@ impl ChatDemo {
             transcript: Transcript::new(),
             viewport: Viewport::new(),
             composer: Composer::new(),
+            history: History::new(),
             sidebar,
             tool: None,
             stream: Stream::new(),
@@ -161,7 +164,7 @@ impl Demo for ChatDemo {
     }
 
     fn hint(&self) -> &str {
-        "Enter: turno · F6: permiso · F5: foco chat (j/k u/d g/G) · F2 reinicia · F3 pausa · F4 paso"
+        "Enter: turno · Ctrl+J salto · F6 permiso · F5 foco chat · F2 reinicia · F3 pausa · F4 paso"
     }
 
     fn tick(&mut self, anim: &Anim) {
@@ -205,6 +208,10 @@ impl Demo for ChatDemo {
     }
 
     fn handle_key(&mut self, code: KeyCode) -> bool {
+        self.handle_key_event(code, KeyModifiers::NONE)
+    }
+
+    fn handle_key_event(&mut self, code: KeyCode, mods: KeyModifiers) -> bool {
         if let Some(d) = self.dialog.as_mut() {
             let choice = match code {
                 KeyCode::Left => {
@@ -254,20 +261,17 @@ impl Demo for ChatDemo {
             return true;
         }
         match code {
-            KeyCode::Enter => {
-                if let Some(text) = self.composer.submit() {
-                    self.start_turn(text);
-                }
-            }
             KeyCode::F(6) => self.start_permission_turn(),
             KeyCode::F(2) => *self = Self::new(),
             KeyCode::F(3) => self.paused = !self.paused,
             KeyCode::F(4) => self.step(),
             KeyCode::PageUp => self.viewport.scroll_up(5),
             KeyCode::PageDown => self.viewport.scroll_down(5),
-            KeyCode::Backspace => self.composer.backspace(),
-            KeyCode::Char(c) => self.composer.push_char(c),
-            _ => return false,
+            _ => match apply(&mut self.composer, &mut self.history, code, mods) {
+                Outcome::Submitted(text) => self.start_turn(text),
+                Outcome::Edited => {}
+                Outcome::Ignored => return false,
+            },
         }
         true
     }
@@ -306,6 +310,18 @@ mod tests {
         assert_eq!(d.transcript.len(), 2);
         assert_eq!(d.transcript.line(1).unwrap().plain(), ANSWER);
         assert_eq!(d.tool.as_ref().unwrap().status(), ToolStatus::Success);
+    }
+
+    #[test]
+    fn composer_contract_in_the_chat() {
+        let mut d = ChatDemo::new();
+        d.handle_key(KeyCode::Char('a'));
+        d.handle_key_event(KeyCode::Char('j'), KeyModifiers::CONTROL);
+        d.handle_key(KeyCode::Char('b'));
+        d.handle_key(KeyCode::Enter);
+        assert_eq!(d.transcript.line(0).unwrap().plain(), "a\nb");
+        d.handle_key(KeyCode::Up);
+        assert_eq!(d.composer.text(), "a\nb");
     }
 
     #[test]
