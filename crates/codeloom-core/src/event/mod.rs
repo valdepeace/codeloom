@@ -5,12 +5,29 @@ use tokio::sync::broadcast;
 pub enum LiveEvent {
     TurnStarted,
     TurnEnded,
-    Delta { text: String },
-    ReasoningDelta { text: String },
+    Delta {
+        text: String,
+    },
+    ReasoningDelta {
+        text: String,
+    },
     MessageAdded(Message),
-    ToolStarted { call_id: String, name: String },
-    ToolFinished { call_id: String, is_error: bool },
-    Error { message: String },
+    ToolStarted {
+        call_id: String,
+        name: String,
+    },
+    ToolFinished {
+        call_id: String,
+        is_error: bool,
+    },
+    FileDiff {
+        path: String,
+        added: usize,
+        removed: usize,
+    },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Clone)]
