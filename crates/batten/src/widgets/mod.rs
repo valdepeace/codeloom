@@ -24,7 +24,7 @@ pub use chip::chip;
 pub use composer::render as render_composer;
 pub use key_help::key_help;
 pub use panel::{render as render_panel, Panel};
-pub use progress::progress;
+pub use progress::{progress, progress_smooth};
 pub use rule::rule;
 pub use spinner::{Anim, Animatable, FRAME_INTERVAL};
 pub use status::status;
