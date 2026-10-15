@@ -17,6 +17,9 @@ toml = "0.8"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 bytes = "1"
+glob = "0.3"
+regex = "1"
+ignore = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
