@@ -4,6 +4,9 @@ use async_trait::async_trait;
 use std::pin::Pin;
 use tokio_util::sync::CancellationToken;
 
+pub mod openai;
+pub mod sse;
+
 #[derive(Debug, Clone)]
 pub struct ToolSpec {
     pub name: String,
