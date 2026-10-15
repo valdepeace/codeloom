@@ -1,0 +1,15 @@
+[package]
+name = "codeloom-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "loom"
+path = "src/main.rs"
+
+[[bin]]
+name = "codeloom"
+path = "src/main.rs"
+
+[dependencies]
