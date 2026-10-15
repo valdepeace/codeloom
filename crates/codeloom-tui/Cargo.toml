@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+batten = { path = "../batten" }
 codeloom-core = { path = "../codeloom-core" }
 ratatui = "0.30"
 crossterm = "0.29"

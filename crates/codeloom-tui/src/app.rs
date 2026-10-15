@@ -13,6 +13,7 @@ pub struct App {
     pub should_quit: bool,
     pub cwd: String,
     pub model: String,
+    pub theme: batten::widgets::Theme,
 }
 
 impl Default for App {
@@ -30,6 +31,7 @@ impl App {
             should_quit: false,
             cwd: String::new(),
             model: String::new(),
+            theme: batten::widgets::Theme::default_dark(),
         }
     }
 
@@ -82,6 +84,17 @@ impl App {
         }
         Some(std::mem::take(&mut self.input))
     }
+
+    /// Construye el sidebar de batten con la marca y las secciones de sesión.
+    pub fn sidebar(&self) -> batten::state::Sidebar {
+        let mut sb = batten::state::Sidebar::with_logo("CodeLoom");
+        sb.push_section("estado", vec![self.status.clone()]);
+        sb.push_section("cwd", vec![self.cwd.clone()]);
+        sb.push_section("modelo", vec![self.model.clone()]);
+        sb.push_section("agente", vec!["steps    —".into()]);
+        sb.push_section("subagentes / jobs", vec!["(m2)".into()]);
+        sb
+    }
 }
 
 #[cfg(test)]
@@ -126,5 +139,18 @@ mod tests {
         assert_eq!(app.cwd, "/tmp/proj");
         assert_eq!(app.model, "mistral-nemo");
         assert_eq!(app.status, "ready");
+    }
+
+    #[test]
+    fn sidebar_has_logo_and_session_sections() {
+        let app = App::with_context("/proj", "mistral-nemo");
+        let sb = app.sidebar();
+        assert_eq!(sb.logo.as_ref().unwrap().name, "CodeLoom");
+        let titles: Vec<&str> = sb.sections.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            ["estado", "cwd", "modelo", "agente", "subagentes / jobs"]
+        );
+        assert_eq!(sb.sections[1].lines, vec!["/proj".to_string()]);
     }
 }

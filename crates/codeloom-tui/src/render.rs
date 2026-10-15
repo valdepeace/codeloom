@@ -1,5 +1,4 @@
 use crate::app::App;
-use crate::widgets::sidebar;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
@@ -62,7 +61,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         let cols = Layout::horizontal([Constraint::Min(1), Constraint::Length(SIDEBAR_WIDTH)])
             .split(rows[1]);
         draw_transcript(frame, cols[0], app);
-        sidebar::render(frame, cols[1], app);
+        batten::widgets::sidebar::render(frame, cols[1], &app.sidebar(), &app.theme);
     } else {
         draw_transcript(frame, rows[1], app);
     }
@@ -116,6 +115,6 @@ mod tests {
         let content = buffer_of(&app, 120, 40);
         assert!(content.contains("mistral-nemo"));
         assert!(content.contains("subagentes"));
-        assert!(content.contains("CodeLoom"));
+        assert!(content.contains('█'));
     }
 }
