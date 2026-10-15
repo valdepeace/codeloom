@@ -1,3 +1,2 @@
-//! Terminal UI for CodeLoom.
-
-pub fn placeholder() {}
+pub mod app;
+pub mod render;
