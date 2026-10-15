@@ -11,6 +11,8 @@ pub struct App {
     pub input: String,
     pub status: String,
     pub should_quit: bool,
+    pub cwd: String,
+    pub model: String,
 }
 
 impl Default for App {
@@ -26,6 +28,16 @@ impl App {
             input: String::new(),
             status: "ready".into(),
             should_quit: false,
+            cwd: String::new(),
+            model: String::new(),
+        }
+    }
+
+    pub fn with_context(cwd: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            cwd: cwd.into(),
+            model: model.into(),
+            ..Self::new()
         }
     }
 
@@ -106,5 +118,13 @@ mod tests {
             codeloom_core::message::Message::user("hi"),
         ));
         assert_eq!(app.items.iter().filter(|i| i.role == "you").count(), 1);
+    }
+
+    #[test]
+    fn with_context_stores_cwd_and_model() {
+        let app = App::with_context("/tmp/proj", "mistral-nemo");
+        assert_eq!(app.cwd, "/tmp/proj");
+        assert_eq!(app.model, "mistral-nemo");
+        assert_eq!(app.status, "ready");
     }
 }

@@ -62,6 +62,8 @@ async fn main() -> Result<()> {
     let cwd = std::env::current_dir()?;
     load_dotenv(&cwd);
     let cfg = CodeLoomConfig::load(&cwd.join("codeloom.toml"))?;
+    let cwd_label = cwd.display().to_string();
+    let model_label = cfg.model.clone();
     let provider = build_provider(&cfg)?;
 
     let data_dir = dirs::home_dir()
@@ -103,7 +105,12 @@ async fn main() -> Result<()> {
         }
     });
 
-    codeloom_tui::run::run(codeloom_tui::app::App::new(), prompt_tx, bus_rx).await?;
+    codeloom_tui::run::run(
+        codeloom_tui::app::App::with_context(cwd_label, model_label),
+        prompt_tx,
+        bus_rx,
+    )
+    .await?;
     Ok(())
 }
 

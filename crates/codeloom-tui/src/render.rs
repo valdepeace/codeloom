@@ -1,24 +1,24 @@
 use crate::app::App;
-use ratatui::layout::{Constraint, Layout};
+use crate::widgets::sidebar;
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
-pub fn render(frame: &mut Frame, app: &App) {
-    let chunks = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(1),
-        Constraint::Length(3),
-    ])
-    .split(frame.area());
+/// Por debajo de este ancho la barra lateral se oculta (modo compacto).
+const SIDEBAR_MIN_WIDTH: u16 = 90;
+const SIDEBAR_WIDTH: u16 = 30;
 
+fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     let header = Line::from(format!(" CodeLoom · {} ", app.status));
     frame.render_widget(
         Paragraph::new(header).style(Style::default().fg(Color::Black).bg(Color::Cyan)),
-        chunks[0],
+        area,
     );
+}
 
+fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) {
     let body: Vec<Line> = app
         .items
         .iter()
@@ -37,12 +37,37 @@ pub fn render(frame: &mut Frame, app: &App) {
         Paragraph::new(body)
             .block(Block::default().borders(Borders::TOP))
             .wrap(Wrap { trim: false }),
-        chunks[1],
+        area,
     );
+}
 
+fn draw_composer(frame: &mut Frame, area: Rect, app: &App) {
     let composer = Paragraph::new(app.input.as_str())
         .block(Block::default().borders(Borders::ALL).title("prompt"));
-    frame.render_widget(composer, chunks[2]);
+    frame.render_widget(composer, area);
+}
+
+pub fn render(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(3),
+    ])
+    .split(area);
+
+    draw_header(frame, rows[0], app);
+
+    if area.width >= SIDEBAR_MIN_WIDTH {
+        let cols = Layout::horizontal([Constraint::Min(1), Constraint::Length(SIDEBAR_WIDTH)])
+            .split(rows[1]);
+        draw_transcript(frame, cols[0], app);
+        sidebar::render(frame, cols[1], app);
+    } else {
+        draw_transcript(frame, rows[1], app);
+    }
+
+    draw_composer(frame, rows[2], app);
 }
 
 #[cfg(test)]
@@ -52,6 +77,18 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
+    fn buffer_of(app: &App, w: u16, h: u16) -> String {
+        let backend = TestBackend::new(w, h);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render(f, app)).unwrap();
+        term.backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
     #[test]
     fn renders_items_and_input() {
         let mut app = App::new();
@@ -60,18 +97,25 @@ mod tests {
             text: "hello".into(),
         });
         app.push_char('x');
-        let backend = TestBackend::new(40, 10);
-        let mut term = Terminal::new(backend).unwrap();
-        term.draw(|f| render(f, &app)).unwrap();
-        let content: String = term
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|c| c.symbol())
-            .collect();
+        let content = buffer_of(&app, 40, 10);
         assert!(content.contains("hello"));
         assert!(content.contains('x'));
+        assert!(content.contains("CodeLoom"));
+    }
+
+    #[test]
+    fn hides_sidebar_when_narrow() {
+        let app = App::with_context("/proj", "m");
+        let content = buffer_of(&app, 60, 20);
+        assert!(!content.contains("subagentes"));
+    }
+
+    #[test]
+    fn shows_sidebar_when_wide() {
+        let app = App::with_context("/proj", "mistral-nemo");
+        let content = buffer_of(&app, 120, 40);
+        assert!(content.contains("mistral-nemo"));
+        assert!(content.contains("subagentes"));
         assert!(content.contains("CodeLoom"));
     }
 }
