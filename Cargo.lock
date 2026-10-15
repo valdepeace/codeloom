@@ -306,6 +306,7 @@ dependencies = [
  "codeloom-core",
  "codeloom-tui",
  "dirs",
+ "dotenvy",
  "tempfile",
  "tokio",
  "tokio-util",

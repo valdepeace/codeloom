@@ -1,0 +1,12 @@
+# CodeLoom — configuracion local. El secreto va en .env (nunca aqui).
+# model: cualquier modelo OpenAI-compatible de OpenRouter, p.ej.
+#   "mistralai/mistral-nemo"        (el mas barato con tool calling)
+#   "openai/gpt-6-luna"             (barato y fiable)
+#   "anthropic/claude-haiku-5.5"    (barato y muy fiable con tools)
+model = "mistralai/mistral-nemo"
+max_steps = 8
+
+[provider]
+kind = "openai_compat"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"

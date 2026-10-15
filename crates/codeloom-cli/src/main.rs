@@ -29,8 +29,12 @@ struct Cli {
 }
 
 fn build_provider(cfg: &CodeLoomConfig) -> Result<Arc<dyn Provider>> {
-    let key = std::env::var(&cfg.provider.api_key_env)
-        .with_context(|| format!("falta la variable de entorno {}", cfg.provider.api_key_env))?;
+    let key = std::env::var(&cfg.provider.api_key_env).with_context(|| {
+        format!(
+            "falta la variable de entorno {} (ponla en .env o en el entorno)",
+            cfg.provider.api_key_env
+        )
+    })?;
     Ok(match cfg.provider.kind {
         ProviderKind::OpenAiCompat => Arc::new(OpenAiCompatProvider::new(
             cfg.provider.base_url.clone(),
@@ -56,6 +60,7 @@ fn build_tools() -> ToolRegistry {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let cwd = std::env::current_dir()?;
+    load_dotenv(&cwd);
     let cfg = CodeLoomConfig::load(&cwd.join("codeloom.toml"))?;
     let provider = build_provider(&cfg)?;
 
@@ -100,4 +105,24 @@ async fn main() -> Result<()> {
 
     codeloom_tui::run::run(codeloom_tui::app::App::new(), prompt_tx, bus_rx).await?;
     Ok(())
+}
+
+/// Carga `.env` del directorio de trabajo al entorno del proceso (sin pisar
+/// variables ya definidas). Los secretos viven en `.env`, no en la linea de
+/// comandos.
+fn load_dotenv(dir: &std::path::Path) {
+    let _ = dotenvy::from_path(dir.join(".env"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loads_env_from_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "CODELOOM_TEST_ENV_VAR=hello\n").unwrap();
+        load_dotenv(dir.path());
+        assert_eq!(std::env::var("CODELOOM_TEST_ENV_VAR").unwrap(), "hello");
+    }
 }
