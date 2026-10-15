@@ -2,9 +2,11 @@
 
 use crate::state::StyleToken;
 use crate::widgets::Theme;
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use std::time::Duration;
+
+use super::gradient::{color_of, lerp_color};
 
 /// Intervalo entre frames. El bucle de eventos de la app lo usa para tickear.
 pub const FRAME_INTERVAL: Duration = Duration::from_millis(50);
@@ -67,29 +69,6 @@ impl Anim {
             .collect();
         Line::from(spans)
     }
-}
-
-fn color_of(style: Style) -> Color {
-    style.fg.unwrap_or(Color::Cyan)
-}
-
-fn lerp(a: u8, b: u8, t: f32) -> u8 {
-    (a as f32 + (b as f32 - a as f32) * t).round() as u8
-}
-
-fn to_rgb(c: Color) -> (u8, u8, u8) {
-    match c {
-        Color::Rgb(r, g, b) => (r, g, b),
-        Color::Cyan => (0, 200, 255),
-        Color::Green => (0, 200, 120),
-        _ => (200, 200, 200),
-    }
-}
-
-fn lerp_color(a: Color, b: Color, t: f32) -> Color {
-    let (ar, ag, ab) = to_rgb(a);
-    let (br, bg, bb) = to_rgb(b);
-    Color::Rgb(lerp(ar, br, t), lerp(ag, bg, t), lerp(ab, bb, t))
 }
 
 #[cfg(test)]
