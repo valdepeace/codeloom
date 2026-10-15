@@ -4,4 +4,5 @@ pub mod config;
 pub mod error;
 pub mod event;
 pub mod message;
+pub mod provider;
 pub mod session;
