@@ -59,6 +59,7 @@ pub struct Styles {
     pub accent_to: Style,
     pub logo_field: Style,
     pub scrollbar: Style,
+    pub border: Style,
 }
 
 impl Default for Styles {
@@ -92,6 +93,7 @@ impl Default for Styles {
             accent_to: Style::default().fg(Color::Rgb(124, 92, 255)),
             logo_field: Style::default().fg(Color::Indexed(238)),
             scrollbar: Style::default().fg(Color::Indexed(240)),
+            border: Style::default().fg(Color::Indexed(240)),
         }
     }
 }
@@ -213,6 +215,7 @@ impl Theme {
             StyleToken::AccentTo => s.accent_to,
             StyleToken::LogoField => s.logo_field,
             StyleToken::Scrollbar => s.scrollbar,
+            StyleToken::Border => s.border,
         })
     }
 
@@ -243,6 +246,7 @@ impl Theme {
             "accent_to" => s.accent_to = style,
             "logo_field" => s.logo_field = style,
             "scrollbar" => s.scrollbar = style,
+            "border" => s.border = style,
             _ => return false,
         }
         true
@@ -275,6 +279,7 @@ fn token_to_key(t: StyleToken) -> &'static str {
         StyleToken::AccentTo => "accent_to",
         StyleToken::LogoField => "logo_field",
         StyleToken::Scrollbar => "scrollbar",
+        StyleToken::Border => "border",
     }
 }
 
@@ -385,5 +390,13 @@ mod tests {
         );
         let th = Theme::from_toml("[styles]\nscrollbar = \"magenta\"\n").unwrap();
         assert_eq!(th.style(StyleToken::Scrollbar).fg, Some(Color::Magenta));
+    }
+
+    #[test]
+    fn border_token_resolves_and_overrides() {
+        let th = Theme::test();
+        assert_eq!(th.style(StyleToken::Border).fg, Some(Color::Indexed(240)));
+        let th = Theme::from_toml("[styles]\nborder = \"magenta\"\n").unwrap();
+        assert_eq!(th.style(StyleToken::Border).fg, Some(Color::Magenta));
     }
 }

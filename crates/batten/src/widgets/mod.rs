@@ -9,6 +9,7 @@ pub mod sidebar;
 pub mod spinner;
 mod text;
 pub mod theme;
+pub mod tone;
 pub mod tool_item;
 pub mod transcript;
 
