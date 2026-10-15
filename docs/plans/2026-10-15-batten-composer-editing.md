@@ -77,7 +77,7 @@ En `crates/batten/src/state/composer.rs`, en `mod tests`, añade (dejando los ac
         c.backspace();
         assert_eq!(c.text(), "bc");
         c.delete();
-        assert_eq!(c.text(), "b");
+        assert_eq!(c.text(), "c");
     }
 
     #[test]
