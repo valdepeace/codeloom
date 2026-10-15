@@ -14,6 +14,7 @@ pub struct App {
     pub cwd: String,
     pub model: String,
     pub theme: batten::widgets::Theme,
+    pub changes: batten::state::FileChanges,
 }
 
 impl Default for App {
@@ -32,6 +33,7 @@ impl App {
             cwd: String::new(),
             model: String::new(),
             theme: batten::widgets::Theme::default_dark(),
+            changes: batten::state::FileChanges::new(),
         }
     }
 
@@ -68,6 +70,15 @@ impl App {
                 }
             }
             LiveEvent::Error { message } => self.status = format!("error: {message}"),
+            LiveEvent::FileDiff {
+                path,
+                added,
+                removed,
+            } => self.changes.upsert(batten::state::FileChange {
+                path,
+                added,
+                removed,
+            }),
             _ => {}
         }
     }
@@ -152,5 +163,17 @@ mod tests {
             ["estado", "cwd", "modelo", "agente", "subagentes / jobs"]
         );
         assert_eq!(sb.sections[1].lines, vec!["/proj".to_string()]);
+    }
+
+    #[test]
+    fn applies_file_diffs() {
+        let mut app = App::new();
+        app.apply(codeloom_core::event::LiveEvent::FileDiff {
+            path: "src/main.rs".into(),
+            added: 3,
+            removed: 1,
+        });
+        assert_eq!(app.changes.len(), 1);
+        assert_eq!(app.changes.totals(), (3, 1));
     }
 }

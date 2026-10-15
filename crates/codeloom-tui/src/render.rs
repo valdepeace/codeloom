@@ -61,7 +61,22 @@ pub fn render(frame: &mut Frame, app: &App) {
         let cols = Layout::horizontal([Constraint::Min(1), Constraint::Length(SIDEBAR_WIDTH)])
             .split(rows[1]);
         draw_transcript(frame, cols[0], app);
-        batten::widgets::sidebar::render(frame, cols[1], &app.sidebar(), &app.theme);
+        let right = cols[1];
+        if app.changes.is_empty() {
+            batten::widgets::sidebar::render(frame, right, &app.sidebar(), &app.theme);
+        } else {
+            let need = (app.changes.len() as u16).saturating_add(2);
+            let h = need.min(right.height.saturating_sub(1));
+            let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(h)]).split(right);
+            batten::widgets::sidebar::render(frame, parts[0], &app.sidebar(), &app.theme);
+            batten::widgets::file_changes::render(
+                frame,
+                parts[1],
+                "ficheros modificados",
+                &app.changes,
+                &app.theme,
+            );
+        }
     } else {
         draw_transcript(frame, rows[1], app);
     }
@@ -116,5 +131,18 @@ mod tests {
         assert!(content.contains("mistral-nemo"));
         assert!(content.contains("subagentes"));
         assert!(content.contains('█'));
+    }
+
+    #[test]
+    fn shows_modified_files_when_wide() {
+        let mut app = App::with_context("/proj", "m");
+        app.apply(codeloom_core::event::LiveEvent::FileDiff {
+            path: "src/main.rs".into(),
+            added: 3,
+            removed: 1,
+        });
+        let content = buffer_of(&app, 120, 40);
+        assert!(content.contains("ficheros modificados"));
+        assert!(content.contains("src/main.rs"));
     }
 }
