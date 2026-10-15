@@ -13,6 +13,8 @@ pub mod key_help;
 pub mod link;
 pub mod logo;
 pub mod panel;
+#[cfg(feature = "termprofile")]
+pub mod profile;
 pub mod progress;
 pub mod rule;
 pub mod scrollbar;
