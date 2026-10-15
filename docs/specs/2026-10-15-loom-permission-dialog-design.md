@@ -7,7 +7,10 @@
 > Relacionado: `docs/specs/2026-10-15-batten-primitives-design.md` (panel,
 > key_help, chip), `docs/plans/2026-10-15-batten-integrations.md` (`fx`).
 > Referencia de UX: Crush (`internal/ui/dialog/permissions.go`,
-> `internal/ui/diffview/`).
+> `internal/ui/diffview/`); filas de diff: `.references/claude-code-rust/src/ui/diff.rs`
+> y `.references/herdr-reviewr/src/diff.rs` (ver
+> `2026-10-15-batten-reference-findings-showcase.md` §3 y P3: la app suministra
+> los textos, batten no lee ficheros ni ejecuta Git).
 
 ## 0. Contexto y problema
 
