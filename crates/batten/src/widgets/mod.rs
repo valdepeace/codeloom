@@ -1,5 +1,7 @@
 //! Widgets ratatui y tema. Sin crossterm.
 
+#[cfg(feature = "ansi")]
+pub mod ansi;
 pub mod chip;
 pub mod composer;
 pub mod file_changes;
