@@ -17,6 +17,7 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 unicode-width = "0.2"
 thiserror = "2"
+similar = "3"
 tachyonfx = { version = "0.25", optional = true }
 ansi-to-tui = { version = "8", optional = true }
 hyperrat = { version = "0.1.3", optional = true }

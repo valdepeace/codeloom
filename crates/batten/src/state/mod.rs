@@ -1,6 +1,7 @@
 //! Estado puro: sin ratatui, sin crossterm.
 
 pub mod composer;
+pub mod diff;
 pub mod file_changes;
 pub mod history;
 pub mod sidebar;
@@ -12,6 +13,7 @@ pub mod transcript;
 pub mod viewport;
 
 pub use composer::Composer;
+pub use diff::{Diff, DiffKind, DiffLine};
 pub use file_changes::{FileChange, FileChanges};
 pub use history::History;
 pub use sidebar::{Logo, Section, Sidebar};
