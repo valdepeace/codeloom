@@ -44,6 +44,7 @@ pub enum StyleToken {
     DiffInsert,
     DiffDelete,
     DiffHunk,
+    Selection,
 }
 
 /// Rango con estilo, como offsets sobre el texto plano de una linea.

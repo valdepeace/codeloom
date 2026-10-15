@@ -72,8 +72,7 @@ fn render_line(line: &Line, theme: &Theme) -> Vec<TLine<'static>> {
     vec![TLine::from(spans)]
 }
 
-/// Pinta el transcript. Una sola geometría (filas tras el wrap) alimenta el
-/// pintado, el scroll y la scrollbar; la fija en `viewport`.
+/// Pinta el transcript sin selección.
 pub fn render(
     frame: &mut Frame,
     area: Rect,
@@ -81,17 +80,41 @@ pub fn render(
     viewport: &mut crate::state::Viewport,
     theme: &Theme,
 ) {
+    render_with_selection(frame, area, transcript, viewport, None, theme);
+}
+
+/// Pinta el transcript. Una sola geometría (filas tras el wrap) alimenta el
+/// pintado, el scroll y la scrollbar; la fija en `viewport`. Las líneas de
+/// `selection` se resaltan y su extremo se mantiene visible.
+pub fn render_with_selection(
+    frame: &mut Frame,
+    area: Rect,
+    transcript: &Transcript,
+    viewport: &mut crate::state::Viewport,
+    selection: Option<&crate::state::Selection>,
+    theme: &Theme,
+) {
     if area.width == 0 || area.height == 0 {
         return;
     }
     let rows = area.height as usize;
+    let sel_style = theme.styles.selection;
     // ponytail: se compone todo el historial en cada frame; cachear por línea
     // si se nota en conversaciones largas.
     let lines: Vec<TLine> = (0..transcript.len())
-        .filter_map(|i| transcript.line(i))
-        .flat_map(|l| render_line(l, theme))
+        .filter_map(|i| transcript.line(i).map(|l| (i, l)))
+        .flat_map(|(i, l)| {
+            let mut out = render_line(l, theme);
+            if selection.is_some_and(|s| s.contains(i)) {
+                for tl in &mut out {
+                    tl.style = tl.style.patch(sel_style);
+                }
+            }
+            out
+        })
         .collect();
-    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let wrap = Wrap { trim: false };
+    let para = Paragraph::new(lines.clone()).wrap(wrap);
     let full = para.line_count(area.width);
     let overflow = full > rows && area.width >= 2;
     let text_area = if overflow {
@@ -108,6 +131,17 @@ pub fn render(
         full
     };
     viewport.set_geometry(total, rows);
+    if let (Some(s), false) = (selection, lines.is_empty()) {
+        let head = s.head().min(lines.len() - 1);
+        let w = text_area.width;
+        let start = Paragraph::new(lines[..head].to_vec())
+            .wrap(wrap)
+            .line_count(w);
+        let height = Paragraph::new(vec![lines[head].clone()])
+            .wrap(wrap)
+            .line_count(w);
+        viewport.ensure_visible(start, start + height);
+    }
     // ponytail: `Paragraph::scroll` usa u16; más de 65535 filas se quedan en el tope.
     let top = u16::try_from(viewport.top()).unwrap_or(u16::MAX);
     frame.render_widget(para.scroll((top, 0)), text_area);
@@ -247,6 +281,46 @@ mod tests {
         assert!(before.contains("line 35"));
         assert!(after.contains("line 35"));
         assert!(!after.contains("line 69"));
+    }
+
+    #[test]
+    fn selected_lines_are_highlighted() {
+        use crate::state::Selection;
+        let mut t = Transcript::new();
+        for s in ["uno", "dos", "tres"] {
+            t.push(Line::new(LineKind::Assistant, s));
+        }
+        let mut term = Terminal::new(TestBackend::new(30, 5)).unwrap();
+        let mut vp = Viewport::new();
+        let sel = Selection::at(1);
+        term.draw(|f| render_with_selection(f, f.area(), &t, &mut vp, Some(&sel), &Theme::test()))
+            .unwrap();
+        let buf = term.backend().buffer();
+        assert_eq!(buf[(0, 1)].bg, ratatui::style::Color::Indexed(238));
+        assert_ne!(buf[(0, 0)].bg, ratatui::style::Color::Indexed(238));
+    }
+
+    #[test]
+    fn the_selection_head_is_scrolled_into_view() {
+        use crate::state::Selection;
+        let mut t = Transcript::new();
+        for i in 0..50 {
+            t.push(Line::new(LineKind::Assistant, format!("line {i:02}")));
+        }
+        let mut term = Terminal::new(TestBackend::new(30, 5)).unwrap();
+        let mut vp = Viewport::new();
+        let sel = Selection::at(0);
+        term.draw(|f| render_with_selection(f, f.area(), &t, &mut vp, Some(&sel), &Theme::test()))
+            .unwrap();
+        let out: String = term
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(out.contains("line 00"));
+        assert!(!vp.is_following());
     }
 
     #[test]

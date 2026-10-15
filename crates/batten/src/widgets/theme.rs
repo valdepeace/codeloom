@@ -63,6 +63,7 @@ pub struct Styles {
     pub diff_insert: Style,
     pub diff_delete: Style,
     pub diff_hunk: Style,
+    pub selection: Style,
 }
 
 impl Default for Styles {
@@ -100,6 +101,7 @@ impl Default for Styles {
             diff_insert: Style::default().fg(Color::Green),
             diff_delete: Style::default().fg(Color::Red),
             diff_hunk: Style::default().fg(Color::Cyan),
+            selection: Style::default().bg(Color::Indexed(238)),
         }
     }
 }
@@ -225,6 +227,7 @@ impl Theme {
             StyleToken::DiffInsert => s.diff_insert,
             StyleToken::DiffDelete => s.diff_delete,
             StyleToken::DiffHunk => s.diff_hunk,
+            StyleToken::Selection => s.selection,
         })
     }
 
@@ -259,6 +262,7 @@ impl Theme {
             "diff_insert" => s.diff_insert = style,
             "diff_delete" => s.diff_delete = style,
             "diff_hunk" => s.diff_hunk = style,
+            "selection" => s.selection = Style::default().bg(style.fg.unwrap_or(Color::Reset)),
             _ => return false,
         }
         true
@@ -295,6 +299,7 @@ fn token_to_key(t: StyleToken) -> &'static str {
         StyleToken::DiffInsert => "diff_insert",
         StyleToken::DiffDelete => "diff_delete",
         StyleToken::DiffHunk => "diff_hunk",
+        StyleToken::Selection => "selection",
     }
 }
 
@@ -422,5 +427,16 @@ mod tests {
         assert_eq!(th.style(StyleToken::DiffHunk).fg, Some(Color::Cyan));
         let th = Theme::from_toml("[styles]\ndiff_delete = \"magenta\"\n").unwrap();
         assert_eq!(th.style(StyleToken::DiffDelete).fg, Some(Color::Magenta));
+    }
+
+    #[test]
+    fn selection_token_is_a_background() {
+        let th = Theme::test();
+        assert_eq!(
+            th.style(StyleToken::Selection).bg,
+            Some(Color::Indexed(238))
+        );
+        let th = Theme::from_toml("[styles]\nselection = \"blue\"\n").unwrap();
+        assert_eq!(th.style(StyleToken::Selection).bg, Some(Color::Blue));
     }
 }

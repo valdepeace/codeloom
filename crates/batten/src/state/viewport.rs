@@ -111,6 +111,16 @@ impl Viewport {
         self.scroll_up(usize::MAX);
     }
 
+    /// Desplaza lo mínimo para que se vean las filas `[start, end)`.
+    pub fn ensure_visible(&mut self, start: usize, end: usize) {
+        if start < self.top {
+            self.top = start;
+        } else if end > self.top + self.rows {
+            self.top = end.saturating_sub(self.rows).min(self.max_top());
+        }
+        self.follow = self.top >= self.max_top();
+    }
+
     /// Primera fila visible.
     pub fn top(&self) -> usize {
         self.top
@@ -218,6 +228,18 @@ mod tests {
         let mut v = vp(100, 0);
         v.page_up();
         assert_eq!(v.top(), 99);
+    }
+
+    #[test]
+    fn ensure_visible_moves_the_minimum() {
+        let mut v = vp(100, 10);
+        v.ensure_visible(5, 6);
+        assert_eq!(v.window(), 5..15);
+        assert!(!v.is_following());
+        v.ensure_visible(50, 52);
+        assert_eq!(v.window(), 42..52);
+        v.ensure_visible(98, 100);
+        assert!(v.is_following());
     }
 
     #[test]
