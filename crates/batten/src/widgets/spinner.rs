@@ -13,6 +13,19 @@ pub const FRAME_INTERVAL: Duration = Duration::from_millis(50);
 
 const RUNES: &[u8] = b"0123456789abcdef#@$%&*+~";
 
+/// Spinners de una celda (frames en orden). Se pintan con `Anim::glyph`.
+pub const BRAILLE: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+pub const DOT_RING: &[&str] = &["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
+pub const ARC: &[&str] = &["◜", "◠", "◝", "◞", "◡", "◟"];
+pub const BOUNCE: &[&str] = &["⠁", "⠂", "⠄", "⡀", "⢀", "⠠", "⠐", "⠈"];
+pub const PULSE: &[&str] = &["·", "•", "●", "•"];
+pub const BARS: &[&str] = &[
+    "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█", "▇", "▆", "▅", "▄", "▃", "▂",
+];
+
+/// Ticks del reloj (50 ms) por frame de un spinner de una celda.
+const TICKS_PER_GLYPH: u64 = 2;
+
 /// Cualquier item que pueda estar "girando" y avanzar un frame.
 pub trait Animatable {
     /// Devuelve `true` si hay una animación activa que consume CPU.
@@ -69,6 +82,21 @@ impl Anim {
             .collect();
         Line::from(spans)
     }
+
+    /// Frame actual de un spinner de una celda. El color oscila entre
+    /// `accent_from` y `accent_to` con un periodo de ~2 s. Sin frames, vacío.
+    pub fn glyph(&self, frames: &[&'static str], theme: &Theme) -> Span<'static> {
+        if frames.is_empty() {
+            return Span::raw("");
+        }
+        let step = self.frame / TICKS_PER_GLYPH;
+        let shown = frames[(step % frames.len() as u64) as usize];
+        let phase = (step % 20) as f32 / 10.0;
+        let t = if phase <= 1.0 { phase } else { 2.0 - phase };
+        let from = color_of(theme.styles.accent_from);
+        let to = color_of(theme.styles.accent_to);
+        Span::styled(shown, Style::default().fg(lerp_color(from, to, t)))
+    }
 }
 
 #[cfg(test)]
@@ -101,5 +129,41 @@ mod tests {
         let text: String = line.spans.iter().map(|s| s.content.to_string()).collect();
         assert_eq!(text.chars().filter(|c| *c == ' ').count(), 1);
         assert_eq!(text.chars().count(), 5);
+    }
+}
+
+#[cfg(test)]
+mod glyph_tests {
+    use super::*;
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn advances_every_two_ticks_and_wraps() {
+        let th = Theme::test();
+        assert_eq!(Anim { frame: 0 }.glyph(BRAILLE, &th).content, "⠋");
+        assert_eq!(Anim { frame: 1 }.glyph(BRAILLE, &th).content, "⠋");
+        assert_eq!(Anim { frame: 2 }.glyph(BRAILLE, &th).content, "⠙");
+        assert_eq!(Anim { frame: 20 }.glyph(BRAILLE, &th).content, "⠋");
+    }
+
+    #[test]
+    fn starts_with_accent_from() {
+        let th = Theme::test();
+        let g = Anim { frame: 0 }.glyph(PULSE, &th);
+        assert_eq!(g.style.fg, Some(color_of(th.styles.accent_from)));
+    }
+
+    #[test]
+    fn empty_frames_are_empty() {
+        assert_eq!(Anim::new().glyph(&[], &Theme::test()).content, "");
+    }
+
+    #[test]
+    fn every_frame_is_one_column() {
+        for frames in [BRAILLE, DOT_RING, ARC, BOUNCE, PULSE, BARS] {
+            for f in frames {
+                assert_eq!(f.width(), 1, "frame {f:?}");
+            }
+        }
     }
 }
