@@ -10,6 +10,7 @@ mod key_help;
 mod links;
 mod logo;
 mod panel;
+mod permission;
 mod profile;
 mod progress;
 mod rule;
@@ -48,6 +49,7 @@ pub fn catalog() -> Vec<Box<dyn Demo>> {
         Box::new(ansi::AnsiDemo::new()),
         Box::new(links::LinksDemo::new()),
         Box::new(profile::ProfileDemo::new()),
+        Box::new(permission::PermissionDemo::new()),
     ]
 }
 
