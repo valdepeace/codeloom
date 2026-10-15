@@ -58,6 +58,7 @@ pub struct Styles {
     pub accent_from: Style,
     pub accent_to: Style,
     pub logo_field: Style,
+    pub scrollbar: Style,
 }
 
 impl Default for Styles {
@@ -90,6 +91,7 @@ impl Default for Styles {
             accent_from: Style::default().fg(Color::Rgb(0, 212, 255)),
             accent_to: Style::default().fg(Color::Rgb(124, 92, 255)),
             logo_field: Style::default().fg(Color::Indexed(238)),
+            scrollbar: Style::default().fg(Color::Indexed(240)),
         }
     }
 }
@@ -210,6 +212,7 @@ impl Theme {
             StyleToken::AccentFrom => s.accent_from,
             StyleToken::AccentTo => s.accent_to,
             StyleToken::LogoField => s.logo_field,
+            StyleToken::Scrollbar => s.scrollbar,
         })
     }
 
@@ -239,6 +242,7 @@ impl Theme {
             "accent_from" => s.accent_from = style,
             "accent_to" => s.accent_to = style,
             "logo_field" => s.logo_field = style,
+            "scrollbar" => s.scrollbar = style,
             _ => return false,
         }
         true
@@ -270,6 +274,7 @@ fn token_to_key(t: StyleToken) -> &'static str {
         StyleToken::AccentFrom => "accent_from",
         StyleToken::AccentTo => "accent_to",
         StyleToken::LogoField => "logo_field",
+        StyleToken::Scrollbar => "scrollbar",
     }
 }
 
@@ -369,5 +374,16 @@ mod tests {
     fn accent_tokens_can_be_overridden() {
         let th = Theme::from_toml("[styles]\naccent_from = \"magenta\"\n").unwrap();
         assert_eq!(th.style(StyleToken::AccentFrom).fg, Some(Color::Magenta));
+    }
+
+    #[test]
+    fn scrollbar_token_resolves_and_overrides() {
+        let th = Theme::test();
+        assert_eq!(
+            th.style(StyleToken::Scrollbar).fg,
+            Some(Color::Indexed(240))
+        );
+        let th = Theme::from_toml("[styles]\nscrollbar = \"magenta\"\n").unwrap();
+        assert_eq!(th.style(StyleToken::Scrollbar).fg, Some(Color::Magenta));
     }
 }

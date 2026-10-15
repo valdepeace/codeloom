@@ -39,6 +39,7 @@ pub enum StyleToken {
     AccentFrom,
     AccentTo,
     LogoField,
+    Scrollbar,
 }
 
 /// Rango con estilo, como offsets sobre el texto plano de una linea.

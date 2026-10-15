@@ -29,6 +29,13 @@ impl TranscriptDemo {
         ] {
             transcript.push(Line::new(kind, text));
         }
+        // Relleno para que haya más líneas que filas y se vea el scrollbar.
+        for i in 0..30 {
+            transcript.push(Line::new(
+                LineKind::Assistant,
+                format!("línea de relleno {i}"),
+            ));
+        }
         Self {
             transcript,
             viewport: Viewport::new(),

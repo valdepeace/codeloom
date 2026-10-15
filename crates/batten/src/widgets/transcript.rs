@@ -87,7 +87,31 @@ pub fn render(
             lines.extend(render_line(line, theme));
         }
     }
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+
+    // Barra a la derecha cuando hay más líneas que filas visibles.
+    let overflow = transcript.len() > rows && area.width >= 2;
+    let text_area = if overflow {
+        Rect {
+            width: area.width - 1,
+            ..area
+        }
+    } else {
+        area
+    };
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), text_area);
+    if overflow {
+        let bar = Rect {
+            x: area.x + area.width - 1,
+            width: 1,
+            ..area
+        };
+        crate::widgets::scrollbar::render(
+            frame,
+            bar,
+            viewport.scroll(transcript.len(), rows),
+            theme,
+        );
+    }
 }
 
 #[cfg(test)]
@@ -162,5 +186,26 @@ mod tests {
         let out = buffer(&t, 40, 5); // 5 filas -> ventana 45..50
         assert!(out.contains("line 49"));
         assert!(!out.contains("line 0"));
+    }
+
+    #[test]
+    fn shows_a_scrollbar_when_content_overflows() {
+        let mut t = Transcript::new();
+        for i in 0..50 {
+            t.push(Line::new(LineKind::Assistant, format!("line {i}")));
+        }
+        let out = buffer(&t, 20, 5);
+        assert!(
+            out.contains('\u{2551}') || out.contains('\u{2588}'),
+            "esperaba una barra de scroll"
+        );
+    }
+
+    #[test]
+    fn no_scrollbar_when_content_fits() {
+        let mut t = Transcript::new();
+        t.push(Line::new(LineKind::Assistant, "hi"));
+        let out = buffer(&t, 20, 5);
+        assert!(!out.contains('\u{2551}') && !out.contains('\u{2588}'));
     }
 }

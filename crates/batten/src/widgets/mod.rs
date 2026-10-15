@@ -3,6 +3,7 @@
 pub mod composer;
 mod gradient;
 pub mod logo;
+pub mod scrollbar;
 pub mod sidebar;
 pub mod spinner;
 pub mod theme;

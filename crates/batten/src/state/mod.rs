@@ -12,4 +12,4 @@ pub use sidebar::{Logo, Section, Sidebar};
 pub use stream::Stream;
 pub use tool::{ToolItem, ToolStatus};
 pub use transcript::{Line, LineKind, SpanSpec, StyleToken, Transcript};
-pub use viewport::Viewport;
+pub use viewport::{Scroll, Viewport};
