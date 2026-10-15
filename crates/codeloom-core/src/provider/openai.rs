@@ -112,14 +112,8 @@ impl OpenAiCompatProvider {
     }
 
     fn build_body(&self, req: &ProviderRequest) -> serde_json::Value {
-        let system = serde_json::json!({ "role": "system", "content": req.system });
-        let messages: Vec<serde_json::Value> = std::iter::once(system)
-            .chain(
-                req.messages
-                    .iter()
-                    .map(|m| serde_json::json!({ "role": role_str(m.role), "content": m.text() })),
-            )
-            .collect();
+        let mut messages = vec![serde_json::json!({ "role": "system", "content": req.system })];
+        messages.extend(wire_messages(&req.messages));
         let tools: Vec<serde_json::Value> = req
             .tools
             .iter()
@@ -153,6 +147,54 @@ fn role_str(r: crate::message::Role) -> &'static str {
         Assistant => "assistant",
         Tool => "tool",
     }
+}
+
+/// Traduce los mensajes al formato Chat Completions, incluyendo `tool_calls`
+/// en el asistente y `tool_call_id` en los resultados (uno por ToolResult).
+fn wire_messages(messages: &[crate::message::Message]) -> Vec<serde_json::Value> {
+    use crate::message::{ContentPart, Role};
+    let mut out = Vec::new();
+    for m in messages {
+        match m.role {
+            Role::Assistant => {
+                let calls: Vec<serde_json::Value> = m
+                    .parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        ContentPart::ToolCall { id, name, input } => Some(serde_json::json!({
+                            "id": id,
+                            "type": "function",
+                            "function": { "name": name, "arguments": input.to_string() }
+                        })),
+                        _ => None,
+                    })
+                    .collect();
+                let mut obj = serde_json::json!({ "role": "assistant", "content": m.text() });
+                if !calls.is_empty() {
+                    obj["tool_calls"] = serde_json::Value::Array(calls);
+                }
+                out.push(obj);
+            }
+            Role::Tool => {
+                for p in &m.parts {
+                    if let ContentPart::ToolResult {
+                        call_id, content, ..
+                    } = p
+                    {
+                        out.push(serde_json::json!({
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": content
+                        }));
+                    }
+                }
+            }
+            other => {
+                out.push(serde_json::json!({ "role": role_str(other), "content": m.text() }));
+            }
+        }
+    }
+    out
 }
 
 #[async_trait]
@@ -320,5 +362,50 @@ mod http_tests {
         }
         assert_eq!(texts, "hello");
         assert!(saw_done);
+    }
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+    use crate::message::{ContentPart, Message, Role};
+
+    #[test]
+    fn serializes_tool_calls_and_tool_results() {
+        let p = OpenAiCompatProvider::new("http://x", "k");
+        let req = ProviderRequest {
+            model: "m".into(),
+            system: "sys".into(),
+            messages: vec![
+                Message::assistant(vec![ContentPart::ToolCall {
+                    id: "c1".into(),
+                    name: "view".into(),
+                    input: serde_json::json!({"path":"a"}),
+                }]),
+                Message::new(
+                    Role::Tool,
+                    vec![ContentPart::ToolResult {
+                        call_id: "c1".into(),
+                        content: "ok".into(),
+                        is_error: false,
+                    }],
+                ),
+            ],
+            tools: vec![],
+            temperature: 0.0,
+            max_tokens: 16,
+        };
+        let body = p.build_body(&req);
+        let msgs = body["messages"].as_array().unwrap();
+        let assistant = msgs.iter().find(|m| m["role"] == "assistant").unwrap();
+        assert_eq!(assistant["tool_calls"][0]["id"], "c1");
+        assert_eq!(assistant["tool_calls"][0]["function"]["name"], "view");
+        assert!(assistant["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap()
+            .contains("path"));
+        let tool = msgs.iter().find(|m| m["role"] == "tool").unwrap();
+        assert_eq!(tool["tool_call_id"], "c1");
+        assert_eq!(tool["content"], "ok");
     }
 }

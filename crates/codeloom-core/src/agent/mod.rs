@@ -107,6 +107,10 @@ impl AgentLoop {
                 }
             }
 
+            if cancel.is_cancelled() {
+                finish = FinishReason::Error;
+            }
+
             let mut parts = Vec::new();
             if !text_buf.is_empty() {
                 parts.push(ContentPart::Text {
@@ -126,6 +130,10 @@ impl AgentLoop {
             self.bus.publish(LiveEvent::MessageAdded(assistant.clone()));
             history.push(assistant);
             final_text = text_buf;
+
+            if cancel.is_cancelled() {
+                break;
+            }
 
             if tool_calls.is_empty() {
                 break;
@@ -356,5 +364,48 @@ mod tests {
             .parts
             .iter()
             .any(|p| matches!(p, ContentPart::ToolResult { is_error: true, .. }))));
+    }
+
+    #[tokio::test]
+    async fn cancelled_turn_marks_partial_message_as_error() {
+        let scripts = vec![vec![StreamChunk::TextDelta("partial".into())]];
+        let provider = Arc::new(QueueProvider {
+            scripts: Mutex::new(scripts.into()),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SqliteStore::open(dir.path().join("c.db").to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+        let sid = store.create_session("/p").await.unwrap();
+        let cfg = CodeLoomConfig {
+            provider: crate::config::ProviderConfig {
+                kind: crate::config::ProviderKind::OpenAiCompat,
+                base_url: "http://x".into(),
+                api_key_env: "K".into(),
+            },
+            model: "m".into(),
+            max_steps: 5,
+        };
+        let agent = AgentLoop::new(
+            provider,
+            store.clone(),
+            Arc::new(ToolRegistry::new()),
+            EventBus::new(64),
+            Arc::new(PermissionService::allow_all()),
+            cfg,
+            dir.path().to_path_buf(),
+        );
+        let token = CancellationToken::new();
+        token.cancel();
+        let _ = agent.run(sid, "hi".into(), token).await.unwrap();
+        let msgs = store.messages(sid).await.unwrap();
+        assert!(msgs.iter().any(|m| m.parts.iter().any(|p| matches!(
+            p,
+            ContentPart::Finish {
+                reason: FinishReason::Error
+            }
+        ))));
     }
 }

@@ -117,11 +117,7 @@ impl AnthropicProvider {
     }
 
     fn build_body(&self, req: &ProviderRequest) -> serde_json::Value {
-        let messages: Vec<serde_json::Value> = req
-            .messages
-            .iter()
-            .map(|m| serde_json::json!({ "role": role_str(m.role), "content": m.text() }))
-            .collect();
+        let messages = wire_messages(&req.messages);
         let tools: Vec<serde_json::Value> = req
             .tools
             .iter()
@@ -153,6 +149,60 @@ fn role_str(r: crate::message::Role) -> &'static str {
         Assistant => "assistant",
         Tool => "user",
     }
+}
+
+/// Traduce los mensajes al formato Messages: bloques `tool_use` en el
+/// asistente y `tool_result` en un mensaje de usuario (uno por ToolResult).
+fn wire_messages(messages: &[crate::message::Message]) -> Vec<serde_json::Value> {
+    use crate::message::{ContentPart, Role};
+    let mut out = Vec::new();
+    for m in messages {
+        match m.role {
+            Role::Assistant => {
+                let mut blocks: Vec<serde_json::Value> = Vec::new();
+                let text = m.text();
+                if !text.is_empty() {
+                    blocks.push(serde_json::json!({ "type": "text", "text": text }));
+                }
+                for p in &m.parts {
+                    if let ContentPart::ToolCall { id, name, input } = p {
+                        blocks.push(serde_json::json!({
+                            "type": "tool_use",
+                            "id": id,
+                            "name": name,
+                            "input": input
+                        }));
+                    }
+                }
+                if blocks.is_empty() {
+                    blocks.push(serde_json::json!({ "type": "text", "text": "" }));
+                }
+                out.push(serde_json::json!({ "role": "assistant", "content": blocks }));
+            }
+            Role::Tool => {
+                let mut blocks: Vec<serde_json::Value> = Vec::new();
+                for p in &m.parts {
+                    if let ContentPart::ToolResult {
+                        call_id, content, ..
+                    } = p
+                    {
+                        blocks.push(serde_json::json!({
+                            "type": "tool_result",
+                            "tool_use_id": call_id,
+                            "content": content
+                        }));
+                    }
+                }
+                if !blocks.is_empty() {
+                    out.push(serde_json::json!({ "role": "user", "content": blocks }));
+                }
+            }
+            other => {
+                out.push(serde_json::json!({ "role": role_str(other), "content": m.text() }));
+            }
+        }
+    }
+    out
 }
 
 #[async_trait]
@@ -287,5 +337,64 @@ mod tests {
             json!({"message":{"usage":{"input_tokens":12,"output_tokens":0}}}),
         );
         assert!(matches!(chunks.as_slice(), [StreamChunk::Usage(u)] if u.input_tokens == 12));
+    }
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+    use crate::message::{ContentPart, Message, Role};
+    use serde_json::json;
+
+    #[test]
+    fn serializes_tool_use_and_tool_result_blocks() {
+        let p = AnthropicProvider::new("http://x", "k");
+        let req = ProviderRequest {
+            model: "m".into(),
+            system: "sys".into(),
+            messages: vec![
+                Message::assistant(vec![ContentPart::ToolCall {
+                    id: "t1".into(),
+                    name: "view".into(),
+                    input: json!({"path":"a"}),
+                }]),
+                Message::new(
+                    Role::Tool,
+                    vec![ContentPart::ToolResult {
+                        call_id: "t1".into(),
+                        content: "ok".into(),
+                        is_error: false,
+                    }],
+                ),
+            ],
+            tools: vec![],
+            temperature: 0.0,
+            max_tokens: 16,
+        };
+        let body = p.build_body(&req);
+        let msgs = body["messages"].as_array().unwrap();
+        let assistant = msgs.iter().find(|m| m["role"] == "assistant").unwrap();
+        let blocks = assistant["content"].as_array().unwrap();
+        assert!(blocks
+            .iter()
+            .any(|b| b["type"] == "tool_use" && b["id"] == "t1" && b["name"] == "view"));
+        let user = msgs
+            .iter()
+            .find(|m| {
+                m["role"] == "user"
+                    && m["content"]
+                        .as_array()
+                        .map(|a| a.iter().any(|b| b["type"] == "tool_result"))
+                        .unwrap_or(false)
+            })
+            .unwrap();
+        let result = user["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["type"] == "tool_result")
+            .unwrap();
+        assert_eq!(result["tool_use_id"], "t1");
+        assert_eq!(result["content"], "ok");
     }
 }
