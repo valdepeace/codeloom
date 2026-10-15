@@ -1,4 +1,5 @@
 use crate::app::App;
+use crate::app::Focus;
 use crate::render::render;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{
@@ -28,10 +29,27 @@ impl Drop for RawGuard {
     }
 }
 
+/// Teclas con el foco en el transcript (como Crush).
+fn transcript_key(app: &mut App, code: KeyCode) {
+    let vp = &mut app.viewport;
+    match code {
+        KeyCode::Up | KeyCode::Char('k') => vp.scroll_up(1),
+        KeyCode::Down | KeyCode::Char('j') => vp.scroll_down(1),
+        KeyCode::Char('u') => vp.half_page_up(),
+        KeyCode::Char('d') => vp.half_page_down(),
+        KeyCode::PageUp | KeyCode::Char('b') => vp.page_up(),
+        KeyCode::PageDown | KeyCode::Char('f') | KeyCode::Char(' ') => vp.page_down(),
+        KeyCode::Home | KeyCode::Char('g') => vp.to_top(),
+        KeyCode::End | KeyCode::Char('G') => vp.follow_bottom(),
+        KeyCode::Esc => app.focus = Focus::Composer,
+        _ => {}
+    }
+}
+
 /// Traduce una tecla a una accion sobre la app. Devuelve el prompt a enviar
 /// cuando el usuario pulsa Enter con texto.
 pub fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Option<String> {
-    if code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL) {
+    if matches!(code, KeyCode::Char('c' | 'q')) && mods.contains(KeyModifiers::CONTROL) {
         app.should_quit = true;
         return None;
     }
@@ -41,11 +59,16 @@ pub fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Option<St
         }
         return None;
     }
+    if code == KeyCode::Tab {
+        app.toggle_focus();
+        return None;
+    }
+    if app.focus == Focus::Transcript {
+        transcript_key(app, code);
+        return None;
+    }
     match code {
-        KeyCode::Esc => {
-            app.should_quit = true;
-            None
-        }
+        KeyCode::Esc => None,
         KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => {
             app.should_quit = true;
             None
@@ -229,10 +252,34 @@ mod tests {
     }
 
     #[test]
-    fn esc_quits() {
+    fn esc_does_not_quit_but_ctrl_q_does() {
         let mut app = App::new();
         handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!app.should_quit);
+        handle_key(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL);
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn tab_moves_focus_and_transcript_keys_scroll() {
+        let mut app = App::new();
+        app.viewport.set_geometry(100, 10);
+        handle_key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(app.focus, Focus::Transcript);
+        handle_key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+        assert_eq!(app.composer.text(), "");
+        assert!(!app.viewport.is_following());
+        handle_key(&mut app, KeyCode::Char('G'), KeyModifiers::NONE);
+        assert!(app.viewport.is_following());
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.focus, Focus::Composer);
+        assert!(!app.should_quit);
+        handle_key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL);
+        assert!(
+            app.should_quit,
+            "Ctrl+Q sale también con foco en el transcript"
+        );
     }
 
     #[test]

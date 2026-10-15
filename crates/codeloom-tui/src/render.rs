@@ -26,7 +26,8 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn draw_composer(frame: &mut Frame, area: Rect, app: &App) {
-    batten::widgets::composer::render(frame, area, &app.composer, &app.theme);
+    let focused = app.focus == crate::app::Focus::Composer;
+    batten::widgets::composer::render_focused(frame, area, &app.composer, focused, &app.theme);
 }
 
 pub fn render(frame: &mut Frame, app: &mut App) {

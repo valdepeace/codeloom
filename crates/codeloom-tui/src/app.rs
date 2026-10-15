@@ -9,6 +9,14 @@ pub struct TranscriptItem {
     pub text: String,
 }
 
+/// Dónde va el teclado.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Focus {
+    #[default]
+    Composer,
+    Transcript,
+}
+
 /// Petición de permiso en pantalla, con su canal de respuesta.
 pub struct PendingPermission {
     pub dialog: batten::state::PermissionDialog,
@@ -27,6 +35,7 @@ pub struct App {
     pub changes: batten::state::FileChanges,
     /// Scroll del transcript (sigue el final salvo que el usuario suba).
     pub viewport: batten::state::Viewport,
+    pub focus: Focus,
     /// Diálogo de permiso abierto, si hay.
     pub permission: Option<PendingPermission>,
     /// Peticiones esperando a que se cierre la actual.
@@ -54,6 +63,7 @@ impl App {
             theme: batten::widgets::Theme::default_dark(),
             changes: batten::state::FileChanges::new(),
             viewport: batten::state::Viewport::new(),
+            focus: Focus::Composer,
             permission: None,
             permission_queue: VecDeque::new(),
             fx_pending: false,
@@ -66,6 +76,14 @@ impl App {
             model: model.into(),
             ..Self::new()
         }
+    }
+
+    /// Alterna el foco entre composer y transcript.
+    pub fn toggle_focus(&mut self) {
+        self.focus = match self.focus {
+            Focus::Composer => Focus::Transcript,
+            Focus::Transcript => Focus::Composer,
+        };
     }
 
     /// Encola una petición; si no hay diálogo abierto, la muestra ya.
