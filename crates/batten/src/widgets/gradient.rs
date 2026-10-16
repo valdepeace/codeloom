@@ -1,5 +1,6 @@
 //! Helpers de color compartidos por los widgets con degradado (spinner, logo).
 
+use super::theme::Theme;
 use ratatui::style::{Color, Style};
 
 /// Color de primer plano del estilo, con un fallback si no tiene.
@@ -25,6 +26,15 @@ pub(crate) fn lerp_color(a: Color, b: Color, t: f32) -> Color {
     let (ar, ag, ab) = to_rgb(a);
     let (br, bg, bb) = to_rgb(b);
     Color::Rgb(lerp(ar, br, t), lerp(ag, bg, t), lerp(ab, bb, t))
+}
+
+/// Estilo con primer plano `color` adaptado a la profundidad del tema
+/// (sin color si el terminal no lo admite).
+pub(crate) fn fg(theme: &Theme, color: Color) -> Style {
+    match theme.adapt(color) {
+        Some(c) => Style::default().fg(c),
+        None => Style::default(),
+    }
 }
 
 #[cfg(test)]

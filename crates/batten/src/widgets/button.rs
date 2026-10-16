@@ -1,23 +1,15 @@
 //! Botones de texto: el enfocado lleva fondo del color del tono.
 
-use super::gradient::color_of;
 use super::theme::Theme;
-use super::tone::tone_style;
+use super::tone::tone_fill;
 use crate::state::Tone;
-use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 /// `" label "`; enfocado → fondo del tono, texto negro en negrita; si no, `muted`.
 pub fn button(label: &str, focused: bool, tone: Tone, theme: &Theme) -> Span<'static> {
     let text = format!(" {label} ");
     if focused {
-        Span::styled(
-            text,
-            Style::default()
-                .bg(color_of(tone_style(tone, theme)))
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD),
-        )
+        Span::styled(text, tone_fill(tone, theme))
     } else {
         Span::styled(text, theme.styles.muted)
     }
@@ -38,6 +30,7 @@ pub fn button_row(items: &[(&str, Tone)], selected: usize, theme: &Theme) -> Lin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::style::Color;
 
     fn text(l: &Line) -> String {
         l.spans.iter().map(|s| s.content.as_ref()).collect()

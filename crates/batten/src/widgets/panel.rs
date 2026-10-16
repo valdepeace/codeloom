@@ -1,12 +1,11 @@
 //! Panel con borde redondeado y título `╭ Título ╱╱╱╱ info ╮`.
 
-use super::gradient::{color_of, lerp_color};
+use super::gradient::{color_of, fg, lerp_color};
 use super::text::truncate;
 use super::theme::Theme;
 use super::tone::tone_style;
 use crate::state::Tone;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
@@ -84,7 +83,7 @@ fn header(panel: &Panel, w: usize, theme: &Theme) -> Line<'static> {
         };
         spans.push(Span::styled(
             theme.glyphs.field.to_string(),
-            Style::default().fg(lerp_color(from, to, t)),
+            fg(theme, lerp_color(from, to, t)),
         ));
     }
     if iw > 0 {

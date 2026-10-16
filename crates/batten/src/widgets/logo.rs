@@ -3,7 +3,7 @@
 /// Filas de la fuente de bloques.
 pub const FONT_ROWS: usize = 5;
 
-use super::gradient::{color_of, lerp_color};
+use super::gradient::{color_of, fg, lerp_color};
 use super::Theme;
 use crate::state::StyleToken;
 use ratatui::style::Style;
@@ -100,7 +100,7 @@ fn gradient_style(col: usize, width: usize, theme: &Theme) -> Style {
     };
     let from = color_of(theme.style(StyleToken::AccentFrom));
     let to = color_of(theme.style(StyleToken::AccentTo));
-    Style::default().fg(lerp_color(from, to, t))
+    fg(theme, lerp_color(from, to, t))
 }
 
 /// Wordmark de bloques: `FONT_ROWS` líneas con el degradado por columna. Los

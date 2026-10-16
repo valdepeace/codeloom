@@ -1,8 +1,9 @@
 //! Resolución de `Tone` a estilo, icono y etiqueta según el tema.
 
+use super::gradient::color_of;
 use super::theme::Theme;
 use crate::state::Tone;
-use ratatui::style::Style;
+use ratatui::style::{Color, Modifier, Style};
 
 /// Estilo del tema asociado al tono.
 pub fn tone_style(tone: Tone, theme: &Theme) -> Style {
@@ -13,6 +14,18 @@ pub fn tone_style(tone: Tone, theme: &Theme) -> Style {
         Tone::Success => s.success,
         Tone::Warning => s.warning,
         Tone::Error => s.error,
+    }
+}
+
+/// Relleno de chip/botón: fondo del color del tono con texto oscuro; sin
+/// color, vídeo inverso para que se siga distinguiendo.
+pub(crate) fn tone_fill(tone: Tone, theme: &Theme) -> Style {
+    match theme.adapt(color_of(tone_style(tone, theme))) {
+        Some(bg) => Style::default()
+            .bg(bg)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD),
+        None => Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD),
     }
 }
 

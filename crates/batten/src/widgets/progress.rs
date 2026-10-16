@@ -1,9 +1,8 @@
 //! Barra de progreso determinada: `━━━━━━━━────────  42%`.
 
-use super::gradient::{color_of, lerp_color};
+use super::gradient::{color_of, fg, lerp_color};
 use super::text::truncate;
 use super::theme::Theme;
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 /// Relleno `━` con degradado `accent_from → accent_to`, resto `─` y porcentaje
@@ -34,7 +33,7 @@ pub fn progress(ratio: f32, width: u16, theme: &Theme) -> Line<'static> {
             } else {
                 0.0
             };
-            Span::styled("━", Style::default().fg(lerp_color(from, to, t)))
+            Span::styled("━", fg(theme, lerp_color(from, to, t)))
         })
         .collect();
     spans.push(Span::styled("─".repeat(bar - filled), s.muted));
@@ -73,7 +72,7 @@ pub fn progress_smooth(ratio: f32, width: u16, theme: &Theme) -> Line<'static> {
         } else {
             0.0
         };
-        Style::default().fg(lerp_color(from, to, t))
+        fg(theme, lerp_color(from, to, t))
     };
     let mut spans: Vec<Span<'static>> = (0..full).map(|i| Span::styled("█", color(i))).collect();
     let mut used = full;
@@ -130,6 +129,24 @@ mod tests {
     fn never_exceeds_width() {
         for w in 0..30u16 {
             assert!(text(&progress(0.37, w, &Theme::test())).width() <= w as usize);
+        }
+    }
+
+    #[test]
+    fn no_color_depth_drops_the_gradient() {
+        let mut th = Theme::test();
+        th.depth = crate::widgets::ColorDepth::NoColor;
+        let l = progress(1.0, 10, &th);
+        assert_eq!(l.spans[0].style.fg, None);
+    }
+
+    #[cfg(feature = "termprofile")]
+    #[test]
+    fn ansi256_depth_never_emits_rgb() {
+        let mut th = Theme::test();
+        th.depth = crate::widgets::ColorDepth::Ansi256;
+        for s in progress_smooth(0.7, 20, &th).spans {
+            assert!(!matches!(s.style.fg, Some(ratatui::style::Color::Rgb(..))));
         }
     }
 }

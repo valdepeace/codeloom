@@ -2,11 +2,10 @@
 
 use crate::state::StyleToken;
 use crate::widgets::Theme;
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use std::time::Duration;
 
-use super::gradient::{color_of, lerp_color};
+use super::gradient::{color_of, fg, lerp_color};
 
 /// Intervalo entre frames. El bucle de eventos de la app lo usa para tickear.
 pub const FRAME_INTERVAL: Duration = Duration::from_millis(50);
@@ -77,7 +76,7 @@ impl Anim {
                 } else {
                     RUNES[((self.frame as usize * 7) + i) % RUNES.len()] as char
                 };
-                Span::styled(shown.to_string(), Style::default().fg(color))
+                Span::styled(shown.to_string(), fg(theme, color))
             })
             .collect();
         Line::from(spans)
@@ -95,7 +94,7 @@ impl Anim {
         let t = if phase <= 1.0 { phase } else { 2.0 - phase };
         let from = color_of(theme.styles.accent_from);
         let to = color_of(theme.styles.accent_to);
-        Span::styled(shown, Style::default().fg(lerp_color(from, to, t)))
+        Span::styled(shown, fg(theme, lerp_color(from, to, t)))
     }
 }
 
@@ -156,6 +155,13 @@ mod glyph_tests {
     #[test]
     fn empty_frames_are_empty() {
         assert_eq!(Anim::new().glyph(&[], &Theme::test()).content, "");
+    }
+
+    #[test]
+    fn no_color_glyph_has_no_fg() {
+        let mut th = Theme::test();
+        th.depth = crate::widgets::ColorDepth::NoColor;
+        assert_eq!(Anim { frame: 0 }.glyph(BRAILLE, &th).style.fg, None);
     }
 
     #[test]
