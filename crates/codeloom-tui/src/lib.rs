@@ -1,5 +1,6 @@
 pub mod app;
 pub mod clipboard;
+pub mod frame;
 pub mod permission_flow;
 pub mod render;
 pub mod run;
