@@ -113,6 +113,20 @@ mod tests {
     }
 
     #[test]
+    fn assistant_markdown_is_rendered() {
+        let mut app = App::new();
+        app.items.push(TranscriptItem {
+            role: "CodeLoom",
+            text: "## Hecho\n\n- **uno**\n- `dos`".into(),
+        });
+        let content = buffer_of(&mut app, 60, 20);
+        assert!(content.contains("Hecho"));
+        assert!(!content.contains("##"));
+        assert!(content.contains("• uno"));
+        assert!(!content.contains("**"));
+    }
+
+    #[test]
     fn hides_sidebar_when_narrow() {
         let mut app = App::with_context("/proj", "m");
         let content = buffer_of(&mut app, 60, 20);

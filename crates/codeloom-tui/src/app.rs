@@ -222,13 +222,14 @@ impl App {
         use batten::state::{Line, LineKind, Transcript};
         let mut t = Transcript::new();
         for item in &self.items {
-            let kind = if item.role == "you" {
-                LineKind::User
+            if item.role == "you" {
+                for l in item.text.lines() {
+                    t.push(Line::new(LineKind::User, l));
+                }
             } else {
-                LineKind::Assistant
-            };
-            for l in item.text.lines() {
-                t.push(Line::new(kind, l));
+                for line in batten::state::markdown::parse(&item.text, LineKind::Assistant) {
+                    t.push(line);
+                }
             }
         }
         t
