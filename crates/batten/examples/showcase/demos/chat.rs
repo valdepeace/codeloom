@@ -3,6 +3,7 @@
 
 use crate::demo::Demo;
 use crate::prompt_keys::{apply, Outcome};
+use batten::state::markdown;
 use batten::state::{
     Composer, History, Line, LineKind, PermissionBody, PermissionChoice, PermissionDialog, Sidebar,
     Stream, ToolItem, Transcript, Viewport,
@@ -16,10 +17,12 @@ use std::collections::VecDeque;
 /// Ticks entre pasos del guion (~150 ms con el reloj de 50 ms).
 const TICKS_PER_STEP: u32 = 3;
 
-const ANSWER: &str = "He leído el fichero y todo está en orden. El transcript ahora cuenta \
-filas visuales, así que las líneas largas como esta se parten en varias filas sin descuadrar \
-el scroll ni la barra. Si subes con PgUp mientras escribo, la vista se queda quieta; al volver \
-abajo con PgDn, vuelve a seguir el final. Prueba también F6 para un turno que pide permiso.";
+const ANSWER: &str = "## Listo\n\nHe leído el fichero. Lo que hay:\n\n\
+- el transcript cuenta **filas visuales**\n\
+- `PgUp` y `PgDn` no mueven tu lectura\n\
+- la selección copia *lo que ves*\n\n\
+```rust\nfn main() {\n    println!(\"hola\");\n}\n```\n\n\
+Prueba también F6 para un turno con permiso.";
 
 const PERMISSION_ANSWER: &str = "Hecho: target/ limpio.";
 
@@ -129,7 +132,13 @@ impl ChatDemo {
                 ));
             }
             Step::Delta(s) => self.stream.push_text_delta(&s),
-            Step::Flush => self.stream.flush(&mut self.transcript),
+            Step::Flush => {
+                let text = self.stream.pending().to_string();
+                self.stream = Stream::new();
+                for line in markdown::parse(&text, LineKind::Assistant) {
+                    self.transcript.push(line);
+                }
+            }
         }
     }
 
@@ -152,7 +161,9 @@ impl ChatDemo {
     fn view(&self) -> Transcript {
         let mut t = self.transcript.clone();
         if !self.stream.is_empty() {
-            t.push(Line::new(LineKind::Assistant, self.stream.pending()));
+            for line in markdown::parse(self.stream.pending(), LineKind::Assistant) {
+                t.push(line);
+            }
         }
         t
     }
@@ -304,11 +315,14 @@ mod tests {
         ticks(&mut d, TICKS_PER_STEP * 5); // tool start, tool done, 3 deltas
         assert!(!d.stream.is_empty());
         assert_eq!(d.transcript.len(), 1);
-        assert_eq!(d.view().len(), 2);
+        assert!(d.view().len() >= 2);
         ticks(&mut d, TICKS_PER_STEP * 200);
         assert!(d.stream.is_empty());
-        assert_eq!(d.transcript.len(), 2);
-        assert_eq!(d.transcript.line(1).unwrap().plain(), ANSWER);
+        assert_eq!(
+            d.transcript.len(),
+            1 + markdown::parse(ANSWER, LineKind::Assistant).len()
+        );
+        assert_eq!(d.transcript.line(1).unwrap().plain(), "Listo");
         assert_eq!(d.tool.as_ref().unwrap().status(), ToolStatus::Success);
     }
 
