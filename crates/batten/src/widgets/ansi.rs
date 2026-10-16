@@ -8,7 +8,7 @@ use ratatui::text::Line;
 pub fn ansi_lines(bytes: &[u8]) -> Vec<Line<'static>> {
     match bytes.into_text() {
         Ok(text) => text.lines,
-        // ponytail: fallback con pérdida; las secuencias rotas quedan visibles.
+        // limitación: fallback con pérdida; las secuencias rotas quedan visibles.
         Err(_) => String::from_utf8_lossy(bytes)
             .lines()
             .map(|l| Line::from(l.to_string()))

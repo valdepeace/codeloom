@@ -9,7 +9,7 @@ use tokio::sync::oneshot;
 pub type PermissionReply = oneshot::Sender<Decision>;
 
 /// Diálogo para una petición. `detail` es el JSON del input de la tool.
-// ponytail: en `edit` los números de línea son relativos al fragmento
+// limitación: en `edit` los números de línea son relativos al fragmento
 // `old`/`new`, no al fichero; leer el fichero si hace falta precisión.
 pub fn dialog_for(req: &PermissionRequest) -> PermissionDialog {
     let parsed: Option<serde_json::Value> = serde_json::from_str(&req.detail).ok();

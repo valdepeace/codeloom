@@ -80,7 +80,7 @@ async fn main() -> Result<()> {
     let bus_rx = bus.subscribe();
     let (perm_tx, perm_rx) = tokio::sync::mpsc::channel(8);
     let permission = Arc::new(if cli.print.is_some() {
-        // ponytail: `-p` no es interactivo; sin `--yolo` se deniega todo.
+        // limitación: `-p` no es interactivo; sin `--yolo` se deniega todo.
         if cli.yolo {
             PermissionService::allow_all()
         } else {

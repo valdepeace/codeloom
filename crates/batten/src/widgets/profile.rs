@@ -7,7 +7,7 @@ pub use termprofile::TermProfile;
 impl Theme {
     /// Adapta todos los estilos al perfil del terminal (truecolor → 256 → 16 →
     /// sin color). La detección es cosa de la app: `TermProfile::detect`.
-    // ponytail: los degradados (logo, progress, panel, spinner) generan RGB al
+    // limitación: los degradados (logo, progress, panel, spinner) generan RGB al
     // pintar y no pasan por aquí; adaptarlos en `gradient::lerp_color` si hace falta.
     pub fn for_profile(&self, profile: TermProfile) -> Self {
         let a = |st: Style| -> Style { profile.adapt_style(st) };

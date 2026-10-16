@@ -228,7 +228,7 @@ impl Builder {
             }
             TagEnd::Link => {
                 self.styles.pop();
-                // ponytail: la URL va entre paréntesis; con OSC 8 sería clicable.
+                // limitación: la URL va entre paréntesis; con OSC 8 sería clicable.
                 if let Some(url) = self.links.pop() {
                     if !url.is_empty() {
                         self.start_line();
@@ -236,7 +236,7 @@ impl Builder {
                     }
                 }
             }
-            // ponytail: tablas como texto plano con separadores.
+            // limitación: tablas como texto plano con separadores.
             TagEnd::TableCell => self.content(" │ "),
             TagEnd::TableHead | TagEnd::TableRow => self.flush(),
             TagEnd::Table => self.block_end(),

@@ -43,7 +43,7 @@ impl Viewport {
     pub fn set_geometry(&mut self, total: usize, rows: usize) {
         self.total = total;
         self.rows = rows;
-        // ponytail: en un resize solo se acota `top`; no se conserva la línea
+        // limitación: en un resize solo se acota `top`; no se conserva la línea
         // que había arriba. Anclar a línea lógica si molesta.
         self.top = if self.follow {
             self.max_top()

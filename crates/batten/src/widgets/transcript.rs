@@ -99,7 +99,7 @@ pub fn render_with_selection(
     }
     let rows = area.height as usize;
     let sel_style = theme.styles.selection;
-    // ponytail: se compone todo el historial en cada frame; cachear por línea
+    // limitación: se compone todo el historial en cada frame; cachear por línea
     // si se nota en conversaciones largas.
     let lines: Vec<TLine> = (0..transcript.len())
         .filter_map(|i| transcript.line(i).map(|l| (i, l)))
@@ -142,7 +142,7 @@ pub fn render_with_selection(
             .line_count(w);
         viewport.ensure_visible(start, start + height);
     }
-    // ponytail: `Paragraph::scroll` usa u16; más de 65535 filas se quedan en el tope.
+    // limitación: `Paragraph::scroll` usa u16; más de 65535 filas se quedan en el tope.
     let top = u16::try_from(viewport.top()).unwrap_or(u16::MAX);
     frame.render_widget(para.scroll((top, 0)), text_area);
     if overflow {
