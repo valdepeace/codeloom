@@ -160,6 +160,18 @@ pub fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Option<St
     }
 }
 
+/// Aplica un evento de terminal. Devuelve el prompt a enviar, si lo hay.
+pub fn handle_event(app: &mut App, ev: Event) -> Option<String> {
+    match ev {
+        Event::Key(k) if k.kind == KeyEventKind::Press => handle_key(app, k.code, k.modifiers),
+        Event::Paste(text) => {
+            app.paste(&text);
+            None
+        }
+        _ => None,
+    }
+}
+
 /// Bucle principal: aplica eventos del bus y lee teclado.
 pub async fn run(
     mut app: App,
@@ -269,6 +281,27 @@ mod tests {
         handle_key(&mut app, KeyCode::Char('s'), KeyModifiers::NONE);
         assert_eq!(first.try_recv().unwrap(), Decision::Deny);
         assert_eq!(second.try_recv().unwrap(), Decision::AllowSession);
+    }
+
+    #[test]
+    fn pasted_newlines_never_submit() {
+        let mut app = App::new();
+        let sent = handle_event(&mut app, Event::Paste("uno\ndos\n".into()));
+        assert_eq!(sent, None);
+        assert_eq!(app.composer.text(), "uno\ndos\n");
+    }
+
+    #[test]
+    fn a_burst_of_keys_is_applied_in_order() {
+        use crossterm::event::KeyEvent;
+        let mut app = App::new();
+        for c in "x".repeat(2000).chars() {
+            handle_event(
+                &mut app,
+                Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)),
+            );
+        }
+        assert_eq!(app.composer.text().len(), 2000);
     }
 
     #[test]

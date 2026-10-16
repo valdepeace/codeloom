@@ -38,6 +38,8 @@ pub struct App {
     pub selection: Option<batten::state::Selection>,
     /// Texto pendiente de enviar al portapapeles (lo consume el bucle).
     pub clipboard: Option<String>,
+    /// Prompts enviados que el agente aún no ha empezado.
+    pub queued: usize,
     /// Diálogo de permiso abierto, si hay.
     pub permission: Option<PendingPermission>,
     /// Peticiones esperando a que se cierre la actual.
@@ -70,6 +72,7 @@ impl App {
             focus: Focus::Composer,
             selection: None,
             clipboard: None,
+            queued: 0,
             permission: None,
             permission_queue: VecDeque::new(),
             fx_pending: false,
@@ -143,7 +146,10 @@ impl App {
 
     pub fn apply(&mut self, ev: LiveEvent) {
         match ev {
-            LiveEvent::TurnStarted => self.status = "working".into(),
+            LiveEvent::TurnStarted => {
+                self.status = "working".into();
+                self.queued = self.queued.saturating_sub(1);
+            }
             LiveEvent::TurnEnded => {
                 self.status = "ready".into();
                 self.assistant = None;
@@ -166,6 +172,17 @@ impl App {
             }),
             _ => {}
         }
+    }
+
+    /// Texto pegado (bracketed paste): entra de una vez en el composer y
+    /// nunca envía. Se ignora con un diálogo abierto o sin foco en el composer.
+    pub fn paste(&mut self, text: &str) {
+        if self.permission.is_some() || self.focus != Focus::Composer {
+            return;
+        }
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        self.composer.insert_str(&text);
+        self.history.reset();
     }
 
     pub fn push_char(&mut self, c: char) {
@@ -308,6 +325,32 @@ mod tests {
             ["estado", "cwd", "modelo", "agente", "subagentes / jobs"]
         );
         assert_eq!(sb.sections[1].lines, vec!["/proj".to_string()]);
+    }
+
+    #[test]
+    fn paste_inserts_normalized_text_without_sending() {
+        let mut app = App::new();
+        app.paste("a\r\nb\rc");
+        assert_eq!(app.composer.text(), "a\nb\nc");
+    }
+
+    #[test]
+    fn paste_is_ignored_without_composer_focus() {
+        let mut app = App::new();
+        app.toggle_focus();
+        app.paste("x");
+        assert_eq!(app.composer.text(), "");
+    }
+
+    #[test]
+    fn queue_counter_drops_on_turn_start_and_never_underflows() {
+        let mut app = App::new();
+        app.queued = 2;
+        app.apply(codeloom_core::event::LiveEvent::TurnStarted);
+        assert_eq!(app.queued, 1);
+        app.apply(codeloom_core::event::LiveEvent::TurnStarted);
+        app.apply(codeloom_core::event::LiveEvent::TurnStarted);
+        assert_eq!(app.queued, 0);
     }
 
     #[test]

@@ -10,7 +10,11 @@ const SIDEBAR_MIN_WIDTH: u16 = 90;
 const SIDEBAR_WIDTH: u16 = 30;
 
 fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
-    let header = Line::from(format!(" CodeLoom · {} ", app.status));
+    let queue = match app.queued {
+        0 => String::new(),
+        n => format!(" · en cola ({n})"),
+    };
+    let header = Line::from(format!(" CodeLoom · {}{queue} ", app.status));
     frame.render_widget(
         Paragraph::new(header).style(Style::default().fg(Color::Black).bg(Color::Cyan)),
         area,
@@ -118,6 +122,13 @@ mod tests {
         assert!(!content.contains("##"));
         assert!(content.contains("• uno"));
         assert!(!content.contains("**"));
+    }
+
+    #[test]
+    fn header_shows_queued_prompts() {
+        let mut app = App::new();
+        app.queued = 2;
+        assert!(buffer_of(&mut app, 60, 10).contains("en cola (2)"));
     }
 
     #[test]
