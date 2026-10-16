@@ -21,6 +21,8 @@ pub struct Viewport {
     follow: bool,
     total: usize,
     rows: usize,
+    /// `(línea, fila dentro de la línea)` que estaba arriba en el último pintado.
+    anchor: Option<(usize, usize)>,
 }
 
 impl Default for Viewport {
@@ -30,6 +32,7 @@ impl Default for Viewport {
             follow: true,
             total: 0,
             rows: 0,
+            anchor: None,
         }
     }
 }
@@ -43,8 +46,7 @@ impl Viewport {
     pub fn set_geometry(&mut self, total: usize, rows: usize) {
         self.total = total;
         self.rows = rows;
-        // limitación: en un resize solo se acota `top`; no se conserva la línea
-        // que había arriba. Anclar a línea lógica si molesta.
+        // Tras un cambio de ancho, el widget restaura antes `top` desde el ancla.
         self.top = if self.follow {
             self.max_top()
         } else {
@@ -119,6 +121,21 @@ impl Viewport {
             self.top = end.saturating_sub(self.rows).min(self.max_top());
         }
         self.follow = self.top >= self.max_top();
+    }
+
+    /// Fija `top` sin tocar el seguimiento (`set_geometry` lo acota después).
+    pub fn restore_top(&mut self, top: usize) {
+        self.top = top;
+    }
+
+    /// Lo llama el widget al pintar: qué línea quedó arriba y cuántas filas
+    /// de ella se saltaron.
+    pub fn set_anchor(&mut self, line: usize, row: usize) {
+        self.anchor = Some((line, row));
+    }
+
+    pub fn anchor(&self) -> Option<(usize, usize)> {
+        self.anchor
     }
 
     /// Primera fila visible.
@@ -240,6 +257,17 @@ mod tests {
         assert_eq!(v.window(), 42..52);
         v.ensure_visible(98, 100);
         assert!(v.is_following());
+    }
+
+    #[test]
+    fn restore_top_is_clamped_by_geometry() {
+        let mut v = vp(100, 10);
+        v.scroll_up(5);
+        v.restore_top(500);
+        v.set_geometry(100, 10);
+        assert_eq!(v.window(), 90..100);
+        v.set_anchor(3, 1);
+        assert_eq!(v.anchor(), Some((3, 1)));
     }
 
     #[test]
