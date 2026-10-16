@@ -112,11 +112,23 @@ impl Default for Styles {
     }
 }
 
+/// Colores que admite el terminal. Lo fija `Theme::for_profile`; los
+/// widgets lo usan para los colores que generan al pintar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ColorDepth {
+    #[default]
+    TrueColor,
+    Ansi256,
+    Ansi16,
+    NoColor,
+}
+
 #[derive(Debug, Clone)]
 pub struct Theme {
     pub styles: Styles,
     pub glyphs: Glyphs,
     pub extensions: BTreeMap<String, Style>,
+    pub depth: ColorDepth,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -169,12 +181,23 @@ impl Theme {
             styles: Styles::default(),
             glyphs: Glyphs::default(),
             extensions: BTreeMap::new(),
+            depth: ColorDepth::TrueColor,
         }
     }
 
     /// Tema fijo y determinista para tests.
     pub fn test() -> Self {
         Self::default_dark()
+    }
+
+    /// Adapta un color generado al pintar a la profundidad del tema.
+    /// `None` = sin color (usar el del terminal).
+    pub fn adapt(&self, color: Color) -> Option<Color> {
+        match self.depth {
+            ColorDepth::TrueColor => Some(color),
+            ColorDepth::NoColor => None,
+            ColorDepth::Ansi256 | ColorDepth::Ansi16 => adapt_lower(self.depth, color),
+        }
     }
 
     /// Resuelve un token semántico a su estilo. Si el nombre no coincide con
@@ -279,6 +302,21 @@ impl Theme {
         }
         true
     }
+}
+
+#[cfg(feature = "termprofile")]
+fn adapt_lower(depth: ColorDepth, color: Color) -> Option<Color> {
+    let profile = match depth {
+        ColorDepth::Ansi256 => termprofile::TermProfile::Ansi256,
+        _ => termprofile::TermProfile::Ansi16,
+    };
+    profile.adapt_color(color)
+}
+
+/// Sin `termprofile` no hay tablas de conversión: se deja el color.
+#[cfg(not(feature = "termprofile"))]
+fn adapt_lower(_depth: ColorDepth, color: Color) -> Option<Color> {
+    Some(color)
 }
 
 fn token_to_key(t: StyleToken) -> &'static str {
@@ -468,5 +506,28 @@ mod tests {
             .style(StyleToken::Emphasis)
             .add_modifier
             .contains(Modifier::ITALIC));
+    }
+
+    #[test]
+    fn adapt_follows_the_depth() {
+        let mut th = Theme::test();
+        let rgb = Color::Rgb(0, 212, 255);
+        assert_eq!(th.adapt(rgb), Some(rgb));
+        th.depth = ColorDepth::NoColor;
+        assert_eq!(th.adapt(rgb), None);
+    }
+
+    #[cfg(feature = "termprofile")]
+    #[test]
+    fn adapt_lowers_rgb_with_termprofile() {
+        let mut th = Theme::test();
+        th.depth = ColorDepth::Ansi256;
+        assert!(matches!(
+            th.adapt(Color::Rgb(0, 212, 255)),
+            Some(Color::Indexed(_))
+        ));
+        th.depth = ColorDepth::Ansi16;
+        let c = th.adapt(Color::Rgb(0, 212, 255));
+        assert!(c.is_some() && !matches!(c, Some(Color::Rgb(..)) | Some(Color::Indexed(_))));
     }
 }

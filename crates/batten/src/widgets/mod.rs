@@ -40,7 +40,7 @@ pub use progress::{progress, progress_smooth};
 pub use rule::rule;
 pub use spinner::{Anim, Animatable, FRAME_INTERVAL};
 pub use status::status;
-pub use theme::{Glyphs, Styles, Theme, ThemeError};
+pub use theme::{ColorDepth, Glyphs, Styles, Theme, ThemeError};
 pub use toast::render as render_toast;
 pub use tool_item::render as render_tool;
 pub use transcript::render as render_transcript;

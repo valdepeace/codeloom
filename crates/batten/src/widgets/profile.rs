@@ -1,14 +1,12 @@
 //! Rebaja de los colores del tema según lo que soporte el terminal.
 
-use super::theme::{Styles, Theme};
+use super::theme::{ColorDepth, Styles, Theme};
 use ratatui::style::Style;
 pub use termprofile::TermProfile;
 
 impl Theme {
     /// Adapta todos los estilos al perfil del terminal (truecolor → 256 → 16 →
     /// sin color). La detección es cosa de la app: `TermProfile::detect`.
-    // limitación: los degradados (logo, progress, panel, spinner) generan RGB al
-    // pintar y no pasan por aquí; adaptarlos en `gradient::lerp_color` si hace falta.
     pub fn for_profile(&self, profile: TermProfile) -> Self {
         let a = |st: Style| -> Style { profile.adapt_style(st) };
         let s = &self.styles;
@@ -55,6 +53,12 @@ impl Theme {
             styles,
             glyphs: self.glyphs,
             extensions,
+            depth: match profile {
+                TermProfile::TrueColor => ColorDepth::TrueColor,
+                TermProfile::Ansi256 => ColorDepth::Ansi256,
+                TermProfile::Ansi16 => ColorDepth::Ansi16,
+                TermProfile::NoColor | TermProfile::NoTty => ColorDepth::NoColor,
+            },
         }
     }
 }
@@ -95,5 +99,18 @@ mod tests {
         let t = Theme::test().for_profile(TermProfile::NoColor);
         assert_eq!(t.styles.error.fg, None);
         assert!(t.styles.heading.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn profile_sets_the_depth() {
+        use super::ColorDepth;
+        assert_eq!(
+            Theme::test().for_profile(TermProfile::Ansi256).depth,
+            ColorDepth::Ansi256
+        );
+        assert_eq!(
+            Theme::test().for_profile(TermProfile::NoTty).depth,
+            ColorDepth::NoColor
+        );
     }
 }
