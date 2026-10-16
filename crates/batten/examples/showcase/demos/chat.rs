@@ -3,10 +3,9 @@
 
 use crate::demo::Demo;
 use crate::prompt_keys::{apply, Outcome};
-use batten::state::markdown;
 use batten::state::{
-    Composer, History, Line, LineKind, PermissionBody, PermissionChoice, PermissionDialog, Sidebar,
-    Stream, ToolItem, Transcript, Viewport,
+    Composer, EntryId, Format, History, Line, LineKind, PermissionBody, PermissionChoice,
+    PermissionDialog, Sidebar, ToolItem, Transcript, Viewport,
 };
 use batten::widgets::{composer, permission, sidebar, tool_item, transcript, Anim, Theme};
 use ratatui::crossterm::event::{KeyCode, KeyModifiers};
@@ -50,7 +49,7 @@ pub struct ChatDemo {
     history: History,
     sidebar: Sidebar,
     tool: Option<ToolItem>,
-    stream: Stream,
+    answer: Option<EntryId>,
     script: VecDeque<Step>,
     dialog: Option<PermissionDialog>,
     anim: Anim,
@@ -72,7 +71,7 @@ impl ChatDemo {
             history: History::new(),
             sidebar,
             tool: None,
-            stream: Stream::new(),
+            answer: None,
             script: VecDeque::new(),
             dialog: None,
             anim: Anim::new(),
@@ -133,14 +132,16 @@ impl ChatDemo {
                     PermissionBody::Text(cmd.into()),
                 ));
             }
-            Step::Delta(s) => self.stream.push_text_delta(&s),
-            Step::Flush => {
-                let text = self.stream.pending().to_string();
-                self.stream = Stream::new();
-                for line in markdown::parse(&text, LineKind::Assistant) {
-                    self.transcript.push(line);
+            Step::Delta(s) => match self.answer {
+                Some(id) => self.transcript.append(id, &s),
+                None => {
+                    let id = self
+                        .transcript
+                        .push_entry(LineKind::Assistant, Format::Markdown, s);
+                    self.answer = Some(id);
                 }
-            }
+            },
+            Step::Flush => self.answer = None,
         }
     }
 
@@ -157,17 +158,6 @@ impl ChatDemo {
         } else if let Some(t) = self.tool.as_mut() {
             t.resolve_awaiting();
         }
-    }
-
-    /// Transcript con la respuesta en curso añadida al final.
-    fn view(&self) -> Transcript {
-        let mut t = self.transcript.clone();
-        if !self.stream.is_empty() {
-            for line in markdown::parse(self.stream.pending(), LineKind::Assistant) {
-                t.push(line);
-            }
-        }
-        t
     }
 }
 
@@ -209,11 +199,10 @@ impl Demo for ChatDemo {
         if let Some(t) = &self.tool {
             tool_item::render(f, rows[0], t, &self.anim, theme);
         }
-        let view = self.view();
         transcript::render(
             f,
             rows[1],
-            &view,
+            &self.transcript,
             &mut self.viewport,
             &mut self.layout,
             None,
@@ -301,7 +290,7 @@ impl Demo for ChatDemo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use batten::state::ToolStatus;
+    use batten::state::{markdown, ToolStatus};
 
     fn ticks(d: &mut ChatDemo, n: u32) {
         let a = Anim::new();
@@ -323,11 +312,10 @@ mod tests {
         type_and_send(&mut d, "hi");
         assert_eq!(d.transcript.line(0).unwrap().plain(), "hi");
         ticks(&mut d, TICKS_PER_STEP * 5); // tool start, tool done, 3 deltas
-        assert!(!d.stream.is_empty());
-        assert_eq!(d.transcript.len(), 1);
-        assert!(d.view().len() >= 2);
+        assert!(d.answer.is_some());
+        assert!(d.transcript.len() >= 2);
         ticks(&mut d, TICKS_PER_STEP * 200);
-        assert!(d.stream.is_empty());
+        assert!(d.answer.is_none());
         assert_eq!(
             d.transcript.len(),
             1 + markdown::parse(ANSWER, LineKind::Assistant).len()
