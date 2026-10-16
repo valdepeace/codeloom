@@ -26,5 +26,5 @@ pub use stream::Stream;
 pub use toast::{Toast, Toasts};
 pub use tone::Tone;
 pub use tool::{ToolItem, ToolStatus};
-pub use transcript::{EntryId, Format, Line, LineKind, SpanSpec, StyleToken, Transcript};
+pub use transcript::{EntryId, Format, Line, LineKind, LinkSpec, SpanSpec, StyleToken, Transcript};
 pub use viewport::{Scroll, Viewport};

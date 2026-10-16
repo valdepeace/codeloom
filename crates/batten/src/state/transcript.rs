@@ -58,11 +58,20 @@ pub struct SpanSpec {
     pub token: StyleToken,
 }
 
+/// Enlace sobre el texto plano de una línea (offsets en bytes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkSpec {
+    pub start: usize,
+    pub len: usize,
+    pub url: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Line {
     pub text: String,
     pub kind: LineKind,
     pub spans: Vec<SpanSpec>,
+    pub links: Vec<LinkSpec>,
 }
 
 impl Line {
@@ -71,6 +80,7 @@ impl Line {
             text: text.into(),
             kind,
             spans: Vec::new(),
+            links: Vec::new(),
         }
     }
 

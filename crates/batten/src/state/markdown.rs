@@ -2,7 +2,7 @@
 //! Puro (sin ratatui): el widget pinta los tokens como cualquier otra línea,
 //! y la selección copia el texto tal como se ve.
 
-use super::transcript::{Line, LineKind, SpanSpec, StyleToken};
+use super::transcript::{Line, LineKind, LinkSpec, SpanSpec, StyleToken};
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
 /// Convierte `src` en líneas de tipo `kind`. Markdown incompleto (streaming)
@@ -29,7 +29,10 @@ struct Builder {
     item_start: bool,
     quote: usize,
     code: bool,
-    links: Vec<String>,
+    /// Enlaces abiertos: (url, offset de inicio, línea en la que empezaron).
+    links: Vec<(String, usize, usize)>,
+    /// Enlaces cerrados de la línea en curso.
+    line_links: Vec<LinkSpec>,
 }
 
 impl Builder {
@@ -47,6 +50,7 @@ impl Builder {
             quote: 0,
             code: false,
             links: Vec::new(),
+            line_links: Vec::new(),
         }
     }
 
@@ -105,6 +109,7 @@ impl Builder {
             text: std::mem::take(&mut self.text),
             kind: self.kind,
             spans: std::mem::take(&mut self.spans),
+            links: std::mem::take(&mut self.line_links),
         });
         self.started = false;
     }
@@ -189,8 +194,10 @@ impl Builder {
             Tag::Strong => self.styles.push(StyleToken::Strong),
             Tag::Strikethrough => self.styles.push(StyleToken::Dim),
             Tag::Link { dest_url, .. } => {
+                self.start_line();
                 self.styles.push(StyleToken::Accent);
-                self.links.push(dest_url.to_string());
+                self.links
+                    .push((dest_url.to_string(), self.text.len(), self.out.len()));
             }
             _ => {}
         }
@@ -228,11 +235,14 @@ impl Builder {
             }
             TagEnd::Link => {
                 self.styles.pop();
-                // limitación: la URL va entre paréntesis; con OSC 8 sería clicable.
-                if let Some(url) = self.links.pop() {
-                    if !url.is_empty() {
-                        self.start_line();
-                        self.raw(&format!(" ({url})"), Some(StyleToken::Dim));
+                // Solo si el enlace empezó y acabó en la misma línea y tiene texto.
+                if let Some((url, start, line)) = self.links.pop() {
+                    if !url.is_empty() && line == self.out.len() && self.text.len() > start {
+                        self.line_links.push(LinkSpec {
+                            start,
+                            len: self.text.len() - start,
+                            url,
+                        });
                     }
                 }
             }
@@ -315,8 +325,16 @@ mod tests {
     #[test]
     fn quote_and_link() {
         assert_eq!(texts(&md("> cita")), vec!["│ cita"]);
-        let l = md("[docs](https://x.y)");
-        assert_eq!(texts(&l), vec!["docs (https://x.y)"]);
+        let l = md("ver [docs](https://x.y) ya");
+        assert_eq!(texts(&l), vec!["ver docs ya"]);
+        assert_eq!(
+            l[0].links,
+            vec![LinkSpec {
+                start: 4,
+                len: 4,
+                url: "https://x.y".into()
+            }]
+        );
         assert_eq!(l[0].spans[0].token, StyleToken::Accent);
     }
 
