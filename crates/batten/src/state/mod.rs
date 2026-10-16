@@ -4,6 +4,7 @@ pub mod composer;
 pub mod diff;
 pub mod file_changes;
 pub mod history;
+pub mod markdown;
 pub mod permission;
 pub mod selection;
 pub mod sidebar;

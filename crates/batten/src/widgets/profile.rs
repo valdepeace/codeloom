@@ -42,6 +42,9 @@ impl Theme {
             diff_delete: a(s.diff_delete),
             diff_hunk: a(s.diff_hunk),
             selection: a(s.selection),
+            code: a(s.code),
+            strong: a(s.strong),
+            emphasis: a(s.emphasis),
         };
         let extensions = self
             .extensions

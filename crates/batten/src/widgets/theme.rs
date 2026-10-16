@@ -64,6 +64,9 @@ pub struct Styles {
     pub diff_delete: Style,
     pub diff_hunk: Style,
     pub selection: Style,
+    pub code: Style,
+    pub strong: Style,
+    pub emphasis: Style,
 }
 
 impl Default for Styles {
@@ -102,6 +105,9 @@ impl Default for Styles {
             diff_delete: Style::default().fg(Color::Red),
             diff_hunk: Style::default().fg(Color::Cyan),
             selection: Style::default().bg(Color::Indexed(238)),
+            code: Style::default().fg(Color::Indexed(180)),
+            strong: Style::default().add_modifier(Modifier::BOLD),
+            emphasis: Style::default().add_modifier(Modifier::ITALIC),
         }
     }
 }
@@ -228,6 +234,9 @@ impl Theme {
             StyleToken::DiffDelete => s.diff_delete,
             StyleToken::DiffHunk => s.diff_hunk,
             StyleToken::Selection => s.selection,
+            StyleToken::Code => s.code,
+            StyleToken::Strong => s.strong,
+            StyleToken::Emphasis => s.emphasis,
         })
     }
 
@@ -263,6 +272,9 @@ impl Theme {
             "diff_delete" => s.diff_delete = style,
             "diff_hunk" => s.diff_hunk = style,
             "selection" => s.selection = Style::default().bg(style.fg.unwrap_or(Color::Reset)),
+            "code" => s.code = style,
+            "strong" => s.strong = style,
+            "emphasis" => s.emphasis = style,
             _ => return false,
         }
         true
@@ -300,6 +312,9 @@ fn token_to_key(t: StyleToken) -> &'static str {
         StyleToken::DiffDelete => "diff_delete",
         StyleToken::DiffHunk => "diff_hunk",
         StyleToken::Selection => "selection",
+        StyleToken::Code => "code",
+        StyleToken::Strong => "strong",
+        StyleToken::Emphasis => "emphasis",
     }
 }
 
@@ -438,5 +453,20 @@ mod tests {
         );
         let th = Theme::from_toml("[styles]\nselection = \"blue\"\n").unwrap();
         assert_eq!(th.style(StyleToken::Selection).bg, Some(Color::Blue));
+    }
+
+    #[test]
+    fn markdown_tokens_resolve() {
+        use ratatui::style::Modifier;
+        let th = Theme::test();
+        assert_eq!(th.style(StyleToken::Code).fg, Some(Color::Indexed(180)));
+        assert!(th
+            .style(StyleToken::Strong)
+            .add_modifier
+            .contains(Modifier::BOLD));
+        assert!(th
+            .style(StyleToken::Emphasis)
+            .add_modifier
+            .contains(Modifier::ITALIC));
     }
 }
