@@ -129,6 +129,8 @@ pub struct Theme {
     pub glyphs: Glyphs,
     pub extensions: BTreeMap<String, Style>,
     pub depth: ColorDepth,
+    /// Pintar los enlaces como hipervínculos OSC 8.
+    pub hyperlinks: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -182,6 +184,7 @@ impl Theme {
             glyphs: Glyphs::default(),
             extensions: BTreeMap::new(),
             depth: ColorDepth::TrueColor,
+            hyperlinks: true,
         }
     }
 

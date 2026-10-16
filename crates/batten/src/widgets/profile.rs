@@ -59,6 +59,7 @@ impl Theme {
                 TermProfile::Ansi16 => ColorDepth::Ansi16,
                 TermProfile::NoColor | TermProfile::NoTty => ColorDepth::NoColor,
             },
+            hyperlinks: self.hyperlinks,
         }
     }
 }
