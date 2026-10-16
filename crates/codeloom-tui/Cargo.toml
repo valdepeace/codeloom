@@ -8,8 +8,9 @@ license.workspace = true
 batten = { path = "../batten" }
 codeloom-core = { path = "../codeloom-core" }
 ratatui = "0.30"
-crossterm = "0.29"
+crossterm = { version = "0.29", features = ["event-stream", "bracketed-paste"] }
 base64 = "0.22"
 tokio.workspace = true
 async-trait.workspace = true
 serde_json.workspace = true
+futures.workspace = true

@@ -105,7 +105,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let (prompt_tx, mut prompt_rx) = tokio::sync::mpsc::channel::<String>(8);
+    let (prompt_tx, mut prompt_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let agent_task = agent.clone();
     tokio::spawn(async move {
         while let Some(p) = prompt_rx.recv().await {

@@ -1,14 +1,25 @@
 use crate::app::App;
 use crate::app::Focus;
+use crate::frame::{FrameScheduler, Urgency, MIN_FRAME};
 use crate::render::render;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+use crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEventKind,
+    KeyModifiers,
 };
-use crossterm::{execute, ExecutableCommand};
+use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, EndSynchronizedUpdate,
+    EnterAlternateScreen, LeaveAlternateScreen,
+};
+use futures::{FutureExt, StreamExt};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use std::time::Duration;
+use std::time::Instant;
+use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::mpsc::UnboundedSender;
+
+/// Eventos de teclado que se procesan como máximo antes de pintar.
+const MAX_BURST: usize = 512;
 
 /// Restaura el terminal al salir, pase lo que pase (retorno normal, error o
 /// panic): sin esto, un fallo en modo raw dejaba la terminal inutilizable.
@@ -17,7 +28,11 @@ struct RawGuard;
 impl RawGuard {
     fn enter() -> std::io::Result<Self> {
         enable_raw_mode()?;
-        execute!(std::io::stdout(), EnterAlternateScreen)?;
+        execute!(
+            std::io::stdout(),
+            EnterAlternateScreen,
+            EnableBracketedPaste
+        )?;
         Ok(Self)
     }
 }
@@ -25,7 +40,11 @@ impl RawGuard {
 impl Drop for RawGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = std::io::stdout().execute(LeaveAlternateScreen);
+        let _ = execute!(
+            std::io::stdout(),
+            DisableBracketedPaste,
+            LeaveAlternateScreen
+        );
     }
 }
 
@@ -172,10 +191,20 @@ pub fn handle_event(app: &mut App, ev: Event) -> Option<String> {
     }
 }
 
-/// Bucle principal: aplica eventos del bus y lee teclado.
+/// Envía un prompt al agente y lo cuenta como en cola.
+fn send(app: &mut App, tx: &UnboundedSender<String>, prompt: Option<String>) {
+    if let Some(text) = prompt {
+        app.queued += 1;
+        let _ = tx.send(text);
+    }
+}
+
+/// Bucle principal por eventos: teclado (prioritario), permisos, bus del
+/// agente, vencimiento de frame y animaciones. Solo pinta cuando hay cambios;
+/// las ráfagas de teclado se agrupan en un frame; cada frame es atómico.
 pub async fn run(
     mut app: App,
-    prompt_tx: tokio::sync::mpsc::Sender<String>,
+    prompt_tx: UnboundedSender<String>,
     mut bus_rx: tokio::sync::broadcast::Receiver<codeloom_core::event::LiveEvent>,
     mut perm_rx: tokio::sync::mpsc::Receiver<(
         codeloom_core::permission::PermissionRequest,
@@ -185,16 +214,65 @@ pub async fn run(
     let _guard = RawGuard::enter()?;
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend)?;
+    let mut input = EventStream::new();
+    let mut frames = FrameScheduler::new(MIN_FRAME);
+    let mut anim = tokio::time::interval(batten::widgets::FRAME_INTERVAL);
+    anim.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut fx: Option<batten::widgets::fx::Effect> = None;
+    let mut fx_clock = Instant::now();
+    let (mut bus_open, mut perm_open) = (true, true);
+    frames.request(Urgency::Input);
+
     while !app.should_quit {
-        while let Ok(ev) = bus_rx.try_recv() {
-            app.apply(ev);
+        let animating = fx.is_some() && app.permission.is_some();
+        let deadline = frames.deadline();
+        tokio::select! {
+            biased;
+            ev = input.next() => match ev {
+                Some(Ok(ev)) => {
+                    let prompt = handle_event(&mut app, ev);
+                    send(&mut app, &prompt_tx, prompt);
+                    for _ in 0..MAX_BURST {
+                        match input.next().now_or_never() {
+                            Some(Some(Ok(ev))) => {
+                                let prompt = handle_event(&mut app, ev);
+                                send(&mut app, &prompt_tx, prompt);
+                            }
+                            _ => break,
+                        }
+                    }
+                    frames.request(Urgency::Input);
+                }
+                Some(Err(e)) => return Err(e),
+                None => break,
+            },
+            req = perm_rx.recv(), if perm_open => match req {
+                Some((req, reply)) => {
+                    app.enqueue_permission(req, reply);
+                    frames.request(Urgency::Input);
+                }
+                None => perm_open = false,
+            },
+            ev = bus_rx.recv(), if bus_open => {
+                match ev {
+                    Ok(ev) => app.apply(ev),
+                    Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => bus_open = false,
+                }
+                while let Ok(ev) = bus_rx.try_recv() {
+                    app.apply(ev);
+                }
+                frames.request(Urgency::Background);
+            }
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
+                deadline.unwrap_or_else(Instant::now),
+            )), if deadline.is_some() => {}
+            _ = anim.tick(), if animating => frames.request(Urgency::Background),
         }
-        while let Ok((req, reply)) = perm_rx.try_recv() {
-            app.enqueue_permission(req, reply);
-        }
+
         if std::mem::take(&mut app.fx_pending) {
             fx = Some(batten::widgets::fx::dialog_open(&app.theme));
+            fx_clock = Instant::now();
         }
         if let Some(text) = app.clipboard.take() {
             use std::io::Write;
@@ -202,25 +280,24 @@ pub async fn run(
             let _ = out.write_all(crate::clipboard::osc52(&text).as_bytes());
             let _ = out.flush();
         }
-        terminal.draw(|f| {
-            render(f, &mut app);
-            if let (Some(e), Some(_)) = (fx.as_mut(), app.permission.as_ref()) {
-                let area = batten::widgets::permission::area(f.area());
-                e.process(
-                    batten::widgets::fx::FxDuration::from_millis(50),
-                    f.buffer_mut(),
-                    area,
-                );
-            }
-        })?;
-        if event::poll(Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    if let Some(text) = handle_key(&mut app, key.code, key.modifiers) {
-                        let _ = prompt_tx.try_send(text);
-                    }
+
+        let now = Instant::now();
+        if frames.due(now) {
+            let elapsed = now.duration_since(fx_clock);
+            fx_clock = now;
+            execute!(std::io::stdout(), BeginSynchronizedUpdate)?;
+            terminal.draw(|f| {
+                render(f, &mut app);
+                if let (Some(e), Some(_)) = (fx.as_mut(), app.permission.as_ref()) {
+                    let area = batten::widgets::permission::area(f.area());
+                    e.process(elapsed.into(), f.buffer_mut(), area);
                 }
+            })?;
+            execute!(std::io::stdout(), EndSynchronizedUpdate)?;
+            if fx.as_ref().is_some_and(|e| e.done()) {
+                fx = None;
             }
+            frames.drawn(now);
         }
     }
     Ok(())
