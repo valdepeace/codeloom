@@ -35,6 +35,7 @@ pub struct App {
     pub changes: batten::state::FileChanges,
     /// Scroll del transcript (sigue el final salvo que el usuario suba).
     pub viewport: batten::state::Viewport,
+    pub layout: batten::widgets::transcript::Layout,
     pub focus: Focus,
     /// Líneas seleccionadas del transcript, si hay.
     pub selection: Option<batten::state::Selection>,
@@ -67,6 +68,7 @@ impl App {
             theme: batten::widgets::Theme::default_dark(),
             changes: batten::state::FileChanges::new(),
             viewport: batten::state::Viewport::new(),
+            layout: batten::widgets::transcript::Layout::new(),
             focus: Focus::Composer,
             selection: None,
             clipboard: None,

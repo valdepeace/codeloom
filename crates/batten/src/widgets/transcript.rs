@@ -1,6 +1,6 @@
 //! Vista del transcript: ventana visible + scroll + wraps CJK-aware.
 
-use crate::state::{Line, LineKind, StyleToken, Transcript};
+use crate::state::{Line, LineKind, Selection, StyleToken, Transcript, Viewport};
 use crate::widgets::Theme;
 use ratatui::layout::Rect;
 use ratatui::text::{Line as TLine, Span};
@@ -72,79 +72,207 @@ fn render_line(line: &Line, theme: &Theme) -> Vec<TLine<'static>> {
     vec![TLine::from(spans)]
 }
 
-/// Pinta el transcript sin selección.
+/// Altura en filas de una línea a `width` columnas (mínimo 1).
+fn measure(line: &Line, width: u16, theme: &Theme) -> usize {
+    Paragraph::new(render_line(line, theme))
+        .wrap(Wrap { trim: false })
+        .line_count(width)
+        .max(1)
+}
+
+#[derive(Debug, Clone)]
+struct EntryLayout {
+    rev: u64,
+    heights: Vec<usize>,
+}
+
+/// Caché de alturas (filas tras el wrap) por entrada y ancho. La guarda quien
+/// usa el widget; `sync` solo re-mide las entradas cuya revisión cambió.
+#[derive(Debug, Default, Clone)]
+pub struct Layout {
+    width: u16,
+    entries: Vec<EntryLayout>,
+    /// Por línea global: fila donde empieza y altura.
+    row_starts: Vec<usize>,
+    heights: Vec<usize>,
+    total_rows: usize,
+    measured: usize,
+}
+
+impl Layout {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Pone la caché al día para `width`.
+    pub fn sync(&mut self, transcript: &Transcript, width: u16, theme: &Theme) {
+        if width != self.width {
+            self.entries.clear();
+            self.width = width;
+        }
+        self.entries.truncate(transcript.entry_count());
+        let mut first_changed = None;
+        for i in 0..transcript.entry_count() {
+            let rev = transcript.entry_rev(i);
+            if self.entries.get(i).is_some_and(|e| e.rev == rev) {
+                continue;
+            }
+            let heights = transcript
+                .entry_lines(i)
+                .iter()
+                .map(|l| measure(l, width, theme))
+                .collect();
+            self.measured += 1;
+            let layout = EntryLayout { rev, heights };
+            if i < self.entries.len() {
+                self.entries[i] = layout;
+            } else {
+                self.entries.push(layout);
+            }
+            first_changed.get_or_insert(i);
+        }
+        if let Some(entry) = first_changed {
+            self.reindex_from(entry, transcript.entry_start(entry));
+        }
+    }
+
+    fn reindex_from(&mut self, entry: usize, line: usize) {
+        self.row_starts.truncate(line);
+        self.heights.truncate(line);
+        let mut acc = match line {
+            0 => 0,
+            _ => self.row_starts[line - 1] + self.heights[line - 1],
+        };
+        for e in &self.entries[entry..] {
+            for &h in &e.heights {
+                self.row_starts.push(acc);
+                self.heights.push(h);
+                acc += h;
+            }
+        }
+        self.total_rows = acc;
+    }
+
+    pub fn total_rows(&self) -> usize {
+        self.total_rows
+    }
+
+    /// Entradas medidas desde la creación (para tests de rendimiento).
+    pub fn measured(&self) -> usize {
+        self.measured
+    }
+
+    pub fn width(&self) -> u16 {
+        self.width
+    }
+
+    /// Fila global donde empieza la línea `line`.
+    pub fn row_of(&self, line: usize) -> usize {
+        self.row_starts
+            .get(line)
+            .copied()
+            .unwrap_or(self.total_rows)
+    }
+
+    /// Filas que ocupa la línea `line`.
+    pub fn height_of(&self, line: usize) -> usize {
+        self.heights.get(line).copied().unwrap_or(0)
+    }
+
+    /// `(línea, fila dentro de la línea)` que ocupa la fila `row`.
+    pub fn line_at_row(&self, row: usize) -> Option<(usize, usize)> {
+        if self.heights.is_empty() {
+            return None;
+        }
+        let row = row.min(self.total_rows.saturating_sub(1));
+        let line = self.row_starts.partition_point(|&s| s <= row) - 1;
+        Some((line, row - self.row_starts[line]))
+    }
+}
+
+/// Pinta el transcript: solo las líneas visibles. `layout` cachea alturas;
+/// `viewport` recibe la geometría y el ancla; `selection` se resalta y su
+/// extremo se mantiene visible.
 pub fn render(
     frame: &mut Frame,
     area: Rect,
     transcript: &Transcript,
-    viewport: &mut crate::state::Viewport,
-    theme: &Theme,
-) {
-    render_with_selection(frame, area, transcript, viewport, None, theme);
-}
-
-/// Pinta el transcript. Una sola geometría (filas tras el wrap) alimenta el
-/// pintado, el scroll y la scrollbar; la fija en `viewport`. Las líneas de
-/// `selection` se resaltan y su extremo se mantiene visible.
-pub fn render_with_selection(
-    frame: &mut Frame,
-    area: Rect,
-    transcript: &Transcript,
-    viewport: &mut crate::state::Viewport,
-    selection: Option<&crate::state::Selection>,
+    viewport: &mut Viewport,
+    layout: &mut Layout,
+    selection: Option<&Selection>,
     theme: &Theme,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
     }
     let rows = area.height as usize;
-    let sel_style = theme.styles.selection;
-    // limitación: se compone todo el historial en cada frame; cachear por línea
-    // si se nota en conversaciones largas.
-    let lines: Vec<TLine> = (0..transcript.len())
-        .filter_map(|i| transcript.line(i).map(|l| (i, l)))
-        .flat_map(|(i, l)| {
-            let mut out = render_line(l, theme);
-            if selection.is_some_and(|s| s.contains(i)) {
-                for tl in &mut out {
-                    tl.style = tl.style.patch(sel_style);
-                }
-            }
-            out
-        })
-        .collect();
-    let wrap = Wrap { trim: false };
-    let para = Paragraph::new(lines.clone()).wrap(wrap);
-    let full = para.line_count(area.width);
-    let overflow = full > rows && area.width >= 2;
-    let text_area = if overflow {
-        Rect {
-            width: area.width - 1,
-            ..area
+    let prev_width = layout.width();
+    // Ancho de texto: si ya se medía sin la columna de la scrollbar y sigue
+    // desbordando, se mantiene (así no se invalida la caché cada frame).
+    let narrow = area.width.saturating_sub(1).max(1);
+    let text_w = if area.width >= 2 && prev_width == narrow {
+        layout.sync(transcript, narrow, theme);
+        if layout.total_rows() > rows {
+            narrow
+        } else {
+            layout.sync(transcript, area.width, theme);
+            area.width
         }
     } else {
-        area
+        layout.sync(transcript, area.width, theme);
+        if area.width >= 2 && layout.total_rows() > rows {
+            layout.sync(transcript, narrow, theme);
+            narrow
+        } else {
+            area.width
+        }
     };
-    let total = if overflow {
-        para.line_count(text_area.width)
-    } else {
-        full
-    };
-    viewport.set_geometry(total, rows);
-    if let (Some(s), false) = (selection, lines.is_empty()) {
-        let head = s.head().min(lines.len() - 1);
-        let w = text_area.width;
-        let start = Paragraph::new(lines[..head].to_vec())
-            .wrap(wrap)
-            .line_count(w);
-        let height = Paragraph::new(vec![lines[head].clone()])
-            .wrap(wrap)
-            .line_count(w);
-        viewport.ensure_visible(start, start + height);
+    let overflow = text_w < area.width;
+
+    if prev_width != 0 && prev_width != text_w && !viewport.is_following() {
+        if let Some((line, row)) = viewport.anchor() {
+            let h = layout.height_of(line).max(1);
+            viewport.restore_top(layout.row_of(line) + row.min(h - 1));
+        }
     }
-    // limitación: `Paragraph::scroll` usa u16; más de 65535 filas se quedan en el tope.
-    let top = u16::try_from(viewport.top()).unwrap_or(u16::MAX);
-    frame.render_widget(para.scroll((top, 0)), text_area);
+    viewport.set_geometry(layout.total_rows(), rows);
+    if let (Some(s), false) = (selection, transcript.is_empty()) {
+        let head = s.head().min(transcript.len() - 1);
+        let start = layout.row_of(head);
+        viewport.ensure_visible(start, start + layout.height_of(head));
+    }
+
+    let text_area = Rect {
+        width: text_w,
+        ..area
+    };
+    if let Some((first, skip)) = layout.line_at_row(viewport.top()) {
+        viewport.set_anchor(first, skip);
+        let sel_style = theme.styles.selection;
+        let mut lines = Vec::new();
+        let mut filled = 0;
+        let mut i = first;
+        while i < transcript.len() && filled < rows + skip {
+            if let Some(line) = transcript.line(i) {
+                let mut out = render_line(line, theme);
+                if selection.is_some_and(|s| s.contains(i)) {
+                    for tl in &mut out {
+                        tl.style = tl.style.patch(sel_style);
+                    }
+                }
+                lines.extend(out);
+            }
+            filled += layout.height_of(i);
+            i += 1;
+        }
+        let skip = u16::try_from(skip).unwrap_or(u16::MAX);
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .scroll((skip, 0)),
+            text_area,
+        );
+    }
     if overflow {
         let bar = Rect {
             x: area.x + area.width - 1,
@@ -162,10 +290,15 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    fn draw(transcript: &Transcript, vp: &mut Viewport, w: u16, h: u16) -> String {
-        let backend = TestBackend::new(w, h);
-        let mut term = Terminal::new(backend).unwrap();
-        term.draw(|f| render(f, f.area(), transcript, vp, &Theme::test()))
+    fn draw(
+        transcript: &Transcript,
+        vp: &mut Viewport,
+        layout: &mut Layout,
+        w: u16,
+        h: u16,
+    ) -> String {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| render(f, f.area(), transcript, vp, layout, None, &Theme::test()))
             .unwrap();
         term.backend()
             .buffer()
@@ -176,7 +309,7 @@ mod tests {
     }
 
     fn buffer(transcript: &Transcript, w: u16, h: u16) -> String {
-        draw(transcript, &mut Viewport::new(), w, h)
+        draw(transcript, &mut Viewport::new(), &mut Layout::new(), w, h)
     }
 
     #[test]
@@ -271,13 +404,14 @@ mod tests {
             t.push(Line::new(LineKind::Assistant, format!("line {i:02}")));
         }
         let mut vp = Viewport::new();
-        draw(&t, &mut vp, 30, 5);
+        let mut layout = Layout::new();
+        draw(&t, &mut vp, &mut layout, 30, 5);
         vp.scroll_up(10);
-        let before = draw(&t, &mut vp, 30, 5);
+        let before = draw(&t, &mut vp, &mut layout, 30, 5);
         for i in 50..70 {
             t.push(Line::new(LineKind::Assistant, format!("line {i:02}")));
         }
-        let after = draw(&t, &mut vp, 30, 5);
+        let after = draw(&t, &mut vp, &mut layout, 30, 5);
         assert!(before.contains("line 35"));
         assert!(after.contains("line 35"));
         assert!(!after.contains("line 69"));
@@ -292,9 +426,20 @@ mod tests {
         }
         let mut term = Terminal::new(TestBackend::new(30, 5)).unwrap();
         let mut vp = Viewport::new();
+        let mut layout = Layout::new();
         let sel = Selection::at(1);
-        term.draw(|f| render_with_selection(f, f.area(), &t, &mut vp, Some(&sel), &Theme::test()))
-            .unwrap();
+        term.draw(|f| {
+            render(
+                f,
+                f.area(),
+                &t,
+                &mut vp,
+                &mut layout,
+                Some(&sel),
+                &Theme::test(),
+            )
+        })
+        .unwrap();
         let buf = term.backend().buffer();
         assert_eq!(buf[(0, 1)].bg, ratatui::style::Color::Indexed(238));
         assert_ne!(buf[(0, 0)].bg, ratatui::style::Color::Indexed(238));
@@ -309,9 +454,20 @@ mod tests {
         }
         let mut term = Terminal::new(TestBackend::new(30, 5)).unwrap();
         let mut vp = Viewport::new();
+        let mut layout = Layout::new();
         let sel = Selection::at(0);
-        term.draw(|f| render_with_selection(f, f.area(), &t, &mut vp, Some(&sel), &Theme::test()))
-            .unwrap();
+        term.draw(|f| {
+            render(
+                f,
+                f.area(),
+                &t,
+                &mut vp,
+                &mut layout,
+                Some(&sel),
+                &Theme::test(),
+            )
+        })
+        .unwrap();
         let out: String = term
             .backend()
             .buffer()
@@ -330,8 +486,94 @@ mod tests {
             t.push(Line::new(LineKind::Assistant, format!("line {i:02}")));
         }
         let mut vp = Viewport::new();
-        draw(&t, &mut vp, 30, 5);
+        let mut layout = Layout::new();
+        draw(&t, &mut vp, &mut layout, 30, 5);
         t.push(Line::new(LineKind::Assistant, "nueva"));
-        assert!(draw(&t, &mut vp, 30, 5).contains("nueva"));
+        assert!(draw(&t, &mut vp, &mut layout, 30, 5).contains("nueva"));
+    }
+
+    fn long_transcript(n: usize) -> (Transcript, crate::state::EntryId) {
+        let mut t = Transcript::new();
+        for i in 0..n {
+            t.push_entry(
+                LineKind::Assistant,
+                crate::state::Format::Plain,
+                format!("l{i:05}"),
+            );
+        }
+        let last = t.push_entry(LineKind::Assistant, crate::state::Format::Plain, "fin");
+        (t, last)
+    }
+
+    #[test]
+    fn only_changed_entries_are_measured() {
+        let (mut t, last) = long_transcript(1000);
+        let (mut vp, mut layout) = (Viewport::new(), Layout::new());
+        draw(&t, &mut vp, &mut layout, 40, 10);
+        draw(&t, &mut vp, &mut layout, 40, 10);
+        let before = layout.measured();
+        t.append(last, " y más");
+        let out = draw(&t, &mut vp, &mut layout, 40, 10);
+        assert_eq!(layout.measured(), before + 1);
+        assert!(out.contains("fin y más"));
+    }
+
+    #[test]
+    fn width_change_remeasures_everything() {
+        let (t, _) = long_transcript(100);
+        let (mut vp, mut layout) = (Viewport::new(), Layout::new());
+        draw(&t, &mut vp, &mut layout, 40, 10);
+        let before = layout.measured();
+        draw(&t, &mut vp, &mut layout, 60, 10);
+        assert!(layout.measured() >= before + 101);
+    }
+
+    #[test]
+    fn line_at_row_handles_multi_row_lines() {
+        let mut t = Transcript::new();
+        t.push(Line::new(LineKind::Assistant, "corta"));
+        t.push(Line::new(LineKind::Assistant, "palabra ".repeat(10)));
+        t.push(Line::new(LineKind::Assistant, "otra"));
+        let mut layout = Layout::new();
+        layout.sync(&t, 20, &Theme::test());
+        let h1 = layout.height_of(1);
+        assert!(h1 > 1);
+        assert_eq!(layout.line_at_row(0), Some((0, 0)));
+        assert_eq!(layout.line_at_row(1), Some((1, 0)));
+        assert_eq!(layout.line_at_row(h1), Some((1, h1 - 1)));
+        assert_eq!(layout.line_at_row(h1 + 1), Some((2, 0)));
+        assert_eq!(layout.line_at_row(10_000), Some((2, 0)));
+    }
+
+    #[test]
+    fn rows_beyond_u16_are_reachable() {
+        let mut t = Transcript::new();
+        for i in 0..70_000 {
+            t.push(Line::new(LineKind::Banner, format!("l{i:05}")));
+        }
+        let (mut vp, mut layout) = (Viewport::new(), Layout::new());
+        let out = draw(&t, &mut vp, &mut layout, 20, 5);
+        assert!(out.contains("l69999"));
+        vp.to_top();
+        let out = draw(&t, &mut vp, &mut layout, 20, 5);
+        assert!(out.contains("l00000"));
+    }
+
+    #[test]
+    fn width_change_keeps_the_anchor_line_on_top() {
+        let mut t = Transcript::new();
+        for i in 0..200 {
+            t.push(Line::new(
+                LineKind::Assistant,
+                format!("a{i:03} {}", "xx ".repeat(15)),
+            ));
+        }
+        let (mut vp, mut layout) = (Viewport::new(), Layout::new());
+        draw(&t, &mut vp, &mut layout, 40, 10);
+        vp.scroll_up(100);
+        draw(&t, &mut vp, &mut layout, 40, 10);
+        let (line, _) = vp.anchor().unwrap();
+        draw(&t, &mut vp, &mut layout, 25, 10);
+        assert_eq!(vp.anchor().unwrap().0, line);
     }
 }

@@ -11,6 +11,7 @@ use ratatui::Frame;
 pub struct TranscriptDemo {
     transcript: Transcript,
     viewport: Viewport,
+    layout: transcript::Layout,
     selection: Option<Selection>,
     copied: Option<String>,
 }
@@ -42,6 +43,7 @@ impl TranscriptDemo {
         Self {
             transcript,
             viewport: Viewport::new(),
+            layout: transcript::Layout::new(),
             selection: None,
             copied: None,
         }
@@ -60,11 +62,12 @@ impl Demo for TranscriptDemo {
     fn render(&mut self, f: &mut Frame, area: Rect, theme: &Theme) {
         let [body, status] =
             Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
-        transcript::render_with_selection(
+        transcript::render(
             f,
             body,
             &self.transcript,
             &mut self.viewport,
+            &mut self.layout,
             self.selection.as_ref(),
             theme,
         );

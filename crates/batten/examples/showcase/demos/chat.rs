@@ -45,6 +45,7 @@ fn answer_steps(text: &str) -> Vec<Step> {
 pub struct ChatDemo {
     transcript: Transcript,
     viewport: Viewport,
+    layout: transcript::Layout,
     composer: Composer,
     history: History,
     sidebar: Sidebar,
@@ -66,6 +67,7 @@ impl ChatDemo {
         Self {
             transcript: Transcript::new(),
             viewport: Viewport::new(),
+            layout: transcript::Layout::new(),
             composer: Composer::new(),
             history: History::new(),
             sidebar,
@@ -208,7 +210,15 @@ impl Demo for ChatDemo {
             tool_item::render(f, rows[0], t, &self.anim, theme);
         }
         let view = self.view();
-        transcript::render(f, rows[1], &view, &mut self.viewport, theme);
+        transcript::render(
+            f,
+            rows[1],
+            &view,
+            &mut self.viewport,
+            &mut self.layout,
+            None,
+            theme,
+        );
         composer::render_focused(f, rows[2], &self.composer, !self.focus_transcript, theme);
         if let Some(s) = side {
             sidebar::render(f, s, &self.sidebar, theme);

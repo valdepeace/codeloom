@@ -22,11 +22,12 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let t = app.transcript();
-    batten::widgets::transcript::render_with_selection(
+    batten::widgets::transcript::render(
         frame,
         inner,
         &t,
         &mut app.viewport,
+        &mut app.layout,
         app.selection.as_ref(),
         &app.theme,
     );
