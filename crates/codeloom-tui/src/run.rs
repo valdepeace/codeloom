@@ -31,14 +31,14 @@ impl Drop for RawGuard {
 
 /// Teclas con el foco en el transcript (como Crush).
 fn transcript_key(app: &mut App, code: KeyCode) {
-    let len = app.transcript().len();
+    let len = app.transcript.len();
     if let Some(mut s) = app.selection {
         match code {
             KeyCode::Up | KeyCode::Char('k') => s.extend(-1, len),
             KeyCode::Down | KeyCode::Char('j') => s.extend(1, len),
             KeyCode::Char('y') | KeyCode::Char('c') => {
                 app.status = format!("copiado ({} líneas)", s.range().count());
-                app.clipboard = Some(s.text(&app.transcript()));
+                app.clipboard = Some(s.text(&app.transcript));
                 app.selection = None;
                 return;
             }
@@ -356,10 +356,7 @@ mod tests {
     fn select_extend_copy_and_escape() {
         let mut app = App::new();
         for s in ["uno", "dos", "tres"] {
-            app.items.push(crate::app::TranscriptItem {
-                role: "you",
-                text: s.into(),
-            });
+            app.push_user(s);
         }
         handle_key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
         handle_key(&mut app, KeyCode::Char('v'), KeyModifiers::NONE);

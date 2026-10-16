@@ -3,12 +3,6 @@ use codeloom_core::event::LiveEvent;
 use codeloom_core::permission::{Decision, PermissionRequest};
 use std::collections::VecDeque;
 
-#[derive(Default, Clone)]
-pub struct TranscriptItem {
-    pub role: &'static str,
-    pub text: String,
-}
-
 /// Dónde va el teclado.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Focus {
@@ -24,7 +18,10 @@ pub struct PendingPermission {
 }
 
 pub struct App {
-    pub items: Vec<TranscriptItem>,
+    /// Transcript persistente: se actualiza con los eventos, no por frame.
+    pub transcript: batten::state::Transcript,
+    /// Entrada de la respuesta en curso (los deltas se añaden a ella).
+    assistant: Option<batten::state::EntryId>,
     pub composer: batten::state::Composer,
     pub history: batten::state::History,
     pub status: String,
@@ -58,7 +55,8 @@ impl Default for App {
 impl App {
     pub fn new() -> Self {
         Self {
-            items: Vec::new(),
+            transcript: batten::state::Transcript::new(),
+            assistant: None,
             composer: batten::state::Composer::new(),
             history: batten::state::History::new(),
             status: "ready".into(),
@@ -121,28 +119,39 @@ impl App {
         }
     }
 
+    /// Mensaje del usuario: entrada nueva; la siguiente respuesta empieza otra.
+    pub fn push_user(&mut self, text: &str) {
+        use batten::state::{Format, LineKind};
+        self.transcript
+            .push_entry(LineKind::User, Format::Plain, text);
+        self.assistant = None;
+    }
+
+    /// Delta de la respuesta: se añade a la entrada en curso (markdown).
+    pub fn push_assistant(&mut self, delta: &str) {
+        use batten::state::{Format, LineKind};
+        match self.assistant {
+            Some(id) => self.transcript.append(id, delta),
+            None => {
+                let id = self
+                    .transcript
+                    .push_entry(LineKind::Assistant, Format::Markdown, delta);
+                self.assistant = Some(id);
+            }
+        }
+    }
+
     pub fn apply(&mut self, ev: LiveEvent) {
         match ev {
             LiveEvent::TurnStarted => self.status = "working".into(),
-            LiveEvent::TurnEnded => self.status = "ready".into(),
-            LiveEvent::Delta { text } => {
-                if let Some(last) = self.items.last_mut() {
-                    if last.role == "assistant" {
-                        last.text.push_str(&text);
-                        return;
-                    }
-                }
-                self.items.push(TranscriptItem {
-                    role: "assistant",
-                    text,
-                });
+            LiveEvent::TurnEnded => {
+                self.status = "ready".into();
+                self.assistant = None;
             }
+            LiveEvent::Delta { text } => self.push_assistant(&text),
             LiveEvent::MessageAdded(m) => {
                 if m.role == codeloom_core::message::Role::User {
-                    self.items.push(TranscriptItem {
-                        role: "you",
-                        text: m.text(),
-                    });
+                    self.push_user(&m.text());
                 }
             }
             LiveEvent::Error { message } => self.status = format!("error: {message}"),
@@ -219,24 +228,6 @@ impl App {
         Some(text)
     }
 
-    /// Transcript de batten a partir de los items (una línea por línea de texto).
-    pub fn transcript(&self) -> batten::state::Transcript {
-        use batten::state::{Line, LineKind, Transcript};
-        let mut t = Transcript::new();
-        for item in &self.items {
-            if item.role == "you" {
-                for l in item.text.lines() {
-                    t.push(Line::new(LineKind::User, l));
-                }
-            } else {
-                for line in batten::state::markdown::parse(&item.text, LineKind::Assistant) {
-                    t.push(line);
-                }
-            }
-        }
-        t
-    }
-
     /// Construye el sidebar de batten con la marca y las secciones de sesión.
     pub fn sidebar(&self) -> batten::state::Sidebar {
         let mut sb = batten::state::Sidebar::with_logo("CodeLoom");
@@ -258,8 +249,8 @@ mod tests {
         let mut app = App::new();
         app.apply(codeloom_core::event::LiveEvent::Delta { text: "a".into() });
         app.apply(codeloom_core::event::LiveEvent::Delta { text: "b".into() });
-        assert_eq!(app.items.len(), 1);
-        assert_eq!(app.items[0].text, "ab");
+        assert_eq!(app.transcript.entry_count(), 1);
+        assert_eq!(app.transcript.line(0).unwrap().plain(), "ab");
     }
 
     #[test]
@@ -278,11 +269,24 @@ mod tests {
         app.push_char('h');
         app.push_char('i');
         assert_eq!(app.submit(), Some("hi".to_string()));
-        assert!(app.items.iter().all(|i| i.role != "you"));
+        assert!(app.transcript.is_empty());
         app.apply(codeloom_core::event::LiveEvent::MessageAdded(
             codeloom_core::message::Message::user("hi"),
         ));
-        assert_eq!(app.items.iter().filter(|i| i.role == "you").count(), 1);
+        assert_eq!(
+            app.transcript.line(0).unwrap().kind,
+            batten::state::LineKind::User
+        );
+    }
+
+    #[test]
+    fn a_user_message_starts_a_new_answer_entry() {
+        let mut app = App::new();
+        app.push_assistant("uno");
+        app.push_user("pregunta");
+        app.push_assistant("dos");
+        assert_eq!(app.transcript.entry_count(), 3);
+        assert_eq!(app.transcript.line(2).unwrap().plain(), "dos");
     }
 
     #[test]

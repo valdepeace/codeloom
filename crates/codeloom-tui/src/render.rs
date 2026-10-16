@@ -21,11 +21,10 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
     let block = Block::default().borders(Borders::TOP);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let t = app.transcript();
     batten::widgets::transcript::render(
         frame,
         inner,
-        &t,
+        &app.transcript,
         &mut app.viewport,
         &mut app.layout,
         app.selection.as_ref(),
@@ -83,7 +82,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{App, TranscriptItem};
+    use crate::app::App;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -102,10 +101,7 @@ mod tests {
     #[test]
     fn renders_items_and_input() {
         let mut app = App::new();
-        app.items.push(TranscriptItem {
-            role: "you",
-            text: "hello".into(),
-        });
+        app.push_user("hello");
         app.push_char('x');
         let content = buffer_of(&mut app, 40, 10);
         assert!(content.contains("hello"));
@@ -116,10 +112,7 @@ mod tests {
     #[test]
     fn assistant_markdown_is_rendered() {
         let mut app = App::new();
-        app.items.push(TranscriptItem {
-            role: "CodeLoom",
-            text: "## Hecho\n\n- **uno**\n- `dos`".into(),
-        });
+        app.push_assistant("## Hecho\n\n- **uno**\n- `dos`");
         let content = buffer_of(&mut app, 60, 20);
         assert!(content.contains("Hecho"));
         assert!(!content.contains("##"));
@@ -177,10 +170,7 @@ mod tests {
     fn chatty_app() -> App {
         let mut app = App::new();
         for i in 0..60 {
-            app.items.push(TranscriptItem {
-                role: "you",
-                text: format!("msg-{i:02}"),
-            });
+            app.push_user(&format!("msg-{i:02}"));
         }
         app
     }
