@@ -1,0 +1,15 @@
+id = "codeloom.herdr"
+name = "CodeLoom"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "CodeLoom agent pane"
+platforms = ["linux", "macos", "windows"]
+
+[[build]]
+command = ["cargo", "build", "--release", "-p", "codeloom-cli", "--bin", "loom"]
+
+[[panes]]
+id = "loom"
+title = "CodeLoom"
+placement = "tab"
+command = ["cargo", "run", "--release", "-p", "codeloom-cli", "--bin", "loom"]
