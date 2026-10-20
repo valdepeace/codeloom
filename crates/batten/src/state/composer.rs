@@ -1,6 +1,7 @@
 //! Composer: buffer multilínea con cursor. Puro (sin ratatui).
 
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Default)]
 pub struct Composer {
@@ -14,31 +15,44 @@ impl Composer {
         Self::default()
     }
 
-    fn char_count(&self) -> usize {
-        self.buf.chars().count()
-    }
-
-    /// Offset de byte del carácter en `idx` (o el final del buffer).
-    fn byte_at(&self, idx: usize) -> usize {
-        self.buf
-            .char_indices()
-            .nth(idx)
-            .map(|(b, _)| b)
-            .unwrap_or(self.buf.len())
-    }
-
-    /// Rangos (inicio, fin) en índices de carácter, por línea lógica.
+    /// Rangos de byte por línea lógica, sin incluir el salto.
     fn line_spans(&self) -> Vec<(usize, usize)> {
         let mut spans = Vec::new();
         let mut start = 0;
-        for (i, c) in self.buf.chars().enumerate() {
-            if c == '\n' {
-                spans.push((start, i));
-                start = i + 1;
+        for (i, _) in self.buf.match_indices('\n') {
+            spans.push((start, i));
+            start = i + 1;
+        }
+        spans.push((start, self.buf.len()));
+        spans
+    }
+
+    fn snap_cursor_to_grapheme_end(&mut self) {
+        if let Some((start, grapheme)) = self
+            .buf
+            .grapheme_indices(true)
+            .find(|(start, grapheme)| *start < self.cursor && self.cursor < *start + grapheme.len())
+        {
+            self.cursor = start + grapheme.len();
+        }
+    }
+
+    fn byte_at_column(&self, start: usize, end: usize, column: usize) -> usize {
+        let mut width = 0;
+        let mut byte = start;
+        for (offset, grapheme) in self.buf[start..end].grapheme_indices(true) {
+            let grapheme_width = UnicodeWidthStr::width(grapheme);
+            let next_width = width + grapheme_width;
+            if next_width > column {
+                break;
+            }
+            width = next_width;
+            byte = start + offset + grapheme.len();
+            if width == column {
+                break;
             }
         }
-        spans.push((start, self.char_count()));
-        spans
+        byte
     }
 
     fn row_of_cursor(&self) -> usize {
@@ -49,9 +63,13 @@ impl Composer {
     }
 
     pub fn insert_char(&mut self, c: char) {
-        let at = self.byte_at(self.cursor);
-        self.buf.insert(at, c);
-        self.cursor += 1;
+        if c == '\r' {
+            self.newline();
+            return;
+        }
+        self.buf.insert(self.cursor, c);
+        self.cursor += c.len_utf8();
+        self.snap_cursor_to_grapheme_end();
         self.preferred_col = None;
     }
 
@@ -60,9 +78,10 @@ impl Composer {
     }
 
     pub fn insert_str(&mut self, s: &str) {
-        let at = self.byte_at(self.cursor);
-        self.buf.insert_str(at, s);
-        self.cursor += s.chars().count();
+        let normalized = s.replace("\r\n", "\n").replace('\r', "\n");
+        self.buf.insert_str(self.cursor, &normalized);
+        self.cursor += normalized.len();
+        self.snap_cursor_to_grapheme_end();
         self.preferred_col = None;
     }
 
@@ -70,31 +89,43 @@ impl Composer {
         if self.cursor == 0 {
             return;
         }
-        let start = self.byte_at(self.cursor - 1);
-        let end = self.byte_at(self.cursor);
+        let (start, grapheme) = self
+            .buf
+            .grapheme_indices(true)
+            .take_while(|(start, grapheme)| *start + grapheme.len() <= self.cursor)
+            .last()
+            .unwrap();
+        let end = start + grapheme.len();
         self.buf.replace_range(start..end, "");
-        self.cursor -= 1;
+        self.cursor = start;
         self.preferred_col = None;
     }
 
     pub fn delete(&mut self) {
-        if self.cursor >= self.char_count() {
+        if self.cursor >= self.buf.len() {
             return;
         }
-        let start = self.byte_at(self.cursor);
-        let end = self.byte_at(self.cursor + 1);
+        let start = self.cursor;
+        let end = start + self.buf[start..].graphemes(true).next().unwrap().len();
         self.buf.replace_range(start..end, "");
         self.preferred_col = None;
     }
 
     pub fn move_left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
+        self.cursor = self.buf[..self.cursor]
+            .grapheme_indices(true)
+            .next_back()
+            .map_or(0, |(start, _)| start);
         self.preferred_col = None;
     }
 
     pub fn move_right(&mut self) {
-        if self.cursor < self.char_count() {
-            self.cursor += 1;
+        if self.cursor < self.buf.len() {
+            self.cursor += self.buf[self.cursor..]
+                .graphemes(true)
+                .next()
+                .unwrap()
+                .len();
         }
         self.preferred_col = None;
     }
@@ -117,9 +148,12 @@ impl Composer {
         if row == 0 {
             return;
         }
-        let col = self.preferred_col.unwrap_or(self.cursor - spans[row].0);
+        let (start, _) = spans[row];
+        let col = self
+            .preferred_col
+            .unwrap_or(UnicodeWidthStr::width(&self.buf[start..self.cursor]));
         let (s, e) = spans[row - 1];
-        self.cursor = s + col.min(e - s);
+        self.cursor = self.byte_at_column(s, e, col);
         self.preferred_col = Some(col);
     }
 
@@ -129,14 +163,17 @@ impl Composer {
         if row + 1 >= spans.len() {
             return;
         }
-        let col = self.preferred_col.unwrap_or(self.cursor - spans[row].0);
+        let (start, _) = spans[row];
+        let col = self
+            .preferred_col
+            .unwrap_or(UnicodeWidthStr::width(&self.buf[start..self.cursor]));
         let (s, e) = spans[row + 1];
-        self.cursor = s + col.min(e - s);
+        self.cursor = self.byte_at_column(s, e, col);
         self.preferred_col = Some(col);
     }
 
     pub fn cursor(&self) -> usize {
-        self.cursor
+        self.buf[..self.cursor].graphemes(true).count()
     }
 
     pub fn lines(&self) -> usize {
@@ -148,19 +185,13 @@ impl Composer {
         let spans = self.line_spans();
         let row = self.row_of_cursor();
         let (s, _) = spans[row];
-        let col = self
-            .buf
-            .chars()
-            .skip(s)
-            .take(self.cursor - s)
-            .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
-            .sum();
+        let col = UnicodeWidthStr::width(&self.buf[s..self.cursor]);
         (row, col)
     }
 
     pub fn set_text(&mut self, s: &str) {
-        self.buf = s.to_string();
-        self.cursor = self.char_count();
+        self.buf = s.replace("\r\n", "\n").replace('\r', "\n");
+        self.cursor = self.buf.len();
         self.preferred_col = None;
     }
 
@@ -308,5 +339,40 @@ mod tests {
         c.set_text("new\nline");
         assert_eq!(c.text(), "new\nline");
         assert_eq!(c.cursor(), 8);
+    }
+
+    #[test]
+    fn cursor_and_deletion_keep_combining_and_emoji_graphemes_intact() {
+        let mut c = Composer::new();
+        c.insert_str("e\u{301}👩‍💻");
+        assert_eq!(c.cursor(), 2);
+        c.move_left();
+        c.backspace();
+        assert_eq!(c.text(), "👩‍💻");
+        assert_eq!(c.cursor_row_col(), (0, 0));
+    }
+
+    #[test]
+    fn vertical_cursor_keeps_display_column_with_wide_graphemes() {
+        let mut c = Composer::new();
+        c.set_text("星x\n1234");
+        c.move_up();
+        assert_eq!(c.cursor_row_col(), (0, 3));
+    }
+
+    #[test]
+    fn normalizes_windows_line_endings_before_editing() {
+        let mut c = Composer::new();
+        c.insert_str("first\r\nsecond");
+        assert_eq!(c.text(), "first\nsecond");
+        c.set_text("first\r\nsecond");
+        assert_eq!(c.text(), "first\nsecond");
+        c.set_text("\r\n");
+        assert_eq!(c.text(), "\n");
+        c.move_end();
+        c.move_up();
+        c.move_down();
+        c.backspace();
+        assert!(c.is_empty());
     }
 }

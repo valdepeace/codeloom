@@ -13,6 +13,8 @@ pub struct ToolItem {
     pub call_id: String,
     pub name: String,
     pub expanded: bool,
+    pub summary: Option<String>,
+    pub output: Option<String>,
     started: bool,
     result: Option<bool>,
     canceled: bool,
@@ -25,6 +27,8 @@ impl ToolItem {
             call_id: call_id.into(),
             name: name.into(),
             expanded: false,
+            summary: None,
+            output: None,
             started: false,
             result: None,
             canceled: false,
@@ -46,6 +50,12 @@ impl ToolItem {
         // Un resultado implica que la tool termino: ya no espera permiso.
         self.awaiting_permission = false;
         self.started = true;
+    }
+    pub fn set_summary(&mut self, summary: impl Into<String>) {
+        self.summary = Some(summary.into());
+    }
+    pub fn set_output(&mut self, output: impl Into<String>) {
+        self.output = Some(output.into());
     }
     pub fn cancel(&mut self) {
         self.canceled = true;

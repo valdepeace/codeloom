@@ -1,105 +1,61 @@
-//! Demo del tema: tokens resueltos con el default y con un theme.toml parcial.
+//! Muestrario de las paletas disponibles en el showcase.
 
 use crate::demo::Demo;
 use batten::state::StyleToken;
-use batten::widgets::Theme;
-use ratatui::crossterm::event::KeyCode;
+use batten::widgets::{Theme, ThemePreset};
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-const TOKENS: &[(&str, StyleToken)] = &[
-    ("default", StyleToken::Default),
-    ("muted", StyleToken::Muted),
-    ("dim", StyleToken::Dim),
-    ("heading", StyleToken::Heading),
-    ("user", StyleToken::User),
-    ("assistant", StyleToken::Assistant),
-    ("system", StyleToken::System),
-    ("error", StyleToken::Error),
-    ("warning", StyleToken::Warning),
-    ("success", StyleToken::Success),
-    ("tool_name", StyleToken::ToolName),
-    ("tool_running", StyleToken::ToolRunning),
-    ("tool_success", StyleToken::ToolSuccess),
-    ("tool_error", StyleToken::ToolError),
-    ("accent", StyleToken::Accent),
-    ("accent_from", StyleToken::AccentFrom),
-    ("accent_to", StyleToken::AccentTo),
-    ("logo_field", StyleToken::LogoField),
-];
-
 pub struct ThemeDemo {
-    default: Theme,
-    partial: Theme,
-    alt: bool,
+    palettes: Vec<(ThemePreset, Theme)>,
 }
 
 impl ThemeDemo {
     pub fn new() -> Self {
-        let partial = Theme::from_toml(
-            "[styles]\naccent_from = \"magenta\"\naccent_to = \"yellow\"\nerror = \"indexed:196\"\n",
-        )
-        .unwrap_or_else(|_| Theme::default_dark());
         Self {
-            default: Theme::default_dark(),
-            partial,
-            alt: false,
+            palettes: ThemePreset::ALL
+                .into_iter()
+                .map(|preset| (preset, Theme::preset(preset)))
+                .collect(),
         }
     }
 }
 
 impl Demo for ThemeDemo {
     fn title(&self) -> &str {
-        "theme"
+        "themes"
     }
 
     fn hint(&self) -> &str {
-        "t: alternar default / theme.toml parcial"
+        "F7: siguiente paleta · Shift+F7: anterior · las demos usan la paleta activa"
     }
 
-    fn render(&mut self, f: &mut Frame, area: Rect, _theme: &Theme) {
-        let title = if self.alt {
-            "tema: theme.toml parcial"
-        } else {
-            "tema: default_dark"
-        };
-        let th = if self.alt {
-            &self.partial
-        } else {
-            &self.default
-        };
-        let mut lines = vec![Line::from(title.to_string())];
-        for (name, token) in TOKENS {
+    fn render(&mut self, f: &mut Frame, area: Rect, active: &Theme) {
+        let mut lines = vec![Line::from("Paletas base de Batten y referencias visuales:")];
+        for (preset, theme) in &self.palettes {
+            let selected = theme.styles.accent == active.styles.accent
+                && theme.styles.default.bg == active.styles.default.bg;
+            let marker = if selected { "› " } else { "  " };
             lines.push(Line::from(vec![
-                Span::styled("Aa ", th.style(*token)),
-                Span::styled((*name).to_string(), th.style(*token)),
+                Span::styled(marker, theme.style(StyleToken::Muted)),
+                Span::styled("██ ", theme.styles.default),
+                Span::styled(
+                    format!("{:<17}", preset.name()),
+                    theme.style(StyleToken::Accent),
+                ),
+                Span::styled(" user ", theme.style(StyleToken::User)),
+                Span::styled(" assistant ", theme.style(StyleToken::Assistant)),
+                Span::styled(" tool ", theme.style(StyleToken::ToolRunning)),
+                Span::styled("✓", theme.style(StyleToken::Success)),
+                Span::raw(" / "),
+                Span::styled("×", theme.style(StyleToken::Error)),
             ]));
         }
+        lines.push(Line::from(
+            "F7 cambia la paleta global; luego abre chat o tool_item para comparar.",
+        ));
         f.render_widget(Paragraph::new(lines), area);
-    }
-
-    fn handle_key(&mut self, code: KeyCode) -> bool {
-        if code == KeyCode::Char('t') {
-            self.alt = !self.alt;
-            true
-        } else {
-            false
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ratatui::crossterm::event::KeyCode;
-
-    #[test]
-    fn t_toggles_between_default_and_partial() {
-        let mut d = ThemeDemo::new();
-        let before = d.alt;
-        d.handle_key(KeyCode::Char('t'));
-        assert_ne!(d.alt, before);
     }
 }

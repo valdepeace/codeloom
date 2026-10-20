@@ -24,6 +24,21 @@ fn make(name: &str, phase: usize) -> ToolItem {
             t.await_permission();
         } // AwaitingPermission
     }
+    t.set_summary(match phase % 6 {
+        0 => "en cola",
+        1 => "buscando referencias en README.md",
+        2 => "lectura completada",
+        3 => "el archivo no existe",
+        4 => "ejecución cancelada",
+        _ => "cargo clean",
+    });
+    if matches!(phase % 6, 2 | 3) {
+        t.set_output(if phase % 6 == 2 {
+            "README.md · 24 líneas\nRust · Ratatui · componentes reutilizables"
+        } else {
+            "No such file: missing.rs\nexit code: 2"
+        });
+    }
     t
 }
 
@@ -60,7 +75,7 @@ impl Demo for ToolItemDemo {
     }
 
     fn hint(&self) -> &str {
-        "↓/↑: elegir · n: cambiar estado · Enter: expandir"
+        "↓/↑: elegir · n: cambiar estado · Enter: plegar/expandir salida"
     }
 
     fn tick(&mut self, anim: &Anim) {
@@ -68,8 +83,20 @@ impl Demo for ToolItemDemo {
     }
 
     fn render(&mut self, f: &mut Frame, area: Rect, theme: &Theme) {
-        let n = self.items.len().max(1);
-        let rows = Layout::vertical(vec![Constraint::Length(2); n]).split(area);
+        let rows = Layout::vertical(
+            self.items
+                .iter()
+                .enumerate()
+                .map(|(i, item)| {
+                    Constraint::Length(if i == self.selected && item.expanded {
+                        6
+                    } else {
+                        3
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .split(area);
         for (i, item) in self.items.iter_mut().enumerate() {
             if i >= rows.len() {
                 break;

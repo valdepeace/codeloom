@@ -1,3 +1,5 @@
+use super::tool::ToolStatus;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineKind {
     User,
@@ -10,6 +12,12 @@ pub enum LineKind {
     Plan,
     Banner,
     Error,
+    /// Cabecera de una herramienta, con su estado.
+    ToolHead(ToolStatus),
+    /// Línea de salida de una herramienta.
+    ToolBody,
+    /// Indicación de salida oculta bajo una herramienta.
+    ToolMore,
 }
 
 /// Token semantico de estilo. La capa `state` no conoce colores: los widgets
@@ -102,6 +110,13 @@ pub enum Format {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EntryId(usize);
 
+impl EntryId {
+    /// Posición de la entrada en el transcript (orden de inserción).
+    pub fn index(self) -> usize {
+        self.0
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Entry {
     kind: LineKind,
@@ -170,6 +185,46 @@ impl Transcript {
         };
         entry.derive();
         self.push_built(entry)
+    }
+
+    /// Entrada con líneas ya construidas. Admite una lista vacía. Estas
+    /// entradas no admiten `append`: sus líneas no se derivan de un texto.
+    pub fn push_lines(&mut self, lines: Vec<Line>) -> EntryId {
+        let entry = Self::built_entry(lines);
+        self.push_built(entry)
+    }
+
+    /// Sustituye las líneas de una entrada existente y sube su revisión.
+    /// Un `id` inválido no hace nada.
+    pub fn replace(&mut self, id: EntryId, lines: Vec<Line>) {
+        let rev = self.bump();
+        let Some(entry) = self.entries.get_mut(id.0) else {
+            return;
+        };
+        let built = Self::built_entry(lines);
+        entry.kind = built.kind;
+        entry.source = built.source;
+        entry.lines = built.lines;
+        entry.rev = rev;
+        self.reindex_from(id.0);
+    }
+
+    /// Entrada de líneas propias. Su tipo es el de la primera línea (o
+    /// `System` si no hay ninguna) y su texto es la unión de las líneas.
+    fn built_entry(lines: Vec<Line>) -> Entry {
+        let kind = lines.first().map_or(LineKind::System, |l| l.kind);
+        let source = lines
+            .iter()
+            .map(|l| l.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        Entry {
+            kind,
+            format: Format::Plain,
+            source,
+            lines,
+            rev: 0,
+        }
     }
 
     /// Una línea ya construida como entrada propia (no admite `append`).
@@ -324,5 +379,44 @@ mod tests {
         let l = Line::new(LineKind::System, "sys");
         assert!(l.spans.is_empty());
         assert_eq!(l.plain(), "sys");
+    }
+
+    #[test]
+    fn push_lines_creates_a_multi_line_entry() {
+        let mut t = Transcript::new();
+        let id = t.push_lines(vec![
+            Line::new(LineKind::Banner, "a"),
+            Line::new(LineKind::Banner, "b"),
+        ]);
+        t.push_entry(LineKind::User, Format::Plain, "z");
+        assert_eq!(t.len(), 3);
+        assert_eq!(t.entry_count(), 2);
+        assert_eq!(t.entry_lines(id.index()).len(), 2);
+        assert_eq!(t.line(2).unwrap().plain(), "z");
+    }
+
+    #[test]
+    fn replace_rewrites_one_entry_and_reindexes_the_rest() {
+        let mut t = Transcript::new();
+        t.push_entry(LineKind::User, Format::Plain, "antes");
+        let id = t.push_lines(vec![Line::new(LineKind::Banner, "x")]);
+        t.push_entry(LineKind::Assistant, Format::Plain, "despues");
+        let (r0, r1) = (t.entry_rev(0), t.entry_rev(1));
+        t.replace(
+            id,
+            vec![
+                Line::new(LineKind::Banner, "x1"),
+                Line::new(LineKind::Banner, "x2"),
+                Line::new(LineKind::Banner, "x3"),
+            ],
+        );
+        assert_eq!(t.entry_rev(0), r0);
+        assert!(t.entry_rev(1) > r1);
+        assert_eq!(t.len(), 5);
+        assert_eq!(t.entry_start(2), 4);
+        assert_eq!(t.line(4).unwrap().plain(), "despues");
+        t.replace(id, Vec::new());
+        assert_eq!(t.len(), 2);
+        assert_eq!(t.line(1).unwrap().plain(), "despues");
     }
 }

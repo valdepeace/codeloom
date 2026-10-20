@@ -20,7 +20,12 @@ pub fn render(frame: &mut Frame, area: Rect, title: &str, changes: &FileChanges,
 
     let width = area.width as usize;
     let room = area.height.saturating_sub(1) as usize;
-    for c in changes.iter().take(room) {
+    let visible = if changes.len() > room {
+        room.saturating_sub(1)
+    } else {
+        room
+    };
+    for c in changes.iter().take(visible) {
         let counts = format!(" +{} -{}", c.added, c.removed);
         let used = counts.chars().count();
         lines.push(Line::from(vec![
@@ -31,6 +36,13 @@ pub fn render(frame: &mut Frame, area: Rect, title: &str, changes: &FileChanges,
             Span::styled(format!(" +{}", c.added), theme.style(StyleToken::Success)),
             Span::styled(format!(" -{}", c.removed), theme.style(StyleToken::Error)),
         ]));
+    }
+    let hidden = changes.len().saturating_sub(visible);
+    if hidden > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("… +{hidden} more files"),
+            theme.style(StyleToken::Muted),
+        )));
     }
 
     frame.render_widget(Paragraph::new(lines), area);
@@ -86,6 +98,21 @@ mod tests {
         });
         let out = buffer(&c, 20, 4);
         assert!(out.contains('…'));
+    }
+
+    #[test]
+    fn reports_files_hidden_by_short_sidebar() {
+        let mut c = FileChanges::new();
+        for index in 0..5 {
+            c.upsert(FileChange {
+                path: format!("src/{index}.rs"),
+                added: 1,
+                removed: 0,
+            });
+        }
+        let out = buffer(&c, 40, 3);
+        assert!(out.contains("src/0.rs"));
+        assert!(out.contains("+4 more files"));
     }
 
     #[test]

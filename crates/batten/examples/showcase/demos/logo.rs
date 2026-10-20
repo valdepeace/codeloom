@@ -13,6 +13,29 @@ pub struct LogoDemo {
     name: String,
 }
 
+pub struct DotLogoDemo;
+
+impl Demo for DotLogoDemo {
+    fn title(&self) -> &str {
+        "Batten dot wordmark"
+    }
+
+    fn hint(&self) -> &str {
+        "wordmark 5×7 de puntos · degradado del tema"
+    }
+
+    fn render(&mut self, f: &mut Frame, area: Rect, theme: &Theme) {
+        let lines = logo::batten_dot_wordmark(theme);
+        let [label, art] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
+        f.render_widget(Paragraph::new("Batten · matriz 5×7"), label);
+        f.render_widget(
+            Paragraph::new(lines).alignment(ratatui::layout::Alignment::Center),
+            art,
+        );
+    }
+}
+
 impl LogoDemo {
     pub fn new() -> Self {
         Self {

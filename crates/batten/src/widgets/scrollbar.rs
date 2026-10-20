@@ -14,7 +14,9 @@ pub fn render(frame: &mut Frame, area: Rect, scroll: Scroll, theme: &Theme) {
     let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
         .begin_symbol(None)
         .end_symbol(None)
-        .style(theme.style(StyleToken::Scrollbar));
+        .track_symbol(Some("│"))
+        .thumb_symbol("█")
+        .style(theme.style(StyleToken::Accent));
     frame.render_stateful_widget(bar, area, &mut state);
 }
 
@@ -54,6 +56,30 @@ mod tests {
             out.chars().any(|c| c != ' '),
             "la barra debe pintar alguna celda"
         );
+    }
+
+    #[test]
+    fn thumb_tracks_the_viewport_offset() {
+        let top = buffer(
+            1,
+            10,
+            Scroll {
+                offset: 0,
+                content: 100,
+                viewport: 10,
+            },
+        );
+        let bottom = buffer(
+            1,
+            10,
+            Scroll {
+                offset: 90,
+                content: 100,
+                viewport: 10,
+            },
+        );
+        assert_eq!(top.find('█'), Some(0));
+        assert!(bottom.find('█').unwrap() > top.find('█').unwrap());
     }
 
     #[test]

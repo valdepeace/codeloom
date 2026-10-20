@@ -1,14 +1,17 @@
 //! Estado del showcase: catálogo, selección y foco.
 
 use crate::demo::Demo;
-use crate::demos;
-use batten::widgets::Anim;
+use crate::demos::{self, CatalogItem};
+use batten::widgets::{Anim, ThemePreset};
 use ratatui::crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Index,
     Demo,
+    ProviderFilter,
+    TextFilter,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,10 +21,13 @@ pub enum Action {
 }
 
 pub struct Showcase {
-    demos: Vec<Box<dyn Demo>>,
+    demos: Vec<CatalogItem>,
     selected: usize,
     focus: Focus,
     quit: bool,
+    theme_preset: ThemePreset,
+    provider_filter: Option<&'static str>,
+    query: String,
 }
 
 impl Showcase {
@@ -31,6 +37,9 @@ impl Showcase {
             selected: 0,
             focus: Focus::Index,
             quit: false,
+            theme_preset: ThemePreset::Batten,
+            provider_filter: None,
+            query: String::new(),
         }
     }
 
@@ -38,15 +47,135 @@ impl Showcase {
         self.demos.len()
     }
 
-    pub fn title_at(&self, i: usize) -> Option<&str> {
-        self.demos.get(i).map(|d| d.title())
+    pub fn provider_filter(&self) -> Option<&str> {
+        self.provider_filter
+    }
+
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+
+    pub fn providers(&self) -> Vec<&'static str> {
+        self.demos
+            .iter()
+            .map(|item| item.provider)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    pub fn filtered_indices(&self) -> Vec<usize> {
+        let query = self.query.to_lowercase();
+        self.demos
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                let provider_matches = self
+                    .provider_filter
+                    .is_none_or(|provider| item.provider == provider);
+                let query_matches = query.is_empty()
+                    || [item.provider, item.component, item.variant]
+                        .iter()
+                        .any(|value| value.to_lowercase().contains(&query));
+                (provider_matches && query_matches).then_some(index)
+            })
+            .collect()
+    }
+
+    pub fn index_rows(&self) -> Vec<(Option<usize>, String)> {
+        let mut rows = Vec::new();
+        let mut last_component = None;
+        for index in self.filtered_indices() {
+            let component = self.demos[index].component;
+            if last_component != Some(component) {
+                rows.push((None, format!("{component} ─")));
+                last_component = Some(component);
+            }
+            rows.push((Some(index), self.demos[index].variant.to_string()));
+        }
+        if rows.is_empty() {
+            rows.push((None, "Sin resultados".to_string()));
+        }
+        rows
+    }
+
+    pub fn visible_index_rows(&self, height: u16) -> (usize, Vec<(Option<usize>, String)>) {
+        let rows = self.index_rows();
+        let selected_row = rows
+            .iter()
+            .position(|(index, _)| *index == Some(self.selected))
+            .unwrap_or(0);
+        let height = usize::from(height);
+        let start = selected_row
+            .saturating_sub(height / 2)
+            .min(rows.len().saturating_sub(height));
+        (start, rows.into_iter().skip(start).take(height).collect())
+    }
+
+    pub fn select(&mut self, index: usize, open: bool) {
+        if index < self.demos.len() {
+            self.selected = index;
+            if open {
+                self.focus = Focus::Demo;
+            }
+        }
+    }
+
+    pub fn select_provider(&mut self, provider: Option<&'static str>) {
+        self.provider_filter = provider;
+        self.keep_selection_visible();
+    }
+
+    pub fn cycle_provider(&mut self, backwards: bool) {
+        let mut choices = vec![None];
+        choices.extend(self.providers().into_iter().map(Some));
+        let current = choices
+            .iter()
+            .position(|choice| *choice == self.provider_filter)
+            .unwrap_or(0);
+        let next = if backwards {
+            (current + choices.len() - 1) % choices.len()
+        } else {
+            (current + 1) % choices.len()
+        };
+        self.select_provider(choices[next]);
+    }
+
+    fn keep_selection_visible(&mut self) {
+        let filtered = self.filtered_indices();
+        if !filtered.contains(&self.selected) {
+            self.selected = filtered.first().copied().unwrap_or(0);
+        }
+    }
+
+    pub fn push_query(&mut self, character: char) {
+        self.query.push(character);
+        self.keep_selection_visible();
+    }
+
+    pub fn pop_query(&mut self) {
+        self.query.pop();
+        self.keep_selection_visible();
+    }
+
+    pub fn clear_query(&mut self) {
+        self.query.clear();
+        self.keep_selection_visible();
+    }
+
+    pub fn component_at(&self, i: usize) -> Option<&str> {
+        self.demos.get(i).map(|d| d.component)
+    }
+
+    pub fn variant_at(&self, i: usize) -> Option<&str> {
+        self.demos.get(i).map(|d| d.variant)
     }
 
     /// Pista de teclas del demo activo.
     pub fn current_hint(&self) -> &str {
         self.demos
             .get(self.selected)
-            .map(|d| d.hint())
+            .map(|d| d.demo.hint())
             .unwrap_or("")
     }
 
@@ -62,29 +191,63 @@ impl Showcase {
         self.quit
     }
 
+    pub fn theme_preset(&self) -> ThemePreset {
+        self.theme_preset
+    }
+
+    fn cycle_theme(&mut self, backwards: bool) {
+        let presets = ThemePreset::ALL;
+        let current = presets
+            .iter()
+            .position(|preset| *preset == self.theme_preset)
+            .unwrap_or(0);
+        let next = if backwards {
+            (current + presets.len() - 1) % presets.len()
+        } else {
+            (current + 1) % presets.len()
+        };
+        self.theme_preset = presets[next];
+    }
+
     /// Mueve la selección una posición abajo (con tope) y vuelve el foco al índice.
     pub fn next(&mut self) {
-        if self.selected + 1 < self.demos.len() {
-            self.selected += 1;
+        let filtered = self.filtered_indices();
+        if let Some(position) = filtered.iter().position(|index| *index == self.selected) {
+            if position + 1 < filtered.len() {
+                self.selected = filtered[position + 1];
+            }
+        } else if let Some(first) = filtered.first() {
+            self.selected = *first;
         }
         self.focus = Focus::Index;
     }
 
     /// Mueve la selección una posición arriba (con tope) y vuelve el foco al índice.
     pub fn prev(&mut self) {
-        self.selected = self.selected.saturating_sub(1);
+        let filtered = self.filtered_indices();
+        if let Some(position) = filtered.iter().position(|index| *index == self.selected) {
+            self.selected = filtered[position.saturating_sub(1)];
+        } else if let Some(first) = filtered.first() {
+            self.selected = *first;
+        }
         self.focus = Focus::Index;
     }
 
     pub fn toggle_focus(&mut self) {
         self.focus = match self.focus {
             Focus::Index => Focus::Demo,
-            Focus::Demo => Focus::Index,
+            _ => Focus::Index,
         };
     }
 
+    pub fn set_focus(&mut self, focus: Focus) {
+        self.focus = focus;
+    }
+
     pub fn current(&mut self) -> Option<&mut Box<dyn Demo>> {
-        self.demos.get_mut(self.selected)
+        self.demos
+            .get_mut(self.selected)
+            .map(|entry| &mut entry.demo)
     }
 
     /// Avanza la animación del demo activo.
@@ -102,10 +265,21 @@ impl Showcase {
     #[cfg(test)]
     pub(crate) fn with_demos(demos: Vec<Box<dyn Demo>>) -> Self {
         Self {
-            demos,
+            demos: demos
+                .into_iter()
+                .map(|demo| CatalogItem {
+                    component: "Tests",
+                    variant: "Test",
+                    provider: "Test",
+                    demo,
+                })
+                .collect(),
             selected: 0,
             focus: Focus::Index,
             quit: false,
+            theme_preset: ThemePreset::Batten,
+            provider_filter: None,
+            query: String::new(),
         }
     }
 }
@@ -118,6 +292,10 @@ pub fn route(show: &mut Showcase, kind: KeyEventKind, code: KeyCode, mods: KeyMo
     if mods.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('c') {
         show.quit = true;
         return Action::Quit;
+    }
+    if code == KeyCode::F(7) {
+        show.cycle_theme(mods.contains(KeyModifiers::SHIFT));
+        return Action::None;
     }
     match show.focus {
         Focus::Index => match code {
@@ -133,9 +311,65 @@ pub fn route(show: &mut Showcase, kind: KeyEventKind, code: KeyCode, mods: KeyMo
                 show.toggle_focus();
                 Action::None
             }
+            KeyCode::Char('/') => {
+                show.focus = Focus::TextFilter;
+                Action::None
+            }
+            KeyCode::Char('p') => {
+                show.focus = Focus::ProviderFilter;
+                Action::None
+            }
             KeyCode::Char('q') => {
                 show.quit = true;
                 Action::Quit
+            }
+            _ => Action::None,
+        },
+        Focus::ProviderFilter => match code {
+            KeyCode::Left => {
+                show.cycle_provider(true);
+                Action::None
+            }
+            KeyCode::Right => {
+                show.cycle_provider(false);
+                Action::None
+            }
+            KeyCode::Tab | KeyCode::Enter => {
+                show.focus = Focus::TextFilter;
+                Action::None
+            }
+            KeyCode::Esc => {
+                show.focus = Focus::Index;
+                Action::None
+            }
+            _ => Action::None,
+        },
+        Focus::TextFilter => match code {
+            KeyCode::Char(c) if !mods.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                show.push_query(c);
+                Action::None
+            }
+            KeyCode::Backspace => {
+                show.pop_query();
+                Action::None
+            }
+            KeyCode::Enter | KeyCode::Tab => {
+                show.focus = Focus::Index;
+                Action::None
+            }
+            KeyCode::Esc => {
+                show.clear_query();
+                show.focus = Focus::Index;
+                Action::None
+            }
+            KeyCode::Up | KeyCode::Down => {
+                show.focus = Focus::Index;
+                if code == KeyCode::Up {
+                    show.prev();
+                } else {
+                    show.next();
+                }
+                Action::None
             }
             _ => Action::None,
         },

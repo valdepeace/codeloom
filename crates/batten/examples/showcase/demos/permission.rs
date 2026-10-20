@@ -92,7 +92,7 @@ impl Demo for PermissionDemo {
             e.process(
                 FxDuration::from_millis(50),
                 f.buffer_mut(),
-                permission::area(area),
+                permission::area(area, &self.dialogs[self.current]),
             );
         }
     }

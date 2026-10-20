@@ -1,6 +1,7 @@
 //! Estado puro: sin ratatui, sin crossterm.
 
 pub mod composer;
+pub mod composer_layout;
 pub mod diff;
 pub mod file_changes;
 pub mod history;
@@ -12,10 +13,12 @@ pub mod stream;
 pub mod toast;
 pub mod tone;
 pub mod tool;
+pub mod tool_lines;
 pub mod transcript;
 pub mod viewport;
 
 pub use composer::Composer;
+pub use composer_layout::{layout as composer_layout, ComposerLayout, VisualRow};
 pub use diff::{Diff, DiffKind, DiffLine};
 pub use file_changes::{FileChange, FileChanges};
 pub use history::History;
@@ -26,5 +29,6 @@ pub use stream::Stream;
 pub use toast::{Toast, Toasts};
 pub use tone::Tone;
 pub use tool::{ToolItem, ToolStatus};
+pub use tool_lines::tool_lines;
 pub use transcript::{EntryId, Format, Line, LineKind, LinkSpec, SpanSpec, StyleToken, Transcript};
 pub use viewport::{Scroll, Viewport};

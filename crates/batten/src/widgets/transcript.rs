@@ -1,9 +1,10 @@
 //! Vista del transcript: ventana visible + scroll + wraps CJK-aware.
 
-use crate::state::{Line, LineKind, Selection, StyleToken, Transcript, Viewport};
+use crate::state::{Line, LineKind, Selection, StyleToken, ToolStatus, Transcript, Viewport};
 use crate::widgets::Theme;
 use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as TLine, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
@@ -12,8 +13,7 @@ use unicode_width::UnicodeWidthStr;
 
 fn prefix(kind: LineKind) -> &'static str {
     match kind {
-        LineKind::User => "you: ",
-        LineKind::Assistant => "loom: ",
+        LineKind::User | LineKind::Assistant => "",
         LineKind::System => "sys: ",
         LineKind::Thinking => "… ",
         LineKind::ToolCall | LineKind::ToolResult => "⚙ ",
@@ -21,6 +21,9 @@ fn prefix(kind: LineKind) -> &'static str {
         LineKind::Plan => "plan: ",
         LineKind::Banner => "",
         LineKind::Error => "! ",
+        LineKind::ToolHead(_) => "● ",
+        LineKind::ToolBody => "│ ",
+        LineKind::ToolMore => "  ",
     }
 }
 
@@ -35,20 +38,42 @@ fn kind_token(kind: LineKind) -> StyleToken {
         LineKind::Plan => StyleToken::Heading,
         LineKind::Banner => StyleToken::Accent,
         LineKind::Error => StyleToken::Error,
+        LineKind::ToolHead(status) => match status {
+            ToolStatus::Pending => StyleToken::ToolPending,
+            ToolStatus::Running => StyleToken::ToolRunning,
+            ToolStatus::Success => StyleToken::ToolSuccess,
+            ToolStatus::Error => StyleToken::ToolError,
+            ToolStatus::Canceled => StyleToken::ToolCanceled,
+            ToolStatus::AwaitingPermission => StyleToken::Warning,
+        },
+        LineKind::ToolBody => StyleToken::Muted,
+        LineKind::ToolMore => StyleToken::Dim,
     }
 }
 
 /// Convierte una `Line` de estado en lineas ratatui, aplicando los `span` por
 /// offsets sobre el texto plano (los huecos usan el token del kind).
-fn render_line(line: &Line, theme: &Theme) -> Vec<TLine<'static>> {
+fn render_line(line: &Line, theme: &Theme, entry_start: bool) -> Vec<TLine<'static>> {
     let base = theme.style(kind_token(line.kind));
-    let prefix_text = prefix(line.kind);
+    let role = match (entry_start, line.kind) {
+        (true, LineKind::User) => Some(("You", theme.styles.user)),
+        (true, LineKind::Assistant) => Some(("Assistant", theme.styles.assistant)),
+        _ => None,
+    };
     let text = line.plain();
-    let mut spans: Vec<Span> = vec![Span::styled(prefix_text.to_string(), base)];
+    let mut rendered = Vec::new();
+    if let Some((label, style)) = role {
+        rendered.push(TLine::from(Span::styled(
+            label,
+            style.add_modifier(Modifier::BOLD),
+        )));
+    }
+    let mut spans: Vec<Span> = vec![Span::styled(prefix(line.kind).to_string(), base)];
 
     if line.spans.is_empty() {
         spans.push(Span::styled(text.to_string(), base));
-        return vec![TLine::from(spans)];
+        rendered.push(TLine::from(spans));
+        return rendered;
     }
 
     let mut spans_sorted = line.spans.clone();
@@ -72,12 +97,13 @@ fn render_line(line: &Line, theme: &Theme) -> Vec<TLine<'static>> {
     if cursor < text.len() {
         spans.push(Span::styled(text[cursor..].to_string(), base));
     }
-    vec![TLine::from(spans)]
+    rendered.push(TLine::from(spans));
+    rendered
 }
 
 /// Altura en filas de una línea a `width` columnas (mínimo 1).
-fn measure(line: &Line, width: u16, theme: &Theme) -> usize {
-    Paragraph::new(render_line(line, theme))
+fn measure(line: &Line, width: u16, theme: &Theme, entry_start: bool) -> usize {
+    Paragraph::new(render_line(line, theme, entry_start))
         .wrap(Wrap { trim: false })
         .line_count(width)
         .max(1)
@@ -123,7 +149,8 @@ impl Layout {
             let heights = transcript
                 .entry_lines(i)
                 .iter()
-                .map(|l| measure(l, width, theme))
+                .enumerate()
+                .map(|(line, l)| measure(l, width, theme, line == 0))
                 .collect();
             self.measured += 1;
             let layout = EntryLayout { rev, heights };
@@ -219,9 +246,15 @@ fn apply_links(
     while i < transcript.len() && layout.row_of(i) < bottom {
         let (start, h) = (layout.row_of(i), layout.height_of(i));
         if let Some(line) = transcript.line(i) {
-            if !line.links.is_empty() && start >= top && start + h <= bottom {
-                let y0 = area.y + (start - top) as u16;
-                link_line(buf, area, y0, h as u16, line);
+            let header = usize::from(
+                transcript.locate(i).is_some_and(|(_, row)| row == 0)
+                    && matches!(line.kind, LineKind::User | LineKind::Assistant),
+            );
+            let body_start = start + header;
+            let body_height = h.saturating_sub(header);
+            if !line.links.is_empty() && body_start >= top && body_start + body_height <= bottom {
+                let y0 = area.y + (body_start - top) as u16;
+                link_line(buf, area, y0, body_height as u16, line);
             }
         }
         i += 1;
@@ -391,7 +424,8 @@ pub fn render(
         let mut i = first;
         while i < transcript.len() && filled < rows + skip {
             if let Some(line) = transcript.line(i) {
-                let mut out = render_line(line, theme);
+                let entry_start = transcript.locate(i).is_some_and(|(_, line)| line == 0);
+                let mut out = render_line(line, theme, entry_start);
                 if selection.is_some_and(|s| s.contains(i)) {
                     for tl in &mut out {
                         tl.style = tl.style.patch(sel_style);
@@ -428,6 +462,94 @@ pub fn render(
     }
 }
 
+/// Rol de mensaje de la vista Pawan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PawanRole {
+    User,
+    Assistant,
+    System,
+    Tool,
+    Error,
+}
+
+/// Mensaje de ejemplo para el renderer Pawan.
+pub struct PawanMessage<'a> {
+    pub role: PawanRole,
+    pub elapsed: &'a str,
+    pub content: &'a str,
+    pub streaming: bool,
+}
+
+/// Renderiza mensajes Pawan con badge de rol, tiempo y contenido indentado.
+pub fn render_pawan(frame: &mut Frame, area: Rect, messages: &[PawanMessage<'_>]) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let muted = Style::default().fg(Color::Rgb(136, 136, 136));
+    let mut lines = Vec::new();
+    for (index, message) in messages.iter().enumerate() {
+        if index > 0 {
+            lines.push(TLine::raw(""));
+        }
+        let (label, badge_color) = match message.role {
+            PawanRole::User => (" You ", Color::Rgb(0, 204, 204)),
+            PawanRole::Assistant => (" Pawan ", Color::Rgb(80, 250, 123)),
+            PawanRole::System => (" System ", Color::Rgb(255, 184, 108)),
+            PawanRole::Tool => (" Tool ", Color::Rgb(0, 153, 153)),
+            PawanRole::Error => (" Error ", Color::Rgb(255, 85, 85)),
+        };
+        lines.push(TLine::from(vec![
+            Span::styled(
+                label,
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(badge_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("  {}", message.elapsed), muted),
+        ]));
+        lines.extend(message.content.lines().map(|line| {
+            TLine::from(vec![
+                Span::raw("  "),
+                Span::styled(line.to_string(), Style::default().fg(Color::White)),
+            ])
+        }));
+        if message.streaming {
+            lines.push(TLine::from(Span::styled(
+                "  ▌",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::SLOW_BLINK),
+            )));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+/// Estado de generación sin bloques, como el spinner de "Pawan is thinking…".
+pub fn render_pawan_waiting(frame: &mut Frame, area: Rect, anim: &crate::widgets::Anim) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let glyph = anim.glyph(
+        crate::widgets::spinner::PULSE,
+        &Theme::preset(crate::widgets::ThemePreset::Pawan),
+    );
+    frame.render_widget(
+        Paragraph::new(TLine::from(vec![
+            Span::raw("  "),
+            glyph,
+            Span::styled(
+                " Pawan is thinking…",
+                Style::default()
+                    .fg(Color::Rgb(255, 184, 108))
+                    .add_modifier(Modifier::ITALIC),
+            ),
+        ])),
+        area,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -458,14 +580,32 @@ mod tests {
     }
 
     #[test]
-    fn shows_user_and_assistant_prefixes() {
+    fn shows_crush_style_role_headers() {
         let mut t = Transcript::new();
         t.push(Line::new(LineKind::User, "hola"));
         t.push(Line::new(LineKind::Assistant, "buenas"));
         let out = buffer(&t, 40, 10);
-        assert!(out.contains("you:"));
+        assert!(out.contains("You"));
+        assert!(out.contains("Assistant"));
+        assert!(!out.contains("loom:"));
         assert!(out.contains("hola"));
         assert!(out.contains("buenas"));
+    }
+
+    #[test]
+    fn tool_entries_paint_a_prefix_that_is_not_part_of_the_text() {
+        use crate::state::{tool_lines, ToolItem};
+        let mut item = ToolItem::new("c1", "View");
+        item.set_summary("src/lib.rs");
+        item.set_result(false);
+        item.set_output("uno\ndos");
+        let mut t = Transcript::new();
+        t.push_lines(tool_lines(&item));
+        let out = buffer(&t, 40, 5);
+        assert!(out.contains("● View"), "falta la cabecera de la tool");
+        assert!(out.contains("│ uno"), "falta el cuerpo de la tool");
+        assert!(!t.line(0).unwrap().plain().contains('●'));
+        assert!(!t.line(1).unwrap().plain().contains('│'));
     }
 
     #[test]
@@ -517,10 +657,8 @@ mod tests {
             t.push(Line::new(LineKind::Assistant, format!("line {i}")));
         }
         let out = buffer(&t, 20, 5);
-        assert!(
-            out.contains('\u{2551}') || out.contains('\u{2588}'),
-            "esperaba una barra de scroll"
-        );
+        assert!(out.contains('│'), "falta la pista de la barra");
+        assert!(out.contains('█'), "falta el thumb de la barra");
     }
 
     #[test]
@@ -557,8 +695,8 @@ mod tests {
             t.push(Line::new(LineKind::Assistant, format!("line {i:02}")));
         }
         let after = draw(&t, &mut vp, &mut layout, 30, 5);
-        assert!(before.contains("line 35"));
-        assert!(after.contains("line 35"));
+        assert!(before.contains("line 42"));
+        assert!(after.contains("line 42"));
         assert!(!after.contains("line 69"));
     }
 
@@ -676,9 +814,9 @@ mod tests {
     #[test]
     fn line_at_row_handles_multi_row_lines() {
         let mut t = Transcript::new();
-        t.push(Line::new(LineKind::Assistant, "corta"));
-        t.push(Line::new(LineKind::Assistant, "palabra ".repeat(10)));
-        t.push(Line::new(LineKind::Assistant, "otra"));
+        t.push(Line::new(LineKind::Banner, "corta"));
+        t.push(Line::new(LineKind::Banner, "palabra ".repeat(10)));
+        t.push(Line::new(LineKind::Banner, "otra"));
         let mut layout = Layout::new();
         layout.sync(&t, 20, &Theme::test());
         let h1 = layout.height_of(1);

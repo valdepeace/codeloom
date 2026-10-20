@@ -29,14 +29,18 @@ const PERMISSION_ANSWER: &str = "Hecho: target/ limpio.";
 enum Step {
     ToolStart(&'static str),
     ToolDone,
+    Thinking,
     AwaitPermission(&'static str),
     Delta(String),
     Flush,
 }
 
 fn answer_steps(text: &str) -> Vec<Step> {
-    text.split_inclusive(' ')
-        .map(|w| Step::Delta(w.to_string()))
+    std::iter::once(Step::Thinking)
+        .chain(
+            text.split_inclusive(' ')
+                .map(|w| Step::Delta(w.to_string())),
+        )
         .chain([Step::Flush])
         .collect()
 }
@@ -53,6 +57,7 @@ pub struct ChatDemo {
     script: VecDeque<Step>,
     dialog: Option<PermissionDialog>,
     anim: Anim,
+    thinking: bool,
     paused: bool,
     wait: u32,
     focus_transcript: bool,
@@ -75,6 +80,7 @@ impl ChatDemo {
             script: VecDeque::new(),
             dialog: None,
             anim: Anim::new(),
+            thinking: false,
             paused: false,
             wait: 0,
             focus_transcript: false,
@@ -115,13 +121,18 @@ impl ChatDemo {
             Step::ToolStart(name) => {
                 let mut t = ToolItem::new("demo", name);
                 t.start();
+                t.set_summary("leyendo README.md");
                 self.tool = Some(t);
             }
             Step::ToolDone => {
                 if let Some(t) = self.tool.as_mut() {
                     t.set_result(false);
+                    t.set_output(
+                        "24 líneas · Rust · Ratatui\nTranscript con Markdown\nComposer multilínea",
+                    );
                 }
             }
+            Step::Thinking => self.thinking = true,
             Step::AwaitPermission(cmd) => {
                 if let Some(t) = self.tool.as_mut() {
                     t.await_permission();
@@ -132,16 +143,22 @@ impl ChatDemo {
                     PermissionBody::Text(cmd.into()),
                 ));
             }
-            Step::Delta(s) => match self.answer {
-                Some(id) => self.transcript.append(id, &s),
-                None => {
-                    let id = self
-                        .transcript
-                        .push_entry(LineKind::Assistant, Format::Markdown, s);
-                    self.answer = Some(id);
+            Step::Delta(s) => {
+                self.thinking = false;
+                match self.answer {
+                    Some(id) => self.transcript.append(id, &s),
+                    None => {
+                        let id =
+                            self.transcript
+                                .push_entry(LineKind::Assistant, Format::Markdown, s);
+                        self.answer = Some(id);
+                    }
                 }
-            },
-            Step::Flush => self.answer = None,
+            }
+            Step::Flush => {
+                self.answer = None;
+                self.thinking = false;
+            }
         }
     }
 
@@ -167,7 +184,7 @@ impl Demo for ChatDemo {
     }
 
     fn hint(&self) -> &str {
-        "Enter: turno · Ctrl+J salto · F6 permiso · F5 foco chat · F2 reinicia · F3 pausa · F4 paso"
+        "Enter: turno · x: expandir salida · Ctrl+J salto · F6 permiso · F5 foco · F2 reinicia · F3 pausa · F4 paso"
     }
 
     fn tick(&mut self, anim: &Anim) {
@@ -190,8 +207,14 @@ impl Demo for ChatDemo {
         } else {
             (area, None)
         };
+        let tool_height = if self.tool.as_ref().is_some_and(|tool| tool.expanded) {
+            6
+        } else {
+            3
+        };
         let rows = Layout::vertical([
-            Constraint::Length(2),
+            Constraint::Length(tool_height),
+            Constraint::Length(1),
             Constraint::Min(1),
             Constraint::Length(3),
         ])
@@ -199,16 +222,19 @@ impl Demo for ChatDemo {
         if let Some(t) = &self.tool {
             tool_item::render(f, rows[0], t, &self.anim, theme);
         }
+        if self.thinking {
+            batten::widgets::render_thinking(f, rows[1], "thinking…", &self.anim, theme);
+        }
         transcript::render(
             f,
-            rows[1],
+            rows[2],
             &self.transcript,
             &mut self.viewport,
             &mut self.layout,
             None,
             theme,
         );
-        composer::render_focused(f, rows[2], &self.composer, !self.focus_transcript, theme);
+        composer::render_focused(f, rows[3], &self.composer, !self.focus_transcript, theme);
         if let Some(s) = side {
             sidebar::render(f, s, &self.sidebar, theme);
         }
@@ -272,6 +298,11 @@ impl Demo for ChatDemo {
         }
         match code {
             KeyCode::F(6) => self.start_permission_turn(),
+            KeyCode::Char('x') if self.tool.is_some() => {
+                if let Some(tool) = self.tool.as_mut() {
+                    tool.toggle_expanded();
+                }
+            }
             KeyCode::F(2) => *self = Self::new(),
             KeyCode::F(3) => self.paused = !self.paused,
             KeyCode::F(4) => self.step(),

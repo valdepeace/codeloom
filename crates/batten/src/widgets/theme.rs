@@ -123,6 +123,47 @@ pub enum ColorDepth {
     NoColor,
 }
 
+/// Variante de presentación del composer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComposerStyle {
+    /// Caja redondeada con título y pie (comportamiento histórico).
+    Classic,
+    /// Sin marco, prompt `> ` y `::: ` por línea, con wrap y scroll vertical.
+    Crush,
+}
+
+/// Dónde se presentan las llamadas a herramientas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolStyle {
+    /// Tarjeta fija junto al composer (solo la última).
+    Pinned,
+    /// Entradas dentro del transcript, en orden cronológico.
+    Inline,
+}
+
+/// Presentación de cada elemento; un preset es paleta más `Look`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Look {
+    pub composer: ComposerStyle,
+    pub tool: ToolStyle,
+}
+
+impl Look {
+    pub const fn classic() -> Self {
+        Self {
+            composer: ComposerStyle::Classic,
+            tool: ToolStyle::Pinned,
+        }
+    }
+
+    pub const fn crush() -> Self {
+        Self {
+            composer: ComposerStyle::Crush,
+            tool: ToolStyle::Inline,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Theme {
     pub styles: Styles,
@@ -131,6 +172,41 @@ pub struct Theme {
     pub depth: ColorDepth,
     /// Pintar los enlaces como hipervínculos OSC 8.
     pub hyperlinks: bool,
+    /// Presentación del composer y de las herramientas.
+    pub look: Look,
+}
+
+/// Paletas de referencia disponibles en Batten y su showcase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThemePreset {
+    Batten,
+    Martty,
+    Mindfork,
+    Pawan,
+    Crush,
+    MastraCode,
+}
+
+impl ThemePreset {
+    pub const ALL: [Self; 6] = [
+        Self::Batten,
+        Self::Martty,
+        Self::Mindfork,
+        Self::Pawan,
+        Self::Crush,
+        Self::MastraCode,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Batten => "Batten",
+            Self::Martty => "Martty",
+            Self::Mindfork => "Mindfork",
+            Self::Pawan => "Pawan",
+            Self::Crush => "Crush · Charmtone",
+            Self::MastraCode => "MastraCode",
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -178,6 +254,119 @@ fn parse_color(s: &str) -> Result<Color, ThemeError> {
 }
 
 impl Theme {
+    /// Paleta de terminal inspirada en un proyecto de referencia.
+    /// Los componentes y el layout siguen siendo los de Batten.
+    pub fn preset(preset: ThemePreset) -> Self {
+        use ThemePreset::*;
+
+        let mut theme = Self::default_dark();
+        let (bg, fg, muted, accent, user, assistant, warning, error, success, border) = match preset
+        {
+            Batten => return theme,
+            // Martty's DEFAULT_DARK DeepSeek token map.
+            Martty => (
+                Color::Rgb(15, 17, 21),
+                Color::Rgb(237, 243, 254),
+                Color::Rgb(151, 157, 166),
+                Color::Rgb(86, 134, 254),
+                Color::Rgb(103, 158, 254),
+                Color::Rgb(78, 209, 126),
+                Color::Rgb(247, 173, 49),
+                Color::Rgb(242, 90, 90),
+                Color::Rgb(78, 209, 126),
+                Color::Rgb(44, 44, 46),
+            ),
+            // Mindfork's dark palette roles over CANVAS_DARK.
+            Mindfork => (
+                Color::Rgb(15, 17, 21),
+                Color::Rgb(201, 204, 210),
+                Color::Rgb(133, 139, 146),
+                Color::Rgb(220, 175, 97),
+                Color::Rgb(121, 169, 219),
+                Color::Rgb(111, 192, 130),
+                Color::Rgb(220, 175, 97),
+                Color::Rgb(223, 105, 92),
+                Color::Rgb(111, 192, 130),
+                Color::Rgb(54, 58, 66),
+            ),
+            // Pawan's built-in DEFAULT Ratatui palette.
+            Pawan => (
+                Color::Rgb(0, 0, 0),
+                Color::Rgb(255, 255, 255),
+                Color::Rgb(136, 136, 136),
+                Color::Rgb(0, 204, 204),
+                Color::Rgb(0, 204, 204),
+                Color::Rgb(230, 230, 230),
+                Color::Rgb(255, 184, 108),
+                Color::Rgb(255, 85, 85),
+                Color::Rgb(80, 250, 123),
+                Color::Rgb(68, 68, 68),
+            ),
+            // Crush's Charmtone Pantera tokens from charmtoneOpts.
+            Crush => (
+                Color::Rgb(32, 31, 38),
+                Color::Rgb(241, 239, 239),
+                Color::Rgb(191, 188, 200),
+                Color::Rgb(107, 80, 255),
+                Color::Rgb(107, 80, 255),
+                Color::Rgb(241, 239, 239),
+                Color::Rgb(245, 239, 52),
+                Color::Rgb(235, 66, 104),
+                Color::Rgb(0, 255, 178),
+                Color::Rgb(45, 44, 53),
+            ),
+            // MastraCode's darkSurface and darkTheme source-map values.
+            MastraCode => (
+                Color::Rgb(2, 2, 2),
+                Color::Rgb(250, 250, 250),
+                Color::Rgb(140, 140, 148),
+                Color::Rgb(98, 246, 157),
+                Color::Rgb(250, 250, 250),
+                Color::Rgb(217, 217, 220),
+                Color::Rgb(245, 158, 11),
+                Color::Rgb(239, 68, 68),
+                Color::Rgb(98, 246, 157),
+                Color::Rgb(63, 63, 70),
+            ),
+        };
+
+        theme.styles.default = Style::default().fg(fg).bg(bg);
+        theme.styles.muted = Style::default().fg(muted);
+        theme.styles.dim = Style::default().fg(muted);
+        theme.styles.heading = Style::default().fg(fg).add_modifier(Modifier::BOLD);
+        theme.styles.user = Style::default().fg(user);
+        theme.styles.assistant = Style::default().fg(assistant);
+        theme.styles.system = Style::default().fg(muted);
+        theme.styles.error = Style::default().fg(error);
+        theme.styles.warning = Style::default().fg(warning);
+        theme.styles.success = Style::default().fg(success);
+        theme.styles.tool_name = Style::default().fg(fg).add_modifier(Modifier::BOLD);
+        theme.styles.tool_pending = Style::default().fg(muted);
+        theme.styles.tool_running = Style::default().fg(accent);
+        theme.styles.tool_success = Style::default().fg(success);
+        theme.styles.tool_error = Style::default().fg(error);
+        theme.styles.tool_canceled = Style::default().fg(muted);
+        theme.styles.todo_pending = Style::default().fg(muted);
+        theme.styles.todo_in_progress = Style::default().fg(accent);
+        theme.styles.todo_completed = Style::default().fg(success);
+        theme.styles.accent = Style::default().fg(accent);
+        theme.styles.accent_from = Style::default().fg(accent);
+        theme.styles.accent_to = Style::default().fg(user);
+        theme.styles.border = Style::default().fg(border);
+        theme.styles.scrollbar = Style::default().fg(border);
+        theme.styles.logo_field = Style::default().fg(muted);
+        theme.styles.selection = Style::default().bg(border);
+        theme.styles.diff_insert = Style::default().fg(success);
+        theme.styles.diff_delete = Style::default().fg(error);
+        theme.styles.diff_hunk = Style::default().fg(accent);
+        theme.styles.code = Style::default().fg(accent);
+        theme.glyphs.tool_pending = '●';
+        if preset == Crush {
+            theme.look = Look::crush();
+        }
+        theme
+    }
+
     pub fn default_dark() -> Self {
         Self {
             styles: Styles::default(),
@@ -185,6 +374,7 @@ impl Theme {
             extensions: BTreeMap::new(),
             depth: ColorDepth::TrueColor,
             hyperlinks: true,
+            look: Look::classic(),
         }
     }
 
@@ -532,5 +722,24 @@ mod tests {
         th.depth = ColorDepth::Ansi16;
         let c = th.adapt(Color::Rgb(0, 212, 255));
         assert!(c.is_some() && !matches!(c, Some(Color::Rgb(..)) | Some(Color::Indexed(_))));
+    }
+
+    #[test]
+    fn only_the_crush_preset_has_its_own_look() {
+        for preset in ThemePreset::ALL {
+            let theme = Theme::preset(preset);
+            let expected = if preset == ThemePreset::Crush {
+                Look::crush()
+            } else {
+                Look::classic()
+            };
+            assert_eq!(theme.look, expected, "{}", preset.name());
+        }
+        assert_eq!(Theme::default_dark().look, Look::classic());
+        assert_eq!(Theme::test().look, Look::classic());
+        assert_eq!(Look::crush().composer, ComposerStyle::Crush);
+        assert_eq!(Look::crush().tool, ToolStyle::Inline);
+        assert_eq!(Look::classic().composer, ComposerStyle::Classic);
+        assert_eq!(Look::classic().tool, ToolStyle::Pinned);
     }
 }

@@ -60,6 +60,7 @@ impl Theme {
                 TermProfile::NoColor | TermProfile::NoTty => ColorDepth::NoColor,
             },
             hyperlinks: self.hyperlinks,
+            look: self.look,
         }
     }
 }

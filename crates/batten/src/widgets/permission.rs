@@ -7,9 +7,11 @@ use super::panel::{render as render_panel, Panel};
 use super::theme::Theme;
 use crate::state::{PermissionBody, PermissionDialog, Tone};
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::text::Span;
-use ratatui::widgets::{Clear, Paragraph, Wrap};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthStr;
 
 const BUTTONS: [(&str, Tone); 3] = [
     ("Permitir", Tone::Success),
@@ -25,13 +27,43 @@ const HELP: [(&str, &str); 5] = [
     ("esc", "denegar"),
 ];
 
-/// Rectángulo del diálogo: 80 % del ancho (máx. 100) y 80 % del alto
-/// (mín. 8 filas), centrado y nunca mayor que la pantalla.
-pub fn area(screen: Rect) -> Rect {
-    let w = ((screen.width as u32 * 8 / 10) as u16).min(100);
-    let h = ((screen.height as u32 * 8 / 10) as u16)
-        .max(8)
+/// Rectángulo compacto, ampliado según el contenido y limitado a la pantalla.
+pub fn area(screen: Rect, dialog: &PermissionDialog) -> Rect {
+    let body_width = match &dialog.body {
+        PermissionBody::Text(text) => text.lines().map(UnicodeWidthStr::width).max().unwrap_or(0),
+        PermissionBody::Diff(diff) => diff
+            .lines()
+            .iter()
+            .map(|line| line.text.width())
+            .max()
+            .unwrap_or(0),
+    };
+    let wanted_width = 52usize
+        .max(body_width + 4)
+        .max(dialog.subtitle.width() + 4)
+        .max(dialog.tool.width() + 12)
+        .min(80) as u16;
+    let max_width = screen.width.saturating_sub(4).min(screen.width);
+    let w = wanted_width.min(max_width);
+    let inner_width = usize::from(w.saturating_sub(2)).max(1);
+    let body_lines = match &dialog.body {
+        PermissionBody::Text(text) => text
+            .split('\n')
+            .map(|line| line.width().max(1).div_ceil(inner_width))
+            .sum::<usize>(),
+        PermissionBody::Diff(diff) => diff
+            .lines()
+            .iter()
+            .map(|line| line.text.width().max(1).div_ceil(inner_width))
+            .sum::<usize>(),
+    }
+    .max(1)
+    .min(usize::from(u16::MAX)) as u16;
+    let wanted_height = 5 + u16::from(!dialog.subtitle.is_empty()) + body_lines;
+    let max_height = ((u32::from(screen.height) * 8 / 10) as u16)
+        .max(6)
         .min(screen.height);
+    let h = wanted_height.min(max_height);
     Rect {
         x: screen.x + (screen.width - w) / 2,
         y: screen.y + (screen.height - h) / 2,
@@ -42,7 +74,7 @@ pub fn area(screen: Rect) -> Rect {
 
 /// Pinta el diálogo sobre `screen` (limpia su área antes).
 pub fn render(frame: &mut Frame, screen: Rect, dialog: &PermissionDialog, theme: &Theme) {
-    let outer = area(screen);
+    let outer = area(screen, dialog);
     if outer.width < 2 || outer.height < 2 {
         return;
     }
@@ -84,6 +116,115 @@ pub fn render(frame: &mut Frame, screen: Rect, dialog: &PermissionDialog, theme:
     frame.render_widget(Paragraph::new(key_help(&HELP, help.width, theme)), help);
 }
 
+/// Pinta el diálogo de aprobación de Pawan: caja elevada de 66 columnas,
+/// argumentos en bloque y las teclas Y/N/A dentro de la última fila.
+pub fn render_pawan(frame: &mut Frame, screen: Rect, tool: &str, arguments: &str) -> Rect {
+    if screen.width < 40 || screen.height < 8 {
+        return Rect::default();
+    }
+    let width = 66.min(screen.width.saturating_sub(4)).min(screen.width);
+    let inner_width = width.saturating_sub(6).max(8) as usize;
+    let chars: Vec<char> = arguments.trim().chars().collect();
+    let arg_lines: Vec<String> = chars
+        .chunks(inner_width)
+        .take(3)
+        .map(|row| row.iter().collect())
+        .collect();
+    let mut text = vec![Line::from(vec![
+        Span::styled("tool  ", Style::default().fg(Color::Rgb(136, 136, 136))),
+        Span::styled(
+            tool,
+            Style::default()
+                .fg(Color::Rgb(0, 204, 204))
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])];
+    text.push(Line::from(""));
+    text.push(Line::styled(
+        "arguments",
+        Style::default().fg(Color::Rgb(136, 136, 136)),
+    ));
+    if arg_lines.is_empty() {
+        text.push(Line::styled(
+            "(none)",
+            Style::default()
+                .fg(Color::Rgb(42, 42, 42))
+                .add_modifier(Modifier::ITALIC),
+        ));
+    } else {
+        text.extend(
+            arg_lines
+                .iter()
+                .map(|line| Line::styled(line.clone(), Style::default().fg(Color::White))),
+        );
+        if chars.len() > inner_width * 3 {
+            if let Some(last) = text.last_mut() {
+                let mut truncated = last.spans[0].content.to_string();
+                truncated.pop();
+                truncated.push('…');
+                *last = Line::styled(truncated, Style::default().fg(Color::White));
+            }
+        }
+    }
+    text.push(Line::from(""));
+    let key = |label: &str, color: Color| {
+        Span::styled(
+            format!(" {label} "),
+            Style::default()
+                .fg(Color::Rgb(0, 0, 0))
+                .bg(color)
+                .add_modifier(Modifier::BOLD),
+        )
+    };
+    text.push(Line::from(vec![
+        key("Y", Color::Rgb(80, 250, 123)),
+        Span::styled(" Allow   ", Style::default().fg(Color::White)),
+        key("N", Color::Rgb(255, 85, 85)),
+        Span::styled(" Deny   ", Style::default().fg(Color::White)),
+        key("A", Color::Rgb(0, 204, 204)),
+        Span::styled(" Allow all", Style::default().fg(Color::White)),
+    ]));
+
+    let height = (text.len() as u16 + 4).min(screen.height.saturating_sub(2));
+    if height < 4 {
+        return Rect::default();
+    }
+    let popup = Rect::new(
+        screen.x + screen.width.saturating_sub(width) / 2,
+        screen.y + screen.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    let shadow = Rect::new(
+        popup.x.saturating_add(1),
+        popup.y.saturating_add(1),
+        width,
+        height,
+    );
+    if shadow.right() <= screen.right() && shadow.bottom() <= screen.bottom() {
+        frame.render_widget(Clear, shadow);
+        frame.render_widget(
+            Block::default().style(Style::default().bg(Color::Rgb(0, 0, 0))),
+            shadow,
+        );
+    }
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(Span::styled(
+            " ⚠  Permission Required ",
+            Style::default()
+                .fg(Color::Rgb(255, 184, 108))
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Rgb(0, 204, 204)))
+        .padding(Padding::new(2, 2, 1, 1))
+        .style(Style::default().bg(Color::Rgb(42, 42, 42)));
+    frame.render_widget(Paragraph::new(text).block(block), popup);
+    popup
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,10 +234,21 @@ mod tests {
 
     #[test]
     fn area_is_centered_and_bounded() {
-        assert_eq!(area(Rect::new(0, 0, 120, 40)), Rect::new(12, 4, 96, 32));
-        assert_eq!(area(Rect::new(0, 0, 200, 50)), Rect::new(50, 5, 100, 40));
-        assert_eq!(area(Rect::new(0, 0, 20, 5)), Rect::new(2, 0, 16, 5));
-        assert_eq!(area(Rect::new(0, 0, 0, 0)), Rect::new(0, 0, 0, 0));
+        let d = PermissionDialog::new("bash", "", PermissionBody::Text("ls -la".into()));
+        assert_eq!(area(Rect::new(0, 0, 120, 40), &d), Rect::new(34, 17, 52, 6));
+        assert_eq!(area(Rect::new(0, 0, 200, 50), &d), Rect::new(74, 22, 52, 6));
+        assert_eq!(area(Rect::new(0, 0, 20, 5), &d), Rect::new(2, 0, 16, 5));
+        assert_eq!(area(Rect::new(0, 0, 0, 0), &d), Rect::new(0, 0, 0, 0));
+    }
+
+    #[test]
+    fn area_grows_for_long_content_but_stays_bounded() {
+        let d = PermissionDialog::new(
+            "bash",
+            "",
+            PermissionBody::Text((0..30).map(|_| "x").collect::<Vec<_>>().join("\n")),
+        );
+        assert_eq!(area(Rect::new(0, 0, 120, 40), &d), Rect::new(34, 4, 52, 32));
     }
 
     fn screen_text(dialog: &PermissionDialog, w: u16, h: u16) -> String {
