@@ -4,6 +4,10 @@ use tokio::sync::broadcast;
 #[derive(Debug, Clone)]
 pub enum LiveEvent {
     TurnStarted,
+    StepStarted {
+        step: usize,
+        max_steps: usize,
+    },
     TurnEnded,
     Delta {
         text: String,
@@ -11,7 +15,15 @@ pub enum LiveEvent {
     ReasoningDelta {
         text: String,
     },
+    Usage {
+        input_tokens: u32,
+        output_tokens: u32,
+    },
     MessageAdded(Message),
+    SessionMessageAdded {
+        session: crate::session::SessionId,
+        message: Message,
+    },
     ToolStarted {
         call_id: String,
         name: String,
@@ -25,6 +37,8 @@ pub enum LiveEvent {
         added: usize,
         removed: usize,
     },
+    JobChanged(crate::job::JobSnapshot),
+    SubagentChanged(crate::session::SubagentDescriptor),
     Error {
         message: String,
     },

@@ -62,6 +62,10 @@ mod tests {
         ToolCtx {
             cwd: dir.to_path_buf(),
             permission: Arc::new(PermissionService::allow_all()),
+            session: crate::session::SessionId(0),
+            jobs: Arc::new(crate::job::LocalJobRegistry::default()),
+            bus: crate::event::EventBus::new(8),
+            subagents: None,
         }
     }
 

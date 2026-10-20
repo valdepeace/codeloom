@@ -80,4 +80,40 @@ mod tests {
         // tempdir no es repo git -> respaldo.
         assert_eq!(t.numbers("x", "a", "a\nb"), (2, 1));
     }
+
+    #[test]
+    fn tracked_file_counts_come_from_git_numstat() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(args)
+                .status()
+                .unwrap()
+        };
+
+        std::fs::write(dir.path().join("a.txt"), "old\n").unwrap();
+        assert!(git(&["init", "--quiet"]).success());
+        assert!(git(&["add", "a.txt"]).success());
+        assert!(git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "baseline",
+        ])
+        .success());
+        std::fs::write(dir.path().join("a.txt"), "new\nline\n").unwrap();
+
+        let tracker = ChangeTracker::detect(dir.path());
+        assert!(tracker.git);
+        assert_eq!(tracker.numbers("a.txt", "old\n", "new\nline\n"), (2, 1));
+    }
 }

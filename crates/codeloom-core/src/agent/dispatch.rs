@@ -1,3 +1,4 @@
+use crate::event::{EventBus, LiveEvent};
 use crate::tools::{ExecutionMode, ToolCtx, ToolOutput, ToolRegistry};
 use futures::StreamExt;
 
@@ -8,6 +9,7 @@ pub async fn execute_tools(
     ctx: ToolCtx,
     calls: Vec<(String, String, serde_json::Value)>,
     cancel: tokio_util::sync::CancellationToken,
+    bus: EventBus,
 ) -> Vec<(String, ToolOutput)> {
     let mut batches: Vec<Vec<(String, String, serde_json::Value)>> = Vec::new();
     let mut current: Vec<(String, String, serde_json::Value)> = Vec::new();
@@ -36,16 +38,31 @@ pub async fn execute_tools(
             let tool = registry.get(&name);
             let ctx = ctx.clone();
             let cancel = cancel.clone();
+            let bus = bus.clone();
             async move {
+                bus.publish(LiveEvent::ToolStarted {
+                    call_id: id.clone(),
+                    name: name.clone(),
+                });
                 match tool {
                     Some(t) => {
                         let out = t
                             .run(ctx, input, cancel)
                             .await
                             .unwrap_or_else(|e| ToolOutput::err(e.to_string()));
+                        bus.publish(LiveEvent::ToolFinished {
+                            call_id: id.clone(),
+                            is_error: out.is_error,
+                        });
                         (id, out)
                     }
-                    None => (id, ToolOutput::err(format!("unknown tool: {name}"))),
+                    None => {
+                        bus.publish(LiveEvent::ToolFinished {
+                            call_id: id.clone(),
+                            is_error: true,
+                        });
+                        (id, ToolOutput::err(format!("unknown tool: {name}")))
+                    }
                 }
             }
         });
@@ -99,6 +116,10 @@ mod tests {
         let ctx = ToolCtx {
             cwd: ".".into(),
             permission: Arc::new(PermissionService::allow_all()),
+            session: crate::session::SessionId(0),
+            jobs: Arc::new(crate::job::LocalJobRegistry::default()),
+            bus: EventBus::new(8),
+            subagents: None,
         };
         let calls = vec![
             (
@@ -117,7 +138,8 @@ mod tests {
                 serde_json::json!({}),
             ),
         ];
-        let mut res = execute_tools(&r, ctx, calls, CancellationToken::new()).await;
+        let mut res =
+            execute_tools(&r, ctx, calls, CancellationToken::new(), EventBus::new(16)).await;
         res.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(res.len(), 3);
         assert_eq!(res[0].1.content, "a");
@@ -157,6 +179,10 @@ mod tests {
         let ctx = ToolCtx {
             cwd: ".".into(),
             permission: Arc::new(PermissionService::allow_all()),
+            session: crate::session::SessionId(0),
+            jobs: Arc::new(crate::job::LocalJobRegistry::default()),
+            bus: EventBus::new(8),
+            subagents: None,
         };
         let calls = vec![
             (
@@ -180,7 +206,8 @@ mod tests {
                 serde_json::json!({"v":"d"}),
             ),
         ];
-        let mut res = execute_tools(&r, ctx, calls, CancellationToken::new()).await;
+        let mut res =
+            execute_tools(&r, ctx, calls, CancellationToken::new(), EventBus::new(16)).await;
         res.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(res.len(), 4);
         assert_eq!(res[0].1.content, "a");

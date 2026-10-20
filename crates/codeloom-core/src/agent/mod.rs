@@ -5,14 +5,14 @@ pub mod stop;
 use crate::config::CodeLoomConfig;
 use crate::error::Result;
 use crate::event::{EventBus, LiveEvent};
-use crate::message::{ContentPart, FinishReason, Message, Role};
+use crate::message::{ContentPart, FinishReason, Message, Role, Usage};
 use crate::permission::PermissionService;
 use crate::provider::{Provider, ProviderRequest, StreamChunk};
 use crate::session::{SessionId, SessionStore};
 use crate::tools::{ToolCtx, ToolRegistry};
 use futures::StreamExt;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio_util::sync::CancellationToken;
 
 pub struct TurnOutcome {
@@ -22,14 +22,16 @@ pub struct TurnOutcome {
 }
 
 pub struct AgentLoop {
-    provider: Arc<dyn Provider>,
+    provider: Arc<RwLock<Arc<dyn Provider>>>,
     store: Arc<dyn SessionStore>,
     tools: Arc<ToolRegistry>,
     bus: EventBus,
     permission: Arc<PermissionService>,
-    config: CodeLoomConfig,
+    config: Arc<RwLock<CodeLoomConfig>>,
     cwd: PathBuf,
     changes: crate::agent::changes::ChangeTracker,
+    jobs: Arc<dyn crate::job::JobRegistry>,
+    subagents: Option<Arc<dyn crate::subagent::SubagentLauncher>>,
 }
 
 impl AgentLoop {
@@ -42,6 +44,21 @@ impl AgentLoop {
         config: CodeLoomConfig,
         cwd: PathBuf,
     ) -> Self {
+        let provider = Arc::new(RwLock::new(provider));
+        let config = Arc::new(RwLock::new(config));
+        let jobs: Arc<dyn crate::job::JobRegistry> =
+            Arc::new(crate::job::LocalJobRegistry::default());
+        let subagents = tools.get("subagent").map(|_| {
+            Arc::new(crate::subagent::InProcessSubagentLauncher::new(
+                provider.clone(),
+                store.clone(),
+                tools.clone(),
+                permission.clone(),
+                config.clone(),
+                cwd.clone(),
+                jobs.clone(),
+            )) as Arc<dyn crate::subagent::SubagentLauncher>
+        });
         Self {
             provider,
             store,
@@ -50,8 +67,24 @@ impl AgentLoop {
             permission,
             config,
             changes: crate::agent::changes::ChangeTracker::detect(cwd.clone()),
+            jobs,
+            subagents,
             cwd,
         }
+    }
+
+    pub fn with_jobs(mut self, jobs: Arc<dyn crate::job::JobRegistry>) -> Self {
+        self.jobs = jobs;
+        self
+    }
+
+    pub fn jobs(&self) -> Arc<dyn crate::job::JobRegistry> {
+        self.jobs.clone()
+    }
+
+    pub fn update_provider(&self, provider: Arc<dyn Provider>, config: CodeLoomConfig) {
+        *self.provider.write().unwrap() = provider;
+        *self.config.write().unwrap() = config;
     }
 
     pub async fn run(
@@ -61,6 +94,25 @@ impl AgentLoop {
         cancel: CancellationToken,
     ) -> Result<TurnOutcome> {
         self.bus.publish(LiveEvent::TurnStarted);
+        let result = self.run_turn(session, user_prompt, cancel).await;
+        match &result {
+            Ok(_) => self.bus.publish(LiveEvent::TurnEnded),
+            Err(error) => self.bus.publish(LiveEvent::Error {
+                message: error.to_string(),
+            }),
+        }
+        result
+    }
+
+    async fn run_turn(
+        &self,
+        session: SessionId,
+        user_prompt: String,
+        cancel: CancellationToken,
+    ) -> Result<TurnOutcome> {
+        let provider = self.provider.read().unwrap().clone();
+        let config = self.config.read().unwrap().clone();
+        self.flush_subagent_notices(session).await?;
         let mut history = self.store.messages(session).await?;
         let user = Message::user(user_prompt);
         self.store.append_message(session, &user).await?;
@@ -71,29 +123,49 @@ impl AgentLoop {
         let ctx = ToolCtx {
             cwd: self.cwd.clone(),
             permission: self.permission.clone(),
+            session,
+            jobs: self.jobs.clone(),
+            bus: self.bus.clone(),
+            subagents: self.subagents.clone(),
         };
         let mut steps = 0usize;
         let mut final_text = String::new();
 
         loop {
-            steps += 1;
-            if crate::agent::stop::should_stop(&history, steps, self.config.max_steps) {
+            if cancel.is_cancelled() {
                 break;
             }
+            self.flush_subagent_notices(session).await?;
+            history = self.store.messages(session).await?;
+            if crate::agent::stop::should_stop(&history, steps, config.max_steps) {
+                break;
+            }
+            steps += 1;
+            self.bus.publish(LiveEvent::StepStarted {
+                step: steps,
+                max_steps: config.max_steps,
+            });
             let req = ProviderRequest {
-                model: self.config.model.clone(),
+                model: config.model.clone(),
                 system: system.clone(),
                 messages: history.clone(),
                 tools: self.tools.specs(),
                 temperature: 0.0,
                 max_tokens: 4096,
             };
-            let mut stream = self.provider.stream(req, cancel.clone()).await?;
+            let mut stream = tokio::select! {
+                _ = cancel.cancelled() => break,
+                result = provider.stream(req, cancel.clone()) => result?,
+            };
             let mut text_buf = String::new();
             let mut tool_calls: Vec<(String, String, serde_json::Value)> = Vec::new();
+            let mut usage: Option<Usage> = None;
             let mut finish = FinishReason::Stop;
 
-            while let Some(chunk) = stream.next().await {
+            while let Some(chunk) = tokio::select! {
+                _ = cancel.cancelled() => None,
+                chunk = stream.next() => chunk,
+            } {
                 match chunk {
                     StreamChunk::TextDelta(t) => {
                         text_buf.push_str(&t);
@@ -101,6 +173,19 @@ impl AgentLoop {
                     }
                     StreamChunk::ReasoningDelta(r) => {
                         self.bus.publish(LiveEvent::ReasoningDelta { text: r });
+                    }
+                    StreamChunk::Usage(chunk) => {
+                        let total = usage.get_or_insert(Usage {
+                            input_tokens: 0,
+                            output_tokens: 0,
+                        });
+                        total.input_tokens = total.input_tokens.saturating_add(chunk.input_tokens);
+                        total.output_tokens =
+                            total.output_tokens.saturating_add(chunk.output_tokens);
+                        self.bus.publish(LiveEvent::Usage {
+                            input_tokens: chunk.input_tokens,
+                            output_tokens: chunk.output_tokens,
+                        });
                     }
                     StreamChunk::ToolCallComplete { id, name, input } => {
                         tool_calls.push((id, name, input));
@@ -128,7 +213,8 @@ impl AgentLoop {
                 });
             }
             parts.push(ContentPart::Finish { reason: finish });
-            let assistant = Message::assistant(parts);
+            let mut assistant = Message::assistant(parts);
+            assistant.usage = usage;
             self.store.append_message(session, &assistant).await?;
             self.bus.publish(LiveEvent::MessageAdded(assistant.clone()));
             history.push(assistant);
@@ -173,8 +259,14 @@ impl AgentLoop {
                 by_id.insert(id.clone(), (name.clone(), input.clone()));
             }
 
-            let results =
-                dispatch::execute_tools(&self.tools, ctx.clone(), allowed, cancel.clone()).await;
+            let results = dispatch::execute_tools(
+                &self.tools,
+                ctx.clone(),
+                allowed,
+                cancel.clone(),
+                self.bus.clone(),
+            )
+            .await;
             for (id, out) in results {
                 if !out.is_error {
                     if let Some((name, input)) = by_id.get(&id) {
@@ -205,12 +297,42 @@ impl AgentLoop {
             }
         }
 
-        self.bus.publish(LiveEvent::TurnEnded);
         Ok(TurnOutcome {
             session,
             final_text,
             steps,
         })
+    }
+
+    async fn flush_subagent_notices(&self, session: SessionId) -> Result<()> {
+        for job in self.jobs.pending_settled_notices(session) {
+            let status = match job.status {
+                crate::job::JobStatus::Completed => "completed",
+                crate::job::JobStatus::Killed => "killed",
+                crate::job::JobStatus::Failed => "failed",
+                _ => continue,
+            };
+            let detail = job
+                .detail
+                .or_else(|| job.result.map(|result| result.content));
+            let message = Message::user(format!(
+                "[Job {} {status}] {}{}",
+                job.id.0,
+                job.label,
+                detail.map(|text| format!("\n{text}")).unwrap_or_default()
+            ));
+            self.store.append_message(session, &message).await?;
+            self.jobs.mark_notice_delivered(session, &job.id)?;
+            self.bus
+                .publish(LiveEvent::SessionMessageAdded { session, message });
+        }
+        if let Some(subagents) = &self.subagents {
+            for message in subagents.deliver_notices(session).await? {
+                self.bus
+                    .publish(LiveEvent::SessionMessageAdded { session, message });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -393,10 +515,39 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_turn_marks_partial_message_as_error() {
-        let scripts = vec![vec![StreamChunk::TextDelta("partial".into())]];
-        let provider = Arc::new(QueueProvider {
-            scripts: Mutex::new(scripts.into()),
-        });
+        struct CancelMidStream;
+
+        #[async_trait]
+        impl Provider for CancelMidStream {
+            fn capabilities(&self) -> Capabilities {
+                Capabilities {
+                    tool_use: false,
+                    reasoning: false,
+                    streaming: true,
+                }
+            }
+
+            async fn stream(
+                &self,
+                _req: ProviderRequest,
+                cancel: CancellationToken,
+            ) -> Result<ProviderStream> {
+                Ok(Box::pin(futures::stream::unfold(
+                    (false, cancel),
+                    |(sent_delta, cancel)| async move {
+                        if sent_delta {
+                            tokio::task::yield_now().await;
+                            cancel.cancel();
+                            None
+                        } else {
+                            Some((StreamChunk::TextDelta("partial".into()), (true, cancel)))
+                        }
+                    },
+                )))
+            }
+        }
+
+        let provider = Arc::new(CancelMidStream);
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(
             SqliteStore::open(dir.path().join("c.db").to_str().unwrap())
@@ -422,9 +573,10 @@ mod tests {
             cfg,
             dir.path().to_path_buf(),
         );
-        let token = CancellationToken::new();
-        token.cancel();
-        let _ = agent.run(sid, "hi".into(), token).await.unwrap();
+        let _ = agent
+            .run(sid, "hi".into(), CancellationToken::new())
+            .await
+            .unwrap();
         let msgs = store.messages(sid).await.unwrap();
         assert!(msgs.iter().any(|m| m.parts.iter().any(|p| matches!(
             p,

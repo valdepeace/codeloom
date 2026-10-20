@@ -1,10 +1,12 @@
 use crate::error::{CoreError, Result};
 use serde::Deserialize;
+use std::io::Write;
+use std::net::IpAddr;
 use std::path::Path;
 
 pub mod context;
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub enum ProviderKind {
     #[serde(rename = "openai_compat")]
     OpenAiCompat,
@@ -31,11 +33,77 @@ fn default_max_steps() -> usize {
     30
 }
 
+pub fn validate_base_url(input: &str) -> std::result::Result<(), String> {
+    let url = reqwest::Url::parse(input).map_err(|_| "Base URL is invalid".to_string())?;
+    let local_http = url.scheme() == "http"
+        && url.host_str().is_some_and(|host| {
+            host == "localhost" || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+        });
+    if url.scheme() != "https" && !local_http {
+        return Err("Use HTTPS, or HTTP for a localhost endpoint".into());
+    }
+    if !url.username().is_empty() || url.password().is_some() || url.query().is_some() {
+        return Err(
+            "Keep credentials out of the Base URL; use the API key environment variable".into(),
+        );
+    }
+    Ok(())
+}
+
 impl CodeLoomConfig {
     pub fn load(path: &Path) -> Result<CodeLoomConfig> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| CoreError::Config(format!("read {}: {e}", path.display())))?;
         toml::from_str(&text).map_err(|e| CoreError::Config(e.to_string()))
+    }
+
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let mut document = std::fs::read_to_string(path)
+            .map_err(|e| CoreError::Config(format!("read {}: {e}", path.display())))?
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| CoreError::Config(format!("parse {}: {e}", path.display())))?;
+        document["model"] = toml_edit::value(self.model.clone());
+        document["provider"]["kind"] = toml_edit::value(match self.provider.kind {
+            ProviderKind::OpenAiCompat => "openai_compat",
+            ProviderKind::Anthropic => "anthropic",
+        });
+        document["provider"]["base_url"] = toml_edit::value(self.provider.base_url.clone());
+        document["provider"]["api_key_env"] = toml_edit::value(self.provider.api_key_env.clone());
+        let text = document.to_string();
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let mut temp_file = None;
+        for attempt in 0..100 {
+            let candidate = parent.join(format!(".{name}.{}.{}.tmp", std::process::id(), attempt));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(file) => {
+                    temp_file = Some((candidate, file));
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(CoreError::Config(format!(
+                        "create config temp file: {error}"
+                    )))
+                }
+            }
+        }
+        let (temp_path, mut temp) = temp_file
+            .ok_or_else(|| CoreError::Config("cannot create temporary config file".into()))?;
+        let result = (|| {
+            temp.write_all(text.as_bytes())?;
+            temp.sync_all()?;
+            std::fs::rename(&temp_path, path)?;
+            Ok::<_, std::io::Error>(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp_path);
+        }
+        result.map_err(|e| CoreError::Config(format!("write {}: {e}", path.display())))
     }
 }
 
@@ -67,5 +135,42 @@ mod tests {
         "#).unwrap();
         let cfg = CodeLoomConfig::load(f.path()).unwrap();
         assert_eq!(cfg.max_steps, 30);
+    }
+
+    #[test]
+    fn saves_and_reloads_provider_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("codeloom.toml");
+        std::fs::write(
+            &path,
+            "# preserved\nmodel = \"old\"\nmax_steps = 7\n[provider]\nkind = \"openai_compat\"\nbase_url = \"https://old.test\"\napi_key_env = \"OLD_KEY\"\n",
+        )
+        .unwrap();
+        let config = CodeLoomConfig {
+            provider: ProviderConfig {
+                kind: ProviderKind::Anthropic,
+                base_url: "https://api.anthropic.com".into(),
+                api_key_env: "ANTHROPIC_API_KEY".into(),
+            },
+            model: "claude-test".into(),
+            max_steps: 7,
+        };
+        config.save(&path).unwrap();
+        let loaded = CodeLoomConfig::load(&path).unwrap();
+        assert_eq!(loaded.model, "claude-test");
+        assert_eq!(loaded.provider.kind, ProviderKind::Anthropic);
+        assert_eq!(loaded.provider.api_key_env, "ANTHROPIC_API_KEY");
+        assert_eq!(loaded.max_steps, 7);
+        assert!(std::fs::read_to_string(path)
+            .unwrap()
+            .contains("# preserved"));
+    }
+
+    #[test]
+    fn accepts_secure_or_local_provider_urls_without_embedded_credentials() {
+        assert!(validate_base_url("https://api.example.test/v1").is_ok());
+        assert!(validate_base_url("http://127.0.0.1:8000/v1").is_ok());
+        assert!(validate_base_url("http://api.example.test/v1").is_err());
+        assert!(validate_base_url("https://user:secret@example.test/v1").is_err());
     }
 }

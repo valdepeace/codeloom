@@ -9,6 +9,13 @@ pub mod bash;
 pub mod edit;
 pub mod glob;
 pub mod grep;
+pub mod job_kill;
+pub mod job_list;
+pub mod job_output;
+pub mod job_start;
+pub mod subagent;
+pub mod subagent_control;
+pub mod subagent_list;
 pub mod view;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +49,10 @@ impl ToolOutput {
 pub struct ToolCtx {
     pub cwd: PathBuf,
     pub permission: Arc<crate::permission::PermissionService>,
+    pub session: crate::session::SessionId,
+    pub jobs: Arc<dyn crate::job::JobRegistry>,
+    pub bus: crate::event::EventBus,
+    pub subagents: Option<Arc<dyn crate::subagent::SubagentLauncher>>,
 }
 
 #[async_trait]
@@ -60,7 +71,7 @@ pub trait Tool: Send + Sync {
     ) -> Result<ToolOutput>;
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ToolRegistry {
     tools: BTreeMap<String, Arc<dyn Tool>>,
 }
@@ -74,6 +85,11 @@ impl ToolRegistry {
     }
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools.get(name).cloned()
+    }
+    pub fn without(&self, name: &str) -> Self {
+        let mut registry = self.clone();
+        registry.tools.remove(name);
+        registry
     }
     pub fn specs(&self) -> Vec<crate::provider::ToolSpec> {
         self.tools
