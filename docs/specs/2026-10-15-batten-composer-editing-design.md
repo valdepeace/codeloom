@@ -19,13 +19,13 @@ es solo "append".
 
 | # | Decisión |
 |---|---|
-| 1 | Cursor con `←/→`, `Home/End`, `↑/↓` entre líneas; borrar con `Backspace`/`Delete`. |
+| 1 | Cursor por grafemas con `←/→`, `Home/End`, `↑/↓` entre líneas; borrar con `Backspace`/`Delete` sin partir emojis ni acentos combinados. |
 | 2 | Multilínea: **`Ctrl+J`** inserta salto; **`Enter` envía siempre** (predecible; `Shift+Enter` no se distingue en todos los terminales). |
 | 3 | Historial con `↑/↓`, guardando el borrador en curso. |
 | 4 | El cursor es el **cursor real del terminal** (`frame.set_cursor_position`), no un bloque pintado. |
 | 5 | El historial vive en batten (`state::History`), genérico y testeable; la app aporta la instancia. |
 | 6 | La TUI migra a `state::Composer` + `widgets::composer`. |
-| 7 | v0 sin wrap horizontal: las líneas lógicas se **recortan** al ancho. |
+| 7 | Sin wrap horizontal: las líneas lógicas se recortan al ancho y el viewport horizontal sigue al cursor para mantenerlo visible. |
 
 ## 2. Arquitectura y archivos
 
@@ -43,7 +43,9 @@ crates/codeloom-tui/src/render.rs     # usa el composer de batten
 
 ## 3. `state::Composer` (ampliar)
 
-El cursor es un **índice de carácter** (`0..=nº de chars`), no de bytes.
+El cursor recorre **grafemas Unicode** (no bytes ni puntos de código); la API
+`cursor()` devuelve el índice de grafema. Así, flechas y borrado tratan una letra
+con acento combinado o un emoji compuesto como una unidad.
 
 ```rust
 impl Composer {
@@ -59,7 +61,7 @@ impl Composer {
     pub fn move_end(&mut self);               // fin de la linea
     pub fn move_up(&mut self);                // linea arriba (columna recordada)
     pub fn move_down(&mut self);
-    pub fn cursor(&self) -> usize;            // indice de caracter
+    pub fn cursor(&self) -> usize;            // indice de grafema
     pub fn lines(&self) -> usize;             // nº de lineas logicas
     pub fn cursor_row_col(&self) -> (usize, usize); // (fila, columna en display)
     pub fn set_text(&mut self, s: &str);      // reemplaza; cursor al final
@@ -70,8 +72,9 @@ impl Composer {
 }
 ```
 
-- `move_up`/`move_down` recuerdan la **columna de carácter** preferida para
+- `move_up`/`move_down` recuerdan la **columna de display** preferida para
   columnas cortas; `cursor_row_col` usa anchura de display (`unicode-width`).
+- `insert_str` y `set_text` normalizan CRLF y CR a LF antes de editar.
 - `submit` limpia buffer y cursor.
 
 ## 4. `state::History` (nuevo)
@@ -139,13 +142,11 @@ impl History {
 
 ## 9. Fuera de alcance (v0)
 
-- Pegado (bracketed paste), ratón, selección y corte/copia dentro del prompt.
+- Ratón para posicionar el cursor, selección y corte/copia dentro del prompt.
 - Movimiento por palabras (`Ctrl+←/→`) y `Ctrl+U`/`Ctrl+K`.
-- Wrap horizontal del texto (se recorta) y desplazamiento horizontal del cursor.
+- Wrap horizontal del texto.
 - Persistir el historial en disco o entre sesiones.
 
 ## 10. Preguntas abiertas
 
 - ¿Tope del historial (100?) y si debe ser configurable.
-- ¿`↑/↓` con varias líneas debería además recordar la columna **en display** en
-  vez de en caracteres? v0 usa columna de carácter.

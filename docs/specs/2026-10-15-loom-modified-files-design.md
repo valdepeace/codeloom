@@ -172,10 +172,10 @@ Checks: `cargo test -p batten --examples`, `cargo test -p codeloom-core -p codel
 
 ## 10. Criterios de aceptación
 
-- [ ] Los ficheros editados aparecen en el sidebar con `+A`/`-R`.
-- [ ] Los números son de git cuando hay repo; si no, delta del `edit`.
-- [ ] Los `path` largos se truncan; 0×0 no rompe.
-- [ ] Los checks pasan.
+- [x] Los ficheros editados aparecen debajo del sidebar con `+A`/`-R`.
+- [x] Los números son de git cuando hay repo; si no, delta del `edit`.
+- [x] Los `path` largos se truncan; 0×0 no rompe.
+- [x] Los checks pasan.
 
 ## 11. Fuera de alcance
 
