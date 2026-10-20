@@ -1,85 +1,892 @@
 use crate::app::App;
-use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Style};
-use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::style::Modifier;
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
-/// Por debajo de este ancho la barra lateral se oculta (modo compacto).
-const SIDEBAR_MIN_WIDTH: u16 = 90;
-const SIDEBAR_WIDTH: u16 = 30;
+fn job_counts(app: &App) -> (usize, usize, usize, usize) {
+    let (running, finished) = app
+        .jobs
+        .values()
+        .filter(|job| Some(job.owner) == app.session_id && job.kind != "subagent")
+        .fold((0, 0), |(running, finished), job| {
+            let active = matches!(
+                job.status,
+                codeloom_core::job::JobStatus::Running | codeloom_core::job::JobStatus::Stopping
+            );
+            (
+                running + usize::from(active),
+                finished + usize::from(!active),
+            )
+        });
+    let (subagents_running, subagents_finished) = app
+        .subagents
+        .values()
+        .filter(|subagent| Some(subagent.parent) == app.session_id)
+        .fold((0, 0), |(running, finished), subagent| {
+            if subagent.status == codeloom_core::session::SubagentStatus::Running {
+                (running + 1, finished)
+            } else {
+                (running, finished + 1)
+            }
+        });
+    (running, finished, subagents_running, subagents_finished)
+}
 
-fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
-    let queue = match app.queued {
-        0 => String::new(),
-        n => format!(" · en cola ({n})"),
+fn draw_workspace_header(frame: &mut Frame, area: Rect, app: &App) {
+    let (state, tone) = if app.status == "working" {
+        ("WORKING", batten::state::Tone::Success)
+    } else if app.status.starts_with("error:") {
+        ("ERROR", batten::state::Tone::Error)
+    } else {
+        ("READY", batten::state::Tone::Neutral)
     };
-    let header = Line::from(format!(" CodeLoom · {}{queue} ", app.status));
+    let mut text = vec![
+        Span::styled(
+            " CODELOOM / WORKSPACE  ",
+            app.theme.styles.heading.add_modifier(Modifier::BOLD),
+        ),
+        batten::widgets::chip(state, tone, &app.theme),
+        Span::styled(format!("  {}", app.model), app.theme.styles.muted),
+    ];
+    if app.queued > 0 {
+        text.push(Span::styled(
+            format!("  ·  {} queued", app.queued),
+            app.theme.styles.muted,
+        ));
+    }
+    if app.queue_paused {
+        text.push(Span::styled("  ·  queue paused", app.theme.styles.warning));
+    }
+    let (running, finished, subagents, subagents_finished) = job_counts(app);
+    if running > 0 || finished > 0 || subagents > 0 || subagents_finished > 0 {
+        text.push(Span::styled(
+            format!(
+                "  ·  {subagents} subagents · {running} jobs · {} finished",
+                finished + subagents_finished
+            ),
+            app.theme.styles.muted,
+        ));
+    }
     frame.render_widget(
-        Paragraph::new(header).style(Style::default().fg(Color::Black).bg(Color::Cyan)),
+        Paragraph::new(vec![
+            Line::from(text),
+            Line::from(Span::styled(
+                "   conversation · activity · context · changed files",
+                app.theme.styles.muted,
+            )),
+        ]),
         area,
     );
 }
 
 fn draw_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
-    let block = Block::default().borders(Borders::TOP);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = batten::widgets::panel::render(
+        frame,
+        area,
+        &batten::widgets::Panel {
+            title: "Conversation",
+            info: &app.status,
+            tone: if app.status == "working" {
+                batten::state::Tone::Info
+            } else {
+                batten::state::Tone::Neutral
+            },
+        },
+        &app.theme,
+    );
+    if inner.is_empty() {
+        return;
+    }
+    // Con el look `Pinned` la última herramienta ocupa una tarjeta fija; con
+    // `Inline` aparece dentro del transcript y no reserva filas aquí.
+    let pinned = app.theme.look.tool == batten::widgets::ToolStyle::Pinned;
+    let crush = app.theme.look.composer == batten::widgets::ComposerStyle::Crush;
+    let thinking_rows = u16::from(app.thinking);
+    let max_tool_rows = inner.height.saturating_sub(4 + thinking_rows);
+    let tool_rows = app.tools.back().filter(|_| pinned).map_or(0, |tool| {
+        let args = usize::from(tool.summary.as_deref().is_some_and(|s| !s.is_empty()));
+        let output_lines = tool
+            .output
+            .as_deref()
+            .map_or(0, |output| output.lines().count());
+        let visible_output = if tool.expanded {
+            output_lines
+        } else {
+            output_lines.min(2) + usize::from(output_lines > 2)
+        };
+        let waiting = usize::from(tool.output.is_none());
+        (1 + args + visible_output + waiting).min(usize::from(max_tool_rows)) as u16
+    });
+    let reserved_rows = 2u16.saturating_add(thinking_rows).saturating_add(tool_rows);
+    let max_composer_height = inner.height.saturating_sub(reserved_rows);
+    let composer_height = batten::widgets::composer::height_for_look(
+        &app.theme,
+        &app.composer,
+        inner.width,
+        max_composer_height,
+    );
+    // El look Crush no muestra la cabecera de la conversación.
+    let header_rows = if crush { 0 } else { 1 };
+    let rows = Layout::vertical([
+        Constraint::Length(header_rows),
+        Constraint::Min(1),
+        Constraint::Length(thinking_rows),
+        Constraint::Length(tool_rows),
+        Constraint::Length(composer_height),
+    ])
+    .split(inner);
+    if !crush {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("CodeLoom", app.theme.styles.heading),
+                Span::styled("  ·  project conversation", app.theme.styles.muted),
+                Span::styled(
+                    format!("  ·  {}", app.theme_preset.name()),
+                    app.theme.styles.muted,
+                ),
+            ])),
+            rows[0],
+        );
+    }
     batten::widgets::transcript::render(
         frame,
-        inner,
+        rows[1],
         &app.transcript,
         &mut app.viewport,
         &mut app.layout,
         app.selection.as_ref(),
         &app.theme,
     );
+    if app.thinking {
+        let line = app.reasoning.lines().last().unwrap_or("Thinking…");
+        batten::widgets::thinking::render(frame, rows[2], line, &app.animation, &app.theme);
+    }
+    if let Some(tool) = app.tools.back().filter(|_| pinned) {
+        batten::widgets::tool_item::render_crush(frame, rows[3], tool, &app.theme);
+    }
+    batten::widgets::composer::render_for_look(
+        frame,
+        rows[4],
+        &app.composer,
+        app.focus == crate::app::Focus::Composer
+            && app.permission.is_none()
+            && !app.session_picker_open
+            && !app.session_loading
+            && !app.queue_open
+            && !app.settings_open
+            && !app.help_open
+            && !app.tools_open,
+        &app.model,
+        &app.theme,
+    );
+    if app.slash_query().is_some() {
+        let matches = app.slash_matches();
+        let commands = matches
+            .iter()
+            .map(
+                |(_, usage, description)| batten::widgets::command_suggestions::MarttyCommand {
+                    usage,
+                    description,
+                    section: None,
+                    skill: false,
+                },
+            )
+            .collect::<Vec<_>>();
+        let chat = Rect::new(
+            inner.x,
+            inner.y,
+            inner.width,
+            rows[4].y.saturating_sub(inner.y),
+        );
+        batten::widgets::command_suggestions::render_martty(
+            frame,
+            rows[4],
+            chat,
+            &commands,
+            app.slash_selected,
+            &app.theme,
+        );
+    }
 }
 
-fn draw_composer(frame: &mut Frame, area: Rect, app: &App) {
-    let focused = app.focus == crate::app::Focus::Composer;
-    batten::widgets::composer::render_focused(frame, area, &app.composer, focused, &app.theme);
+fn draw_workspace_metrics(frame: &mut Frame, area: Rect, app: &App) {
+    let rows = Layout::vertical([
+        Constraint::Length(6),
+        Constraint::Length(5),
+        Constraint::Min(3),
+    ])
+    .split(area);
+    let (agent_info, agent_tone) = if app.status.starts_with("error:") {
+        ("error", batten::state::Tone::Error)
+    } else if app.status == "working" {
+        ("active", batten::state::Tone::Info)
+    } else {
+        ("idle", batten::state::Tone::Neutral)
+    };
+    let agent = batten::widgets::panel::render(
+        frame,
+        rows[0],
+        &batten::widgets::Panel {
+            title: "Agent",
+            info: agent_info,
+            tone: agent_tone,
+        },
+        &app.theme,
+    );
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(app.model.as_str()),
+            Line::from(format!(
+                "{} · {:.1}s",
+                app.phase,
+                app.phase_duration().as_secs_f64()
+            )),
+            Line::from(app.phase_summary()),
+            Line::from(if app.max_steps > 0 {
+                format!("step {}/{}", app.current_step, app.max_steps)
+            } else {
+                app.status.clone()
+            }),
+        ])
+        .wrap(Wrap { trim: true }),
+        agent,
+    );
+    let context = batten::widgets::panel::render(
+        frame,
+        rows[1],
+        &batten::widgets::Panel {
+            title: "Token usage",
+            info: "turn/session",
+            tone: batten::state::Tone::Neutral,
+        },
+        &app.theme,
+    );
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(format!(
+                "Turn ↑{} ↓{}",
+                app.turn_input_tokens, app.turn_output_tokens
+            )),
+            Line::from(format!(
+                "Session ↑{} ↓{}",
+                app.input_tokens, app.output_tokens
+            )),
+        ]),
+        context,
+    );
+    let activity = batten::widgets::panel::render(
+        frame,
+        rows[2],
+        &batten::widgets::Panel {
+            title: "Activity",
+            info: "tools",
+            tone: batten::state::Tone::Info,
+        },
+        &app.theme,
+    );
+    let entries = app
+        .tools
+        .iter()
+        .map(|tool| batten::widgets::queue::QueueEntry {
+            label: tool.name.as_str(),
+            status: match tool.status() {
+                batten::state::ToolStatus::Pending
+                | batten::state::ToolStatus::AwaitingPermission => {
+                    batten::widgets::queue::QueueStatus::Pending
+                }
+                batten::state::ToolStatus::Running => batten::widgets::queue::QueueStatus::Running,
+                batten::state::ToolStatus::Success => batten::widgets::queue::QueueStatus::Done,
+                batten::state::ToolStatus::Error | batten::state::ToolStatus::Canceled => {
+                    batten::widgets::queue::QueueStatus::Failed
+                }
+            },
+        })
+        .collect::<Vec<_>>();
+    batten::widgets::queue::render_pawan(frame, activity, &entries, app.animation.frame);
+}
+
+fn draw_workspace_sidebar(frame: &mut Frame, area: Rect, app: &App) {
+    let changes_height = if app.changes.is_empty() {
+        0
+    } else {
+        (app.changes.len() as u16 + 2).min(area.height.saturating_sub(1))
+    };
+    let [sidebar, changes] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(changes_height)]).areas(area);
+    batten::widgets::sidebar::render(frame, sidebar, &app.sidebar(), &app.theme);
+    if changes_height > 0 {
+        batten::widgets::file_changes::render(
+            frame,
+            changes,
+            "ficheros modificados",
+            &app.changes,
+            &app.theme,
+        );
+    }
+}
+
+fn draw_resize_hint(frame: &mut Frame, area: Rect, title: &str, app: &App) {
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(format!("{title}: enlarge terminal · Esc close"))
+            .style(app.theme.styles.warning)
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn draw_session_picker(frame: &mut Frame, area: Rect, app: &App) {
+    let width = area.width.min(76).saturating_sub(2);
+    let sessions = app.matching_sessions().collect::<Vec<_>>();
+    let search_rows = u16::from(app.session_searching);
+    let height = (sessions
+        .len()
+        .saturating_add(usize::from(search_rows))
+        .saturating_add(6)
+        .min(usize::from(area.height.saturating_sub(2)))) as u16;
+    if width < 24 || height < 5 {
+        draw_resize_hint(frame, area, "Sessions", app);
+        return;
+    }
+    let popup = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(" Open a session ")
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(app.theme.styles.border);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let [search, list, footer] = Layout::vertical([
+        Constraint::Length(search_rows),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+    if app.session_searching {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                format!(
+                    "Filter: {}_  ({} matches · Ctrl+F search · Esc clear)",
+                    app.session_query,
+                    sessions.len()
+                ),
+                app.theme.styles.muted,
+            )),
+            search,
+        );
+    }
+    let mut lines = Vec::new();
+    lines.extend(sessions.iter().enumerate().map(|(index, session)| {
+        let selected = index == app.session_selected;
+        Line::from(vec![
+            Span::styled(
+                if selected { "› " } else { "  " },
+                app.theme.styles.accent_from,
+            ),
+            Span::styled(
+                if app.session_id == Some(session.id) {
+                    format!("{}  · active", session.preview)
+                } else {
+                    session.preview.clone()
+                },
+                if selected {
+                    app.theme.styles.heading.add_modifier(Modifier::BOLD)
+                } else {
+                    app.theme.styles.default
+                },
+            ),
+            Span::styled(
+                format!("  · {} msgs", session.message_count),
+                app.theme.styles.muted,
+            ),
+        ])
+    }));
+    let new_selected = app.session_selected == sessions.len();
+    lines.push(Line::from(vec![
+        Span::styled(
+            if new_selected { "› " } else { "  " },
+            app.theme.styles.accent_from,
+        ),
+        Span::styled(
+            "＋ New session",
+            if new_selected {
+                app.theme.styles.heading.add_modifier(Modifier::BOLD)
+            } else {
+                app.theme.styles.default
+            },
+        ),
+    ]));
+    let scroll = app
+        .session_selected
+        .saturating_sub(usize::from(list.height.saturating_sub(1)))
+        .min(usize::from(u16::MAX)) as u16;
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .scroll((scroll, 0)),
+        list,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "↑/↓ or j/k select · Home/End jump · Enter open · N new · Ctrl+F filter · Esc quit",
+            app.theme.styles.muted,
+        )),
+        footer,
+    );
+}
+
+fn draw_provider_settings(frame: &mut Frame, area: Rect, app: &App) {
+    let width = area.width.min(72).saturating_sub(2);
+    let height = 12.min(area.height.saturating_sub(2));
+    if width < 40 || height < 8 {
+        draw_resize_hint(frame, area, "Provider settings", app);
+        return;
+    }
+    let popup = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(" Provider settings ")
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(app.theme.styles.border);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let Some(settings) = &app.provider_settings else {
+        return;
+    };
+    let kind = match settings.kind {
+        codeloom_core::config::ProviderKind::OpenAiCompat => "OpenAI compatible",
+        codeloom_core::config::ProviderKind::Anthropic => "Anthropic",
+    };
+    let value = |index: usize, current: &str| {
+        if app.settings_editing && app.settings_field == index {
+            app.settings_editor.text().to_string()
+        } else {
+            current.to_string()
+        }
+    };
+    let rows = [
+        ("Provider", kind.to_string()),
+        ("Model", value(1, &settings.model)),
+        ("Base URL", value(2, &settings.base_url)),
+        ("API key env", value(3, &settings.api_key_env)),
+        (
+            "Save and apply",
+            if app.settings_saving {
+                "Applying…"
+            } else {
+                "Enter"
+            }
+            .to_string(),
+        ),
+    ];
+    let mut lines = rows
+        .iter()
+        .enumerate()
+        .map(|(index, (label, value))| {
+            let selected = app.settings_field == index;
+            Line::from(vec![
+                Span::styled(
+                    if selected { "› " } else { "  " },
+                    app.theme.styles.accent_from,
+                ),
+                Span::styled(
+                    format!("{label}: "),
+                    if selected {
+                        app.theme.styles.heading.add_modifier(Modifier::BOLD)
+                    } else {
+                        app.theme.styles.muted
+                    },
+                ),
+                Span::styled(value.as_str(), app.theme.styles.default),
+            ])
+        })
+        .collect::<Vec<_>>();
+    if let Some(feedback) = &app.settings_feedback {
+        lines.push(Line::styled(feedback.clone(), app.theme.styles.warning));
+    }
+    lines.push(Line::styled(
+        if app.settings_editing {
+            "Ctrl+A clear · Enter accept · Esc cancel"
+        } else if app.settings_saving {
+            "Applying settings… · Esc close"
+        } else {
+            "↑/↓ select · ←/→ provider · Enter edit/apply · Ctrl+S save (idle) · Esc close"
+        },
+        app.theme.styles.muted,
+    ));
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+    if app.settings_editing {
+        let label_width = [
+            "Provider: ".len(),
+            "Model: ".len(),
+            "Base URL: ".len(),
+            "API key env: ".len(),
+            "Save and apply: ".len(),
+        ][app.settings_field];
+        let (_, col) = app.settings_editor.cursor_row_col();
+        let x = inner.x + 2 + label_width as u16 + col as u16;
+        let y = inner.y + app.settings_field as u16;
+        if x < inner.right() && y < inner.bottom() {
+            frame.set_cursor_position((x, y));
+        }
+    }
+}
+
+fn draw_prompt_queue(frame: &mut Frame, area: Rect, app: &App) {
+    let width = area.width.min(78).saturating_sub(2);
+    let height = (app
+        .pending_prompts
+        .len()
+        .saturating_add(10)
+        .max(11)
+        .min(usize::from(area.height.saturating_sub(2)))) as u16;
+    if width < 62 || height < 11 {
+        draw_resize_hint(frame, area, "Prompt queue", app);
+        return;
+    }
+    let popup = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(format!(
+            " Prompt queue ({}) · {} ",
+            app.pending_prompts.len(),
+            if app.queue_paused {
+                "paused"
+            } else {
+                "resumes on close"
+            },
+        ))
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(app.theme.styles.border);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let [list, preview, footer] = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(5),
+        Constraint::Length(3),
+    ])
+    .areas(inner);
+    let mut lines = app
+        .pending_prompts
+        .iter()
+        .enumerate()
+        .map(|(index, prompt)| {
+            let prefix = if index == app.queue_selected {
+                "› "
+            } else {
+                "  "
+            };
+            let text = prompt.lines().next().unwrap_or("");
+            let clipped = text
+                .chars()
+                .take(list.width.saturating_sub(3) as usize)
+                .collect::<String>();
+            Line::styled(
+                format!("{prefix}{clipped}"),
+                if index == app.queue_selected {
+                    app.theme.styles.heading.add_modifier(Modifier::BOLD)
+                } else {
+                    app.theme.styles.default
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        lines.push(Line::styled("Queue is empty", app.theme.styles.muted));
+    }
+    let scroll = app
+        .queue_selected
+        .saturating_sub(usize::from(list.height.saturating_sub(1))) as u16;
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .scroll((scroll, 0)),
+        list,
+    );
+    let selected = app.pending_prompts.get(app.queue_selected);
+    let text = selected.map_or("Select a queued prompt", String::as_str);
+    if app.queue_editing {
+        batten::widgets::composer::render_focused(
+            frame,
+            preview,
+            &app.queue_editor,
+            true,
+            &app.theme,
+        );
+    } else {
+        frame.render_widget(
+            Paragraph::new(text)
+                .block(Block::default().title(" Preview ").borders(Borders::TOP))
+                .wrap(Wrap { trim: true }),
+            preview,
+        );
+    }
+    frame.render_widget(
+        Paragraph::new(if app.queue_editing {
+            "Enter accept (nonempty) · Ctrl+J newline\nCtrl+A clear · Esc discard edit"
+        } else {
+            "↑/↓ select · Ctrl+↑/↓ move · Del remove · Enter edit\nSpace pause/resume · Ctrl+X cancel active and pause\nEsc close · Pending prompts wait while this dialog is open"
+        })
+            .style(app.theme.styles.muted)
+            .wrap(Wrap { trim: true }),
+        footer,
+    );
+}
+
+fn draw_tool_inspector(frame: &mut Frame, area: Rect, app: &mut App) {
+    let width = area.width.min(100).saturating_sub(2);
+    let height = area.height.saturating_sub(2);
+    if width < 54 || height < 13 {
+        draw_resize_hint(frame, area, "Tool inspector", app);
+        return;
+    }
+    let popup = Rect::new(area.x + (area.width - width) / 2, area.y + 1, width, height);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(" Tool inspector · last 8 calls ")
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(app.theme.styles.border);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let [list, detail, footer] = Layout::vertical([
+        Constraint::Length(app.tools.len().clamp(1, 4) as u16),
+        Constraint::Min(3),
+        Constraint::Length(3),
+    ])
+    .areas(inner);
+    let rows = if app.tools.is_empty() {
+        vec![Line::styled("No tool calls yet", app.theme.styles.muted)]
+    } else {
+        app.tools
+            .iter()
+            .enumerate()
+            .map(|(index, tool)| {
+                Line::styled(
+                    format!(
+                        "{} {} · {:?}",
+                        if index == app.tool_selected {
+                            "›"
+                        } else {
+                            " "
+                        },
+                        tool.name,
+                        tool.status()
+                    ),
+                    if index == app.tool_selected {
+                        app.theme.styles.heading
+                    } else {
+                        app.theme.styles.muted
+                    },
+                )
+            })
+            .collect()
+    };
+    frame.render_widget(
+        Paragraph::new(rows).scroll((
+            app.tool_selected
+                .saturating_sub(usize::from(list.height.saturating_sub(1))) as u16,
+            0,
+        )),
+        list,
+    );
+    let mut lines = Vec::new();
+    if let Some(tool) = app.tools.get(app.tool_selected) {
+        lines.push(Line::styled("Arguments", app.theme.styles.heading));
+        lines.extend(
+            tool.summary
+                .as_deref()
+                .unwrap_or("No arguments received")
+                .split('\n')
+                .map(Line::from),
+        );
+        lines.push(Line::styled("Output", app.theme.styles.heading));
+        lines.extend(
+            tool.output
+                .as_deref()
+                .unwrap_or("No output received")
+                .split('\n')
+                .map(Line::from),
+        );
+    }
+    let max_y = lines
+        .len()
+        .saturating_sub(usize::from(detail.height))
+        .min(usize::from(u16::MAX)) as u16;
+    let max_x = lines
+        .iter()
+        .map(Line::width)
+        .max()
+        .unwrap_or(0)
+        .saturating_sub(usize::from(detail.width))
+        .min(usize::from(u16::MAX)) as u16;
+    app.tool_scroll.0 = app.tool_scroll.0.min(max_y);
+    app.tool_scroll.1 = app.tool_scroll.1.min(max_x);
+    frame.render_widget(Paragraph::new(lines).scroll(app.tool_scroll), detail);
+    frame.render_widget(
+        Paragraph::new("↑/↓ select · PgUp/PgDn scroll · ←/→ pan\nHome/End start/end · Y copy output\nEsc or Ctrl+T close")
+            .style(app.theme.styles.muted),
+        footer,
+    );
+}
+
+fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
+    let width = area.width.min(78).saturating_sub(2);
+    let height = area.height.min(19).saturating_sub(2);
+    if width < 54 || height < 17 {
+        draw_resize_hint(frame, area, "Keyboard shortcuts", app);
+        return;
+    }
+    let popup = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(" Keyboard shortcuts ")
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(app.theme.styles.border);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from("Enter       Send prompt"),
+            Line::from("Ctrl+J      Insert newline"),
+            Line::from("Tab/Shift+Tab Switch composer/transcript"),
+            Line::from("Mouse wheel Scroll transcript"),
+            Line::from("Ctrl+B      Toggle sidebar at medium width"),
+            Line::from("Ctrl+K      Open prompt queue"),
+            Line::from("Ctrl+O      Expand latest tool output"),
+            Line::from("Ctrl+T      Inspect recent tool calls"),
+            Line::from("/           Commands at start of composer"),
+            Line::from("/theme      Cycle terminal color theme"),
+            Line::from("F3          Switch or create session (when idle)"),
+            Line::from("F2          Provider settings"),
+            Line::from("Esc         Cancel turn; press twice to quit"),
+            Line::from("Ctrl+C/Q    Quit"),
+            Line::styled("Press F1 or Esc to close", app.theme.styles.muted),
+        ])
+        .wrap(Wrap { trim: true }),
+        inner,
+    );
 }
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
+    app.matrix_rain.render(frame, area);
     let rows = Layout::vertical([
-        Constraint::Length(1),
+        Constraint::Length(2),
         Constraint::Min(1),
-        Constraint::Length(3),
+        Constraint::Length(1),
     ])
     .split(area);
-
-    draw_header(frame, rows[0], app);
-
-    if area.width >= SIDEBAR_MIN_WIDTH {
-        let cols = Layout::horizontal([Constraint::Min(1), Constraint::Length(SIDEBAR_WIDTH)])
-            .split(rows[1]);
-        draw_transcript(frame, cols[0], app);
-        let right = cols[1];
-        if app.changes.is_empty() {
-            batten::widgets::sidebar::render(frame, right, &app.sidebar(), &app.theme);
+    draw_workspace_header(frame, rows[0], app);
+    if rows[1].width >= 105 {
+        let [left, center, right] = Layout::horizontal([
+            Constraint::Length(23),
+            Constraint::Min(42),
+            Constraint::Length(30),
+        ])
+        .areas(rows[1]);
+        draw_workspace_sidebar(frame, left, app);
+        draw_transcript(frame, center, app);
+        draw_workspace_metrics(frame, right, app);
+    } else if rows[1].width >= 68 {
+        if app.sidebar_expanded {
+            let [left, center] =
+                Layout::horizontal([Constraint::Length(23), Constraint::Min(1)]).areas(rows[1]);
+            draw_workspace_sidebar(frame, left, app);
+            draw_transcript(frame, center, app);
         } else {
-            let need = (app.changes.len() as u16).saturating_add(2);
-            let h = need.min(right.height.saturating_sub(1));
-            let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(h)]).split(right);
-            batten::widgets::sidebar::render(frame, parts[0], &app.sidebar(), &app.theme);
-            batten::widgets::file_changes::render(
-                frame,
-                parts[1],
-                "ficheros modificados",
-                &app.changes,
-                &app.theme,
-            );
+            let [center, right] =
+                Layout::horizontal([Constraint::Min(1), Constraint::Length(28)]).areas(rows[1]);
+            draw_transcript(frame, center, app);
+            draw_workspace_metrics(frame, right, app);
         }
     } else {
         draw_transcript(frame, rows[1], app);
     }
-
-    draw_composer(frame, rows[2], app);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(format!(" {} ", app.status), app.theme.styles.heading),
+            Span::styled(
+                app.slash_feedback.as_deref().unwrap_or(
+                    "  Enter send · Ctrl+J newline · Ctrl+K queue · Ctrl+O tool · Ctrl+T inspect · F2 settings · Esc cancel",
+                ),
+                app.theme.styles.muted,
+            ),
+            Span::styled(
+                format!("  ↑ {} · ↓ {} tokens", app.input_tokens, app.output_tokens),
+                app.theme.styles.muted,
+            ),
+        ])),
+        rows[2],
+    );
 
     if let Some(p) = &app.permission {
         batten::widgets::permission::render(frame, area, &p.dialog, &app.theme);
+    }
+    if app.session_picker_open {
+        draw_session_picker(frame, area, app);
+    } else if app.queue_open {
+        draw_prompt_queue(frame, area, app);
+    } else if app.session_loading {
+        let width = area.width.min(24);
+        let popup = Rect::new(
+            area.x + (area.width - width) / 2,
+            area.y + area.height / 2,
+            width,
+            u16::from(area.height > 0),
+        );
+        frame.render_widget(
+            Paragraph::new("Loading session…").alignment(Alignment::Center),
+            popup,
+        );
+    }
+    if app.settings_open {
+        draw_provider_settings(frame, area, app);
+    }
+    if app.help_open {
+        draw_help_overlay(frame, area, app);
+    }
+    if app.tools_open {
+        draw_tool_inspector(frame, area, app);
+    }
+    if app.slash_query().is_some() {
+        frame.render_widget(
+            Paragraph::new(if let Some(feedback) = app.slash_feedback.as_deref() {
+                feedback
+            } else if app.slash_matches().is_empty() {
+                "Unknown command · Esc to send as text"
+            } else {
+                "↑/↓ select · Tab complete · Enter run · Esc dismiss"
+            })
+            .style(app.theme.styles.muted),
+            rows[2],
+        );
     }
 }
 
@@ -87,7 +894,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 mod tests {
     use super::*;
     use crate::app::App;
-    use ratatui::backend::TestBackend;
+    use ratatui::backend::{Backend, TestBackend};
     use ratatui::Terminal;
 
     fn buffer_of(app: &mut App, w: u16, h: u16) -> String {
@@ -111,6 +918,7 @@ mod tests {
         assert!(content.contains("hello"));
         assert!(content.contains('x'));
         assert!(content.contains("CodeLoom"));
+        assert!(content.contains("CODELOOM / WORKSPACE"));
     }
 
     #[test]
@@ -128,7 +936,89 @@ mod tests {
     fn header_shows_queued_prompts() {
         let mut app = App::new();
         app.queued = 2;
-        assert!(buffer_of(&mut app, 60, 10).contains("en cola (2)"));
+        assert!(buffer_of(&mut app, 60, 10).contains("2 queued"));
+    }
+
+    #[test]
+    fn header_job_counts_are_scoped_to_the_open_session() {
+        let mut app = App::new();
+        app.session_id = Some(codeloom_core::session::SessionId(2));
+        for (id, owner, status) in [
+            ("shell-1", 2, codeloom_core::job::JobStatus::Running),
+            ("shell-2", 2, codeloom_core::job::JobStatus::Failed),
+            ("shell-3", 1, codeloom_core::job::JobStatus::Running),
+            ("subagent-1", 2, codeloom_core::job::JobStatus::Running),
+        ] {
+            let id = codeloom_core::job::JobId(id.into());
+            let kind = if id.0.starts_with("subagent-") {
+                "subagent"
+            } else {
+                "shell"
+            };
+            app.jobs.insert(
+                id.clone(),
+                codeloom_core::job::JobSnapshot {
+                    id,
+                    kind: kind.into(),
+                    label: "test".into(),
+                    owner: codeloom_core::session::SessionId(owner),
+                    status,
+                    progress: None,
+                    output: String::new(),
+                    output_start: 0,
+                    output_end: 0,
+                    detail: None,
+                    result: None,
+                },
+            );
+        }
+        for (child, status) in [
+            (99, codeloom_core::session::SubagentStatus::Running),
+            (100, codeloom_core::session::SubagentStatus::Interrupted),
+        ] {
+            app.subagents.insert(
+                child,
+                codeloom_core::session::SubagentDescriptor {
+                    parent: codeloom_core::session::SessionId(2),
+                    child: codeloom_core::session::SessionId(child),
+                    job_id: format!("subagent-{child}"),
+                    label: "test".into(),
+                    status,
+                    result: None,
+                    notice_delivered: false,
+                },
+            );
+        }
+        assert_eq!(job_counts(&app), (1, 1, 1, 1));
+    }
+
+    #[test]
+    fn workspace_header_marks_errors_instead_of_ready() {
+        let mut app = App::new();
+        app.status = "error: provider unavailable".into();
+        assert!(buffer_of(&mut app, 80, 20).contains("ERROR"));
+    }
+
+    #[test]
+    fn prompt_queue_previews_the_selected_full_prompt() {
+        let mut app = App::new();
+        app.pending_prompts
+            .push_back("Review the changed files\nThen summarize any risks".into());
+        app.queued = 1;
+        app.queue_open = true;
+        let content = buffer_of(&mut app, 80, 20);
+        assert!(content.contains("Preview"));
+        assert!(content.contains("Then summarize any risks"));
+    }
+
+    #[test]
+    fn help_overlay_shows_supported_shortcuts() {
+        let mut app = App::new();
+        app.help_open = true;
+        let content = buffer_of(&mut app, 80, 24);
+        assert!(content.contains("Keyboard shortcuts"));
+        assert!(content.contains("Ctrl+J"));
+        assert!(content.contains("Ctrl+B"));
     }
 
     #[test]
@@ -143,8 +1033,8 @@ mod tests {
         let mut app = App::with_context("/proj", "mistral-nemo");
         let content = buffer_of(&mut app, 120, 40);
         assert!(content.contains("mistral-nemo"));
-        assert!(content.contains("subagentes"));
-        assert!(content.contains('█'));
+        assert!(content.contains("0 subagents running"));
+        assert!(content.contains("CodeLoom"));
     }
 
     #[test]
@@ -158,6 +1048,314 @@ mod tests {
         let content = buffer_of(&mut app, 120, 40);
         assert!(content.contains("ficheros modificados"));
         assert!(content.contains("src/main.rs"));
+    }
+
+    #[test]
+    fn session_picker_renders_only_matching_previews() {
+        let mut app = App::new();
+        app.set_sessions(vec![
+            codeloom_core::session::SessionInfo {
+                id: codeloom_core::session::SessionId(1),
+                preview: "Build frontend".into(),
+                message_count: 2,
+            },
+            codeloom_core::session::SessionInfo {
+                id: codeloom_core::session::SessionId(2),
+                preview: "Fix provider config".into(),
+                message_count: 4,
+            },
+        ]);
+        app.session_id = Some(codeloom_core::session::SessionId(2));
+        app.session_searching = true;
+        app.session_query = "provider".into();
+        let content = buffer_of(&mut app, 80, 24);
+        assert!(content.contains("Fix provider config"));
+        assert!(content.contains("active"));
+        assert!(content.contains("1 matches"));
+        assert!(!content.contains("Build frontend"));
+    }
+
+    #[test]
+    fn session_picker_keeps_selected_row_visible_when_list_overflows() {
+        let mut app = App::new();
+        app.set_sessions(
+            (0..8)
+                .map(|index| codeloom_core::session::SessionInfo {
+                    id: codeloom_core::session::SessionId(index),
+                    preview: format!("Session {index}"),
+                    message_count: index as usize,
+                })
+                .collect(),
+        );
+        app.session_selected = 7;
+        let content = buffer_of(&mut app, 80, 12);
+        assert!(content.contains("Session 7"));
+        assert!(content.contains("Ctrl+F filter"));
+    }
+
+    #[test]
+    fn ctrl_b_sidebar_is_visible_at_medium_width() {
+        let mut app = App::with_context("/proj", "m");
+        app.sidebar_expanded = true;
+        let content = buffer_of(&mut app, 90, 30);
+        assert!(content.contains("PROJECT"));
+        assert!(content.contains("0 subagents running"));
+        assert!(content.contains("Conversation"));
+    }
+
+    #[test]
+    fn expanded_tool_output_uses_available_transcript_height() {
+        let mut tool = batten::state::ToolItem::new("call-1", "view");
+        tool.set_result(false);
+        tool.set_output(
+            (0..20)
+                .map(|i| format!("line-{i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        tool.expanded = true;
+        let mut app = App::new();
+        app.tools.push_back(tool);
+        let content = buffer_of(&mut app, 120, 40);
+        assert!(content.contains("line-19"));
+    }
+
+    #[test]
+    fn live_tool_card_separates_status_arguments_and_output() {
+        let mut tool = batten::state::ToolItem::new("call-1", "view");
+        tool.set_summary(r#"{"path":"src/main.rs"}"#);
+        tool.set_result(false);
+        tool.set_output("fn main() {}");
+        let mut app = App::new();
+        app.tools.push_back(tool);
+        let content = buffer_of(&mut app, 90, 20);
+        assert!(content.contains("DONE"));
+        assert!(content.contains("IN"));
+        assert!(content.contains("OUT"));
+        assert!(content.contains("fn main()"));
+        assert!(content.contains("src/main.rs"));
+    }
+
+    #[test]
+    fn crush_shows_inline_tool_once_without_fixed_card() {
+        let mut app = App::new();
+        app.theme = batten::widgets::Theme::preset(batten::widgets::ThemePreset::Crush);
+        app.apply(codeloom_core::event::LiveEvent::ToolStarted {
+            call_id: "c1".into(),
+            name: "View".into(),
+        });
+        let content = buffer_of(&mut app, 90, 20);
+        assert_eq!(content.matches("● View").count(), 1);
+        assert!(!content.contains("RUNNING"));
+    }
+
+    #[test]
+    fn crush_composer_keeps_cursor_inside_the_screen_when_wrapping() {
+        let mut app = App::new();
+        app.theme = batten::widgets::Theme::preset(batten::widgets::ThemePreset::Crush);
+        app.composer.set_text(&"x".repeat(100));
+        let backend = TestBackend::new(40, 20);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render(f, &mut app)).unwrap();
+        let cursor = term.backend_mut().get_cursor_position().unwrap();
+        assert!(cursor.x < 40);
+        assert!(cursor.y > 0 && cursor.y < 20);
+    }
+
+    #[test]
+    fn composer_grows_for_multiline_input_and_keeps_cursor_visible_when_limited() {
+        let mut app = App::new();
+        app.composer.set_text("first\nsecond\nthird");
+        let backend = TestBackend::new(60, 20);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render(f, &mut app)).unwrap();
+        let content = term
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        let cursor = term.backend_mut().get_cursor_position().unwrap();
+        assert!(content.contains("first"));
+        assert!(content.contains("second"));
+        assert!(content.contains("third"));
+        assert!(cursor.y > 0);
+
+        app.composer.set_text("one\ntwo\nthree\nfour\nfive");
+        let backend = TestBackend::new(60, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render(f, &mut app)).unwrap();
+        let content = term
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        let cursor = term.backend_mut().get_cursor_position().unwrap();
+        assert!(content.contains("three"));
+        assert!(content.contains("four"));
+        assert!(content.contains("five"));
+        assert!(cursor.y > 0);
+    }
+
+    #[test]
+    fn slash_menu_renders_filters_and_respects_overlays_and_small_sizes() {
+        let mut app = App::new();
+        app.composer.set_text("/");
+        let content = buffer_of(&mut app, 100, 30);
+        assert!(content.contains("/help"));
+        assert!(content.contains("/sessions"));
+        assert!(content.contains("Tab complete"));
+        app.composer.set_text("/to");
+        let content = buffer_of(&mut app, 100, 30);
+        assert!(content.contains("/tools"));
+        assert!(!content.contains("/sessions"));
+        for (width, height) in [(0, 0), (1, 1), (20, 5), (40, 10), (120, 40)] {
+            buffer_of(&mut app, width, height);
+        }
+        app.composer.set_text("/unknown");
+        assert!(buffer_of(&mut app, 100, 30).contains("Unknown command"));
+        app.composer.set_text("/new");
+        app.turn_in_flight = true;
+        crate::run::handle_key(
+            &mut app,
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert!(buffer_of(&mut app, 100, 30).contains("Wait for the active turn"));
+        app.help_open = true;
+        let content = buffer_of(&mut app, 100, 30);
+        assert!(!content.contains("Tab complete"));
+        assert!(content.contains("Press F1 or Esc to close"));
+    }
+
+    #[test]
+    fn tool_inspector_shows_status_arguments_and_scrolls_full_output() {
+        let mut app = App::new();
+        app.tools_open = true;
+        assert!(buffer_of(&mut app, 100, 30).contains("No tool calls yet"));
+        let mut tool = batten::state::ToolItem::new("call", "view");
+        tool.set_summary("{\"path\":\"sample.rs\"}");
+        tool.set_result(true);
+        tool.set_output(
+            (0..40)
+                .map(|index| format!("line-{index:02}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        app.tools.push_back(tool);
+        let top = buffer_of(&mut app, 100, 30);
+        assert!(top.contains("Error"));
+        assert!(top.contains("sample.rs"));
+        assert!(top.contains("line-00"));
+        assert!(!top.contains("line-39"));
+        app.tool_scroll = (u16::MAX, u16::MAX);
+        let bottom = buffer_of(&mut app, 100, 30);
+        assert!(bottom.contains("line-39"));
+        assert_eq!(app.tool_scroll.1, 0);
+        for (width, height) in [(0, 0), (1, 1), (30, 8), (60, 20)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            assert!(!terminal.backend().cursor_visible());
+        }
+        assert!(buffer_of(&mut app, 30, 8).contains("enlarge"));
+        app.tools[0].set_output(format!("{}THE-END", "x".repeat(200)));
+        app.tool_scroll = (0, u16::MAX);
+        assert!(buffer_of(&mut app, 100, 30).contains("THE-END"));
+    }
+
+    #[test]
+    fn queue_shows_pause_controls_and_edits_with_its_own_cursor() {
+        let mut app = App::new();
+        app.queue_open = true;
+        app.queue_paused = true;
+        app.pending_prompts.push_back("original".into());
+        let content = buffer_of(&mut app, 100, 30);
+        assert!(content.contains("paused"));
+        assert!(content.contains("Enter edit"));
+        assert!(content.contains("Ctrl+X"));
+        app.queue_editing = true;
+        app.queue_editor.set_text("edited\nsecond line");
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(terminal.backend().cursor_visible());
+        let content = buffer_of(&mut app, 100, 30);
+        assert!(content.contains("second line"));
+        assert!(content.contains("Esc discard edit"));
+    }
+
+    #[test]
+    fn overlays_render_across_terminal_sizes_and_hide_the_composer_cursor() {
+        for overlay in 0..6 {
+            let mut app = App::new();
+            match overlay {
+                0 => app.session_loading = true,
+                1 => app.session_picker_open = true,
+                2 => app.queue_open = true,
+                3 => app.help_open = true,
+                4 => {
+                    app.set_provider_settings(crate::app::ProviderSettings {
+                        kind: codeloom_core::config::ProviderKind::OpenAiCompat,
+                        model: "test-model".into(),
+                        base_url: "https://example.test/v1".into(),
+                        api_key_env: "API_KEY".into(),
+                    });
+                    app.open_settings();
+                }
+                _ => {
+                    let (tx, _rx) = tokio::sync::oneshot::channel();
+                    app.enqueue_permission(
+                        codeloom_core::permission::PermissionRequest {
+                            tool: "bash".into(),
+                            action: "run".into(),
+                            detail: "cargo test".into(),
+                        },
+                        tx,
+                    );
+                }
+            }
+            for (width, height) in [(0, 0), (1, 1), (10, 3), (30, 8), (60, 20), (120, 40)] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal.draw(|frame| render(frame, &mut app)).unwrap();
+                assert!(
+                    !terminal.backend().cursor_visible(),
+                    "overlay {overlay} at {width}x{height}"
+                );
+            }
+            if (1..=4).contains(&overlay) {
+                assert!(buffer_of(&mut app, 20, 8).contains("enlarge"));
+            }
+        }
+        let mut app = App::new();
+        app.help_open = true;
+        let help = buffer_of(&mut app, 80, 24);
+        assert!(help.contains("Shift+Tab"));
+        assert!(help.contains("Press F1 or Esc to close"));
+    }
+
+    #[test]
+    fn provider_settings_shows_saving_and_recoverable_error() {
+        let mut app = App::new();
+        app.set_provider_settings(crate::app::ProviderSettings {
+            kind: codeloom_core::config::ProviderKind::OpenAiCompat,
+            model: "test-model".into(),
+            base_url: "https://example.test/v1".into(),
+            api_key_env: "API_KEY".into(),
+        });
+        app.open_settings();
+        app.settings_saving = true;
+        let content = buffer_of(&mut app, 120, 40);
+        assert!(content.contains("Applying"));
+        assert!(content.contains("API_KEY"));
+        app.settings_saved(Err("Cannot write config".into()));
+        let content = buffer_of(&mut app, 120, 40);
+        assert!(content.contains("Cannot write config"));
+        assert!(content.contains("Ctrl+S"));
+        let content = buffer_of(&mut app, 30, 8);
+        assert!(content.contains("Provider settings"));
+        assert!(content.contains("Esc close"));
     }
 
     #[test]

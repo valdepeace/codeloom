@@ -1,22 +1,50 @@
-use crate::app::App;
 use crate::app::Focus;
+use crate::app::{App, ProviderSettings, SessionChoice};
 use crate::frame::{FrameScheduler, Urgency, MIN_FRAME};
 use crate::render::render;
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEventKind,
-    KeyModifiers,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, EndSynchronizedUpdate,
     EnterAlternateScreen, LeaveAlternateScreen,
 };
-use futures::{FutureExt, StreamExt};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
+
+pub type ActiveTurn = Arc<Mutex<Option<CancellationToken>>>;
+const ESC_DOUBLE_PRESS: Duration = Duration::from_millis(350);
+
+pub enum SessionCommand {
+    Refresh,
+    Select(SessionChoice),
+}
+
+pub enum SessionUpdate {
+    List(Vec<codeloom_core::session::SessionInfo>),
+    Loaded(
+        codeloom_core::session::SessionId,
+        Vec<codeloom_core::message::Message>,
+    ),
+    Subagents(
+        codeloom_core::session::SessionId,
+        Vec<codeloom_core::session::SubagentDescriptor>,
+    ),
+    Error(String),
+}
+
+pub struct ProviderSettingsCommand {
+    pub settings: ProviderSettings,
+    pub reply: oneshot::Sender<Result<(), String>>,
+}
 
 /// Eventos de teclado que se procesan como máximo antes de pintar.
 const MAX_BURST: usize = 512;
@@ -28,12 +56,14 @@ struct RawGuard;
 impl RawGuard {
     fn enter() -> std::io::Result<Self> {
         enable_raw_mode()?;
+        let guard = Self;
         execute!(
             std::io::stdout(),
             EnterAlternateScreen,
-            EnableBracketedPaste
+            EnableBracketedPaste,
+            EnableMouseCapture,
         )?;
-        Ok(Self)
+        Ok(guard)
     }
 }
 
@@ -42,7 +72,10 @@ impl Drop for RawGuard {
         let _ = disable_raw_mode();
         let _ = execute!(
             std::io::stdout(),
+            EndSynchronizedUpdate,
+            crossterm::cursor::Show,
             DisableBracketedPaste,
+            DisableMouseCapture,
             LeaveAlternateScreen
         );
     }
@@ -61,7 +94,7 @@ fn transcript_key(app: &mut App, code: KeyCode) {
                 app.selection = None;
                 return;
             }
-            KeyCode::Esc | KeyCode::Char('v') => {
+            KeyCode::Char('v') => {
                 app.selection = None;
                 return;
             }
@@ -84,7 +117,6 @@ fn transcript_key(app: &mut App, code: KeyCode) {
         KeyCode::PageDown | KeyCode::Char('f') | KeyCode::Char(' ') => vp.page_down(),
         KeyCode::Home | KeyCode::Char('g') => vp.to_top(),
         KeyCode::End | KeyCode::Char('G') => vp.follow_bottom(),
-        KeyCode::Esc => app.focus = Focus::Composer,
         _ => {}
     }
 }
@@ -92,8 +124,198 @@ fn transcript_key(app: &mut App, code: KeyCode) {
 /// Traduce una tecla a una accion sobre la app. Devuelve el prompt a enviar
 /// cuando el usuario pulsa Enter con texto.
 pub fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Option<String> {
+    if app.slash_query().is_none() {
+        app.slash_feedback = None;
+    }
+    if app
+        .slash_dismissed
+        .as_deref()
+        .is_some_and(|text| text != app.composer.text())
+    {
+        app.slash_dismissed = None;
+    }
     if matches!(code, KeyCode::Char('c' | 'q')) && mods.contains(KeyModifiers::CONTROL) {
         app.should_quit = true;
+        return None;
+    }
+    if app.settings_open {
+        handle_settings_key(app, code, mods);
+        return None;
+    }
+    if app.help_open {
+        if matches!(code, KeyCode::F(1) | KeyCode::Esc) {
+            app.help_open = false;
+        }
+        return None;
+    }
+    if app.tools_open {
+        match code {
+            KeyCode::Esc => {
+                app.tools_open = false;
+                app.last_escape = None;
+            }
+            KeyCode::Char('t') if mods.contains(KeyModifiers::CONTROL) => app.tools_open = false,
+            KeyCode::Up | KeyCode::Down => {
+                app.tool_selected = if code == KeyCode::Up {
+                    app.tool_selected.saturating_sub(1)
+                } else {
+                    (app.tool_selected + 1).min(app.tools.len().saturating_sub(1))
+                };
+                app.tool_scroll = (0, 0);
+            }
+            KeyCode::PageUp => app.tool_scroll.0 = app.tool_scroll.0.saturating_sub(10),
+            KeyCode::PageDown => app.tool_scroll.0 = app.tool_scroll.0.saturating_add(10),
+            KeyCode::Left => app.tool_scroll.1 = app.tool_scroll.1.saturating_sub(5),
+            KeyCode::Right => app.tool_scroll.1 = app.tool_scroll.1.saturating_add(5),
+            KeyCode::Home => app.tool_scroll = (0, 0),
+            KeyCode::End => app.tool_scroll.0 = u16::MAX,
+            KeyCode::Char('y') => {
+                app.clipboard = app
+                    .tools
+                    .get(app.tool_selected)
+                    .and_then(|tool| tool.output.clone());
+                if app.clipboard.is_some() {
+                    app.status = "tool output copied".into();
+                }
+            }
+            _ => {}
+        }
+        return None;
+    }
+    if app.queue_open && app.queue_editing {
+        handle_queue_editor_key(app, code, mods);
+        return None;
+    }
+    if app.slash_query().is_some() {
+        app.slash_feedback = None;
+        let matches = app.slash_matches();
+        app.slash_selected = app.slash_selected.min(matches.len().saturating_sub(1));
+        match code {
+            KeyCode::Esc => {
+                app.slash_dismissed = Some(app.composer.text().to_string());
+                app.last_escape = None;
+                return None;
+            }
+            KeyCode::Up | KeyCode::Down => {
+                app.slash_selected = if code == KeyCode::Up {
+                    app.slash_selected.saturating_sub(1)
+                } else {
+                    (app.slash_selected + 1).min(matches.len().saturating_sub(1))
+                };
+                return None;
+            }
+            KeyCode::Tab => {
+                if let Some((_, name, _)) = matches.get(app.slash_selected) {
+                    app.composer.set_text(name);
+                    app.slash_selected = 0;
+                }
+                return None;
+            }
+            KeyCode::Enter => {
+                let Some((command, _, _)) = matches.get(app.slash_selected) else {
+                    app.slash_feedback =
+                        Some("Unknown command · /help for commands · Esc to send as text".into());
+                    return None;
+                };
+                return execute_slash_command(app, *command);
+            }
+            _ => app.slash_selected = 0,
+        }
+    }
+    if app.session_picker_open {
+        if code == KeyCode::Esc {
+            if app.session_searching {
+                app.session_searching = false;
+                app.session_query.clear();
+                app.session_selected = 0;
+            } else if app.session_picker_return_to_chat {
+                app.session_picker_open = false;
+                app.session_picker_return_to_chat = false;
+                app.last_escape = None;
+            } else {
+                app.should_quit = true;
+            }
+            return None;
+        }
+        if code == KeyCode::Char('f') && mods.contains(KeyModifiers::CONTROL) {
+            app.session_searching = !app.session_searching;
+            app.session_selected = 0;
+            return None;
+        }
+        if code == KeyCode::F(3) && !app.turn_in_flight {
+            app.session_picker_open = false;
+            app.session_picker_return_to_chat = true;
+            app.session_list_refresh_requested = true;
+            app.session_loading = true;
+            app.session_query.clear();
+            app.session_searching = false;
+            return None;
+        }
+        if app.session_searching {
+            match code {
+                KeyCode::Char(c) if !mods.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                    app.session_query.push(c);
+                    app.session_selected = 0;
+                }
+                KeyCode::Backspace => {
+                    app.session_query.pop();
+                    app.session_selected = 0;
+                }
+                _ => {}
+            }
+        }
+        let matches = app.matching_sessions().cloned().collect::<Vec<_>>();
+        let choices = matches.len() + 1;
+        match code {
+            KeyCode::Up | KeyCode::Char('k') if !app.session_searching => {
+                app.session_selected = app.session_selected.saturating_sub(1)
+            }
+            KeyCode::Down | KeyCode::Char('j') if !app.session_searching => {
+                app.session_selected = (app.session_selected + 1).min(choices - 1)
+            }
+            KeyCode::Home => app.session_selected = 0,
+            KeyCode::End => app.session_selected = choices - 1,
+            KeyCode::Char('n' | 'N') if !app.session_searching => {
+                app.session_choice = Some(SessionChoice::New);
+                app.session_picker_open = false;
+                app.session_picker_return_to_chat = false;
+                app.session_loading = true;
+            }
+            KeyCode::Enter => {
+                app.session_choice = Some(if app.session_selected == matches.len() {
+                    SessionChoice::New
+                } else {
+                    SessionChoice::Resume(matches[app.session_selected].id)
+                });
+                app.session_picker_open = false;
+                app.session_picker_return_to_chat = false;
+                app.session_loading = true;
+            }
+            _ => {}
+        }
+        app.session_selected = app.session_selected.min(choices - 1);
+        return None;
+    }
+    if code == KeyCode::Esc {
+        if app.queue_open {
+            app.queue_open = false;
+            return None;
+        }
+        let now = Instant::now();
+        if app
+            .last_escape
+            .is_some_and(|last| now.saturating_duration_since(last) <= ESC_DOUBLE_PRESS)
+        {
+            app.should_quit = true;
+            app.last_escape = None;
+        } else {
+            app.last_escape = Some(now);
+            app.cancel_requested = app.turn_in_flight;
+        }
+        return None;
+    }
+    app.last_escape = None;
+    if app.session_loading {
         return None;
     }
     if let Some(p) = app.permission.as_mut() {
@@ -102,8 +324,88 @@ pub fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Option<St
         }
         return None;
     }
-    if code == KeyCode::Tab {
+    if code == KeyCode::F(1) {
+        app.help_open = true;
+        return None;
+    }
+    if code == KeyCode::Char('t') && mods.contains(KeyModifiers::CONTROL) {
+        app.tools_open = true;
+        app.tool_selected = app.tools.len().saturating_sub(1);
+        app.tool_scroll = (0, 0);
+        return None;
+    }
+    if code == KeyCode::F(2) {
+        app.open_settings();
+        return None;
+    }
+    if code == KeyCode::F(3) && !app.turn_in_flight {
+        app.session_picker_open = false;
+        app.session_picker_return_to_chat = true;
+        app.session_list_refresh_requested = true;
+        app.session_loading = true;
+        app.session_query.clear();
+        app.session_searching = false;
+        return None;
+    }
+    if code == KeyCode::Char('k') && mods.contains(KeyModifiers::CONTROL) {
+        app.queue_open = !app.queue_open;
+        app.queue_selected = app
+            .queue_selected
+            .min(app.pending_prompts.len().saturating_sub(1));
+        return None;
+    }
+    if app.queue_open {
+        let len = app.pending_prompts.len();
+        match (code, mods.contains(KeyModifiers::CONTROL)) {
+            (KeyCode::Char(' '), false) => app.queue_paused = !app.queue_paused,
+            (KeyCode::Char('x'), true) if app.turn_in_flight => {
+                app.queue_paused = true;
+                app.cancel_requested = true;
+            }
+            (KeyCode::Enter, false) if len > 0 => {
+                app.queue_editor
+                    .set_text(&app.pending_prompts[app.queue_selected]);
+                app.queue_editing = true;
+            }
+            (KeyCode::Up, false) => app.queue_selected = app.queue_selected.saturating_sub(1),
+            (KeyCode::Down, false) => {
+                app.queue_selected = (app.queue_selected + 1).min(len.saturating_sub(1))
+            }
+            (KeyCode::Up, true) if app.queue_selected > 0 => {
+                app.pending_prompts
+                    .swap(app.queue_selected, app.queue_selected - 1);
+                app.queue_selected -= 1;
+            }
+            (KeyCode::Down, true) if app.queue_selected + 1 < len => {
+                app.pending_prompts
+                    .swap(app.queue_selected, app.queue_selected + 1);
+                app.queue_selected += 1;
+            }
+            (KeyCode::Delete, _) if len > 0 => {
+                app.pending_prompts.remove(app.queue_selected);
+                app.queue_selected = app.queue_selected.min(len.saturating_sub(2));
+                app.queued = app.pending_prompts.len();
+            }
+            _ => {}
+        }
+        return None;
+    }
+    if matches!(code, KeyCode::Tab | KeyCode::BackTab) {
         app.toggle_focus();
+        return None;
+    }
+    if code == KeyCode::Char('b') && mods.contains(KeyModifiers::CONTROL) {
+        app.toggle_sidebar();
+        return None;
+    }
+    if code == KeyCode::Char('o') && mods.contains(KeyModifiers::CONTROL) {
+        let call_id = app.tools.back_mut().map(|tool| {
+            tool.toggle_expanded();
+            tool.call_id.clone()
+        });
+        if let Some(call_id) = call_id {
+            app.sync_tool(&call_id);
+        }
         return None;
     }
     if app.focus == Focus::Transcript {
@@ -111,15 +413,6 @@ pub fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Option<St
         return None;
     }
     match code {
-        KeyCode::Esc => None,
-        KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => {
-            app.should_quit = true;
-            None
-        }
-        KeyCode::Char('q') if mods.contains(KeyModifiers::CONTROL) => {
-            app.should_quit = true;
-            None
-        }
         KeyCode::Enter => {
             let sent = app.submit();
             if sent.is_some() {
@@ -179,71 +472,358 @@ pub fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Option<St
     }
 }
 
+fn execute_slash_command(app: &mut App, command: crate::commands::Command) -> Option<String> {
+    use crate::commands::Command;
+    if matches!(command, Command::New | Command::Sessions) && app.turn_in_flight {
+        app.slash_feedback = Some("Wait for the active turn before switching sessions".into());
+        return None;
+    }
+    if command == Command::Settings && app.provider_settings.is_none() {
+        app.slash_feedback = Some("Provider settings are unavailable".into());
+        return None;
+    }
+    if command == Command::Cancel && !app.turn_in_flight {
+        app.slash_feedback = Some("No active turn to cancel".into());
+        return None;
+    }
+    app.composer.set_text("");
+    app.slash_selected = 0;
+    app.slash_dismissed = None;
+    app.history.reset();
+    match command {
+        Command::Help => handle_key(app, KeyCode::F(1), KeyModifiers::NONE),
+        Command::Sessions => handle_key(app, KeyCode::F(3), KeyModifiers::NONE),
+        Command::Settings => handle_key(app, KeyCode::F(2), KeyModifiers::NONE),
+        Command::Queue => handle_key(app, KeyCode::Char('k'), KeyModifiers::CONTROL),
+        Command::Tools => handle_key(app, KeyCode::Char('t'), KeyModifiers::CONTROL),
+        Command::Theme => {
+            app.cycle_theme();
+            // El look Crush oculta la cabecera con el nombre del tema: se confirma aquí.
+            app.slash_feedback = Some(format!("Theme: {}", app.theme_preset.name()));
+            None
+        }
+        Command::Sidebar => handle_key(app, KeyCode::Char('b'), KeyModifiers::CONTROL),
+        Command::Cancel => {
+            app.queue_paused = true;
+            app.cancel_requested = true;
+            None
+        }
+        Command::Pause | Command::Resume => {
+            app.queue_paused = command == Command::Pause;
+            app.slash_feedback = Some(if app.queue_paused {
+                "Pending prompts paused".into()
+            } else {
+                "Pending prompts resumed".into()
+            });
+            None
+        }
+        Command::Quit => handle_key(app, KeyCode::Char('q'), KeyModifiers::CONTROL),
+        Command::New => {
+            app.session_choice = Some(SessionChoice::New);
+            app.session_loading = true;
+            None
+        }
+    }
+}
+
+fn handle_queue_editor_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
+    match code {
+        KeyCode::Esc => app.queue_editing = false,
+        KeyCode::Enter => {
+            if !app.queue_editor.text().trim().is_empty() {
+                if let Some(prompt) = app.pending_prompts.get_mut(app.queue_selected) {
+                    *prompt = app.queue_editor.text().to_string();
+                }
+                app.queue_editing = false;
+            }
+        }
+        KeyCode::Char('j') if mods.contains(KeyModifiers::CONTROL) => app.queue_editor.newline(),
+        KeyCode::Char('a') if mods.contains(KeyModifiers::CONTROL) => app.queue_editor.set_text(""),
+        KeyCode::Backspace => app.queue_editor.backspace(),
+        KeyCode::Delete => app.queue_editor.delete(),
+        KeyCode::Left => app.queue_editor.move_left(),
+        KeyCode::Right => app.queue_editor.move_right(),
+        KeyCode::Up => app.queue_editor.move_up(),
+        KeyCode::Down => app.queue_editor.move_down(),
+        KeyCode::Home => app.queue_editor.move_home(),
+        KeyCode::End => app.queue_editor.move_end(),
+        KeyCode::Char(c) if !mods.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+            app.queue_editor.insert_char(c);
+        }
+        _ => {}
+    }
+}
+
+fn handle_settings_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
+    if app.settings_saving {
+        if code == KeyCode::Esc {
+            app.settings_open = false;
+        }
+        return;
+    }
+    if app.settings_editing {
+        match code {
+            KeyCode::Esc => app.settings_editing = false,
+            KeyCode::Enter => app.commit_settings_value(),
+            KeyCode::Char('a') if mods.contains(KeyModifiers::CONTROL) => {
+                app.settings_editor.set_text("")
+            }
+            KeyCode::Backspace => app.settings_editor.backspace(),
+            KeyCode::Delete => app.settings_editor.delete(),
+            KeyCode::Left => app.settings_editor.move_left(),
+            KeyCode::Right => app.settings_editor.move_right(),
+            KeyCode::Home => app.settings_editor.move_home(),
+            KeyCode::End => app.settings_editor.move_end(),
+            KeyCode::Char(c) if !mods.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                app.settings_editor.insert_char(c);
+            }
+            _ => {}
+        }
+        return;
+    }
+    match code {
+        KeyCode::Esc => app.settings_open = false,
+        KeyCode::Up => app.settings_field = app.settings_field.saturating_sub(1),
+        KeyCode::Down => app.settings_field = (app.settings_field + 1).min(4),
+        KeyCode::Left | KeyCode::Right if app.settings_field == 0 => toggle_provider(app),
+        KeyCode::Enter if app.settings_field == 0 => {
+            toggle_provider(app);
+        }
+        KeyCode::Enter if (1..=3).contains(&app.settings_field) => app.edit_settings_value(),
+        KeyCode::Enter if app.settings_field == 4 => app.request_settings_save(),
+        KeyCode::Char('s') if mods.contains(KeyModifiers::CONTROL) => app.request_settings_save(),
+        _ => {}
+    }
+}
+
+fn toggle_provider(app: &mut App) {
+    if let Some(settings) = app.provider_settings.as_mut() {
+        settings.kind = match settings.kind {
+            codeloom_core::config::ProviderKind::OpenAiCompat => {
+                codeloom_core::config::ProviderKind::Anthropic
+            }
+            codeloom_core::config::ProviderKind::Anthropic => {
+                codeloom_core::config::ProviderKind::OpenAiCompat
+            }
+        };
+    }
+}
+
 /// Aplica un evento de terminal. Devuelve el prompt a enviar, si lo hay.
 pub fn handle_event(app: &mut App, ev: Event) -> Option<String> {
     match ev {
         Event::Key(k) if k.kind == KeyEventKind::Press => handle_key(app, k.code, k.modifiers),
-        Event::Paste(text) => {
-            app.paste(&text);
+        Event::Key(k)
+            if k.kind == KeyEventKind::Repeat
+                && !k
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                && app.permission.is_none()
+                && !app.session_picker_open
+                && !app.session_loading
+                && !app.queue_open
+                && !app.settings_open
+                && !app.help_open
+                && !app.tools_open
+                && match k.code {
+                    KeyCode::Char(_) => app.focus == Focus::Composer,
+                    KeyCode::Left
+                    | KeyCode::Right
+                    | KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::Home
+                    | KeyCode::End
+                    | KeyCode::PageUp
+                    | KeyCode::PageDown
+                    | KeyCode::Backspace
+                    | KeyCode::Delete => true,
+                    _ => false,
+                } =>
+        {
+            handle_key(app, k.code, k.modifiers)
+        }
+        Event::Mouse(mouse)
+            if !app.session_picker_open
+                && !app.session_loading
+                && !app.settings_open
+                && !app.help_open
+                && !app.tools_open
+                && !app.queue_open
+                && app.permission.is_none() =>
+        {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => app.viewport.scroll_up(3),
+                MouseEventKind::ScrollDown => app.viewport.scroll_down(3),
+                _ => {}
+            }
+            None
+        }
+        Event::Paste(text)
+            if !app.session_picker_open
+                && !app.session_loading
+                && !app.help_open
+                && !app.tools_open
+                && app.permission.is_none() =>
+        {
+            if app.settings_open {
+                if app.settings_editing && !app.settings_saving {
+                    app.settings_editor
+                        .insert_str(&text.replace(['\r', '\n'], ""));
+                }
+            } else if app.queue_open && app.queue_editing {
+                app.queue_editor.insert_str(&text);
+            } else if !app.queue_open {
+                app.paste(&text);
+            }
             None
         }
         _ => None,
     }
 }
 
-/// Envía un prompt al agente y lo cuenta como en cola.
+/// Encola prompts y mantiene un solo turno enviado al worker.
 fn send(app: &mut App, tx: &UnboundedSender<String>, prompt: Option<String>) {
     if let Some(text) = prompt {
-        app.queued += 1;
-        let _ = tx.send(text);
+        app.pending_prompts.push_back(text);
+        app.queued = app.pending_prompts.len();
+    }
+    dispatch_next(app, tx);
+}
+
+fn dispatch_next(app: &mut App, tx: &UnboundedSender<String>) {
+    if app.turn_in_flight
+        || app.queue_open
+        || app.queue_paused
+        || app.session_loading
+        || app.session_picker_open
+        || app.settings_open
+        || app.settings_saving
+    {
+        return;
+    }
+    if let Some(prompt) = app.pending_prompts.pop_front() {
+        match tx.send(prompt.clone()) {
+            Ok(()) => app.turn_in_flight = true,
+            Err(_) => {
+                app.status = "error: agent channel closed".into();
+                app.pending_prompts.push_front(prompt);
+            }
+        }
+        app.queued = app.pending_prompts.len();
+        app.queue_selected = app.queue_selected.min(app.queued.saturating_sub(1));
+    }
+}
+
+fn cancel_active_turn(app: &mut App, active_turn: &ActiveTurn) {
+    if !app.cancel_requested {
+        return;
+    }
+    if let Ok(active) = active_turn.lock() {
+        if let Some(token) = active.as_ref() {
+            token.cancel();
+            app.cancel_requested = false;
+            app.status = "cancelling".into();
+            while app.permission.is_some() {
+                app.resolve_permission(codeloom_core::permission::Decision::Deny);
+            }
+        }
     }
 }
 
 /// Bucle principal por eventos: teclado (prioritario), permisos, bus del
 /// agente, vencimiento de frame y animaciones. Solo pinta cuando hay cambios;
 /// las ráfagas de teclado se agrupan en un frame; cada frame es atómico.
+// Los canales tienen tipos distintos y los coordina este bucle único.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     mut app: App,
     prompt_tx: UnboundedSender<String>,
+    settings_tx: UnboundedSender<ProviderSettingsCommand>,
     mut bus_rx: tokio::sync::broadcast::Receiver<codeloom_core::event::LiveEvent>,
     mut perm_rx: tokio::sync::mpsc::Receiver<(
         codeloom_core::permission::PermissionRequest,
         crate::permission_flow::PermissionReply,
     )>,
+    active_turn: ActiveTurn,
+    session_command_tx: UnboundedSender<SessionCommand>,
+    mut session_update_rx: tokio::sync::mpsc::UnboundedReceiver<SessionUpdate>,
 ) -> std::io::Result<()> {
     let _guard = RawGuard::enter()?;
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend)?;
-    let mut input = EventStream::new();
+    let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::task::spawn_blocking(move || loop {
+        if input_tx.is_closed() {
+            break;
+        }
+        match crossterm::event::poll(Duration::from_millis(50)) {
+            Ok(true) => match crossterm::event::read() {
+                Ok(event) => {
+                    if input_tx.send(Ok(event)).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = input_tx.send(Err(error));
+                    break;
+                }
+            },
+            Ok(false) => {}
+            Err(error) => {
+                let _ = input_tx.send(Err(error));
+                break;
+            }
+        }
+    });
     let mut frames = FrameScheduler::new(MIN_FRAME);
     let mut anim = tokio::time::interval(batten::widgets::FRAME_INTERVAL);
     anim.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut fx: Option<batten::widgets::fx::Effect> = None;
     let mut fx_clock = Instant::now();
     let (mut bus_open, mut perm_open) = (true, true);
-    frames.request(Urgency::Input);
+    let mut session_update_open = true;
+    let mut pending_settings: Option<oneshot::Receiver<Result<(), String>>> = None;
+    send_session_commands(&mut app, &session_command_tx);
+    // Pintar antes de esperar eventos para que la TUI aparezca al arrancar.
+    execute!(std::io::stdout(), BeginSynchronizedUpdate)?;
+    terminal.draw(|f| render(f, &mut app))?;
+    execute!(std::io::stdout(), EndSynchronizedUpdate)?;
+    frames.drawn(Instant::now());
 
     while !app.should_quit {
-        let animating = fx.is_some() && app.permission.is_some();
+        let animating = (fx.is_some() && app.permission.is_some())
+            || app.matrix_rain.animating()
+            || app.thinking
+            || app.tools.iter().any(|tool| tool.is_spinning());
         let deadline = frames.deadline();
         tokio::select! {
             biased;
-            ev = input.next() => match ev {
+            ev = input_rx.recv() => match ev {
                 Some(Ok(ev)) => {
                     let prompt = handle_event(&mut app, ev);
+                    send_provider_settings(&mut app, &settings_tx, &mut pending_settings);
                     send(&mut app, &prompt_tx, prompt);
+                    send_session_commands(&mut app, &session_command_tx);
+                    cancel_active_turn(&mut app, &active_turn);
                     for _ in 0..MAX_BURST {
-                        match input.next().now_or_never() {
-                            Some(Some(Ok(ev))) => {
+                        match input_rx.try_recv() {
+                            Ok(Ok(ev)) => {
                                 let prompt = handle_event(&mut app, ev);
+                                send_provider_settings(&mut app, &settings_tx, &mut pending_settings);
                                 send(&mut app, &prompt_tx, prompt);
+                                send_session_commands(&mut app, &session_command_tx);
+                                cancel_active_turn(&mut app, &active_turn);
+                                if app.should_quit {
+                                    break;
+                                }
                             }
-                            _ => break,
+                            Ok(Err(error)) => return Err(error),
+                            Err(_) => break,
                         }
                     }
                     frames.request(Urgency::Input);
                 }
-                Some(Err(e)) => return Err(e),
+                Some(Err(error)) => return Err(error),
                 None => break,
             },
             req = perm_rx.recv(), if perm_open => match req {
@@ -252,6 +832,34 @@ pub async fn run(
                     frames.request(Urgency::Input);
                 }
                 None => perm_open = false,
+            },
+            update = session_update_rx.recv(), if session_update_open => {
+                match update {
+                    Some(SessionUpdate::List(sessions)) => app.update_sessions(sessions),
+                    Some(SessionUpdate::Loaded(session, messages)) => {
+                        app.load_session(session, messages);
+                    }
+                    Some(SessionUpdate::Subagents(session, subagents)) => {
+                        app.load_subagents(session, subagents);
+                    }
+                    Some(SessionUpdate::Error(error)) => {
+                        app.session_load_failed();
+                        app.status = format!("error: {error}");
+                    }
+                    None => {
+                        session_update_open = false;
+                        app.session_load_failed();
+                        app.status = "error: session worker closed".into();
+                    }
+                }
+                dispatch_next(&mut app, &prompt_tx);
+                frames.request(Urgency::Input);
+            },
+            saved = async { pending_settings.as_mut().unwrap().await }, if pending_settings.is_some() => {
+                pending_settings = None;
+                app.settings_saved(saved.unwrap_or_else(|_| Err("Settings update failed".into())));
+                dispatch_next(&mut app, &prompt_tx);
+                frames.request(Urgency::Input);
             },
             ev = bus_rx.recv(), if bus_open => {
                 match ev {
@@ -262,14 +870,20 @@ pub async fn run(
                 while let Ok(ev) = bus_rx.try_recv() {
                     app.apply(ev);
                 }
+                dispatch_next(&mut app, &prompt_tx);
                 frames.request(Urgency::Background);
             }
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
                 deadline.unwrap_or_else(Instant::now),
             )), if deadline.is_some() => {}
-            _ = anim.tick(), if animating => frames.request(Urgency::Background),
+            _ = anim.tick(), if animating => {
+                app.matrix_rain.advance();
+                app.animation.advance();
+                frames.request(Urgency::Background);
+            },
         }
 
+        cancel_active_turn(&mut app, &active_turn);
         if std::mem::take(&mut app.fx_pending) {
             fx = Some(batten::widgets::fx::dialog_open(&app.theme));
             fx_clock = Instant::now();
@@ -288,8 +902,8 @@ pub async fn run(
             execute!(std::io::stdout(), BeginSynchronizedUpdate)?;
             terminal.draw(|f| {
                 render(f, &mut app);
-                if let (Some(e), Some(_)) = (fx.as_mut(), app.permission.as_ref()) {
-                    let area = batten::widgets::permission::area(f.area());
+                if let (Some(e), Some(permission)) = (fx.as_mut(), app.permission.as_ref()) {
+                    let area = batten::widgets::permission::area(f.area(), &permission.dialog);
                     e.process(elapsed.into(), f.buffer_mut(), area);
                 }
             })?;
@@ -300,7 +914,42 @@ pub async fn run(
             frames.drawn(now);
         }
     }
+    if let Ok(active) = active_turn.lock() {
+        if let Some(token) = active.as_ref() {
+            token.cancel();
+        }
+    }
     Ok(())
+}
+
+fn send_provider_settings(
+    app: &mut App,
+    tx: &UnboundedSender<ProviderSettingsCommand>,
+    pending: &mut Option<oneshot::Receiver<Result<(), String>>>,
+) {
+    if !std::mem::take(&mut app.settings_save_requested) || pending.is_some() {
+        return;
+    }
+    let Some(settings) = app.provider_settings.clone() else {
+        return;
+    };
+    let (reply, receiver) = oneshot::channel();
+    match tx.send(ProviderSettingsCommand { settings, reply }) {
+        Ok(()) => {
+            app.settings_saving = true;
+            *pending = Some(receiver);
+        }
+        Err(_) => app.settings_feedback = Some("Settings worker is unavailable".into()),
+    }
+}
+
+fn send_session_commands(app: &mut App, tx: &UnboundedSender<SessionCommand>) {
+    if std::mem::take(&mut app.session_list_refresh_requested) {
+        let _ = tx.send(SessionCommand::Refresh);
+    }
+    if let Some(choice) = app.session_choice.take() {
+        let _ = tx.send(SessionCommand::Select(choice));
+    }
 }
 
 #[cfg(test)]
@@ -335,16 +984,138 @@ mod tests {
     }
 
     #[test]
-    fn esc_denies_without_quitting_and_ctrl_c_still_quits() {
-        use codeloom_core::permission::Decision;
+    fn double_esc_and_ctrl_c_quit_even_with_permission_open() {
         let mut app = App::new();
-        let mut rx = open_dialog(&mut app);
+        let _rx = open_dialog(&mut app);
         handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         assert!(!app.should_quit);
-        assert_eq!(rx.try_recv().unwrap(), Decision::Deny);
-        let _rx2 = open_dialog(&mut app);
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.should_quit);
+
+        let mut app = App::new();
+        let _rx = open_dialog(&mut app);
         handle_key(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn session_picker_selects_existing_or_new_session() {
+        let mut app = App::new();
+        app.set_sessions(vec![
+            codeloom_core::session::SessionInfo {
+                id: codeloom_core::session::SessionId(1),
+                preview: "primera".into(),
+                message_count: 2,
+            },
+            codeloom_core::session::SessionInfo {
+                id: codeloom_core::session::SessionId(2),
+                preview: "segunda".into(),
+                message_count: 4,
+            },
+        ]);
+        handle_key(&mut app, KeyCode::End, KeyModifiers::NONE);
+        assert_eq!(app.session_selected, 2);
+        handle_key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+        assert_eq!(app.session_selected, 1);
+        handle_key(&mut app, KeyCode::Home, KeyModifiers::NONE);
+        assert_eq!(app.session_selected, 0);
+        handle_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            app.session_choice,
+            Some(SessionChoice::Resume(codeloom_core::session::SessionId(2)))
+        );
+        assert!(app.session_loading);
+
+        let mut app = App::new();
+        app.set_sessions(vec![codeloom_core::session::SessionInfo {
+            id: codeloom_core::session::SessionId(1),
+            preview: "primera".into(),
+            message_count: 2,
+        }]);
+        handle_key(&mut app, KeyCode::Char('n'), KeyModifiers::NONE);
+        assert_eq!(app.session_choice, Some(SessionChoice::New));
+
+        let mut app = App::new();
+        app.set_sessions(vec![
+            codeloom_core::session::SessionInfo {
+                id: codeloom_core::session::SessionId(1),
+                preview: "primera".into(),
+                message_count: 2,
+            },
+            codeloom_core::session::SessionInfo {
+                id: codeloom_core::session::SessionId(2),
+                preview: "segunda".into(),
+                message_count: 4,
+            },
+        ]);
+        handle_key(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.session_selected, 0);
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            app.session_choice,
+            Some(SessionChoice::Resume(codeloom_core::session::SessionId(1)))
+        );
+        assert!(app.session_loading);
+    }
+
+    #[test]
+    fn session_picker_filters_case_insensitively_and_resumes_match() {
+        let mut app = App::new();
+        app.set_sessions(vec![
+            codeloom_core::session::SessionInfo {
+                id: codeloom_core::session::SessionId(1),
+                preview: "Build frontend".into(),
+                message_count: 2,
+            },
+            codeloom_core::session::SessionInfo {
+                id: codeloom_core::session::SessionId(2),
+                preview: "Fix provider config".into(),
+                message_count: 4,
+            },
+        ]);
+        handle_key(&mut app, KeyCode::Char('f'), KeyModifiers::CONTROL);
+        for c in "PROVIDER".chars() {
+            handle_key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert_eq!(app.matching_sessions().count(), 1);
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            app.session_choice,
+            Some(SessionChoice::Resume(codeloom_core::session::SessionId(2)))
+        );
+    }
+
+    #[test]
+    fn f3_requests_session_picker_only_when_idle() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::F(3), KeyModifiers::NONE);
+        assert!(app.session_loading);
+        assert!(app.session_list_refresh_requested);
+        assert!(app.session_picker_return_to_chat);
+
+        let mut app = App::new();
+        app.turn_in_flight = true;
+        handle_key(&mut app, KeyCode::F(3), KeyModifiers::NONE);
+        assert!(!app.session_loading);
+        assert!(!app.session_list_refresh_requested);
+    }
+
+    #[test]
+    fn escape_clears_session_search_before_quitting_picker() {
+        let mut app = App::new();
+        app.set_sessions(vec![codeloom_core::session::SessionInfo {
+            id: codeloom_core::session::SessionId(1),
+            preview: "Build frontend".into(),
+            message_count: 2,
+        }]);
+        handle_key(&mut app, KeyCode::Char('f'), KeyModifiers::CONTROL);
+        handle_key(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.session_picker_open);
+        assert!(!app.session_searching);
+        assert!(app.session_query.is_empty());
+        assert!(!app.should_quit);
     }
 
     #[test]
@@ -366,6 +1137,36 @@ mod tests {
         let sent = handle_event(&mut app, Event::Paste("uno\ndos\n".into()));
         assert_eq!(sent, None);
         assert_eq!(app.composer.text(), "uno\ndos\n");
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_transcript_but_not_overlays() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let mut app = App::new();
+        app.viewport.set_geometry(20, 5);
+        handle_event(
+            &mut app,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }),
+        );
+        assert!(!app.viewport.is_following());
+
+        app.queue_open = true;
+        app.viewport.follow_bottom();
+        handle_event(
+            &mut app,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }),
+        );
+        assert!(app.viewport.is_following());
     }
 
     #[test]
@@ -392,12 +1193,588 @@ mod tests {
     }
 
     #[test]
-    fn esc_does_not_quit_but_ctrl_q_does() {
+    fn settings_save_waits_for_idle_and_freezes_values_until_reply() {
+        let mut app = App::new();
+        app.set_provider_settings(ProviderSettings {
+            kind: codeloom_core::config::ProviderKind::OpenAiCompat,
+            model: "old-model".into(),
+            base_url: "https://example.test/v1".into(),
+            api_key_env: "API_KEY".into(),
+        });
+        app.open_settings();
+        app.provider_settings.as_mut().unwrap().model = "new-model".into();
+        app.turn_in_flight = true;
+        handle_key(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert!(!app.settings_save_requested);
+        assert!(app
+            .settings_feedback
+            .as_ref()
+            .unwrap()
+            .contains("active turn"));
+
+        app.turn_in_flight = false;
+        handle_key(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut pending = None;
+        send_provider_settings(&mut app, &tx, &mut pending);
+        let command = rx.try_recv().unwrap();
+        assert_eq!(command.settings.model, "new-model");
+        handle_key(&mut app, KeyCode::Right, KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        handle_event(&mut app, Event::Paste("other-model".into()));
+        handle_key(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert!(!app.settings_editing);
+        assert!(!app.settings_save_requested);
+        assert_eq!(
+            app.provider_settings.as_ref().unwrap().kind,
+            command.settings.kind
+        );
+        assert_eq!(app.model, "old-model");
+
+        command
+            .reply
+            .send(Err("Cannot write config".into()))
+            .unwrap();
+        app.settings_saved(pending.take().unwrap().try_recv().unwrap());
+        assert_eq!(app.model, "old-model");
+        assert!(!app.settings_saving);
+        assert_eq!(
+            app.settings_feedback.as_deref(),
+            Some("Cannot write config")
+        );
+
+        handle_key(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        send_provider_settings(&mut app, &tx, &mut pending);
+        rx.try_recv().unwrap().reply.send(Ok(())).unwrap();
+        app.settings_saved(pending.take().unwrap().try_recv().unwrap());
+        assert_eq!(app.model, "new-model");
+        assert_eq!(
+            app.settings_feedback.as_deref(),
+            Some("Settings saved and applied")
+        );
+
+        drop(rx);
+        app.request_settings_save();
+        send_provider_settings(&mut app, &tx, &mut pending);
+        assert!(pending.is_none());
+        assert!(!app.settings_saving);
+        assert_eq!(
+            app.settings_feedback.as_deref(),
+            Some("Settings worker is unavailable")
+        );
+    }
+
+    #[test]
+    fn permission_interrupts_overlays_and_ignores_paste_and_abandoned_requests() {
+        let mut app = App::new();
+        app.help_open = true;
+        handle_event(&mut app, Event::Paste("hidden input".into()));
+        assert!(app.composer.is_empty());
+        app.settings_open = true;
+        app.settings_editing = true;
+        let mut first = open_dialog(&mut app);
+        let abandoned = open_dialog(&mut app);
+        let mut last = open_dialog(&mut app);
+        drop(abandoned);
+        assert!(!app.help_open);
+        assert!(!app.settings_open);
+        assert!(!app.settings_editing);
+        handle_event(&mut app, Event::Paste("hidden input".into()));
+        assert!(app.composer.is_empty());
+        handle_key(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
+        assert_eq!(
+            first.try_recv().unwrap(),
+            codeloom_core::permission::Decision::Deny
+        );
+        assert_eq!(
+            last.try_recv().unwrap(),
+            codeloom_core::permission::Decision::Allow
+        );
+        assert!(app.permission.is_none());
+    }
+
+    #[test]
+    fn provider_settings_edit_values_and_request_save_without_touching_prompt() {
+        let mut app = App::new();
+        app.set_provider_settings(ProviderSettings {
+            kind: codeloom_core::config::ProviderKind::OpenAiCompat,
+            model: "old-model".into(),
+            base_url: "https://example.test/v1".into(),
+            api_key_env: "API_KEY".into(),
+        });
+        handle_key(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(
+            app.provider_settings.as_ref().unwrap().kind,
+            codeloom_core::config::ProviderKind::Anthropic
+        );
+        handle_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::End, KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('2'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert_eq!(app.provider_settings.as_ref().unwrap().model, "old-model2");
+        assert!(app.settings_save_requested);
+        assert!(app.composer.is_empty());
+    }
+
+    #[test]
+    fn esc_and_ctrl_q_quit() {
         let mut app = App::new();
         handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         assert!(!app.should_quit);
+        assert!(!app.cancel_requested);
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.should_quit);
+
+        let mut app = App::new();
         handle_key(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL);
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn f1_opens_help_and_escape_closes_it_without_canceling() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::F(1), KeyModifiers::NONE);
+        assert!(app.help_open);
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!app.help_open);
+        assert!(!app.cancel_requested);
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn ctrl_b_toggles_sidebar_without_editing_composer() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+        assert!(app.sidebar_expanded);
+        assert!(app.composer.is_empty());
+        handle_key(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+        assert!(!app.sidebar_expanded);
+    }
+
+    #[test]
+    fn ctrl_o_toggles_latest_tool_output() {
+        let mut app = App::new();
+        app.tools
+            .push_back(batten::state::ToolItem::new("call-1", "view"));
+        handle_key(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert!(app.tools.back().unwrap().expanded);
+        handle_key(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert!(!app.tools.back().unwrap().expanded);
+    }
+
+    #[test]
+    fn esc_cancellation_waits_for_worker_token() {
+        let mut app = App::new();
+        app.turn_in_flight = true;
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        let active_turn: ActiveTurn = Arc::new(Mutex::new(None));
+        cancel_active_turn(&mut app, &active_turn);
+        assert!(app.cancel_requested);
+
+        let token = CancellationToken::new();
+        *active_turn.lock().unwrap() = Some(token.clone());
+        cancel_active_turn(&mut app, &active_turn);
+        assert!(token.is_cancelled());
+        assert!(!app.cancel_requested);
+        assert_eq!(app.status, "cancelling");
+    }
+
+    #[test]
+    fn slash_controls_pause_cancel_resume_and_sidebar_without_dispatching_commands() {
+        let mut app = App::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.turn_in_flight = true;
+        let token = CancellationToken::new();
+        let active = Arc::new(Mutex::new(Some(token.clone())));
+        send(&mut app, &tx, Some("pending work".into()));
+        for text in ["/pause", "/pause"] {
+            app.composer.set_text(text);
+            let prompt = handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            send(&mut app, &tx, prompt);
+            assert!(app.queue_paused);
+            assert!(
+                !token.is_cancelled(),
+                "pause does not cancel the active turn"
+            );
+            assert!(rx.try_recv().is_err());
+        }
+        app.composer.set_text("/cancel");
+        let prompt = handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        send(&mut app, &tx, prompt);
+        cancel_active_turn(&mut app, &active);
+        assert!(token.is_cancelled());
+        app.apply(codeloom_core::event::LiveEvent::TurnEnded);
+        dispatch_next(&mut app, &tx);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(app.queued, 1);
+        app.composer.set_text("/resume");
+        let prompt = handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        send(&mut app, &tx, prompt);
+        assert!(!app.queue_paused);
+        assert_eq!(rx.try_recv().unwrap(), "pending work");
+        assert!(rx.try_recv().is_err());
+        for expanded in [true, false] {
+            app.composer.set_text("/sidebar");
+            assert_eq!(
+                handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE),
+                None
+            );
+            assert_eq!(app.sidebar_expanded, expanded);
+        }
+        app.apply(codeloom_core::event::LiveEvent::TurnEnded);
+        app.composer.set_text("/cancel");
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            app.slash_feedback.as_deref(),
+            Some("No active turn to cancel")
+        );
+        assert_eq!(app.composer.text(), "/cancel");
+        assert!(!app.cancel_requested);
+        assert!(!app.queue_paused);
+    }
+
+    #[test]
+    fn turn_completion_discards_cancellation_that_arrived_after_the_worker_finished() {
+        for event in [
+            codeloom_core::event::LiveEvent::TurnEnded,
+            codeloom_core::event::LiveEvent::Error {
+                message: "failed".into(),
+            },
+        ] {
+            let mut app = App::new();
+            app.turn_in_flight = true;
+            app.composer.set_text("/cancel");
+            handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(app.cancel_requested);
+            app.apply(event);
+            let next = CancellationToken::new();
+            let active = Arc::new(Mutex::new(Some(next.clone())));
+            app.turn_in_flight = true;
+            cancel_active_turn(&mut app, &active);
+            assert!(!next.is_cancelled());
+            assert!(!app.cancel_requested);
+            assert!(app.queue_paused);
+        }
+    }
+
+    #[test]
+    fn slash_menu_filters_completes_and_executes_without_sending_a_prompt() {
+        let mut app = App::new();
+        handle_event(&mut app, Event::Paste("/s".into()));
+        assert_eq!(app.slash_matches().len(), 3);
+        handle_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(app.composer.text(), "/settings");
+        assert_eq!(app.focus, Focus::Composer);
+        app.set_provider_settings(ProviderSettings {
+            kind: codeloom_core::config::ProviderKind::OpenAiCompat,
+            model: "test".into(),
+            base_url: "https://example.test".into(),
+            api_key_env: "KEY".into(),
+        });
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE),
+            None
+        );
+        assert!(app.settings_open);
+        assert!(app.composer.is_empty());
+        assert!(app.pending_prompts.is_empty());
+        assert_eq!(app.queued, 0);
+        assert!(!app.history.is_browsing());
+    }
+
+    #[test]
+    fn slash_commands_share_existing_actions_and_session_guards() {
+        for text in ["/help", "/new", "/sessions", "/queue", "/tools", "/quit"] {
+            let mut app = App::new();
+            app.composer.set_text(text);
+            assert_eq!(
+                handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE),
+                None
+            );
+            match text {
+                "/help" => assert!(app.help_open),
+                "/new" => {
+                    assert_eq!(app.session_choice, Some(SessionChoice::New));
+                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                    send_session_commands(&mut app, &tx);
+                    assert!(matches!(
+                        rx.try_recv().unwrap(),
+                        SessionCommand::Select(SessionChoice::New)
+                    ));
+                }
+                "/sessions" => assert!(app.session_list_refresh_requested),
+                "/queue" => assert!(app.queue_open),
+                "/tools" => assert!(app.tools_open),
+                _ => assert!(app.should_quit),
+            }
+            assert!(app.composer.is_empty());
+        }
+        for text in ["/new", "/sessions"] {
+            let mut app = App::new();
+            app.turn_in_flight = true;
+            app.composer.set_text(text);
+            handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(app.composer.text(), text);
+            assert!(!app.session_loading);
+            assert!(app.session_choice.is_none());
+            assert!(app
+                .slash_feedback
+                .as_deref()
+                .unwrap()
+                .contains("active turn"));
+        }
+    }
+
+    #[test]
+    fn slash_escape_preserves_literal_text_and_unknown_commands_do_not_dispatch() {
+        let mut app = App::new();
+        app.turn_in_flight = true;
+        app.composer.set_text("/unknown");
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE),
+            None
+        );
+        assert_eq!(app.composer.text(), "/unknown");
+        assert!(app
+            .slash_feedback
+            .as_deref()
+            .unwrap()
+            .contains("Unknown command"));
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!app.cancel_requested);
+        assert!(!app.should_quit);
+        assert!(app.slash_query().is_none());
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE),
+            Some("/unknown".into())
+        );
+        handle_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        assert_eq!(app.slash_matches().len(), crate::commands::COMMANDS.len());
+
+        for text in [
+            "explain /help",
+            "/tmp/file.rs",
+            "//literal",
+            "/help me",
+            "/help\nsecond line",
+        ] {
+            let mut app = App::new();
+            app.composer.set_text(text);
+            assert!(app.slash_query().is_none());
+            assert_eq!(
+                handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE),
+                Some(text.into())
+            );
+        }
+        app.composer.set_text("/tools");
+        let _reply = open_dialog(&mut app);
+        assert!(app.slash_query().is_none());
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(!app.tools_open);
+        assert_eq!(app.composer.text(), "/tools");
+    }
+
+    #[test]
+    fn tool_inspector_navigates_copies_and_preserves_the_draft() {
+        let mut app = App::new();
+        app.composer.set_text("unfinished draft");
+        let mut first = batten::state::ToolItem::new("first", "view");
+        first.set_output("complete output\nsecond line");
+        app.tools.push_back(first);
+        app.tools
+            .push_back(batten::state::ToolItem::new("second", "bash"));
+        handle_key(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert!(app.tools_open);
+        assert_eq!(app.tool_selected, 1);
+        handle_key(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+        assert!(app.clipboard.is_none());
+        handle_key(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+        assert_eq!(
+            app.clipboard.as_deref(),
+            Some("complete output\nsecond line")
+        );
+        handle_key(&mut app, KeyCode::PageDown, KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(app.tool_scroll, (10, 5));
+        handle_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.tool_scroll, (0, 0));
+        handle_event(&mut app, Event::Paste("hidden input".into()));
+        assert_eq!(app.composer.text(), "unfinished draft");
+        let _reply = open_dialog(&mut app);
+        assert!(!app.tools_open);
+        handle_key(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!app.tools_open);
+        assert!(!app.cancel_requested);
+        assert!(!app.should_quit);
+
+        let mut empty = App::new();
+        handle_key(&mut empty, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        handle_key(&mut empty, KeyCode::Down, KeyModifiers::NONE);
+        handle_key(&mut empty, KeyCode::Char('y'), KeyModifiers::NONE);
+        assert_eq!(empty.tool_selected, 0);
+        assert!(empty.clipboard.is_none());
+    }
+
+    #[test]
+    fn tool_inspector_tracks_selection_when_old_calls_are_evicted() {
+        let mut app = App::new();
+        for index in 0..8 {
+            app.apply(codeloom_core::event::LiveEvent::ToolStarted {
+                call_id: index.to_string(),
+                name: "view".into(),
+            });
+        }
+        app.tools_open = true;
+        app.tool_selected = 2;
+        app.tool_scroll = (10, 5);
+        for index in 8..10 {
+            app.apply(codeloom_core::event::LiveEvent::ToolStarted {
+                call_id: index.to_string(),
+                name: "view".into(),
+            });
+            assert_eq!(app.tools[app.tool_selected].call_id, "2");
+        }
+        assert_eq!(app.tool_scroll, (10, 5));
+        app.apply(codeloom_core::event::LiveEvent::ToolStarted {
+            call_id: "10".into(),
+            name: "view".into(),
+        });
+        assert_eq!(app.tools[app.tool_selected].call_id, "3");
+        assert_eq!(app.tool_scroll, (0, 0));
+        app.restore_messages(Vec::new());
+        assert!(!app.tools_open);
+        assert!(app.tools.is_empty());
+    }
+
+    #[test]
+    fn queue_editing_preserves_original_and_composer_until_accepting() {
+        let mut app = App::new();
+        app.pending_prompts.push_back("original".into());
+        app.queued = 1;
+        app.composer.set_text("separate draft");
+        handle_key(&mut app, KeyCode::Char('k'), KeyModifiers::CONTROL);
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(
+            app.queue_editing,
+            "empty prompts cannot replace the original"
+        );
+        handle_event(&mut app, Event::Paste("changed\nsecond line".into()));
+        assert_eq!(app.pending_prompts[0], "original");
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.queue_open);
+        assert!(!app.queue_editing);
+        assert_eq!(app.pending_prompts[0], "original");
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        handle_event(&mut app, Event::Paste("changed".into()));
+        handle_key(&mut app, KeyCode::Char('j'), KeyModifiers::CONTROL);
+        handle_key(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.pending_prompts[0], "changed\nx");
+        assert_eq!(app.composer.text(), "separate draft");
+        assert_eq!(app.queued, 1);
+        assert!(!app.queue_editing);
+    }
+
+    #[test]
+    fn queue_pause_cancel_and_resume_dispatch_one_prompt_at_a_time() {
+        let mut app = App::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let token = CancellationToken::new();
+        let active = Arc::new(Mutex::new(Some(token.clone())));
+        app.turn_in_flight = true;
+        send(&mut app, &tx, Some("first".into()));
+        send(&mut app, &tx, Some("second".into()));
+        handle_key(&mut app, KeyCode::Char('k'), KeyModifiers::CONTROL);
+        handle_key(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+        cancel_active_turn(&mut app, &active);
+        assert!(token.is_cancelled());
+        assert!(app.queue_paused);
+        app.apply(codeloom_core::event::LiveEvent::TurnEnded);
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        dispatch_next(&mut app, &tx);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(app.queued, 2);
+
+        handle_key(&mut app, KeyCode::Char('k'), KeyModifiers::CONTROL);
+        handle_key(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+        dispatch_next(&mut app, &tx);
+        assert!(
+            rx.try_recv().is_err(),
+            "inspection holds dispatch until close"
+        );
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        dispatch_next(&mut app, &tx);
+        assert_eq!(rx.try_recv().unwrap(), "first");
+        dispatch_next(&mut app, &tx);
+        assert!(rx.try_recv().is_err());
+        app.apply(codeloom_core::event::LiveEvent::Error {
+            message: "provider failed".into(),
+        });
+        dispatch_next(&mut app, &tx);
+        assert_eq!(rx.try_recv().unwrap(), "second");
+        assert_eq!(app.queued, 0);
+        assert_eq!(app.queue_selected, 0);
+
+        app.apply(codeloom_core::event::LiveEvent::TurnEnded);
+        drop(rx);
+        send(&mut app, &tx, Some("retained on failure".into()));
+        assert_eq!(app.pending_prompts[0], "retained on failure");
+        assert!(!app.turn_in_flight);
+    }
+
+    #[test]
+    fn reverse_tab_restores_focus_and_dialogs_preserve_the_draft() {
+        let mut app = App::new();
+        app.composer.set_text("unfinished prompt");
+        handle_key(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT);
+        assert_eq!(app.focus, Focus::Transcript);
+        handle_key(&mut app, KeyCode::F(1), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT);
+        assert_eq!(app.focus, Focus::Transcript);
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(app.focus, Focus::Composer);
+        assert_eq!(app.composer.text(), "unfinished prompt");
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn repeat_edits_text_but_does_not_submit_or_answer_permissions() {
+        use crossterm::event::KeyEvent;
+        let mut app = App::new();
+        let repeat = |code| {
+            Event::Key(KeyEvent::new_with_kind(
+                code,
+                KeyModifiers::NONE,
+                KeyEventKind::Repeat,
+            ))
+        };
+        handle_event(&mut app, repeat(KeyCode::Char('a')));
+        handle_event(&mut app, repeat(KeyCode::Char('b')));
+        handle_event(&mut app, repeat(KeyCode::Backspace));
+        assert_eq!(app.composer.text(), "a");
+        assert_eq!(handle_event(&mut app, repeat(KeyCode::Enter)), None);
+        assert_eq!(app.composer.text(), "a");
+        let mut reply = open_dialog(&mut app);
+        handle_event(&mut app, repeat(KeyCode::Char('a')));
+        handle_event(&mut app, repeat(KeyCode::Enter));
+        assert!(matches!(
+            reply.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(app.permission.is_some());
     }
 
     #[test]
@@ -412,13 +1789,11 @@ mod tests {
         handle_key(&mut app, KeyCode::Char('G'), KeyModifiers::NONE);
         assert!(app.viewport.is_following());
         handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-        assert_eq!(app.focus, Focus::Composer);
-        assert!(!app.should_quit);
-        handle_key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
-        handle_key(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL);
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.focus, Focus::Transcript);
         assert!(
             app.should_quit,
-            "Ctrl+Q sale también con foco en el transcript"
+            "Esc sale también con foco en el transcript"
         );
     }
 
@@ -463,7 +1838,7 @@ mod tests {
     }
 
     #[test]
-    fn select_extend_copy_and_escape() {
+    fn escape_quits_with_transcript_selection() {
         let mut app = App::new();
         for s in ["uno", "dos", "tres"] {
             app.push_user(s);
@@ -476,10 +1851,9 @@ mod tests {
         assert!(app.selection.is_none());
         handle_key(&mut app, KeyCode::Char('v'), KeyModifiers::NONE);
         handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-        assert!(app.selection.is_none());
-        assert_eq!(app.focus, Focus::Transcript);
         handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-        assert_eq!(app.focus, Focus::Composer);
+        assert!(app.should_quit);
+        assert_eq!(app.focus, Focus::Transcript);
     }
 
     #[test]

@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 codeloom-core = { path = "../codeloom-core" }
 codeloom-tui = { path = "../codeloom-tui" }
+codeloom-herdr = { path = "../codeloom-herdr" }
 tokio.workspace = true
 tokio-util.workspace = true
 anyhow.workspace = true

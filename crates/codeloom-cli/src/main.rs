@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
 use codeloom_core::agent::AgentLoop;
 use codeloom_core::config::{CodeLoomConfig, ProviderKind};
@@ -13,8 +13,18 @@ use codeloom_core::tools::bash::BashTool;
 use codeloom_core::tools::edit::EditTool;
 use codeloom_core::tools::glob::GlobTool;
 use codeloom_core::tools::grep::GrepTool;
+use codeloom_core::tools::job_kill::JobKillTool;
+use codeloom_core::tools::job_list::JobListTool;
+use codeloom_core::tools::job_output::JobOutputTool;
+use codeloom_core::tools::job_start::JobStartTool;
+use codeloom_core::tools::subagent::SubagentTool;
+use codeloom_core::tools::subagent_control::SubagentControlTool;
+use codeloom_core::tools::subagent_list::SubagentListTool;
 use codeloom_core::tools::view::ViewTool;
 use codeloom_core::tools::ToolRegistry;
+use codeloom_herdr::{AgentState, HerdrContext};
+use codeloom_tui::app::{ProviderSettings, SessionChoice};
+use codeloom_tui::run::{SessionCommand, SessionUpdate};
 use codeloom_tui::widgets::permission::UiPermissionResponder;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -36,6 +46,9 @@ fn build_provider(cfg: &CodeLoomConfig) -> Result<Arc<dyn Provider>> {
             cfg.provider.api_key_env
         )
     })?;
+    if key.is_empty() {
+        bail!("environment variable {} is empty", cfg.provider.api_key_env);
+    }
     Ok(match cfg.provider.kind {
         ProviderKind::OpenAiCompat => Arc::new(OpenAiCompatProvider::new(
             cfg.provider.base_url.clone(),
@@ -47,6 +60,46 @@ fn build_provider(cfg: &CodeLoomConfig) -> Result<Arc<dyn Provider>> {
     })
 }
 
+fn config_from_provider_settings(
+    settings: ProviderSettings,
+    current: &CodeLoomConfig,
+) -> Result<CodeLoomConfig, String> {
+    let mut candidate = current.clone();
+    candidate.model = settings.model.trim().to_string();
+    candidate.provider.kind = settings.kind;
+    candidate.provider.base_url = settings.base_url.trim().to_string();
+    candidate.provider.api_key_env = settings.api_key_env.trim().to_string();
+
+    if candidate.model.is_empty() {
+        return Err("Model cannot be empty".into());
+    }
+    codeloom_core::config::validate_base_url(&candidate.provider.base_url)?;
+    let mut chars = candidate.provider.api_key_env.chars();
+    if !chars
+        .next()
+        .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+        || !chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+    {
+        return Err("API key variable must be a valid environment variable name".into());
+    }
+    Ok(candidate)
+}
+
+fn apply_provider_settings(
+    settings: ProviderSettings,
+    current: &CodeLoomConfig,
+    config_path: &std::path::Path,
+    agent: &AgentLoop,
+) -> Result<CodeLoomConfig, String> {
+    let candidate = config_from_provider_settings(settings, current)?;
+    let provider = build_provider(&candidate).map_err(|error| error.to_string())?;
+    candidate
+        .save(config_path)
+        .map_err(|error| error.to_string())?;
+    agent.update_provider(provider, candidate.clone());
+    Ok(candidate)
+}
+
 fn build_tools() -> ToolRegistry {
     let mut tools = ToolRegistry::new();
     tools.register(Arc::new(ViewTool));
@@ -54,15 +107,38 @@ fn build_tools() -> ToolRegistry {
     tools.register(Arc::new(GrepTool));
     tools.register(Arc::new(EditTool));
     tools.register(Arc::new(BashTool));
+    tools.register(Arc::new(JobListTool));
+    tools.register(Arc::new(JobOutputTool));
+    tools.register(Arc::new(JobKillTool));
+    tools.register(Arc::new(JobStartTool));
+    tools.register(Arc::new(SubagentTool));
+    tools.register(Arc::new(SubagentControlTool));
+    tools.register(Arc::new(SubagentListTool));
     tools
+}
+
+async fn report_herdr(context: &mut Option<HerdrContext>, state: AgentState, message: &str) {
+    if let Some(herdr) = context {
+        if let Err(error) = herdr.report(state, message).await {
+            eprintln!("herdr reporting unavailable; continuing standalone: {error}");
+            *context = None;
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let cwd = std::env::current_dir()?;
+    let mut herdr = HerdrContext::from_env();
+    let cwd = herdr
+        .as_ref()
+        .and_then(|context| context.workspace_cwd.as_ref())
+        .filter(|path| path.is_dir())
+        .cloned()
+        .unwrap_or(std::env::current_dir()?);
     load_dotenv(&cwd);
-    let cfg = CodeLoomConfig::load(&cwd.join("codeloom.toml"))?;
+    let config_path = cwd.join("codeloom.toml");
+    let cfg = CodeLoomConfig::load(&config_path)?;
     let cwd_label = cwd.display().to_string();
     let model_label = cfg.model.clone();
     let provider = build_provider(&cfg)?;
@@ -72,9 +148,12 @@ async fn main() -> Result<()> {
         .join(".codeloom");
     std::fs::create_dir_all(&data_dir)?;
     let store = Arc::new(SqliteStore::open(data_dir.join("sessions.db").to_str().unwrap()).await?);
-    let session = store
-        .create_session(cwd.to_str().unwrap_or_default())
-        .await?;
+    let project = cwd.to_str().unwrap_or_default().to_string();
+    let sessions = if cli.print.is_none() {
+        store.list_sessions(&project).await?
+    } else {
+        Vec::new()
+    };
 
     let bus = EventBus::new(1024);
     let bus_rx = bus.subscribe();
@@ -91,35 +170,116 @@ async fn main() -> Result<()> {
     });
     let agent = Arc::new(AgentLoop::new(
         provider,
-        store,
+        store.clone(),
         Arc::new(build_tools()),
         bus,
         permission,
-        cfg,
+        cfg.clone(),
         cwd,
     ));
 
     if let Some(prompt) = cli.print {
+        let session = store.create_session(&project).await?;
         let outcome = agent.run(session, prompt, CancellationToken::new()).await?;
         println!("{}", outcome.final_text);
         return Ok(());
     }
 
+    report_herdr(&mut herdr, AgentState::Idle, "ready").await;
+
     let (prompt_tx, mut prompt_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (settings_tx, mut settings_rx) =
+        tokio::sync::mpsc::unbounded_channel::<codeloom_tui::run::ProviderSettingsCommand>();
+    let (session_command_tx, mut session_command_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (session_update_tx, session_update_rx) = tokio::sync::mpsc::unbounded_channel();
+    let active_turn: codeloom_tui::run::ActiveTurn = Arc::new(std::sync::Mutex::new(None));
+    let worker_active_turn = active_turn.clone();
     let agent_task = agent.clone();
+    let worker_store = store.clone();
+    let worker_project = project.clone();
+    let worker_config_path = config_path.clone();
+    let mut worker_config = cfg.clone();
     tokio::spawn(async move {
-        while let Some(p) = prompt_rx.recv().await {
-            if let Err(e) = agent_task.run(session, p, CancellationToken::new()).await {
-                eprintln!("{}: {e}", env!("CARGO_BIN_NAME"));
+        let mut herdr = herdr;
+        let mut session = None;
+        loop {
+            tokio::select! {
+                command = session_command_rx.recv() => match command {
+                    Some(SessionCommand::Refresh) => {
+                        let update = worker_store.list_sessions(&worker_project).await
+                            .map(SessionUpdate::List)
+                            .unwrap_or_else(|error| SessionUpdate::Error(error.to_string()));
+                        let _ = session_update_tx.send(update);
+                    }
+                    Some(SessionCommand::Select(choice)) => {
+                        let loaded = async {
+                            let id = match choice {
+                                SessionChoice::Resume(id) => id,
+                                SessionChoice::New => worker_store.create_session(&worker_project).await?,
+                            };
+                            let messages = worker_store.messages(id).await?;
+                            let subagents = worker_store.list_subagents(id).await?;
+                            Ok::<_, codeloom_core::error::CoreError>((id, messages, subagents))
+                        }.await;
+                        match loaded {
+                            Ok((id, messages, subagents)) => {
+                                session = Some(id);
+                                let _ = session_update_tx.send(SessionUpdate::Loaded(id, messages));
+                                let _ = session_update_tx.send(SessionUpdate::Subagents(id, subagents));
+                            }
+                            Err(error) => {
+                                let _ = session_update_tx.send(SessionUpdate::Error(error.to_string()));
+                            }
+                        }
+                    }
+                    None => break,
+                },
+                Some(command) = settings_rx.recv() => {
+                    let result = apply_provider_settings(
+                        command.settings,
+                        &worker_config,
+                        &worker_config_path,
+                        &agent_task,
+                    );
+                    if let Ok(config) = &result {
+                        worker_config = config.clone();
+                    }
+                    let _ = command.reply.send(result.map(|_| ( )));
+                }
+                prompt = prompt_rx.recv() => match prompt {
+                    Some(prompt) => {
+                        let Some(session_id) = session else { continue; };
+                        report_herdr(&mut herdr, AgentState::Working, "working").await;
+                        let cancel = CancellationToken::new();
+                        *worker_active_turn.lock().unwrap() = Some(cancel.clone());
+                        let result = agent_task.run(session_id, prompt, cancel).await;
+                        *worker_active_turn.lock().unwrap() = None;
+                        match result {
+                            Ok(_) => report_herdr(&mut herdr, AgentState::Idle, "ready").await,
+                            Err(error) => {
+                                report_herdr(&mut herdr, AgentState::Blocked, "error").await;
+                                eprintln!("{}: {error}", env!("CARGO_BIN_NAME"));
+                            }
+                        }
+                    }
+                    None => break,
+                }
             }
         }
     });
 
+    let mut app = codeloom_tui::app::App::with_context(cwd_label, model_label);
+    app.set_provider_settings((&cfg).into());
+    app.set_sessions(sessions);
     codeloom_tui::run::run(
-        codeloom_tui::app::App::with_context(cwd_label, model_label),
+        app,
         prompt_tx,
+        settings_tx,
         bus_rx,
         perm_rx,
+        active_turn,
+        session_command_tx,
+        session_update_rx,
     )
     .await?;
     Ok(())
@@ -136,11 +296,41 @@ fn load_dotenv(dir: &std::path::Path) {
 mod tests {
     use super::*;
 
+    fn test_config() -> CodeLoomConfig {
+        CodeLoomConfig {
+            provider: codeloom_core::config::ProviderConfig {
+                kind: ProviderKind::OpenAiCompat,
+                base_url: "https://old.test/v1".into(),
+                api_key_env: "OLD_KEY".into(),
+            },
+            model: "old-model".into(),
+            max_steps: 8,
+        }
+    }
+
     #[test]
     fn loads_env_from_directory() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".env"), "CODELOOM_TEST_ENV_VAR=hello\n").unwrap();
         load_dotenv(dir.path());
         assert_eq!(std::env::var("CODELOOM_TEST_ENV_VAR").unwrap(), "hello");
+    }
+
+    #[test]
+    fn validates_provider_settings_before_persisting() {
+        let current = test_config();
+        let settings = ProviderSettings {
+            kind: ProviderKind::Anthropic,
+            model: "  claude-test  ".into(),
+            base_url: "https://api.anthropic.com/v1".into(),
+            api_key_env: "ANTHROPIC_API_KEY".into(),
+        };
+        let updated = config_from_provider_settings(settings.clone(), &current).unwrap();
+        assert_eq!(updated.model, "claude-test");
+        assert_eq!(updated.provider.kind, ProviderKind::Anthropic);
+
+        let mut invalid = settings;
+        invalid.base_url = "https://".into();
+        assert!(config_from_provider_settings(invalid, &current).is_err());
     }
 }
