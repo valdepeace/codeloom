@@ -378,6 +378,7 @@ mod tests {
             },
             model: "old-model".into(),
             max_steps: 8,
+            effort: None,
         }
     }
 

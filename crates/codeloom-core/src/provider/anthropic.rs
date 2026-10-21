@@ -370,6 +370,7 @@ mod wire_tests {
             tools: vec![],
             temperature: 0.0,
             max_tokens: 16,
+            effort: None,
         };
         let body = p.build_body(&req);
         let msgs = body["messages"].as_array().unwrap();

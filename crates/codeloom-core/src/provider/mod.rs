@@ -23,6 +23,8 @@ pub struct ProviderRequest {
     pub tools: Vec<ToolSpec>,
     pub temperature: f32,
     pub max_tokens: u32,
+    /// Nivel de esfuerzo de razonamiento; `None` significa «default» y la petición no cambia.
+    pub effort: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -137,6 +139,7 @@ mod tests {
             tools: vec![],
             temperature: 0.0,
             max_tokens: 16,
+            effort: None,
         };
         let mut s = p
             .stream(req, tokio_util::sync::CancellationToken::new())
@@ -197,6 +200,7 @@ mod retry_tests {
             tools: vec![],
             temperature: 0.0,
             max_tokens: 16,
+            effort: None,
         };
         let res = stream_with_retry(&p, req, CancellationToken::new(), 2).await;
         assert!(res.is_ok());

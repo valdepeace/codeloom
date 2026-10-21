@@ -192,6 +192,7 @@ impl AgentLoop {
                 tools: self.tools.specs(),
                 temperature: 0.0,
                 max_tokens: 4096,
+                effort: config.effort.clone(),
             };
             let mut stream = tokio::select! {
                 _ = cancel.cancelled() => break,
@@ -399,6 +400,73 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
+    /// Proveedor que anota el esfuerzo de cada petición que recibe.
+    struct EffortSpy {
+        seen: Mutex<Vec<Option<String>>>,
+    }
+
+    #[async_trait]
+    impl Provider for EffortSpy {
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                tool_use: false,
+                reasoning: false,
+                streaming: true,
+            }
+        }
+        async fn stream(
+            &self,
+            req: ProviderRequest,
+            _cancel: CancellationToken,
+        ) -> Result<ProviderStream> {
+            self.seen.lock().unwrap().push(req.effort.clone());
+            Ok(Box::pin(futures::stream::iter(vec![StreamChunk::Done(
+                FinishReason::Stop,
+            )])))
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_passes_config_effort_to_the_request() {
+        let provider = Arc::new(EffortSpy {
+            seen: Mutex::new(Vec::new()),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SqliteStore::open(dir.path().join("e.db").to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+        let sid = store.create_session("/p").await.unwrap();
+        let cfg = CodeLoomConfig {
+            provider: crate::config::ProviderConfig {
+                kind: crate::config::ProviderKind::OpenAiCompat,
+                base_url: "http://x".into(),
+                api_key_env: "K".into(),
+            },
+            model: "m".into(),
+            max_steps: 5,
+            effort: Some("high".into()),
+        };
+        let agent = AgentLoop::new(
+            provider.clone(),
+            store.clone(),
+            Arc::new(ToolRegistry::new()),
+            EventBus::new(64),
+            Arc::new(PermissionService::allow_all()),
+            cfg,
+            dir.path().to_path_buf(),
+        );
+        agent
+            .run(sid, "hi".into(), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            provider.seen.lock().unwrap().as_slice(),
+            &[Some("high".to_string())]
+        );
+    }
+
     struct QueueProvider {
         scripts: Mutex<VecDeque<Vec<StreamChunk>>>,
     }
@@ -486,6 +554,7 @@ mod tests {
             },
             model: "m".into(),
             max_steps: 5,
+            effort: None,
         };
         let agent = AgentLoop::new(
             provider,
@@ -543,6 +612,7 @@ mod tests {
             },
             model: "m".into(),
             max_steps: 5,
+            effort: None,
         };
         let agent = AgentLoop::new(
             provider,
@@ -616,6 +686,7 @@ mod tests {
             },
             model: "m".into(),
             max_steps: 5,
+            effort: None,
         };
         let agent = AgentLoop::new(
             provider,
@@ -679,6 +750,7 @@ mod tests {
             },
             model: "m".into(),
             max_steps: 5,
+            effort: None,
         };
         let bus = EventBus::new(64);
         let mut rx = bus.subscribe();
@@ -777,6 +849,7 @@ mod tests {
                 },
                 model: "m".into(),
                 max_steps: 5,
+                effort: None,
             },
             dir.to_path_buf(),
         )
@@ -911,6 +984,7 @@ mod tests {
                 },
                 model: "m".into(),
                 max_steps: 5,
+                effort: None,
             },
             dir.path().to_path_buf(),
         );

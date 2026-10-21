@@ -27,6 +27,9 @@ pub struct CodeLoomConfig {
     pub model: String,
     #[serde(default = "default_max_steps")]
     pub max_steps: usize,
+    /// Nivel de esfuerzo de razonamiento; `None` equivale a «default» y no se escribe en el fichero.
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 fn default_max_steps() -> usize {
@@ -69,6 +72,12 @@ impl CodeLoomConfig {
         });
         document["provider"]["base_url"] = toml_edit::value(self.provider.base_url.clone());
         document["provider"]["api_key_env"] = toml_edit::value(self.provider.api_key_env.clone());
+        match &self.effort {
+            Some(effort) => document["effort"] = toml_edit::value(effort.clone()),
+            None => {
+                document.remove("effort");
+            }
+        }
         let text = document.to_string();
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         let name = path.file_name().unwrap_or_default().to_string_lossy();
@@ -154,6 +163,7 @@ mod tests {
             },
             model: "claude-test".into(),
             max_steps: 7,
+            effort: None,
         };
         config.save(&path).unwrap();
         let loaded = CodeLoomConfig::load(&path).unwrap();
@@ -162,6 +172,51 @@ mod tests {
         assert_eq!(loaded.provider.api_key_env, "ANTHROPIC_API_KEY");
         assert_eq!(loaded.max_steps, 7);
         assert!(std::fs::read_to_string(path)
+            .unwrap()
+            .contains("# preserved"));
+    }
+
+    #[test]
+    fn config_without_effort_still_loads() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(f, r#"
+            model = "gpt-4o"
+            provider = {{ kind = "openai_compat", base_url = "https://api.openai.com", api_key_env = "OPENAI_API_KEY" }}
+        "#).unwrap();
+        let cfg = CodeLoomConfig::load(f.path()).unwrap();
+        assert_eq!(cfg.effort, None, "una config antigua equivale a «default»");
+    }
+
+    #[test]
+    fn config_roundtrips_effort() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("codeloom.toml");
+        std::fs::write(
+            &path,
+            "# preserved\nmodel = \"old\"\nmax_steps = 7\n[provider]\nkind = \"openai_compat\"\nbase_url = \"https://old.test\"\napi_key_env = \"OLD_KEY\"\n",
+        )
+        .unwrap();
+        let mut config = CodeLoomConfig {
+            provider: ProviderConfig {
+                kind: ProviderKind::Anthropic,
+                base_url: "https://api.anthropic.com".into(),
+                api_key_env: "ANTHROPIC_API_KEY".into(),
+            },
+            model: "claude-test".into(),
+            max_steps: 7,
+            effort: Some("high".into()),
+        };
+        config.save(&path).unwrap();
+        let loaded = CodeLoomConfig::load(&path).unwrap();
+        assert_eq!(loaded.effort.as_deref(), Some("high"));
+        assert_eq!(loaded.provider.kind, ProviderKind::Anthropic);
+
+        // Con `None` la clave desaparece del fichero y al releerlo no hay esfuerzo.
+        config.effort = None;
+        config.save(&path).unwrap();
+        let loaded = CodeLoomConfig::load(&path).unwrap();
+        assert_eq!(loaded.effort, None);
+        assert!(std::fs::read_to_string(&path)
             .unwrap()
             .contains("# preserved"));
     }

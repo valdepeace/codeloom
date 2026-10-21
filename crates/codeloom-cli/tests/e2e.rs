@@ -43,6 +43,7 @@ async fn end_to_end_single_turn() {
         },
         model: "m".into(),
         max_steps: 3,
+        effort: None,
     };
     let provider = Arc::new(OpenAiCompatProvider::new(server.uri(), "sk-test"));
     let agent = AgentLoop::new(

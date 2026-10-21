@@ -352,6 +352,7 @@ mod http_tests {
             tools: vec![],
             temperature: 0.0,
             max_tokens: 16,
+            effort: None,
         };
         let mut s = p.stream(req, CancellationToken::new()).await.unwrap();
         let mut texts = String::new();
@@ -397,6 +398,7 @@ mod wire_tests {
             tools: vec![],
             temperature: 0.0,
             max_tokens: 16,
+            effort: None,
         };
         let body = p.build_body(&req);
         let msgs = body["messages"].as_array().unwrap();
@@ -422,6 +424,7 @@ mod wire_tests {
             tools: vec![],
             temperature: 0.0,
             max_tokens: 16,
+            effort: None,
         };
         let body = p.build_body(&req);
         assert_eq!(body["stream_options"]["include_usage"], true);

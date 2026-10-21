@@ -19,6 +19,17 @@ pub const CATALOG_TTL: Duration = Duration::from_secs(24 * 3600);
 /// Tiempo límite de la descarga del catálogo.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Capacidades de razonamiento de un modelo, según `reasoning_options` de models.dev.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Reasoning {
+    /// Niveles con nombre (`low`, `high`…) de la opción `effort`, en el orden del catálogo.
+    pub efforts: Vec<String>,
+    /// Rango `(mínimo, máximo)` de la opción `budget_tokens`, si la publica.
+    pub budget: Option<(Option<u64>, Option<u64>)>,
+    /// Indica si el modelo admite activar o desactivar el razonamiento (`toggle`).
+    pub toggle: bool,
+}
+
 /// Modelo del catálogo, con solo lo que CodeLoom puede aprovechar.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CatalogModel {
@@ -32,7 +43,8 @@ pub struct CatalogModel {
     pub input_cost: Option<f64>,
     /// Coste de salida por millón de tokens.
     pub output_cost: Option<f64>,
-    pub reasoning: bool,
+    /// Capacidades de razonamiento; `None` si el modelo no razona.
+    pub reasoning: Option<Reasoning>,
     /// Fecha de publicación en formato `AAAA-MM-DD`.
     pub release_date: Option<String>,
 }
@@ -86,10 +98,20 @@ struct RawModel {
     name: Option<String>,
     tool_call: Option<bool>,
     reasoning: Option<bool>,
+    reasoning_options: Option<Vec<RawReasoningOption>>,
     status: Option<String>,
     release_date: Option<String>,
     limit: Option<RawLimit>,
     cost: Option<RawCost>,
+}
+
+#[derive(Deserialize)]
+struct RawReasoningOption {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    values: Option<Vec<String>>,
+    min: Option<u64>,
+    max: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -214,8 +236,28 @@ fn build_model(key: String, raw: RawModel) -> Option<CatalogModel> {
         max_output,
         input_cost,
         output_cost,
-        reasoning: raw.reasoning.unwrap_or(false),
+        reasoning: build_reasoning(raw.reasoning, raw.reasoning_options),
         release_date: raw.release_date,
+    })
+}
+
+/// Traduce `reasoning_options` a `Reasoning`. Sin `reasoning` verdadero el modelo no razona
+/// (`None`); con `reasoning` verdadero pero sin opciones, queda el valor por defecto.
+fn build_reasoning(
+    reasoning: Option<bool>,
+    options: Option<Vec<RawReasoningOption>>,
+) -> Option<Reasoning> {
+    if reasoning != Some(true) {
+        return None;
+    }
+    let options = options.unwrap_or_default();
+    let find = |kind: &str| options.iter().find(|o| o.kind.as_deref() == Some(kind));
+    Some(Reasoning {
+        efforts: find("effort")
+            .and_then(|o| o.values.clone())
+            .unwrap_or_default(),
+        budget: find("budget_tokens").map(|o| (o.min, o.max)),
+        toggle: find("toggle").is_some(),
     })
 }
 
@@ -465,7 +507,7 @@ mod tests {
         assert_eq!(model.max_output, None);
         assert_eq!(model.input_cost, None);
         assert_eq!(model.output_cost, None);
-        assert!(!model.reasoning);
+        assert!(model.reasoning.is_none());
         assert_eq!(model.release_date, None);
     }
 
@@ -552,5 +594,67 @@ mod tests {
         assert_eq!(catalog.providers.len(), 5);
         let (cached, _) = read_cache(&path).expect("la caché debe haberse escrito");
         assert_eq!(cached.providers.len(), 5);
+    }
+
+    /// Catálogo mínimo con un único modelo de proveedor `p`, con el JSON del modelo dado.
+    fn catalog_with_model(model_json: &str) -> Catalog {
+        let raw = format!(
+            r#"{{
+                "p": {{
+                    "id": "p", "npm": "@ai-sdk/openai-compatible", "api": "https://p.example/v1",
+                    "models": {{ "m": {model_json} }}
+                }}
+            }}"#
+        );
+        Catalog::from_json(&raw).expect("el JSON de prueba es válido")
+    }
+
+    #[test]
+    fn parses_effort_values() {
+        let catalog = catalog_with_model(
+            r#"{"id": "m", "tool_call": true, "reasoning": true,
+                "reasoning_options": [{"type": "effort", "values": ["low", "medium", "high"]}]}"#,
+        );
+        let model = &catalog.provider("p").expect("p debe estar").models[0];
+        let reasoning = model.reasoning.as_ref().expect("el modelo razona");
+        assert_eq!(reasoning.efforts, ["low", "medium", "high"]);
+        assert_eq!(reasoning.budget, None);
+        assert!(!reasoning.toggle);
+    }
+
+    #[test]
+    fn parses_budget_range() {
+        let catalog = catalog_with_model(
+            r#"{"id": "m", "tool_call": true, "reasoning": true,
+                "reasoning_options": [{"type": "toggle"},
+                    {"type": "budget_tokens", "min": 512, "max": 24576}]}"#,
+        );
+        let reasoning = catalog.provider("p").expect("p debe estar").models[0]
+            .reasoning
+            .clone()
+            .expect("el modelo razona");
+        assert_eq!(reasoning.budget, Some((Some(512), Some(24576))));
+        assert!(reasoning.toggle);
+        assert!(reasoning.efforts.is_empty());
+    }
+
+    #[test]
+    fn non_reasoning_model_has_no_reasoning() {
+        let catalog = catalog_with_model(
+            r#"{"id": "m", "tool_call": true, "reasoning": false,
+                "reasoning_options": [{"type": "effort", "values": ["low"]}]}"#,
+        );
+        let model = &catalog.provider("p").expect("p debe estar").models[0];
+        assert!(
+            model.reasoning.is_none(),
+            "sin razonamiento no hay Reasoning"
+        );
+    }
+
+    #[test]
+    fn reasoning_true_without_options_is_some_default() {
+        let catalog = catalog_with_model(r#"{"id": "m", "tool_call": true, "reasoning": true}"#);
+        let model = &catalog.provider("p").expect("p debe estar").models[0];
+        assert_eq!(model.reasoning, Some(Reasoning::default()));
     }
 }
