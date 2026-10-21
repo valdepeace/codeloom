@@ -190,6 +190,10 @@ pub struct App {
     pub theme_preset: batten::widgets::ThemePreset,
     /// Fichero donde se guardan las preferencias de la interfaz. `None` = no persistir.
     pub prefs_path: Option<std::path::PathBuf>,
+    /// Captura del ratón (`/mouse`). Apagada, la terminal conserva su selección nativa.
+    pub mouse_capture: bool,
+    /// Hay un cambio de `mouse_capture` pendiente de aplicar al terminal.
+    pub mouse_capture_dirty: bool,
     pub matrix_rain: batten::widgets::matrix_rain::MatrixRain,
     pub animation: batten::widgets::Anim,
     pub tools: VecDeque<batten::state::ToolItem>,
@@ -333,7 +337,30 @@ impl App {
         if let Some(preset) = crate::prefs::load_theme(&path) {
             self.apply_theme(preset);
         }
+        // Se aplica sin marcar `mouse_capture_dirty`: el arranque ya usa este valor.
+        if let Some(on) = crate::prefs::load_mouse(&path) {
+            self.mouse_capture = on;
+        }
         self.prefs_path = Some(path);
+    }
+
+    /// Fija la captura del ratón, la marca como pendiente de aplicar y la persiste
+    /// si hay `prefs_path`. Un fallo al guardar no impide el cambio: se avisa en
+    /// `slash_feedback`.
+    pub fn set_mouse_capture(&mut self, on: bool) {
+        self.mouse_capture = on;
+        self.mouse_capture_dirty = true;
+        self.slash_feedback = None;
+        if let Some(path) = &self.prefs_path {
+            if let Err(err) = crate::prefs::save_mouse(path, on) {
+                self.slash_feedback = Some(format!("Mouse setting not saved: {err}"));
+            }
+        }
+    }
+
+    /// Invierte la captura del ratón (`/mouse`).
+    pub fn toggle_mouse_capture(&mut self) {
+        self.set_mouse_capture(!self.mouse_capture);
     }
 
     fn apply_theme(&mut self, preset: batten::widgets::ThemePreset) {
@@ -364,6 +391,8 @@ impl App {
             theme: batten::widgets::Theme::default_dark(),
             theme_preset: batten::widgets::ThemePreset::Batten,
             prefs_path: None,
+            mouse_capture: true,
+            mouse_capture_dirty: false,
             matrix_rain: batten::widgets::matrix_rain::MatrixRain::default(),
             animation: batten::widgets::Anim::new(),
             tools: VecDeque::new(),
@@ -3311,5 +3340,56 @@ mod tests {
             .as_deref()
             .unwrap()
             .starts_with("Theme not saved"));
+    }
+
+    #[test]
+    fn toggle_mouse_capture_marks_dirty_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ui.toml");
+        let mut app = App::new();
+        assert!(app.mouse_capture);
+        assert!(!app.mouse_capture_dirty);
+        app.set_prefs_path(path.clone());
+        app.toggle_mouse_capture();
+        assert!(!app.mouse_capture);
+        assert!(app.mouse_capture_dirty);
+        assert!(app.slash_feedback.is_none());
+        assert_eq!(crate::prefs::load_mouse(&path), Some(false));
+        app.toggle_mouse_capture();
+        assert!(app.mouse_capture);
+        assert_eq!(crate::prefs::load_mouse(&path), Some(true));
+    }
+
+    #[test]
+    fn set_prefs_path_loads_mouse_without_marking_dirty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ui.toml");
+        // Espacios finales: si el fichero se reescribiera, desaparecerían.
+        let original = "mouse = false   \n";
+        std::fs::write(&path, original).unwrap();
+        let mut app = App::new();
+        app.set_prefs_path(path.clone());
+        assert!(!app.mouse_capture);
+        assert!(!app.mouse_capture_dirty);
+        assert!(app.slash_feedback.is_none());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn mouse_save_error_does_not_block_the_change() {
+        let dir = tempfile::tempdir().unwrap();
+        // Un fichero normal como «directorio» padre: la escritura siempre falla.
+        let blocker = dir.path().join("bloqueo");
+        std::fs::write(&blocker, "x").unwrap();
+        let mut app = App::new();
+        app.set_prefs_path(blocker.join("ui.toml"));
+        app.toggle_mouse_capture();
+        assert!(!app.mouse_capture);
+        assert!(app.mouse_capture_dirty);
+        assert!(app
+            .slash_feedback
+            .as_deref()
+            .unwrap()
+            .starts_with("Mouse setting not saved"));
     }
 }

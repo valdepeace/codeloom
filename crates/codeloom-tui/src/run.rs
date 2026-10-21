@@ -54,15 +54,19 @@ const MAX_BURST: usize = 512;
 struct RawGuard;
 
 impl RawGuard {
-    fn enter() -> std::io::Result<Self> {
+    /// Entra en modo raw y en la pantalla alternativa. La captura del ratón solo
+    /// se activa si `mouse` es `true`; sin ella, la selección nativa del terminal sigue disponible.
+    fn enter(mouse: bool) -> std::io::Result<Self> {
         enable_raw_mode()?;
         let guard = Self;
         execute!(
             std::io::stdout(),
             EnterAlternateScreen,
             EnableBracketedPaste,
-            EnableMouseCapture,
         )?;
+        if mouse {
+            execute!(std::io::stdout(), EnableMouseCapture)?;
+        }
         Ok(guard)
     }
 }
@@ -541,6 +545,11 @@ fn execute_slash_command(app: &mut App, command: crate::commands::Command) -> Op
             None
         }
         Command::Sidebar => handle_key(app, KeyCode::Char('b'), KeyModifiers::CONTROL),
+        Command::Mouse => {
+            app.toggle_mouse_capture();
+            confirm_mouse(app);
+            None
+        }
         Command::Cancel => {
             app.queue_paused = true;
             app.request_cancel();
@@ -571,6 +580,18 @@ fn confirm_theme(app: &mut App) {
     let name = app.theme_preset.name();
     app.slash_feedback
         .get_or_insert_with(|| format!("Theme: {name}"));
+}
+
+/// Confirma la captura del ratón elegida en el composer. Si el guardado falló,
+/// se conserva ese aviso en lugar de la confirmación.
+fn confirm_mouse(app: &mut App) {
+    let message = if app.mouse_capture {
+        "Mouse capture on (wheel scrolls)"
+    } else {
+        "Mouse capture off — select text with the mouse"
+    };
+    app.slash_feedback
+        .get_or_insert_with(|| message.to_string());
 }
 
 fn handle_queue_editor_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
@@ -817,7 +838,7 @@ pub async fn run(
     session_command_tx: UnboundedSender<SessionCommand>,
     mut session_update_rx: tokio::sync::mpsc::UnboundedReceiver<SessionUpdate>,
 ) -> std::io::Result<()> {
-    let _guard = RawGuard::enter()?;
+    let _guard = RawGuard::enter(app.mouse_capture)?;
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend)?;
     let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -973,6 +994,13 @@ pub async fn run(
             let mut out = std::io::stdout();
             let _ = out.write_all(crate::clipboard::osc52(&text).as_bytes());
             let _ = out.flush();
+        }
+        if std::mem::take(&mut app.mouse_capture_dirty) {
+            if app.mouse_capture {
+                execute!(std::io::stdout(), EnableMouseCapture)?;
+            } else {
+                execute!(std::io::stdout(), DisableMouseCapture)?;
+            }
         }
 
         let now = Instant::now();
@@ -2091,5 +2119,34 @@ mod tests {
         assert_eq!(app.theme_preset, ThemePreset::Batten);
         assert_eq!(app.theme.look, Look::classic());
         assert_eq!(app.slash_feedback.as_deref(), Some("Theme: Batten"));
+    }
+
+    #[test]
+    fn mouse_command_toggles_capture_and_reports() {
+        let mut app = App::new();
+        assert!(app.mouse_capture);
+        app.composer.set_text("/mouse");
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE),
+            None
+        );
+        assert!(!app.mouse_capture);
+        assert!(app.mouse_capture_dirty);
+        assert_eq!(
+            app.slash_feedback.as_deref(),
+            Some("Mouse capture off — select text with the mouse")
+        );
+        assert!(app.composer.is_empty());
+
+        app.composer.set_text("/mouse");
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE),
+            None
+        );
+        assert!(app.mouse_capture);
+        assert_eq!(
+            app.slash_feedback.as_deref(),
+            Some("Mouse capture on (wheel scrolls)")
+        );
     }
 }

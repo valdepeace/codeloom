@@ -15,6 +15,7 @@ pub enum Command {
     Pause,
     Resume,
     Sidebar,
+    Mouse,
     Quit,
 }
 
@@ -40,5 +41,10 @@ pub const COMMANDS: &[(Command, &str, &str)] = &[
     (Command::Pause, "/pause", "Pause pending prompts"),
     (Command::Resume, "/resume", "Resume pending prompts"),
     (Command::Sidebar, "/sidebar", "Toggle workspace sidebar"),
+    (
+        Command::Mouse,
+        "/mouse",
+        "Toggle mouse capture (off: select text with the mouse)",
+    ),
     (Command::Quit, "/quit", "Exit CodeLoom"),
 ];
