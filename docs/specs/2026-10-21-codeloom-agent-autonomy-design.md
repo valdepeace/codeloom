@@ -66,17 +66,30 @@ paginación: no hace falta mientras todo sea local.
 
 ## Propuesta de diseño
 
-### Fase A — Reacción y presupuesto
+### Fase A — Reacción y presupuesto (implementada, 2026-10-21)
 
-- Un evento del hijo (`SubagentInputRequested`, o fin de job con aviso
-  pendiente) hace que la TUI, si el padre no tiene turno activo, arranque uno.
-  El texto de entrada es el aviso mismo (ya es un mensaje de usuario).
-- **Presupuesto**: `max_auto_turns` por mensaje del usuario; al agotarse, la TUI
-  muestra el aviso pendiente pero no arranca el turno hasta que el usuario
-  escriba. *Valor propuesto: 8* (decisión mía, a confirmar).
-- Los turnos automáticos se marcan en el transcript (p. ej. cabecera
-  «auto») y Esc los cancela como cualquier otro.
-- No arranca turno si hay un diálogo de permisos o preguntas abierto.
+- Un evento del hijo (`SubagentInputRequested`, o `SubagentSettled` con
+  `Completed` o `Failed`) hace que la TUI, si el padre no tiene turno activo,
+  pida un despertar. El trabajador ejecuta `AgentLoop::run_woken`, que entrega
+  los avisos pendientes y **solo si había alguno** ejecuta un turno, **sin
+  fabricar mensaje de usuario**; sin avisos publica `WakeIdle` y no gasta nada.
+- **Presupuesto**: `MAX_AUTO_TURNS = 8` por mensaje del usuario (decisión mía,
+  a confirmar); se gasta al empezar el turno despertado y se rearma al enviar
+  un mensaje. Agotado, la TUI muestra «auto-turns exhausted — write to
+  continue» y aguarda.
+- El turno despertado se señala con el estado `auto-turn` en el pie; Esc lo
+  cancela como cualquier otro y descarta el despertar pendiente. Un hijo
+  interrumpido por el usuario (`Killed`) no despierta al padre.
+- No se despierta con turno en curso, mensaje en cola, diálogo de permisos o
+  preguntas abierto, selector o ajustes abiertos, ni mientras se carga una
+  sesión. Un prompt en cola tiene prioridad sobre el despertar.
+- Para evitar carreras, el lanzador publica `SubagentSettled` **después** de
+  persistir el estado final del hijo, y `SubagentInputRequested` solo tras
+  registrar la pregunta en el buzón (`request_with`).
+
+Limitaciones conocidas: durante un turno despertado herdr sigue viendo `Idle`
+hasta el final (no se emite `Working`); el turno automático no se marca en el
+transcript, solo en el pie; validación en terminal real pendiente.
 
 ### Fase B — Artefactos
 

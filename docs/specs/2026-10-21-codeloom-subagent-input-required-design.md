@@ -71,14 +71,8 @@ directo a la pantalla.
 
 ## Preguntas abiertas
 
-- **Padre ocioso** (decidido en principio, plan aparte). Los avisos solo se
-  leen al comenzar un turno del padre, de modo que una pregunta de un hijo
-  queda dormida mientras el padre no actúe. La especificación A2A prevé que el
-  cliente reaccione a `input-required` y a los estados terminales mediante
-  suscripción o *push*; lo coherente es que un evento del hijo arranque un
-  turno del padre cuando este esté ocioso. Esta entrega solo marca la espera
-  en la TUI; el despertar automático se planifica después, una vez leído el
-  bucle de ejecución de `codeloom-tui`.
+- **Padre ocioso**: resuelto con el despertar automático de la Fase A de
+  `2026-10-21-codeloom-agent-autonomy-design.md`.
 - **Tiempo máximo de espera** de un hijo: no lo hay; `interrupt` basta por
   ahora.
 
@@ -118,7 +112,7 @@ Limitaciones conocidas:
 
 - El aviso se marca como anunciado antes de guardarse: si el guardado fallase,
   la pregunta no se reanunciaría.
-- El padre ocioso no despierta solo (véase «Preguntas abiertas» y la spec de
-  autonomía).
+- El despertar del padre ocioso está implementado (Fase A de la spec de
+  autonomía): la pregunta de un hijo lanza un turno del padre con presupuesto.
 - En el look Classic no hay marca visible; solo el aviso al padre.
 - Validación visual en terminal real: pendiente.
