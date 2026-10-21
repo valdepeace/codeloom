@@ -61,3 +61,35 @@ proveedor con y sin esfuerzo (la sin esfuerzo idéntica a la actual), configurac
 (guardar y leer), campo del diálogo (visibilidad, ciclo, descarte al cambiar de
 modelo) y rail. Sin red. Validación visual y contra proveedores reales: pendiente
 (la tabla de presupuestos y la forma de OpenRouter son suposiciones a comprobar).
+
+## Estado (2026-10-21)
+
+Implementado, cada tarea en su commit: catálogo, configuración y petición
+(`99b7951`), traducción por proveedor (`e842f24`) y campo «Effort» con nivel en
+el rail (commit de la tarea 3).
+
+Cómo se usa: en `/settings`, tras elegir un modelo que razona, aparece la fila
+`Effort` justo antes de «Save and apply». Con el foco en ella, `←`/`→` (o `Enter`)
+recorren «default» y los niveles del modelo. Guardar lo escribe en
+`codeloom.toml` (`effort`) y el rail lo muestra como `effort high` bajo el modelo.
+
+Decisiones tomadas al implementar:
+
+- El campo ocupa el índice 4 solo si es visible; sin él, «Save and apply» sigue
+  en el 4 y los demás índices no cambian.
+- El nivel se reajusta a «default» (con aviso) al cambiar modelo, proveedor o URL
+  si el nuevo destino no lo admite.
+- En el proveedor OpenAI-compatible el nivel se envía tal cual; solo Anthropic
+  valida contra su tabla de presupuestos.
+- El rail lee el nivel de lo guardado, igual que el modelo.
+
+Limitaciones conocidas:
+
+- Los presupuestos de Anthropic (`minimal` 1024, `low` 2048, `medium` 8192, `high`
+  16384, `max` 32000) y la forma `reasoning: {effort}` de OpenRouter son
+  suposiciones **sin contrastar con los servicios reales**.
+- Los modelos de Anthropic más recientes podrían preferir un esfuerzo nativo
+  frente a `budget_tokens`; no se ha comprobado.
+- `toggle` y el presupuesto numérico libre no están soportados.
+- Los subagentes heredan el esfuerzo de la configuración del padre.
+- Validación visual en terminal real: pendiente.
