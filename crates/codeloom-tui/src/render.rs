@@ -596,13 +596,19 @@ fn draw_provider_settings(frame: &mut Frame, area: Rect, app: &App) {
             current.to_string()
         }
     };
+    let changes = app.settings_change_count();
+    let save_label = match changes {
+        0 => "Save and apply".to_string(),
+        1 => "Save and apply (1 change)".to_string(),
+        n => format!("Save and apply ({n} changes)"),
+    };
     let rows = [
         ("Provider", kind.to_string()),
         ("Model", value(1, &settings.model)),
         ("Base URL", value(2, &settings.base_url)),
         ("API key env", value(3, &settings.api_key_env)),
         (
-            "Save and apply",
+            save_label.as_str(),
             if app.settings_saving {
                 "Applying…"
             } else {
@@ -616,7 +622,7 @@ fn draw_provider_settings(frame: &mut Frame, area: Rect, app: &App) {
         .enumerate()
         .map(|(index, (label, value))| {
             let selected = app.settings_field == index;
-            Line::from(vec![
+            let mut spans = vec![
                 Span::styled(
                     if selected { "› " } else { "  " },
                     app.theme.styles.accent_from,
@@ -630,7 +636,11 @@ fn draw_provider_settings(frame: &mut Frame, area: Rect, app: &App) {
                     },
                 ),
                 Span::styled(value.as_str(), app.theme.styles.default),
-            ])
+            ];
+            if index < 4 && app.settings_field_changed(index) {
+                spans.push(Span::styled(" ● unsaved", app.theme.styles.warning));
+            }
+            Line::from(spans)
         })
         .collect::<Vec<_>>();
     if let Some(feedback) = &app.settings_feedback {
@@ -2436,5 +2446,23 @@ mod tests {
             user,
             "tras subir, el primer bloque es del usuario"
         );
+    }
+
+    #[test]
+    fn settings_dialog_marks_changed_fields_unsaved() {
+        let mut app = App::new();
+        app.set_provider_settings(crate::app::ProviderSettings {
+            kind: codeloom_core::config::ProviderKind::OpenAiCompat,
+            model: "test-model".into(),
+            base_url: "https://example.test/v1".into(),
+            api_key_env: "API_KEY".into(),
+        });
+        app.open_settings();
+        assert!(!buffer_of(&mut app, 120, 40).contains("unsaved"));
+        app.provider_settings.as_mut().unwrap().model = "other-model".into();
+        let content = buffer_of(&mut app, 120, 40);
+        assert_eq!(content.matches("● unsaved").count(), 1);
+        assert!(content.contains("other-model"));
+        assert!(content.contains("Save and apply (1 change)"));
     }
 }

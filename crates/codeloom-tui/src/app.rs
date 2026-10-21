@@ -54,7 +54,10 @@ pub enum SessionChoice {
     New,
 }
 
-#[derive(Debug, Clone)]
+/// Aviso que se muestra al cerrar `/settings` con cambios sin guardar.
+const SETTINGS_DISCARD_WARNING: &str = "Unsaved changes · Esc again to discard";
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ProviderSettings {
     pub kind: ProviderKind,
     pub model: String,
@@ -349,6 +352,11 @@ pub struct App {
     /// Set after user makes a selection and before messages are loaded.
     pub session_loading: bool,
     pub provider_settings: Option<ProviderSettings>,
+    /// Copia de los ajustes al abrir el diálogo y tras guardar con éxito.
+    /// Sirve para saber si hay cambios sin guardar.
+    pub settings_baseline: Option<ProviderSettings>,
+    /// `true` tras avisar de cambios sin guardar; una segunda `Esc` descarta.
+    pub settings_warned: bool,
     pub settings_open: bool,
     pub settings_field: usize,
     pub settings_editing: bool,
@@ -518,6 +526,8 @@ impl App {
             session_choice: None,
             session_loading: false,
             provider_settings: None,
+            settings_baseline: None,
+            settings_warned: false,
             settings_open: false,
             settings_field: 0,
             settings_editing: false,
@@ -612,6 +622,7 @@ impl App {
 
     pub fn set_provider_settings(&mut self, settings: ProviderSettings) {
         self.model = settings.model.clone();
+        self.settings_baseline = Some(settings.clone());
         self.provider_settings = Some(settings);
     }
 
@@ -619,6 +630,66 @@ impl App {
         if self.provider_settings.is_some() {
             self.settings_open = true;
             self.settings_feedback = None;
+            self.settings_warned = false;
+            self.settings_baseline = self.provider_settings.clone();
+        }
+    }
+
+    /// `true` si los ajustes en pantalla difieren de la copia guardada.
+    pub fn settings_dirty(&self) -> bool {
+        match (&self.provider_settings, &self.settings_baseline) {
+            (Some(current), Some(baseline)) => current != baseline,
+            _ => false,
+        }
+    }
+
+    /// `true` si el campo `index` (0 proveedor, 1 modelo, 2 URL, 3 variable de clave)
+    /// difiere de la copia guardada.
+    pub fn settings_field_changed(&self, index: usize) -> bool {
+        match (&self.provider_settings, &self.settings_baseline) {
+            (Some(current), Some(baseline)) => match index {
+                0 => current.kind != baseline.kind,
+                1 => current.model != baseline.model,
+                2 => current.base_url != baseline.base_url,
+                3 => current.api_key_env != baseline.api_key_env,
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// Número de campos con cambios sin guardar.
+    pub fn settings_change_count(&self) -> usize {
+        (0..4)
+            .filter(|&index| self.settings_field_changed(index))
+            .count()
+    }
+
+    /// Cierra `/settings`. Con cambios sin guardar avisa primero: devuelve `false`
+    /// y deja el aviso en `settings_feedback`. Con el aviso ya dado descarta los
+    /// cambios, restaura la copia guardada y devuelve `true`.
+    pub fn close_settings(&mut self) -> bool {
+        if self.settings_dirty() && !self.settings_warned {
+            self.settings_warned = true;
+            self.settings_feedback = Some(SETTINGS_DISCARD_WARNING.into());
+            return false;
+        }
+        if self.settings_dirty() {
+            self.provider_settings = self.settings_baseline.clone();
+        }
+        self.settings_open = false;
+        self.settings_warned = false;
+        self.settings_feedback = None;
+        true
+    }
+
+    /// Anula el aviso de «cambios sin guardar» tras cualquier acción distinta de `Esc`.
+    pub fn settings_disarm(&mut self) {
+        if self.settings_warned {
+            self.settings_warned = false;
+            if self.settings_feedback.as_deref() == Some(SETTINGS_DISCARD_WARNING) {
+                self.settings_feedback = None;
+            }
         }
     }
 
@@ -637,6 +708,7 @@ impl App {
     }
 
     pub fn commit_settings_value(&mut self) {
+        self.settings_disarm();
         let value = self.settings_editor.text().to_string();
         if let Some(settings) = self.provider_settings.as_mut() {
             match self.settings_field {
@@ -681,6 +753,7 @@ impl App {
             Ok(()) => {
                 if let Some(settings) = &self.provider_settings {
                     self.model = settings.model.clone();
+                    self.settings_baseline = Some(settings.clone());
                 }
                 "Settings saved and applied".into()
             }
@@ -3995,5 +4068,91 @@ mod tests {
         // Los bordes derecho e inferior quedan fuera del rectángulo.
         assert_eq!(app.pane_at(40, 0), None);
         assert_eq!(app.pane_at(3, 20), None);
+    }
+
+    fn settings_fixture() -> ProviderSettings {
+        ProviderSettings {
+            kind: codeloom_core::config::ProviderKind::OpenAiCompat,
+            model: "model-a".into(),
+            base_url: "https://example.test/v1".into(),
+            api_key_env: "API_KEY".into(),
+        }
+    }
+
+    fn app_with_settings_open() -> App {
+        let mut app = App::new();
+        app.set_provider_settings(settings_fixture());
+        app.open_settings();
+        app
+    }
+
+    #[test]
+    fn settings_not_dirty_when_opened() {
+        let app = app_with_settings_open();
+        assert!(app.settings_open);
+        assert!(!app.settings_dirty());
+    }
+
+    #[test]
+    fn editing_a_field_makes_settings_dirty() {
+        let mut app = app_with_settings_open();
+        app.provider_settings.as_mut().unwrap().model = "model-b".into();
+        assert!(app.settings_dirty());
+    }
+
+    #[test]
+    fn esc_with_unsaved_changes_warns_first() {
+        let mut app = app_with_settings_open();
+        app.provider_settings.as_mut().unwrap().model = "model-b".into();
+        assert!(!app.close_settings());
+        assert!(app.settings_open);
+        assert_eq!(
+            app.settings_feedback.as_deref(),
+            Some("Unsaved changes · Esc again to discard")
+        );
+        assert_eq!(app.provider_settings.as_ref().unwrap().model, "model-b");
+    }
+
+    #[test]
+    fn second_esc_discards_and_restores() {
+        let mut app = app_with_settings_open();
+        app.provider_settings.as_mut().unwrap().model = "model-b".into();
+        assert!(!app.close_settings());
+        assert!(app.close_settings());
+        assert!(!app.settings_open);
+        assert!(!app.settings_dirty());
+        assert_eq!(app.provider_settings.as_ref().unwrap().model, "model-a");
+        assert_eq!(app.model, "model-a");
+    }
+
+    #[test]
+    fn esc_without_changes_closes_at_once() {
+        let mut app = app_with_settings_open();
+        assert!(app.close_settings());
+        assert!(!app.settings_open);
+    }
+
+    #[test]
+    fn successful_save_clears_dirty() {
+        let mut app = app_with_settings_open();
+        app.provider_settings.as_mut().unwrap().model = "model-b".into();
+        app.settings_saving = true;
+        app.settings_saved(Ok(()));
+        assert!(!app.settings_dirty());
+        assert!(app.close_settings());
+    }
+
+    #[test]
+    fn editing_after_warning_cancels_the_warning() {
+        let mut app = app_with_settings_open();
+        app.provider_settings.as_mut().unwrap().model = "model-b".into();
+        assert!(!app.close_settings());
+        app.settings_field = 1;
+        app.edit_settings_value();
+        app.settings_editor.set_text("model-c");
+        app.commit_settings_value();
+        assert_eq!(app.settings_feedback, None);
+        assert!(!app.close_settings());
+        assert!(app.settings_open);
     }
 }

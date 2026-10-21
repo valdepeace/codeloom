@@ -790,8 +790,13 @@ fn handle_settings_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         }
         return;
     }
+    if code != KeyCode::Esc {
+        app.settings_disarm();
+    }
     match code {
-        KeyCode::Esc => app.settings_open = false,
+        KeyCode::Esc => {
+            app.close_settings();
+        }
         KeyCode::Up => app.settings_field = app.settings_field.saturating_sub(1),
         KeyCode::Down => app.settings_field = (app.settings_field + 1).min(4),
         KeyCode::Left | KeyCode::Right if app.settings_field == 0 => toggle_provider(app),
@@ -3152,5 +3157,28 @@ mod tests {
         app.turn_in_flight = true;
         execute_slash_command(&mut app, crate::commands::Command::Parent);
         assert_eq!(app.status, "wait for the turn to finish");
+    }
+
+    #[test]
+    fn esc_in_settings_warns_before_discarding_changes() {
+        let mut app = App::new();
+        app.set_provider_settings(ProviderSettings {
+            kind: codeloom_core::config::ProviderKind::OpenAiCompat,
+            model: "old-model".into(),
+            base_url: "https://example.test/v1".into(),
+            api_key_env: "API_KEY".into(),
+        });
+        app.open_settings();
+        app.provider_settings.as_mut().unwrap().model = "new-model".into();
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.settings_open);
+        assert!(app
+            .settings_feedback
+            .as_deref()
+            .unwrap()
+            .contains("Esc again"));
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!app.settings_open);
+        assert_eq!(app.provider_settings.as_ref().unwrap().model, "old-model");
     }
 }
