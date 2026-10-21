@@ -5,6 +5,7 @@ mod ansi;
 mod button;
 mod chat;
 mod chip;
+mod codeloom_tools;
 mod composer;
 mod crush_atoms;
 mod crush_chat;
@@ -86,6 +87,7 @@ pub struct CatalogItem {
 fn provider_for(variant: &str) -> &'static str {
     [
         "Batten",
+        "CodeLoom",
         "Crush",
         "Martty",
         "Mindfork",
@@ -760,6 +762,67 @@ pub fn catalog() -> Vec<CatalogItem> {
             "Activity spinner",
             "Batten · single",
             Box::new(spinner::SpinnerDemo::new()),
+        ),
+        // Una entrada por herramienta real de CodeLoom, con su pieza de render.
+        item(
+            "CodeLoom tools",
+            "CodeLoom · bash",
+            Box::new(codeloom_tools::CodeLoomToolDemo::new("bash")),
+        ),
+        item(
+            "CodeLoom tools",
+            "CodeLoom · view",
+            Box::new(codeloom_tools::CodeLoomToolDemo::new("view")),
+        ),
+        item(
+            "CodeLoom tools",
+            "CodeLoom · edit",
+            Box::new(codeloom_tools::CodeLoomToolDemo::new("edit")),
+        ),
+        item(
+            "CodeLoom tools",
+            "CodeLoom · grep",
+            Box::new(codeloom_tools::CodeLoomToolDemo::new("grep")),
+        ),
+        item(
+            "CodeLoom tools",
+            "CodeLoom · glob",
+            Box::new(codeloom_tools::CodeLoomToolDemo::new("glob")),
+        ),
+        item(
+            "CodeLoom tools",
+            "CodeLoom · todo_write",
+            Box::new(codeloom_tools::CodeLoomToolDemo::new("todo_write")),
+        ),
+        item(
+            "CodeLoom tools",
+            "CodeLoom · ask_user",
+            Box::new(codeloom_tools::CodeLoomToolDemo::new("ask_user")),
+        ),
+        item(
+            "CodeLoom tools",
+            "CodeLoom · subagent",
+            Box::new(codeloom_tools::CodeLoomToolDemo::new("subagent")),
+        ),
+        item(
+            "CodeLoom tools",
+            "CodeLoom · subagent_control",
+            Box::new(codeloom_tools::CodeLoomToolDemo::new("subagent_control")),
+        ),
+        item(
+            "CodeLoom tools",
+            "CodeLoom · subagent_list",
+            Box::new(codeloom_tools::CodeLoomToolDemo::new("subagent_list")),
+        ),
+        item(
+            "CodeLoom tools",
+            "CodeLoom · job_start",
+            Box::new(codeloom_tools::CodeLoomToolDemo::new("job_start")),
+        ),
+        item(
+            "CodeLoom tools",
+            "CodeLoom · job_list",
+            Box::new(codeloom_tools::CodeLoomToolDemo::new("job_list")),
         ),
     ]
 }

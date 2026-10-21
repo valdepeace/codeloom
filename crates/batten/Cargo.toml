@@ -10,6 +10,8 @@ fx = ["dep:tachyonfx"]
 ansi = ["dep:ansi-to-tui"]
 links = ["dep:hyperrat"]
 termprofile = ["dep:termprofile"]
+# Datos de ejemplo de las herramientas reales (catálogo del showcase y tests).
+fixtures = []
 
 [dependencies]
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
@@ -29,3 +31,6 @@ termprofile = { version = "0.2", optional = true, features = ["convert", "ratatu
 tempfile = "3"
 image = { version = "=0.25.10", default-features = false, features = ["png"] }
 dotmax = { version = "0.1.11", default-features = false }
+# Auto-referencia: el showcase y los ejemplos compilan con la feature `fixtures`
+# sin flags, porque los dev-dependencies activan features también en ejemplos.
+batten = { path = ".", features = ["fixtures"] }

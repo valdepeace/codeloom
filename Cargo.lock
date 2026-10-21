@@ -175,6 +175,7 @@ name = "batten"
 version = "0.1.0"
 dependencies = [
  "ansi-to-tui",
+ "batten",
  "dotmax",
  "hyperrat",
  "image",

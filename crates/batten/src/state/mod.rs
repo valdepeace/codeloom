@@ -18,6 +18,8 @@ pub mod todo_lines;
 pub mod tone;
 pub mod tool;
 pub mod tool_atom;
+#[cfg(any(test, feature = "fixtures"))]
+pub mod tool_atom_fixtures;
 pub mod tool_lines;
 pub mod transcript;
 pub mod viewport;
