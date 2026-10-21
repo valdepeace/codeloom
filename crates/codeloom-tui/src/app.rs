@@ -1,6 +1,7 @@
 use crate::permission_flow::{dialog_for, spec_for, PermissionReply, QuestionReply};
 use crate::tool_facts::tool_facts;
 use batten::widgets::composer::hit_index;
+use codeloom_core::catalog::Catalog;
 use codeloom_core::config::{CodeLoomConfig, ProviderKind};
 use codeloom_core::event::LiveEvent;
 use codeloom_core::message::{ContentPart, Message, Role};
@@ -12,6 +13,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Dónde va el teclado.
@@ -352,6 +354,8 @@ pub struct App {
     /// Set after user makes a selection and before messages are loaded.
     pub session_loading: bool,
     pub provider_settings: Option<ProviderSettings>,
+    /// Catálogo de proveedores y modelos de models.dev. Vacío hasta que llega la carga en segundo plano.
+    pub catalog: Arc<Catalog>,
     /// Copia de los ajustes al abrir el diálogo y tras guardar con éxito.
     /// Sirve para saber si hay cambios sin guardar.
     pub settings_baseline: Option<ProviderSettings>,
@@ -526,6 +530,7 @@ impl App {
             session_choice: None,
             session_loading: false,
             provider_settings: None,
+            catalog: Arc::new(Catalog::default()),
             settings_baseline: None,
             settings_warned: false,
             settings_open: false,
@@ -624,6 +629,11 @@ impl App {
         self.model = settings.model.clone();
         self.settings_baseline = Some(settings.clone());
         self.provider_settings = Some(settings);
+    }
+
+    /// Sustituye el catálogo por otro recién llegado de la carga en segundo plano.
+    pub fn set_catalog(&mut self, catalog: Arc<Catalog>) {
+        self.catalog = catalog;
     }
 
     pub fn open_settings(&mut self) {
@@ -4154,5 +4164,27 @@ mod tests {
         assert_eq!(app.settings_feedback, None);
         assert!(!app.close_settings());
         assert!(app.settings_open);
+    }
+
+    #[test]
+    fn set_catalog_replaces_the_catalog() {
+        use codeloom_core::catalog::Catalog;
+
+        let sample = r#"{"anthropic": {"id": "anthropic", "name": "Anthropic",
+            "npm": "@ai-sdk/anthropic", "env": ["ANTHROPIC_API_KEY"],
+            "models": {"m": {"id": "m", "tool_call": true}}}}"#;
+
+        let mut app = App::new();
+        assert!(app.catalog.is_empty(), "por defecto el catálogo está vacío");
+
+        app.set_catalog(std::sync::Arc::new(Catalog::from_json(sample).unwrap()));
+        assert_eq!(app.catalog.providers.len(), 1);
+        assert_eq!(app.catalog.providers[0].id, "anthropic");
+
+        app.set_catalog(std::sync::Arc::new(Catalog::default()));
+        assert!(
+            app.catalog.is_empty(),
+            "el catálogo nuevo sustituye al anterior"
+        );
     }
 }

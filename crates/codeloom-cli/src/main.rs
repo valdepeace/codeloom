@@ -1,6 +1,9 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use codeloom_core::agent::AgentLoop;
+use codeloom_core::catalog::{
+    cache_path, fetch_raw, is_stale, read_cache, refresh, Catalog, CATALOG_URL,
+};
 use codeloom_core::config::{CodeLoomConfig, ProviderKind};
 use codeloom_core::event::EventBus;
 use codeloom_core::permission::{DenyAll, PermissionService};
@@ -29,6 +32,7 @@ use codeloom_tui::app::{ProviderSettings, SessionChoice};
 use codeloom_tui::run::{SessionCommand, SessionUpdate};
 use codeloom_tui::widgets::permission::UiPermissionResponder;
 use std::sync::Arc;
+use std::time::SystemTime;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Parser)]
@@ -200,6 +204,9 @@ async fn main() -> Result<()> {
         tokio::sync::mpsc::unbounded_channel::<codeloom_tui::run::ProviderSettingsCommand>();
     let (session_command_tx, mut session_command_rx) = tokio::sync::mpsc::unbounded_channel();
     let (session_update_tx, session_update_rx) = tokio::sync::mpsc::unbounded_channel();
+    // Solo en modo TUI (`--print` ya ha salido arriba): la carga corre en segundo plano.
+    let (catalog_tx, catalog_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(load_catalog(catalog_tx));
     let active_turn: codeloom_tui::run::ActiveTurn = Arc::new(std::sync::Mutex::new(None));
     let worker_active_turn = active_turn.clone();
     let agent_task = agent.clone();
@@ -315,9 +322,40 @@ async fn main() -> Result<()> {
         active_turn,
         session_command_tx,
         session_update_rx,
+        catalog_rx,
     )
     .await?;
     Ok(())
+}
+
+/// Entrega a la interfaz el catálogo de models.dev: primero la caché (si existe) y, si falta
+/// o ha caducado, uno descargado. Los fallos se ignoran en silencio: sin catálogo, `/settings`
+/// funciona como antes. Corre en su propia tarea, así que nunca retrasa el arranque.
+async fn load_catalog(tx: tokio::sync::mpsc::UnboundedSender<Arc<Catalog>>) {
+    let Some(path) = cache_path() else {
+        return;
+    };
+    // La lectura de la caché es E/S síncrona: se aparta del hilo del ejecutor.
+    let cached = tokio::task::spawn_blocking({
+        let path = path.clone();
+        move || read_cache(&path)
+    })
+    .await
+    .ok()
+    .flatten();
+
+    let needs_refresh = match &cached {
+        Some((_, modified)) => is_stale(*modified, SystemTime::now()),
+        None => true,
+    };
+    if let Some((catalog, _)) = cached {
+        let _ = tx.send(Arc::new(catalog));
+    }
+    if needs_refresh {
+        if let Ok(catalog) = refresh(&path, || fetch_raw(CATALOG_URL)).await {
+            let _ = tx.send(Arc::new(catalog));
+        }
+    }
 }
 
 /// Carga `.env` del directorio de trabajo al entorno del proceso (sin pisar

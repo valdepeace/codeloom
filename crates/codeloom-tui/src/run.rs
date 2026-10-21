@@ -2,6 +2,7 @@ use crate::app::Focus;
 use crate::app::{App, ProviderSettings, SessionChoice};
 use crate::frame::{FrameScheduler, Urgency, MIN_FRAME};
 use crate::render::render;
+use codeloom_core::catalog::Catalog;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
     KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
@@ -977,6 +978,11 @@ fn cancel_active_turn(app: &mut App, active_turn: &ActiveTurn) {
     }
 }
 
+/// Aplica a la interfaz el catálogo recibido de la carga en segundo plano.
+fn apply_catalog(app: &mut App, catalog: Arc<Catalog>) {
+    app.set_catalog(catalog);
+}
+
 /// Bucle principal por eventos: teclado (prioritario), permisos, bus del
 /// agente, vencimiento de frame y animaciones. Solo pinta cuando hay cambios;
 /// las ráfagas de teclado se agrupan en un frame; cada frame es atómico.
@@ -1000,6 +1006,8 @@ pub async fn run(
     active_turn: ActiveTurn,
     session_command_tx: UnboundedSender<SessionCommand>,
     mut session_update_rx: tokio::sync::mpsc::UnboundedReceiver<SessionUpdate>,
+    // Catálogo de models.dev: llega en segundo plano y nunca bloquea el arranque.
+    mut catalog_rx: tokio::sync::mpsc::UnboundedReceiver<Arc<Catalog>>,
 ) -> std::io::Result<()> {
     let _guard = RawGuard::enter(app.mouse_capture)?;
     let backend = CrosstermBackend::new(std::io::stdout());
@@ -1035,6 +1043,7 @@ pub async fn run(
     let mut fx_clock = Instant::now();
     let (mut bus_open, mut perm_open, mut ask_open) = (true, true, true);
     let mut session_update_open = true;
+    let mut catalog_open = true;
     let mut pending_settings: Option<oneshot::Receiver<Result<(), String>>> = None;
     send_session_commands(&mut app, &session_command_tx);
     // Pintar antes de esperar eventos para que la TUI aparezca al arrancar.
@@ -1116,6 +1125,14 @@ pub async fn run(
                 dispatch_next(&mut app, &prompt_tx);
                 dispatch_wake(&mut app, &wake_tx);
                 frames.request(Urgency::Input);
+            },
+            // Catálogo llegado en segundo plano: basta con repintar; no hay trabajo pesado aquí.
+            catalog = catalog_rx.recv(), if catalog_open => match catalog {
+                Some(catalog) => {
+                    apply_catalog(&mut app, catalog);
+                    frames.request(Urgency::Background);
+                }
+                None => catalog_open = false,
             },
             saved = async { pending_settings.as_mut().unwrap().await }, if pending_settings.is_some() => {
                 pending_settings = None;
@@ -3180,5 +3197,26 @@ mod tests {
         handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         assert!(!app.settings_open);
         assert_eq!(app.provider_settings.as_ref().unwrap().model, "old-model");
+    }
+
+    #[tokio::test]
+    async fn catalog_update_is_applied_by_the_loop() {
+        use codeloom_core::catalog::Catalog;
+
+        let sample = r#"{"openrouter": {"id": "openrouter", "name": "OpenRouter",
+            "npm": "@openrouter/ai-sdk-provider", "api": "https://openrouter.ai/api/v1",
+            "env": ["OPENROUTER_API_KEY"],
+            "models": {"m": {"id": "m", "tool_call": true}}}}"#;
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(Arc::new(Catalog::from_json(sample).unwrap()))
+            .expect("el canal sigue abierto");
+
+        let mut app = App::new();
+        let update = rx.recv().await.expect("el catálogo llega por el canal");
+        apply_catalog(&mut app, update);
+
+        assert_eq!(app.catalog.providers.len(), 1);
+        assert_eq!(app.catalog.providers[0].id, "openrouter");
     }
 }
