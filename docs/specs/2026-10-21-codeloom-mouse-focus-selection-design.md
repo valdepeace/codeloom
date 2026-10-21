@@ -80,3 +80,46 @@ posición → cursor en ambos estilos (incluidos ajuste de línea, texto ancho y
 desplazamiento), del mapa de ventanas y del enrutado de eventos de ratón.
 Validación visual en terminal real: imprescindible (es una entrega de
 interacción) y pendiente.
+
+## Estado (2026-10-21)
+
+Implementada y commiteada, con 317 pruebas en `batten` y 214 en
+`codeloom-tui`, `clippy -D warnings` y `rustfmt` limpios:
+
+- Modelo de selección en el `Composer` (ancla y cursor en grafemas, `extend_*`,
+  `selected_text`), resaltado con `theme.styles.selection` en ambos estilos y
+  desplazamiento vertical persistido (`view_top`).
+- `hit_index`: traducción celda → grafema para Classic y Crush, con ajuste de
+  línea, caracteres anchos, recorte horizontal y desplazamiento. El composer
+  recuerda el cursor y el diseño con que se pintó por última vez, de modo que
+  un arrastre con varios eventos entre fotogramas no discrepa de lo visible.
+- `Focus` ampliado (`Sidebar`, `Agent`, `Activity`, `Rail`), `pane_rects` y
+  `composer_area` rellenados por `render`, `pane_at` e indicador de foco
+  (borde de acento o filete en el margen en Crush).
+- Enrutado: clic cambia foco y coloca cursor; arrastrar selecciona; soltar
+  copia con aviso `Copied N chars`; Mayús + flechas/Inicio/Fin; Ctrl+C con
+  selección copia y no sale; Esc con selección la limpia sin contar para la
+  doble pulsación; el ratón se ignora con diálogos abiertos.
+
+Decisiones tomadas al implementar:
+
+- El composer no lleva indicador de foco (es el foco por defecto y ya muestra
+  su cursor).
+- Tab desde un panel lateral vuelve al composer.
+- Con foco en un panel lateral, Enter, Retroceso y flechas siguen actuando
+  sobre el composer; pegar con foco lateral sigue ignorado.
+- Cualquier tecla o pegado anula el arrastre en curso; los cambios de texto
+  programáticos (historial, comandos, carga de sesión) no lo hacen
+  explícitamente, aunque `select_range` acota y nada queda fuera de rango.
+- Ctrl+C copia la selección del composer aunque el foco esté en otro panel.
+- «Token usage» registra un segundo rectángulo `Focus::Agent`.
+
+Limitaciones conocidas:
+
+- Cada evento de arrastre cuesta O(texto) (`hit_index` y recuento de
+  grafemas); aceptable para textos de composer, pero ha de validarse la
+  fluidez en terminal real.
+- Los paneles laterales reciben foco pero no hacen nada con él aún.
+- Sin selección en el transcript, doble o triple clic ni autodesplazamiento.
+- Validación visual en terminal real: pendiente (clic, arrastre, copia,
+  fluidez, `/mouse`).
