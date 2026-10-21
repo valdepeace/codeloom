@@ -157,6 +157,10 @@ impl SubagentLauncher for InProcessSubagentLauncher {
         let child_cwd = self.cwd.clone();
         let child_jobs = self.jobs.clone();
         let descriptor_label = label.clone();
+        // El bus del hijo se crea y se suscribe antes de lanzarlo, para no perder ningún
+        // evento de su arranque. Su canal se cierra cuando se sueltan todos sus emisores.
+        let child_bus = EventBus::new(256);
+        let mut child_rx = child_bus.subscribe();
         let job = self.jobs.start(JobSpec {
             kind: "subagent".into(),
             label,
@@ -173,7 +177,7 @@ impl SubagentLauncher for InProcessSubagentLauncher {
                         child_provider,
                         child_store.clone(),
                         child_tools,
-                        EventBus::new(64),
+                        child_bus,
                         child_permission,
                         child_config,
                         child_cwd,
@@ -191,6 +195,9 @@ impl SubagentLauncher for InProcessSubagentLauncher {
                             return Ok(None);
                         }
                     };
+                    // El agente ya no emite: soltarlo cierra el bus del hijo y permite
+                    // que la tarea de reenvío termine.
+                    drop(child_agent);
                     let text = outcome.final_text;
                     child_store.complete_subagent(parent, child, &text).await?;
                     handle.append(&text);
@@ -198,6 +205,27 @@ impl SubagentLauncher for InProcessSubagentLauncher {
                 })
             }),
         })?;
+        // Reenvío filtrado: solo los eventos relevantes del hijo llegan al padre,
+        // etiquetados con su identidad. La tarea termina cuando el bus del hijo se cierra.
+        let forward_bus = self.bus.clone();
+        tokio::spawn(async move {
+            loop {
+                match child_rx.recv().await {
+                    Ok(event) => {
+                        if event.is_child_relevant() {
+                            forward_bus.publish(LiveEvent::ChildEvent {
+                                parent,
+                                child,
+                                event: Box::new(event),
+                            });
+                        }
+                    }
+                    // Un hijo muy verboso puede adelantar el búfer: se pierden eventos, no el reenvío.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
         let descriptor = SubagentDescriptor {
             parent,
             child,
@@ -842,5 +870,236 @@ mod tests {
             .await
             .expect("el hijo debería terminar tras la respuesta")
             .unwrap();
+    }
+
+    /// Herramienta trivial que devuelve su entrada; sirve para observar sus eventos desde el padre.
+    struct EchoTool;
+
+    #[async_trait]
+    impl crate::tools::Tool for EchoTool {
+        fn name(&self) -> &str {
+            "echo"
+        }
+        fn description(&self) -> &str {
+            "devuelve su entrada"
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn run(
+            &self,
+            _ctx: crate::tools::ToolCtx,
+            input: serde_json::Value,
+            _cancel: CancellationToken,
+        ) -> Result<crate::tools::ToolOutput> {
+            Ok(crate::tools::ToolOutput::ok(input.to_string()))
+        }
+    }
+
+    /// Lanzador con la herramienta `echo` y un guion de pasos para el hijo.
+    fn echo_launcher(
+        dir: &std::path::Path,
+        store: Arc<SqliteStore>,
+        jobs: Arc<LocalJobRegistry>,
+        bus: EventBus,
+        script: Vec<Vec<StreamChunk>>,
+    ) -> InProcessSubagentLauncher {
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+        let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+            scripts: std::sync::Mutex::new(script.into()),
+        });
+        InProcessSubagentLauncher::new(
+            Arc::new(RwLock::new(provider)),
+            store,
+            Arc::new(tools),
+            Arc::new(PermissionService::allow_all()),
+            Arc::new(RwLock::new(CodeLoomConfig {
+                provider: ProviderConfig {
+                    kind: ProviderKind::OpenAiCompat,
+                    base_url: "http://localhost".into(),
+                    api_key_env: "KEY".into(),
+                },
+                model: "test".into(),
+                max_steps: 4,
+            })),
+            dir.to_path_buf(),
+            jobs,
+            bus,
+        )
+    }
+
+    #[tokio::test]
+    async fn child_events_are_forwarded_tagged_with_the_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SqliteStore::open(dir.path().join("forward.db").to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+        let parent = store.create_session("/project").await.unwrap();
+        let bus = EventBus::new(256);
+        let mut rx = bus.subscribe();
+        let jobs = Arc::new(LocalJobRegistry::default());
+        let runtime = echo_launcher(
+            dir.path(),
+            store.clone(),
+            jobs.clone(),
+            bus.clone(),
+            vec![
+                vec![
+                    StreamChunk::ToolCallComplete {
+                        id: "c1".into(),
+                        name: "echo".into(),
+                        input: serde_json::json!({"texto": "hola"}),
+                    },
+                    StreamChunk::Done(FinishReason::ToolCalls),
+                ],
+                vec![
+                    StreamChunk::TextDelta("listo".into()),
+                    StreamChunk::Done(FinishReason::Stop),
+                ],
+            ],
+        );
+
+        let (child, _job) = runtime
+            .start(
+                parent,
+                "obrero".into(),
+                "usa echo".into(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        // Se recogen los reenvíos hasta el TurnEnded del hijo (acotado en tiempo).
+        let forwarded = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut seen = Vec::new();
+            loop {
+                match rx.recv().await {
+                    Ok(LiveEvent::ChildEvent {
+                        parent: p,
+                        child: c,
+                        event,
+                    }) => {
+                        let finished = c == child && matches!(*event, LiveEvent::TurnEnded);
+                        seen.push((p, c, *event));
+                        if finished {
+                            return seen;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => panic!("el bus del padre debería seguir abierto: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("el hijo debería reenviar su TurnEnded");
+
+        assert!(
+            forwarded
+                .iter()
+                .all(|(p, c, _)| *p == parent && *c == child),
+            "{forwarded:?}"
+        );
+        assert!(
+            !forwarded
+                .iter()
+                .any(|(_, _, e)| matches!(e, LiveEvent::Delta { .. })),
+            "{forwarded:?}"
+        );
+        let started = forwarded.iter().position(
+            |(_, _, e)| matches!(e, LiveEvent::ToolStarted { name, .. } if name.as_str() == "echo"),
+        );
+        let finished = forwarded.iter().position(|(_, _, e)| {
+            matches!(
+                e,
+                LiveEvent::ToolFinished {
+                    is_error: false,
+                    ..
+                }
+            )
+        });
+        let ended = forwarded
+            .iter()
+            .position(|(_, _, e)| matches!(e, LiveEvent::TurnEnded));
+        let (Some(started), Some(finished), Some(ended)) = (started, finished, ended) else {
+            panic!("faltan eventos reenviados: {forwarded:?}");
+        };
+        assert!(started < finished && finished < ended, "{forwarded:?}");
+    }
+
+    #[tokio::test]
+    async fn forwarder_ends_when_the_child_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SqliteStore::open(dir.path().join("ends.db").to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+        let parent = store.create_session("/project").await.unwrap();
+        let bus = EventBus::new(256);
+        let mut rx = bus.subscribe();
+        let jobs = Arc::new(LocalJobRegistry::default());
+        let runtime = echo_launcher(
+            dir.path(),
+            store.clone(),
+            jobs.clone(),
+            bus.clone(),
+            vec![vec![
+                StreamChunk::TextDelta("listo".into()),
+                StreamChunk::Done(FinishReason::Stop),
+            ]],
+        );
+
+        let metrics = tokio::runtime::Handle::current().metrics();
+        let baseline = metrics.num_alive_tasks();
+        let (child, job) = runtime
+            .start(
+                parent,
+                "obrero".into(),
+                "termina".into(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), jobs.wait(parent, &job))
+            .await
+            .expect("el hijo debería terminar")
+            .unwrap();
+        assert_eq!(outcome.status, JobStatus::Completed);
+
+        // Al terminar el hijo, el reenvío debe acabar y no quedar tareas huérfanas.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while metrics.num_alive_tasks() > baseline {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("el reenvío debería terminar con el hijo");
+
+        // Todo lo reenviado ya está en el bus; tras el TurnEnded no llega nada más del hijo.
+        let mut child_events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let LiveEvent::ChildEvent {
+                child: c, event, ..
+            } = event
+            {
+                if c == child {
+                    child_events.push(*event);
+                }
+            }
+        }
+        assert!(
+            matches!(child_events.last(), Some(LiveEvent::TurnEnded)),
+            "{child_events:?}"
+        );
+        assert_eq!(
+            child_events
+                .iter()
+                .filter(|e| matches!(e, LiveEvent::TurnEnded))
+                .count(),
+            1,
+            "{child_events:?}"
+        );
     }
 }

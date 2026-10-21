@@ -67,6 +67,43 @@ pub enum LiveEvent {
     Error {
         message: String,
     },
+    /// Evento de un hijo reenviado al bus del padre por el lanzador de subagentes.
+    /// Envuelve el evento original para que los manejadores existentes no lo
+    /// confundan con uno propio: la interfaz lo despacha aparte.
+    ChildEvent {
+        parent: crate::session::SessionId,
+        child: crate::session::SessionId,
+        event: Box<LiveEvent>,
+    },
+}
+
+impl LiveEvent {
+    /// Indica si un evento del bus de un hijo merece reenviarse al padre. Quedan
+    /// fuera los deltas de texto (volumen) y el resto de eventos de la sesión.
+    pub fn is_child_relevant(&self) -> bool {
+        match self {
+            LiveEvent::TurnStarted
+            | LiveEvent::StepStarted { .. }
+            | LiveEvent::ToolStarted { .. }
+            | LiveEvent::ToolFinished { .. }
+            | LiveEvent::Usage { .. }
+            | LiveEvent::TurnEnded
+            | LiveEvent::Error { .. } => true,
+            LiveEvent::Delta { .. }
+            | LiveEvent::ReasoningDelta { .. }
+            | LiveEvent::MessageAdded(_)
+            | LiveEvent::SessionMessageAdded { .. }
+            | LiveEvent::FileDiff { .. }
+            | LiveEvent::JobChanged(_)
+            | LiveEvent::SubagentChanged(_)
+            | LiveEvent::SubagentInputRequested { .. }
+            | LiveEvent::SubagentInputResolved { .. }
+            | LiveEvent::TodosChanged { .. }
+            | LiveEvent::WakeIdle
+            | LiveEvent::SubagentSettled { .. }
+            | LiveEvent::ChildEvent { .. } => false,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -106,5 +143,59 @@ mod tests {
     async fn publish_without_subscriber_is_ok() {
         let bus = EventBus::new(8);
         bus.publish(LiveEvent::Delta { text: "x".into() });
+    }
+
+    #[test]
+    fn child_relevance_filter_excludes_deltas() {
+        let session = crate::session::SessionId(1);
+        let job = crate::job::JobSnapshot {
+            id: crate::job::JobId("subagent-1".into()),
+            kind: "subagent".into(),
+            label: "obrero".into(),
+            owner: session,
+            status: crate::job::JobStatus::Running,
+            progress: None,
+            output: String::new(),
+            output_start: 0,
+            output_end: 0,
+            detail: None,
+            result: None,
+        };
+        let excluded = [
+            LiveEvent::Delta { text: "x".into() },
+            LiveEvent::ReasoningDelta { text: "x".into() },
+            LiveEvent::MessageAdded(Message::user("hola")),
+            LiveEvent::JobChanged(job),
+        ];
+        for event in &excluded {
+            assert!(!event.is_child_relevant(), "debería filtrarse: {event:?}");
+        }
+
+        let included = [
+            LiveEvent::TurnStarted,
+            LiveEvent::StepStarted {
+                step: 1,
+                max_steps: 4,
+            },
+            LiveEvent::ToolStarted {
+                call_id: "c1".into(),
+                name: "glob".into(),
+            },
+            LiveEvent::ToolFinished {
+                call_id: "c1".into(),
+                is_error: false,
+            },
+            LiveEvent::Usage {
+                input_tokens: 10,
+                output_tokens: 2,
+            },
+            LiveEvent::TurnEnded,
+            LiveEvent::Error {
+                message: "fallo".into(),
+            },
+        ];
+        for event in &included {
+            assert!(event.is_child_relevant(), "debería reenviarse: {event:?}");
+        }
     }
 }

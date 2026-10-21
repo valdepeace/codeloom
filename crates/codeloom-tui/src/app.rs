@@ -1033,6 +1033,8 @@ impl App {
                 self.awaiting_input.remove(&child.0);
             }
             LiveEvent::WakeIdle => self.wake_in_flight = false,
+            // Provisional: la interfaz aún no muestra lo que hacen los hijos (tarea 2).
+            LiveEvent::ChildEvent { .. } => {}
             LiveEvent::SubagentSettled { parent, status, .. } => {
                 // Un hijo que termina bien o con fallo despierta al padre; uno matado
                 // por el usuario o interrumpido no.
