@@ -98,7 +98,9 @@ struct RawModel {
     name: Option<String>,
     tool_call: Option<bool>,
     reasoning: Option<bool>,
-    reasoning_options: Option<Vec<RawReasoningOption>>,
+    // Se lee como valor libre y se interpreta con tolerancia: un elemento extraño
+    // (p. ej. un presupuesto de -1) no debe tumbar el catálogo entero.
+    reasoning_options: Option<serde_json::Value>,
     status: Option<String>,
     release_date: Option<String>,
     limit: Option<RawLimit>,
@@ -110,8 +112,9 @@ struct RawReasoningOption {
     #[serde(rename = "type")]
     kind: Option<String>,
     values: Option<Vec<String>>,
-    min: Option<u64>,
-    max: Option<u64>,
+    // `-1` significa «dinámico» en models.dev; lo negativo se descarta.
+    min: Option<i64>,
+    max: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -245,18 +248,28 @@ fn build_model(key: String, raw: RawModel) -> Option<CatalogModel> {
 /// (`None`); con `reasoning` verdadero pero sin opciones, queda el valor por defecto.
 fn build_reasoning(
     reasoning: Option<bool>,
-    options: Option<Vec<RawReasoningOption>>,
+    options: Option<serde_json::Value>,
 ) -> Option<Reasoning> {
     if reasoning != Some(true) {
         return None;
     }
-    let options = options.unwrap_or_default();
+    let options: Vec<RawReasoningOption> = options
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|v| serde_json::from_value(v).ok())
+        .collect();
     let find = |kind: &str| options.iter().find(|o| o.kind.as_deref() == Some(kind));
     Some(Reasoning {
         efforts: find("effort")
             .and_then(|o| o.values.clone())
             .unwrap_or_default(),
-        budget: find("budget_tokens").map(|o| (o.min, o.max)),
+        budget: find("budget_tokens").map(|o| {
+            (
+                o.min.and_then(|n| u64::try_from(n).ok()),
+                o.max.and_then(|n| u64::try_from(n).ok()),
+            )
+        }),
         toggle: find("toggle").is_some(),
     })
 }
@@ -620,6 +633,37 @@ mod tests {
         assert_eq!(reasoning.efforts, ["low", "medium", "high"]);
         assert_eq!(reasoning.budget, None);
         assert!(!reasoning.toggle);
+    }
+
+    #[test]
+    fn negative_or_malformed_reasoning_options_do_not_break_the_catalog() {
+        let raw = r#"{"p":{"id":"p","npm":"@ai-sdk/openai-compatible","api":"https://x/v1","models":{
+            "a":{"id":"a","tool_call":true,"reasoning":true,
+                 "reasoning_options":[{"type":"budget_tokens","min":-1,"max":-1},{"type":"effort","values":["low"]}]},
+            "b":{"id":"b","tool_call":true,"reasoning":true,"reasoning_options":"raro"},
+            "c":{"id":"c","tool_call":true,"reasoning":true,"reasoning_options":[42,{"type":"toggle"}]}}}}"#;
+        let catalog = Catalog::from_json(raw).expect("debe leerse");
+        let models = &catalog.providers[0].models;
+        let a = models.iter().find(|m| m.id == "a").unwrap();
+        let r = a.reasoning.as_ref().unwrap();
+        assert_eq!(r.efforts, vec!["low".to_string()]);
+        assert_eq!(r.budget, Some((None, None)));
+        assert!(models
+            .iter()
+            .find(|m| m.id == "b")
+            .unwrap()
+            .reasoning
+            .is_some());
+        assert!(
+            models
+                .iter()
+                .find(|m| m.id == "c")
+                .unwrap()
+                .reasoning
+                .as_ref()
+                .unwrap()
+                .toggle
+        );
     }
 
     #[test]
