@@ -188,6 +188,8 @@ pub struct App {
     pub model: String,
     pub theme: batten::widgets::Theme,
     pub theme_preset: batten::widgets::ThemePreset,
+    /// Fichero donde se guardan las preferencias de la interfaz. `None` = no persistir.
+    pub prefs_path: Option<std::path::PathBuf>,
     pub matrix_rain: batten::widgets::matrix_rain::MatrixRain,
     pub animation: batten::widgets::Anim,
     pub tools: VecDeque<batten::state::ToolItem>,
@@ -302,6 +304,7 @@ impl Default for App {
 }
 
 impl App {
+    /// Pasa al siguiente preset de la rotación (`/theme`).
     pub fn cycle_theme(&mut self) {
         use batten::widgets::ThemePreset;
         let presets = ThemePreset::ALL;
@@ -309,8 +312,33 @@ impl App {
             .iter()
             .position(|preset| *preset == self.theme_preset)
             .unwrap_or(0);
-        self.theme_preset = presets[(current + 1) % presets.len()];
-        self.theme = batten::widgets::Theme::preset(self.theme_preset);
+        self.set_theme(presets[(current + 1) % presets.len()]);
+    }
+
+    /// Fija el tema, lo persiste si hay `prefs_path` y reaplica el look a lo ya dibujado.
+    /// Un fallo al guardar no impide el cambio: se avisa en `slash_feedback`.
+    pub fn set_theme(&mut self, preset: batten::widgets::ThemePreset) {
+        self.apply_theme(preset);
+        self.slash_feedback = None;
+        if let Some(path) = &self.prefs_path {
+            if let Err(err) = crate::prefs::save_theme(path, preset) {
+                self.slash_feedback = Some(format!("Theme not saved: {err}"));
+            }
+        }
+    }
+
+    /// Fija el fichero de preferencias y aplica el tema guardado en él, si lo hay.
+    /// No vuelve a escribir el fichero al aplicarlo.
+    pub fn set_prefs_path(&mut self, path: std::path::PathBuf) {
+        if let Some(preset) = crate::prefs::load_theme(&path) {
+            self.apply_theme(preset);
+        }
+        self.prefs_path = Some(path);
+    }
+
+    fn apply_theme(&mut self, preset: batten::widgets::ThemePreset) {
+        self.theme_preset = preset;
+        self.theme = batten::widgets::Theme::preset(preset);
         self.sync_all_tools();
     }
 
@@ -335,6 +363,7 @@ impl App {
             model: String::new(),
             theme: batten::widgets::Theme::default_dark(),
             theme_preset: batten::widgets::ThemePreset::Batten,
+            prefs_path: None,
             matrix_rain: batten::widgets::matrix_rain::MatrixRain::default(),
             animation: batten::widgets::Anim::new(),
             tools: VecDeque::new(),
@@ -3223,5 +3252,64 @@ mod tests {
         assert!(!app.agent_stats.is_empty());
         app.load_session(SessionId(2), Vec::new());
         assert!(app.agent_stats.is_empty());
+    }
+
+    #[test]
+    fn set_theme_changes_the_look() {
+        use batten::widgets::{Look, ThemePreset};
+        let mut app = App::new();
+        app.set_theme(ThemePreset::Crush);
+        assert_eq!(app.theme_preset, ThemePreset::Crush);
+        assert_eq!(app.theme.look, Look::crush());
+        app.set_theme(ThemePreset::Batten);
+        assert_eq!(app.theme.look, Look::classic());
+    }
+
+    #[test]
+    fn set_prefs_path_applies_the_saved_theme_without_rewriting() {
+        use batten::widgets::ThemePreset;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ui.toml");
+        // Espacios finales: si el fichero se reescribiera, desaparecerían.
+        let original = "theme = \"crush\"   \n";
+        std::fs::write(&path, original).unwrap();
+        let mut app = App::new();
+        app.set_prefs_path(path.clone());
+        assert_eq!(app.theme_preset, ThemePreset::Crush);
+        assert!(app.slash_feedback.is_none());
+        assert_eq!(app.prefs_path.as_deref(), Some(path.as_path()));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn set_theme_persists_when_a_path_is_set() {
+        use batten::widgets::ThemePreset;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ui.toml");
+        let mut app = App::new();
+        app.set_prefs_path(path.clone());
+        app.set_theme(ThemePreset::MastraCode);
+        assert_eq!(
+            crate::prefs::load_theme(&path),
+            Some(ThemePreset::MastraCode)
+        );
+    }
+
+    #[test]
+    fn a_save_error_does_not_break_the_theme_change() {
+        use batten::widgets::ThemePreset;
+        let dir = tempfile::tempdir().unwrap();
+        // Un fichero normal como «directorio» padre: la escritura siempre falla.
+        let blocker = dir.path().join("bloqueo");
+        std::fs::write(&blocker, "x").unwrap();
+        let mut app = App::new();
+        app.set_prefs_path(blocker.join("ui.toml"));
+        app.set_theme(ThemePreset::Crush);
+        assert_eq!(app.theme_preset, ThemePreset::Crush);
+        assert!(app
+            .slash_feedback
+            .as_deref()
+            .unwrap()
+            .starts_with("Theme not saved"));
     }
 }

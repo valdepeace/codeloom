@@ -303,6 +303,7 @@ async fn main() -> Result<()> {
     let mut app = codeloom_tui::app::App::with_context(cwd_label, model_label);
     app.set_provider_settings((&cfg).into());
     app.set_sessions(sessions);
+    app.set_prefs_path(data_dir.join("ui.toml"));
     codeloom_tui::run::run(
         app,
         prompt_tx,

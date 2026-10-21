@@ -527,8 +527,17 @@ fn execute_slash_command(app: &mut App, command: crate::commands::Command) -> Op
         Command::Tools => handle_key(app, KeyCode::Char('t'), KeyModifiers::CONTROL),
         Command::Theme => {
             app.cycle_theme();
-            // El look Crush oculta la cabecera con el nombre del tema: se confirma aquí.
-            app.slash_feedback = Some(format!("Theme: {}", app.theme_preset.name()));
+            confirm_theme(app);
+            None
+        }
+        Command::Crush => {
+            app.set_theme(batten::widgets::ThemePreset::Crush);
+            confirm_theme(app);
+            None
+        }
+        Command::Classic => {
+            app.set_theme(batten::widgets::ThemePreset::Batten);
+            confirm_theme(app);
             None
         }
         Command::Sidebar => handle_key(app, KeyCode::Char('b'), KeyModifiers::CONTROL),
@@ -553,6 +562,15 @@ fn execute_slash_command(app: &mut App, command: crate::commands::Command) -> Op
             None
         }
     }
+}
+
+/// Confirma el tema elegido en el composer. El look Crush oculta la cabecera con
+/// el nombre del tema, así que se muestra aquí. Si el guardado falló, se conserva
+/// ese aviso en lugar de la confirmación.
+fn confirm_theme(app: &mut App) {
+    let name = app.theme_preset.name();
+    app.slash_feedback
+        .get_or_insert_with(|| format!("Theme: {name}"));
 }
 
 fn handle_queue_editor_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
@@ -2047,5 +2065,31 @@ mod tests {
             !app.take_wake(),
             "cancelar no rearma el despertar del mismo evento"
         );
+    }
+
+    #[test]
+    fn crush_and_classic_commands_switch_the_look() {
+        use batten::widgets::{Look, ThemePreset};
+        let mut app = App::new();
+        app.composer.set_text("/crush");
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE),
+            None
+        );
+        assert_eq!(app.theme_preset, ThemePreset::Crush);
+        assert_eq!(app.theme.look, Look::crush());
+        assert_eq!(
+            app.slash_feedback.as_deref(),
+            Some("Theme: Crush · Charmtone")
+        );
+
+        app.composer.set_text("/classic");
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE),
+            None
+        );
+        assert_eq!(app.theme_preset, ThemePreset::Batten);
+        assert_eq!(app.theme.look, Look::classic());
+        assert_eq!(app.slash_feedback.as_deref(), Some("Theme: Batten"));
     }
 }
