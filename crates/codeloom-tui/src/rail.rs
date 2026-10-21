@@ -64,6 +64,13 @@ fn rail_lines(app: &App, width: usize) -> Vec<Line<'_>> {
     push_gap(&mut out);
     out.push(title("MODEL", app));
     out.push(Line::from(app.model.as_str()));
+    // Precio por millón del modelo actual, solo si el catálogo lo conoce.
+    if let Some((input, output)) = app.model_prices() {
+        out.push(Line::from(Span::styled(
+            recortar(&format_prices(input, output), width),
+            app.theme.styles.muted,
+        )));
+    }
     // El nivel se lee de la copia guardada, la misma que `app.model`.
     if let Some(level) = app
         .settings_baseline
@@ -89,10 +96,11 @@ fn rail_lines(app: &App, width: usize) -> Vec<Line<'_>> {
         format!("↑{} ↓{}", app.input_tokens, app.output_tokens),
         app.theme.styles.muted,
     )));
-    // Estimación de coste bajo los tokens: solo con precio y tokens, y recortada al rail.
-    if let Some(cost) = app.estimated_cost() {
+    // Coste de la sesión bajo los tokens: solo con apuntes, y recortado al rail.
+    // Si ningún apunte tiene precio, un «$0+» no informa de nada: se omite la línea.
+    if let Some((cost, partial)) = app.estimated_cost().filter(|(cost, _)| *cost > 0.0) {
         out.push(Line::from(Span::styled(
-            recortar(&format_cost(cost), width),
+            recortar(&format_cost(cost, partial), width),
             app.theme.styles.muted,
         )));
     }
@@ -297,8 +305,19 @@ pub fn format_tokens(n: u64) -> String {
 /// Coste estimado en dólares, siempre con el prefijo `≈` de estimación: `≈ $0.0123` por
 /// debajo de uno (cuatro decimales), `≈ $1.23` hasta cien y `≈ $123` desde ahí. Un valor
 /// positivo pero menor que una diezmilésima se muestra como `≈ < $0.0001`. Los umbrales
-/// de redondeo evitan salidas como «1.0000» o «100.00».
-pub fn format_cost(dollars: f64) -> String {
+/// de redondeo evitan salidas como «1.0000» o «100.00». Si `partial`, lleva un `+` final:
+/// hay apuntes sin precio que no entran en la cifra.
+pub fn format_cost(dollars: f64, partial: bool) -> String {
+    let base = format_dollars(dollars);
+    if partial {
+        format!("{base}+")
+    } else {
+        base
+    }
+}
+
+/// Cifra de `format_cost` sin el marcador de parcial.
+fn format_dollars(dollars: f64) -> String {
     if dollars <= 0.0 {
         return "≈ $0".to_owned();
     }
@@ -311,6 +330,22 @@ pub fn format_cost(dollars: f64) -> String {
         format!("≈ ${dollars:.2}")
     } else {
         format!("≈ ${dollars:.0}")
+    }
+}
+
+/// Precio por millón del modelo, p. ej. `$3/$15 /M`. Sin decimales si el precio es entero;
+/// si no, hasta dos decimales sin ceros sobrantes.
+pub fn format_prices(input: f64, output: f64) -> String {
+    format!("{}/{} /M", price_part(input), price_part(output))
+}
+
+/// Un precio con el signo `$` delante y sin ceros sobrantes.
+fn price_part(price: f64) -> String {
+    if price.fract() == 0.0 {
+        format!("${price:.0}")
+    } else {
+        let fixed = format!("{price:.2}");
+        format!("${}", fixed.trim_end_matches('0').trim_end_matches('.'))
     }
 }
 
@@ -416,7 +451,7 @@ fn tool_style(status: ToolStatus, app: &App) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codeloom_core::session::{SessionId, SubagentDescriptor};
+    use codeloom_core::session::{SessionId, SubagentDescriptor, UsageRecord};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -762,19 +797,44 @@ mod tests {
 
     #[test]
     fn format_cost_ranges() {
-        assert_eq!(format_cost(0.00005), "≈ < $0.0001");
-        assert_eq!(format_cost(0.0001), "≈ $0.0001");
-        assert_eq!(format_cost(0.0123), "≈ $0.0123");
-        assert_eq!(format_cost(1.234), "≈ $1.23");
-        assert_eq!(format_cost(123.4), "≈ $123");
+        assert_eq!(format_cost(0.00005, false), "≈ < $0.0001");
+        assert_eq!(format_cost(0.0001, false), "≈ $0.0001");
+        assert_eq!(format_cost(0.0123, false), "≈ $0.0123");
+        assert_eq!(format_cost(1.234, false), "≈ $1.23");
+        assert_eq!(format_cost(123.4, false), "≈ $123");
     }
 
     #[test]
     fn format_cost_rounding_edges_and_zero() {
         // El redondeo no debe producir «1.0000» ni «100.00».
-        assert_eq!(format_cost(0.99996), "≈ $1.00");
-        assert_eq!(format_cost(99.996), "≈ $100");
-        assert_eq!(format_cost(0.0), "≈ $0");
+        assert_eq!(format_cost(0.99996, false), "≈ $1.00");
+        assert_eq!(format_cost(99.996, false), "≈ $100");
+        assert_eq!(format_cost(0.0, false), "≈ $0");
+    }
+
+    #[test]
+    fn format_cost_partial_adds_plus() {
+        assert_eq!(format_cost(0.0123, true), "≈ $0.0123+");
+        assert_eq!(format_cost(0.0, true), "≈ $0+");
+    }
+
+    #[test]
+    fn format_prices_shapes() {
+        assert_eq!(format_prices(3.0, 15.0), "$3/$15 /M");
+        assert_eq!(format_prices(0.3, 2.5), "$0.3/$2.5 /M");
+        assert_eq!(format_prices(0.25, 1.0), "$0.25/$1 /M");
+    }
+
+    /// Apunte con precios `(entrada, salida)` por millón, o sin precio si `prices` es `None`.
+    fn record(input: u64, output: u64, prices: Option<(f64, f64)>) -> UsageRecord {
+        UsageRecord {
+            model: "priced".into(),
+            input_tokens: input,
+            output_tokens: output,
+            input_price: prices.map(|(price_in, _)| price_in),
+            output_price: prices.map(|(_, price_out)| price_out),
+            created_at_ms: 1,
+        }
     }
 
     /// Ajustes de `acme` con el modelo dado, con el catálogo de precios cargado.
@@ -792,9 +852,60 @@ mod tests {
     }
 
     #[test]
+    fn rail_shows_session_total_and_model_prices() {
+        let mut app = priced_rail_app("priced");
+        app.usage_records = vec![
+            record(1_000_000, 0, Some((3.0, 15.0))),
+            record(0, 100_000, Some((3.0, 15.0))),
+        ];
+        let rows = rows_of(&app, 40, 24);
+        // Entrada: 3,00. Salida: 100.000 a 15 $/M = 1,50. Total: 4,50.
+        assert!(
+            rows.iter().any(|row| row.contains("≈ $4.50")),
+            "el rail muestra el total de la sesión: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("$3/$15 /M")),
+            "el rail muestra el precio por millón del modelo: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn rail_hides_cost_line_when_no_record_has_a_price() {
+        use codeloom_core::session::UsageRecord;
+        let mut app = App::new();
+        app.session_id = Some(SessionId(1));
+        app.usage_records.push(UsageRecord {
+            model: "m".into(),
+            input_tokens: 10,
+            output_tokens: 5,
+            input_price: None,
+            output_price: None,
+            created_at_ms: 0,
+        });
+        let rows = rows_of(&app, 40, 24);
+        assert!(
+            !rows.iter().any(|row| row.contains('≈')),
+            "sale un coste sin precio alguno: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn rail_hides_prices_line_without_catalog() {
+        let mut app = App::new();
+        app.usage_records = vec![record(1_000, 1_000, None)];
+        let rows = rows_of(&app, 40, 24);
+        assert!(
+            !rows.iter().any(|row| row.contains("/M")),
+            "sin catálogo no hay línea de precios: {rows:?}"
+        );
+    }
+
+    #[test]
     fn rail_shows_cost_line_when_priced() {
         let mut app = priced_rail_app("priced");
         app.input_tokens = 1_000_000;
+        app.usage_records = vec![record(1_000_000, 0, Some((3.0, 15.0)))];
 
         let rows = rows_of(&app, 40, 24);
         let idx = rows
@@ -832,7 +943,7 @@ mod tests {
     fn rail_clips_huge_cost_to_width() {
         // Tres mil millones de dólares: la cifra no debe desbordar un rail de 11 columnas.
         let mut app = priced_rail_app("priced");
-        app.input_tokens = 1_000_000_000_000_000;
+        app.usage_records = vec![record(1_000_000_000_000_000, 0, Some((3.0, 15.0)))];
 
         let rows = rows_of(&app, 12, 24);
         let fila = rows

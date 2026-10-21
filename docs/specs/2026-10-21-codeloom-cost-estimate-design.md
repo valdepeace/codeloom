@@ -57,3 +57,9 @@ Nombres internos no fijados en el plan y la colocación exacta de la línea.
 
 Pruebas puras de la búsqueda de precios, del cálculo, del formato y del rail
 (con y sin precio). Sin red. Validación visual en terminal real: pendiente.
+
+## Nota (2026-10-21)
+
+La estimación basada en tokens × precio del modelo actual quedó **sustituida** por
+el libro de consumo (`2026-10-21-codeloom-usage-ledger-design.md`): `estimated_cost`
+suma ahora los apuntes guardados, cada uno con su precio congelado.

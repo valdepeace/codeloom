@@ -1834,17 +1834,22 @@ impl App {
         Some((model.input_cost?, model.output_cost?))
     }
 
-    /// Coste estimado en dólares de la sesión abierta: tokens propios más los de los hijos,
-    /// por el precio del modelo. `None` sin precio o si no hay ningún token que valorar.
-    pub fn estimated_cost(&self) -> Option<f64> {
-        let (price_in, price_out) = self.model_prices()?;
-        let (child_in, child_out) = self.hierarchy_tokens();
-        let input = self.input_tokens.saturating_add(child_in);
-        let output = self.output_tokens.saturating_add(child_out);
-        if input == 0 && output == 0 {
+    /// Coste de la sesión abierta: suma cada apunte del libro (propios e hijos) a su precio
+    /// congelado en el momento. Devuelve `(total, parcial)`, donde `parcial` indica que algún
+    /// apunte no tenía precio y el total queda por debajo de lo real. `None` sin apuntes.
+    pub fn estimated_cost(&self) -> Option<(f64, bool)> {
+        if self.usage_records.is_empty() {
             return None;
         }
-        Some(input as f64 * price_in / 1e6 + output as f64 * price_out / 1e6)
+        let mut total = 0.0;
+        let mut partial = false;
+        for record in &self.usage_records {
+            match record.cost() {
+                Some(cost) => total += cost,
+                None => partial = true,
+            }
+        }
+        Some((total, partial))
     }
 
     /// Número de subagentes de la sesión abierta que siguen en marcha.
@@ -4451,12 +4456,61 @@ mod tests {
         assert_eq!(app.usage_records.len(), 2);
     }
 
+    /// Apunte con precios `(entrada, salida)` por millón, o sin precio si `prices` es `None`.
+    fn priced_record(input: u64, output: u64, prices: Option<(f64, f64)>) -> UsageRecord {
+        UsageRecord {
+            model: "m".into(),
+            input_tokens: input,
+            output_tokens: output,
+            input_price: prices.map(|(price_in, _)| price_in),
+            output_price: prices.map(|(_, price_out)| price_out),
+            created_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn estimated_cost_sums_each_record_at_its_own_price() {
+        // Cambio de modelo a mitad de sesión: cada apunte conserva su precio.
+        let mut app = App::new();
+        app.usage_records = vec![
+            priced_record(1_000_000, 0, Some((3.0, 15.0))),
+            priced_record(0, 100_000, Some((2.0, 10.0))),
+        ];
+        // Primero: 1.000.000 a 3 $/M = 3. Segundo: 100.000 a 10 $/M = 1.
+        let (cost, partial) = app.estimated_cost().expect("hay apuntes");
+        assert!((cost - 4.0).abs() < 1e-9, "coste inesperado: {cost}");
+        assert!(!partial, "todos los apuntes tienen precio");
+    }
+
+    #[test]
+    fn estimated_cost_marks_partial_when_a_record_has_no_price() {
+        let mut app = App::new();
+        app.usage_records = vec![
+            priced_record(1_000_000, 0, Some((3.0, 15.0))),
+            priced_record(1_000_000, 1_000_000, None),
+        ];
+        let (cost, partial) = app.estimated_cost().expect("hay apuntes");
+        assert!(
+            (cost - 3.0).abs() < 1e-9,
+            "solo suma los apuntes con precio: {cost}"
+        );
+        assert!(partial, "un apunte sin precio marca el total como parcial");
+    }
+
+    #[test]
+    fn estimated_cost_none_without_records() {
+        let app = priced_app("priced", "https://acme.example/v1");
+        assert_eq!(app.estimated_cost(), None, "sin apuntes no hay estimación");
+    }
+
     #[test]
     fn estimated_cost_adds_children() {
         let mut app = priced_app("priced", "https://acme.example/v1");
         app.session_id = Some(SessionId(1));
-        app.input_tokens = 1_000_000;
-        app.output_tokens = 100_000;
+        app.apply(LiveEvent::Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 100_000,
+        });
         app.apply(child_event(
             SessionId(1),
             9,
@@ -4466,14 +4520,9 @@ mod tests {
             },
         ));
         // Entrada: 2.000.000 a 3 $/M = 6. Salida: 100.000 a 15 $/M = 1,5.
-        let cost = app.estimated_cost().expect("hay precio y tokens");
+        let (cost, partial) = app.estimated_cost().expect("hay apuntes");
         assert!((cost - 7.5).abs() < 1e-9, "coste inesperado: {cost}");
-    }
-
-    #[test]
-    fn estimated_cost_none_with_zero_tokens() {
-        let app = priced_app("priced", "https://acme.example/v1");
-        assert_eq!(app.estimated_cost(), None, "sin tokens no hay estimación");
+        assert!(!partial);
     }
 
     #[test]

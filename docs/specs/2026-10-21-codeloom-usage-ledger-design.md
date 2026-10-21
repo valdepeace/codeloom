@@ -80,3 +80,38 @@ registrando un apunte por respuesta con modelo y precio vigentes (y precio `NULL
 sin catálogo), el cambio de modelo a mitad de sesión (dos apuntes con precios
 distintos suman bien), y la TUI (carga de apuntes, suma en vivo, marca `+`).
 Validación visual en terminal real: pendiente.
+
+## Estado (2026-10-21)
+
+Implementado, cada tarea en su commit: núcleo, con tabla `usage`,
+`Catalog::prices` y apunte por respuesta (`972f412`); carga compartida del
+catálogo y entrega de apuntes a la interfaz (`d5d10fe`); total y precio por
+millón en el rail (commit de la tarea 3).
+
+Cómo se ve: bajo los tokens del rail, `≈ $0.0123` (o `≈ $0.0123+` si algún
+apunte carece de precio); bajo el modelo, `$3/$15 /M`. Al reabrir una sesión el
+total reaparece, porque sale de la base de datos y no de contadores en memoria.
+
+Decisiones tomadas al implementar:
+
+- El agente apunta **una** fila por respuesta: acumula el uso del flujo y apunta al
+  cerrarlo (Anthropic emite dos eventos de uso por respuesta).
+- En vivo la interfaz añade un apunte local por cada evento de uso; el coste es
+  lineal, de modo que el total coincide, y al recargar se sustituye por la verdad
+  de la base de datos.
+- Si ningún apunte tiene precio, la línea de coste se omite (un `≈ $0+` no
+  informaría de nada).
+- El modo `--print` no carga el catálogo: sus apuntes llevan precio `NULL`.
+- Si falla la lectura de apuntes al abrir una sesión, falla la apertura, igual
+  que con mensajes y subagentes.
+
+Limitaciones conocidas:
+
+- No hay precio de caché ni de razonamiento: es una cota orientativa.
+- El `output_tokens` de Anthropic puede contarse con un exceso de unos pocos
+  tokens (el evento inicial trae un valor mínimo que se suma al acumulado final).
+- Los apuntes anteriores a esta versión no existen: las sesiones antiguas no
+  muestran coste.
+- `AgentLoop::with_jobs` llamado después de `new` deja al lanzador de hijos con
+  el registro anterior (hoy nadie lo hace).
+- Validación visual en terminal real: pendiente.
