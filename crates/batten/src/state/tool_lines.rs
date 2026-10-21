@@ -7,7 +7,7 @@ use unicode_segmentation::UnicodeSegmentation;
 const FOLDED_LINES: usize = 2;
 
 /// Longitud máxima del resumen en grafemas, incluido el `…` final.
-const SUMMARY_GRAPHEMES: usize = 80;
+pub(crate) const SUMMARY_GRAPHEMES: usize = 80;
 
 /// Cabecera (nombre y resumen), cuerpo con la salida y, si procede, la
 /// indicación de líneas ocultas. Los prefijos de cada línea los pinta el
@@ -41,6 +41,15 @@ pub fn tool_lines(item: &ToolItem) -> Vec<Line> {
     }
 
     let mut lines = vec![head];
+    lines.extend(body_lines(item));
+    lines
+}
+
+/// Cuerpo de una herramienta: su salida, plegada a `FOLDED_LINES` salvo que esté
+/// expandida, con la indicación de líneas ocultas si procede. Lo comparten las
+/// piezas propias (`tool_atom`) para que el cuerpo sea el mismo en todas.
+pub(crate) fn body_lines(item: &ToolItem) -> Vec<Line> {
+    let mut lines = Vec::new();
     if let Some(output) = item.output.as_deref() {
         let body: Vec<&str> = output.lines().collect();
         let shown = if item.expanded || body.len() <= FOLDED_LINES {
@@ -65,7 +74,7 @@ pub fn tool_lines(item: &ToolItem) -> Vec<Line> {
 }
 
 /// Recorta `text` a `max` grafemas, terminando en `…` si se corta.
-fn truncate_graphemes(text: &str, max: usize) -> String {
+pub(crate) fn truncate_graphemes(text: &str, max: usize) -> String {
     if text.graphemes(true).count() <= max {
         return text.to_string();
     }
