@@ -71,6 +71,21 @@ impl InputBroker {
         label: String,
         questions: Vec<Question>,
     ) -> Option<Vec<Answer>> {
+        self.request_with(parent, child, label, questions, || {})
+            .await
+    }
+
+    /// Como `request`, pero llama a `on_registered` justo después de registrar la
+    /// petición y sin mantener el cerrojo. Así quien anuncia la petición (p. ej. por
+    /// el bus) puede confiar en que ya es visible en `pending`.
+    pub async fn request_with(
+        &self,
+        parent: SessionId,
+        child: SessionId,
+        label: String,
+        questions: Vec<Question>,
+        on_registered: impl FnOnce(),
+    ) -> Option<Vec<Answer>> {
         let (tx, rx) = oneshot::channel();
         let (ticket, replaced) = {
             let mut inner = self.lock();
@@ -89,6 +104,7 @@ impl InputBroker {
             );
             (ticket, replaced)
         };
+        on_registered();
         // La petición sustituida se avisa fuera del cerrojo.
         if let Some(previous) = replaced {
             let _ = previous.tx.send(None);
@@ -267,22 +283,29 @@ impl PermissionResponder for ChildResponder {
     }
 
     async fn ask(&self, questions: &[Question]) -> Option<Vec<Answer>> {
-        self.bus.publish(LiveEvent::SubagentInputRequested {
-            parent: self.parent,
-            child: self.child,
-            label: self.label.clone(),
-        });
         let _resolved = ResolvedOnDrop {
             bus: self.bus.clone(),
             parent: self.parent,
             child: self.child,
         };
+        // El aviso sale por el bus solo cuando la petición ya está en el buzón, para
+        // que quien reaccione al evento (un despertar del padre) la encuentre.
+        let bus = self.bus.clone();
+        let (parent, child) = (self.parent, self.child);
+        let label = self.label.clone();
         self.broker
-            .request(
+            .request_with(
                 self.parent,
                 self.child,
                 self.label.clone(),
                 questions.to_vec(),
+                move || {
+                    bus.publish(LiveEvent::SubagentInputRequested {
+                        parent,
+                        child,
+                        label,
+                    });
+                },
             )
             .await
     }
@@ -431,6 +454,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_with_calls_the_callback_after_registration() {
+        let broker = Arc::new(InputBroker::default());
+        let observed = Arc::new(Mutex::new(None));
+        let b = broker.clone();
+        let o = observed.clone();
+        let on_registered = move || {
+            *o.lock().unwrap() = Some(b.pending(PARENT).len());
+        };
+        let b = broker.clone();
+        let handle = tokio::spawn(async move {
+            b.request_with(
+                PARENT,
+                CHILD,
+                "obrero".into(),
+                vec![question("Q")],
+                on_registered,
+            )
+            .await
+        });
+
+        wait_for_pending(&broker, PARENT).await;
+        broker.answer(PARENT, CHILD, vec!["a".into()]).unwrap();
+        assert!(handle.await.unwrap().is_some());
+        // El callback vio la petición ya registrada (y sin cerrojo: pending no bloquea).
+        assert_eq!(*observed.lock().unwrap(), Some(1));
+    }
+
+    #[tokio::test]
     async fn take_unannounced_returns_each_request_once() {
         let broker = Arc::new(InputBroker::default());
         let b = broker.clone();
@@ -564,6 +615,37 @@ mod tests {
         };
         assert_eq!(child_service.check(req).await, Decision::Deny);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn child_responder_publishes_requested_after_registration() {
+        let broker = Arc::new(InputBroker::default());
+        let bus = EventBus::new(8);
+        let mut rx = bus.subscribe();
+        let service = Arc::new(PermissionService::with_responder(Box::new(
+            ChildResponder::new(
+                Arc::new(PermissionService::allow_all()),
+                broker.clone(),
+                PARENT,
+                CHILD,
+                "obrero".into(),
+                bus.clone(),
+            ),
+        )));
+        let questions = vec![question("¿Cuál?")];
+        let s = service.clone();
+        let q = questions.clone();
+        let handle = tokio::spawn(async move { s.ask_user(&q).await });
+
+        match next_event(&mut rx).await {
+            LiveEvent::SubagentInputRequested { .. } => {}
+            other => panic!("evento inesperado: {other:?}"),
+        }
+        // Al recibir el aviso, la petición ya debe estar registrada en el buzón del padre.
+        assert_eq!(broker.pending(PARENT).len(), 1);
+
+        broker.answer(PARENT, CHILD, vec!["a".into()]).unwrap();
+        assert!(handle.await.unwrap().is_some());
     }
 
     #[tokio::test]

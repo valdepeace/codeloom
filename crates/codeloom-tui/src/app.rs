@@ -966,6 +966,8 @@ impl App {
             LiveEvent::SubagentInputResolved { child, .. } => {
                 self.awaiting_input.remove(&child.0);
             }
+            // Los despertares llegan en la tarea 3; por ahora no alteran la vista.
+            LiveEvent::WakeIdle | LiveEvent::SubagentSettled { .. } => {}
         }
     }
 

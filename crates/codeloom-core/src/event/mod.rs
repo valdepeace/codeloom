@@ -54,6 +54,16 @@ pub enum LiveEvent {
         session: crate::session::SessionId,
         items: Vec<crate::todo::TodoItem>,
     },
+    /// Un despertar del padre no encontró avisos: no hubo turno. Permite a la
+    /// interfaz limpiar su marca de despertar en curso.
+    WakeIdle,
+    /// Un hijo ha llegado a su estado final y el estado ya está persistido. Se
+    /// publica tras guardarlo, de modo que el padre puede leer el aviso al recibirlo.
+    SubagentSettled {
+        parent: crate::session::SessionId,
+        child: crate::session::SessionId,
+        status: crate::session::SubagentStatus,
+    },
     Error {
         message: String,
     },

@@ -1,7 +1,7 @@
 use crate::agent::AgentLoop;
 use crate::config::CodeLoomConfig;
 use crate::error::{CoreError, Result};
-use crate::event::EventBus;
+use crate::event::{EventBus, LiveEvent};
 use crate::job::{JobId, JobRegistry, JobResult, JobSpec};
 use crate::permission::PermissionService;
 use crate::provider::Provider;
@@ -213,6 +213,7 @@ impl SubagentLauncher for InProcessSubagentLauncher {
         }
         let mut updates = self.jobs.subscribe(parent, job.id())?;
         let store = self.store.clone();
+        let settle_bus = self.bus.clone();
         tokio::spawn(async move {
             loop {
                 let snapshot = updates.borrow_and_update().clone();
@@ -226,6 +227,13 @@ impl SubagentLauncher for InProcessSubagentLauncher {
                     if let Err(error) = store.update_subagent_status(parent, child, status).await {
                         tracing::warn!("persist subagent status: {error}");
                     }
+                    // Se publica tras el intento de persistir, también si falló: así el
+                    // padre nunca lee el aviso antes del estado final.
+                    settle_bus.publish(LiveEvent::SubagentSettled {
+                        parent,
+                        child,
+                        status,
+                    });
                     break;
                 }
                 if updates.changed().await.is_err() {
@@ -432,6 +440,85 @@ mod tests {
             .control(parent, child, "interrupt", None)
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn settled_event_is_published_after_the_status_is_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SqliteStore::open(dir.path().join("settled.db").to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+        let parent = store.create_session("/project").await.unwrap();
+        let provider: Arc<dyn Provider> = Arc::new(ScriptedProvider {
+            script: vec![
+                StreamChunk::TextDelta("child result".into()),
+                StreamChunk::Done(FinishReason::Stop),
+            ],
+        });
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(SubagentTool));
+        let bus = EventBus::new(64);
+        let mut rx = bus.subscribe();
+        let runtime = InProcessSubagentLauncher::new(
+            Arc::new(RwLock::new(provider)),
+            store.clone(),
+            Arc::new(tools),
+            Arc::new(PermissionService::allow_all()),
+            Arc::new(RwLock::new(CodeLoomConfig {
+                provider: ProviderConfig {
+                    kind: ProviderKind::OpenAiCompat,
+                    base_url: "http://localhost".into(),
+                    api_key_env: "KEY".into(),
+                },
+                model: "test".into(),
+                max_steps: 2,
+            })),
+            dir.path().to_path_buf(),
+            Arc::new(LocalJobRegistry::default()),
+            bus,
+        );
+
+        let (child, _job) = runtime
+            .start(
+                parent,
+                "research".into(),
+                "do work".into(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await {
+                    Ok(crate::event::LiveEvent::SubagentSettled {
+                        child: settled,
+                        status,
+                        ..
+                    }) if settled == child => return status,
+                    Ok(_) => {}
+                    Err(error) => panic!("el bus debería seguir abierto: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("el hijo debería asentarse");
+
+        assert_eq!(status, SubagentStatus::Completed);
+        // Al llegar el evento, el estado final ya debe estar persistido y el aviso listo.
+        assert!(store
+            .list_subagents(parent)
+            .await
+            .unwrap()
+            .iter()
+            .any(|d| d.child == child && d.status == SubagentStatus::Completed));
+        assert!(runtime
+            .deliver_notices(parent)
+            .await
+            .unwrap()
+            .iter()
+            .any(|message| message.text().contains("child result")));
     }
 
     #[tokio::test]

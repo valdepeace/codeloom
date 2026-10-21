@@ -88,6 +88,7 @@ impl AgentLoop {
         *self.config.write().unwrap() = config;
     }
 
+    /// Turno iniciado por un mensaje del usuario.
     pub async fn run(
         &self,
         session: SessionId,
@@ -95,30 +96,68 @@ impl AgentLoop {
         cancel: CancellationToken,
     ) -> Result<TurnOutcome> {
         self.bus.publish(LiveEvent::TurnStarted);
-        let result = self.run_turn(session, user_prompt, cancel).await;
-        match &result {
+        let result = match self.flush_subagent_notices(session).await {
+            Ok(_) => self.run_turn(session, Some(user_prompt), cancel).await,
+            Err(error) => Err(error),
+        };
+        self.publish_turn_result(&result);
+        result
+    }
+
+    /// Despertar del padre ocioso: entrega los avisos pendientes y, solo si había
+    /// alguno, ejecuta un turno sin mensaje de usuario. Sin avisos devuelve `None`
+    /// y publica `WakeIdle`, sin turno ni gasto alguno.
+    pub async fn run_woken(
+        &self,
+        session: SessionId,
+        cancel: CancellationToken,
+    ) -> Result<Option<TurnOutcome>> {
+        let delivered = match self.flush_subagent_notices(session).await {
+            Ok(delivered) => delivered,
+            Err(error) => {
+                self.bus.publish(LiveEvent::Error {
+                    message: error.to_string(),
+                });
+                return Err(error);
+            }
+        };
+        if delivered == 0 {
+            self.bus.publish(LiveEvent::WakeIdle);
+            return Ok(None);
+        }
+        self.bus.publish(LiveEvent::TurnStarted);
+        let result = self.run_turn(session, None, cancel).await;
+        self.publish_turn_result(&result);
+        result.map(Some)
+    }
+
+    /// Publica el desenlace de un turno ya ejecutado (fin o error).
+    fn publish_turn_result(&self, result: &Result<TurnOutcome>) {
+        match result {
             Ok(_) => self.bus.publish(LiveEvent::TurnEnded),
             Err(error) => self.bus.publish(LiveEvent::Error {
                 message: error.to_string(),
             }),
         }
-        result
     }
 
+    /// Ejecuta el turno. Los avisos pendientes los entrega el llamante antes de
+    /// llamar aquí; el bucle solo los vuelve a vaciar entre pasos.
     async fn run_turn(
         &self,
         session: SessionId,
-        user_prompt: String,
+        user_prompt: Option<String>,
         cancel: CancellationToken,
     ) -> Result<TurnOutcome> {
         let provider = self.provider.read().unwrap().clone();
         let config = self.config.read().unwrap().clone();
-        self.flush_subagent_notices(session).await?;
         let mut history = self.store.messages(session).await?;
-        let user = Message::user(user_prompt);
-        self.store.append_message(session, &user).await?;
-        self.bus.publish(LiveEvent::MessageAdded(user.clone()));
-        history.push(user);
+        if let Some(prompt) = user_prompt {
+            let user = Message::user(prompt);
+            self.store.append_message(session, &user).await?;
+            self.bus.publish(LiveEvent::MessageAdded(user.clone()));
+            history.push(user);
+        }
 
         let system = crate::config::context::load_context_files(&self.cwd).join("\n\n");
         let ctx = ToolCtx {
@@ -305,7 +344,10 @@ impl AgentLoop {
         })
     }
 
-    async fn flush_subagent_notices(&self, session: SessionId) -> Result<()> {
+    /// Entrega los avisos pendientes de jobs y subagentes. Devuelve cuántos se
+    /// entregaron en esta llamada; cada aviso sale una sola vez.
+    async fn flush_subagent_notices(&self, session: SessionId) -> Result<usize> {
+        let mut delivered = 0usize;
         for job in self.jobs.pending_settled_notices(session) {
             let status = match job.status {
                 crate::job::JobStatus::Completed => "completed",
@@ -326,11 +368,13 @@ impl AgentLoop {
             self.jobs.mark_notice_delivered(session, &job.id)?;
             self.bus
                 .publish(LiveEvent::SessionMessageAdded { session, message });
+            delivered += 1;
         }
         if let Some(subagents) = &self.subagents {
             for message in subagents.deliver_notices(session).await? {
                 self.bus
                     .publish(LiveEvent::SessionMessageAdded { session, message });
+                delivered += 1;
             }
             // Las preguntas de los hijos se guardan aquí, a diferencia de los avisos
             // de finalización, que el propio lanzador persiste al entregarlos.
@@ -338,9 +382,10 @@ impl AgentLoop {
                 self.store.append_message(session, &message).await?;
                 self.bus
                     .publish(LiveEvent::SessionMessageAdded { session, message });
+                delivered += 1;
             }
         }
-        Ok(())
+        Ok(delivered)
     }
 }
 
@@ -666,9 +711,9 @@ mod tests {
         assert_eq!(found, Some(("a.txt".to_string(), 1, 1)));
     }
 
-    /// Lanzador de prueba: solo entrega avisos de preguntas de subagentes.
+    /// Lanzador de prueba: entrega cada aviso de pregunta una sola vez, como el real.
     struct InputNoticeLauncher {
-        notice: Message,
+        notices: std::sync::Mutex<Vec<Message>>,
     }
 
     #[async_trait]
@@ -705,8 +750,138 @@ mod tests {
         }
 
         async fn pending_input_notices(&self, _parent: SessionId) -> Result<Vec<Message>> {
-            Ok(vec![self.notice.clone()])
+            Ok(std::mem::take(&mut *self.notices.lock().unwrap()))
         }
+    }
+
+    /// Construye un agente de prueba con un proveedor guionizado y un bus propio.
+    fn woken_agent(
+        dir: &std::path::Path,
+        store: Arc<SqliteStore>,
+        scripts: Vec<Vec<StreamChunk>>,
+        bus: EventBus,
+    ) -> AgentLoop {
+        AgentLoop::new(
+            Arc::new(QueueProvider {
+                scripts: Mutex::new(scripts.into()),
+            }),
+            store,
+            Arc::new(ToolRegistry::new()),
+            bus,
+            Arc::new(PermissionService::allow_all()),
+            CodeLoomConfig {
+                provider: crate::config::ProviderConfig {
+                    kind: crate::config::ProviderKind::OpenAiCompat,
+                    base_url: "http://x".into(),
+                    api_key_env: "K".into(),
+                },
+                model: "m".into(),
+                max_steps: 5,
+            },
+            dir.to_path_buf(),
+        )
+    }
+
+    /// Vacía el bus y devuelve los eventos recibidos hasta ese momento.
+    fn drain(rx: &mut tokio::sync::broadcast::Receiver<LiveEvent>) -> Vec<LiveEvent> {
+        let mut out = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            out.push(event);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn run_woken_without_notices_runs_no_turn_and_emits_wake_idle() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SqliteStore::open(dir.path().join("idle.db").to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+        let sid = store.create_session("/p").await.unwrap();
+        let bus = EventBus::new(64);
+        let mut rx = bus.subscribe();
+        // Si el proveedor llegara a consultarse, dejaría un mensaje del asistente.
+        let agent = woken_agent(
+            dir.path(),
+            store.clone(),
+            vec![vec![
+                StreamChunk::TextDelta("no debería".into()),
+                StreamChunk::Done(FinishReason::Stop),
+            ]],
+            bus,
+        );
+
+        let outcome = agent
+            .run_woken(sid, CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert!(outcome.is_none());
+        assert!(store.messages(sid).await.unwrap().is_empty());
+        let events = drain(&mut rx);
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, LiveEvent::TurnStarted | LiveEvent::TurnEnded)));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, LiveEvent::WakeIdle))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn run_woken_with_a_notice_runs_a_turn_without_inventing_a_user_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SqliteStore::open(dir.path().join("woken.db").to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+        let sid = store.create_session("/p").await.unwrap();
+        let bus = EventBus::new(64);
+        let mut rx = bus.subscribe();
+        let mut agent = woken_agent(
+            dir.path(),
+            store.clone(),
+            vec![vec![
+                StreamChunk::TextDelta("hecho".into()),
+                StreamChunk::Done(FinishReason::Stop),
+            ]],
+            bus,
+        );
+        let notice = Message::user("[Subagent obrero needs input]\n1. ¿Cuál?");
+        agent.subagents = Some(Arc::new(InputNoticeLauncher {
+            notices: std::sync::Mutex::new(vec![notice.clone()]),
+        }));
+
+        let outcome = agent
+            .run_woken(sid, CancellationToken::new())
+            .await
+            .unwrap()
+            .expect("con un aviso debe ejecutarse un turno");
+
+        assert_eq!(outcome.final_text, "hecho");
+        let stored = store.messages(sid).await.unwrap();
+        let user_texts: Vec<String> = stored
+            .iter()
+            .filter(|message| message.role == Role::User)
+            .map(|message| message.text())
+            .collect();
+        assert_eq!(user_texts, vec![notice.text()]);
+        let events = drain(&mut rx);
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, LiveEvent::TurnStarted)));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, LiveEvent::TurnEnded)));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, LiveEvent::WakeIdle)));
     }
 
     #[tokio::test]
@@ -744,10 +919,10 @@ mod tests {
 1. ¿Cuál?",
         );
         agent.subagents = Some(Arc::new(InputNoticeLauncher {
-            notice: notice.clone(),
+            notices: std::sync::Mutex::new(vec![notice.clone()]),
         }));
 
-        agent.flush_subagent_notices(sid).await.unwrap();
+        assert_eq!(agent.flush_subagent_notices(sid).await.unwrap(), 1);
 
         let stored = store.messages(sid).await.unwrap();
         assert!(stored.iter().any(|m| m.text() == notice.text()));
