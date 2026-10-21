@@ -10,10 +10,12 @@ use ratatui::Frame;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-fn line_view(line: &str, cursor: Option<usize>, width: usize) -> (String, usize) {
+/// Ventana visible de una línea lógica, en índices de grafema `[inicio, fin)`,
+/// junto con la columna del cursor dentro de la ventana.
+fn line_window(line: &str, cursor: Option<usize>, width: usize) -> (usize, usize, usize) {
     let graphemes = line.graphemes(true).collect::<Vec<_>>();
     if width == 0 {
-        return (String::new(), 0);
+        return (0, 0, 0);
     }
     let Some(cursor) = cursor.map(|cursor| cursor.min(graphemes.len())) else {
         let mut used = 0;
@@ -26,7 +28,7 @@ fn line_view(line: &str, cursor: Option<usize>, width: usize) -> (String, usize)
             used = next;
             end += 1;
         }
-        return (graphemes[..end].concat(), 0);
+        return (0, end, 0);
     };
 
     // Keep the caret in view while filling from the left first, as Herdr does.
@@ -50,31 +52,119 @@ fn line_view(line: &str, cursor: Option<usize>, width: usize) -> (String, usize)
         used = next;
         end += 1;
     }
-    (graphemes[start..end].concat(), cursor_col)
+    (start, end, cursor_col)
 }
 
-fn horizontal_view(
+/// Texto visible de una línea según `line_window`. Solo lo usan las pruebas:
+/// el render trabaja con rangos de bytes sobre el texto completo.
+#[cfg(test)]
+fn line_view(line: &str, cursor: Option<usize>, width: usize) -> (String, usize) {
+    let graphemes = line.graphemes(true).collect::<Vec<_>>();
+    let (start, end, col) = line_window(line, cursor, width);
+    (graphemes[start..end].concat(), col)
+}
+
+/// Índice de byte del grafema `grapheme` de `line` (o el final si no existe).
+fn grapheme_byte(line: &str, grapheme: usize) -> usize {
+    line.grapheme_indices(true)
+        .nth(grapheme)
+        .map_or(line.len(), |(i, _)| i)
+}
+
+/// Rangos de byte `[inicio, fin)` de cada línea lógica visible dentro de
+/// `text`, más la columna del cursor. Los rangos apuntan al texto completo del
+/// composer, así que el resaltado de la selección se calcula sobre el mismo
+/// texto que el cursor. El recorte horizontal es el de `line_window`.
+fn horizontal_windows(
     text: &str,
     cursor_row: usize,
     cursor_index: usize,
     width: usize,
-) -> (String, usize) {
+) -> (Vec<(usize, usize)>, usize) {
     let mut graphemes_before = 0;
+    let mut line_start = 0;
     let mut cursor_col = 0;
-    let lines = text
-        .split('\n')
-        .enumerate()
-        .map(|(row, line)| {
-            let cursor = (row == cursor_row).then(|| cursor_index.saturating_sub(graphemes_before));
-            let (view, col) = line_view(line, cursor, width);
-            if row == cursor_row {
-                cursor_col = col;
-            }
-            graphemes_before += line.graphemes(true).count() + 1;
-            view
-        })
-        .collect::<Vec<_>>();
-    (lines.join("\n"), cursor_col)
+    let mut ranges = Vec::new();
+    for (row, line) in text.split('\n').enumerate() {
+        let cursor = (row == cursor_row).then(|| cursor_index.saturating_sub(graphemes_before));
+        let (start, end, col) = line_window(line, cursor, width);
+        if row == cursor_row {
+            cursor_col = col;
+        }
+        ranges.push((
+            line_start + grapheme_byte(line, start),
+            line_start + grapheme_byte(line, end),
+        ));
+        graphemes_before += line.graphemes(true).count() + 1;
+        line_start += line.len() + 1;
+    }
+    (ranges, cursor_col)
+}
+
+/// Divide la fila `[row_start, row_end)` de `text` en (antes, seleccionado,
+/// después). `sel` es la selección en bytes del texto completo. Los tres
+/// tramos son subcadenas de la fila y su unión es la fila entera; sin
+/// solapamiento con la selección, el tramo seleccionado queda vacío.
+fn split_selected(
+    text: &str,
+    row_start: usize,
+    row_end: usize,
+    sel: Option<(usize, usize)>,
+) -> [(&str, bool); 3] {
+    let plain = [(&text[row_start..row_end], false), ("", false), ("", false)];
+    let Some((sel_start, sel_end)) = sel else {
+        return plain;
+    };
+    let start = sel_start.clamp(row_start, row_end);
+    let end = sel_end.clamp(row_start, row_end);
+    if start == end {
+        return plain;
+    }
+    [
+        (&text[row_start..start], false),
+        (&text[start..end], true),
+        (&text[end..row_end], false),
+    ]
+}
+
+/// Añade a `spans` los tramos no vacíos de una fila, con el estilo llano o el
+/// de selección según la marca de cada tramo.
+fn push_parts<'a>(
+    spans: &mut Vec<Span<'a>>,
+    parts: [(&'a str, bool); 3],
+    plain: Style,
+    selected: Style,
+) {
+    for (part, is_selected) in parts {
+        if !part.is_empty() {
+            spans.push(Span::styled(
+                part,
+                if is_selected { selected } else { plain },
+            ));
+        }
+    }
+}
+
+/// Indica si el salto de línea que cierra la fila `[.., row_end)` queda dentro
+/// de la selección. Se muestra como una celda seleccionada de un espacio, solo
+/// en el aspecto: el texto no cambia.
+fn newline_selected(text: &str, row_end: usize, sel: Option<(usize, usize)>) -> bool {
+    sel.is_some_and(|(start, end)| start <= row_end && row_end < end)
+        && text.as_bytes().get(row_end) == Some(&b'\n')
+}
+
+/// Fila superior visible que mantiene el cursor a la vista desplazando lo
+/// mínimo desde `view_top`. Con el cursor en la última fila equivale a
+/// `cursor_row - (visible - 1)`, el cálculo que se usaba antes.
+fn stable_top(view_top: usize, cursor_row: usize, visible: usize, total_rows: usize) -> usize {
+    let visible = visible.max(1);
+    let lowest = cursor_row.saturating_sub(visible - 1);
+    view_top
+        .clamp(lowest, cursor_row)
+        .min(total_rows.saturating_sub(visible))
+        // Red de seguridad: si el cursor cae fuera de las filas, nunca lo
+        // dejamos por encima de su ventana mínima.
+        .max(lowest)
 }
 
 /// Composer con foco (borde de acento y cursor).
@@ -146,14 +236,22 @@ pub fn render_focused_with_model(
     frame.render_widget(block, area);
 
     let (row, _) = composer.cursor_row_col();
-    let scroll = row.saturating_sub(usize::from(inner.height.saturating_sub(1)));
-    let (text, col) = horizontal_view(
-        composer.text(),
+    let scroll = stable_top(
+        composer.view_top(),
+        row,
+        usize::from(inner.height),
+        line_count,
+    );
+    composer.set_view_top(scroll);
+    let source = composer.text();
+    let (ranges, col) = horizontal_windows(
+        source,
         row,
         composer.cursor(),
         usize::from(inner.width.saturating_sub(2)),
     );
     let input = theme.style(StyleToken::Default);
+    let selected = theme.style(StyleToken::Selection);
     let prompt = accent.add_modifier(Modifier::BOLD);
     let lines = if composer.is_empty() {
         vec![Line::from(vec![
@@ -164,13 +262,23 @@ pub fn render_focused_with_model(
             ),
         ])]
     } else {
-        text.split('\n')
+        let sel = composer.selection_bytes();
+        ranges
+            .iter()
             .enumerate()
-            .map(|(line, text)| {
-                Line::from(vec![
-                    Span::styled(if line == 0 { "❯ " } else { "│ " }, prompt),
-                    Span::styled(text.to_string(), input),
-                ])
+            .map(|(line, &(start, end))| {
+                let mut spans = Vec::with_capacity(4);
+                spans.push(Span::styled(if line == 0 { "❯ " } else { "│ " }, prompt));
+                push_parts(
+                    &mut spans,
+                    split_selected(source, start, end, sel),
+                    input,
+                    selected,
+                );
+                if newline_selected(source, end, sel) {
+                    spans.push(Span::styled(" ", selected));
+                }
+                Line::from(spans)
             })
             .collect()
     };
@@ -290,18 +398,29 @@ pub fn render_crush(
 
     let layout = crush_layout(composer, area.width);
     let (cursor_row, cursor_col) = layout.cursor;
-    let scroll = cursor_row.saturating_sub(height - 1);
+    let scroll = stable_top(composer.view_top(), cursor_row, height, layout.rows.len());
+    composer.set_view_top(scroll);
     let source = composer.text();
+    let sel = composer.selection_bytes();
+    let selected = theme.style(StyleToken::Selection);
     let lines = layout
         .rows
         .iter()
         .skip(scroll)
         .take(height)
         .map(|row| {
-            Line::from(vec![
-                Span::styled(crush_gutter(row), prompt),
-                Span::styled(&source[row.start..row.end], text_style),
-            ])
+            let mut spans = Vec::with_capacity(4);
+            spans.push(Span::styled(crush_gutter(row), prompt));
+            push_parts(
+                &mut spans,
+                split_selected(source, row.start, row.end, sel),
+                text_style,
+                selected,
+            );
+            if newline_selected(source, row.end, sel) {
+                spans.push(Span::styled(" ", selected));
+            }
+            Line::from(spans)
         })
         .collect::<Vec<_>>();
     frame.render_widget(
@@ -700,5 +819,202 @@ mod tests {
         let (screen, cursor) = draw(&Composer::new(), 40, 3, &theme);
         assert!(screen.contains("> Describe what you want to build"));
         assert_eq!(cursor, Some((2, 0)));
+    }
+
+    #[test]
+    fn split_selected_without_selection() {
+        assert_eq!(
+            split_selected("abc\ndef", 4, 7, None),
+            [("def", false), ("", false), ("", false)]
+        );
+    }
+
+    #[test]
+    fn split_selected_partial_selection() {
+        assert_eq!(
+            split_selected("abcdef", 0, 6, Some((2, 4))),
+            [("ab", false), ("cd", true), ("ef", false)]
+        );
+        // Los offsets son bytes: la «é» ocupa dos y el corte cae entre grafemas.
+        assert_eq!(
+            split_selected("héllo", 0, 6, Some((1, 3))),
+            [("h", false), ("é", true), ("llo", false)]
+        );
+    }
+
+    #[test]
+    fn split_selected_full_row() {
+        assert_eq!(
+            split_selected("abc\ndef", 4, 7, Some((4, 7))),
+            [("", false), ("def", true), ("", false)]
+        );
+    }
+
+    #[test]
+    fn split_selected_outside_the_row() {
+        let text = "abc\ndef\nghi";
+        let plain = [("def", false), ("", false), ("", false)];
+        assert_eq!(split_selected(text, 4, 7, Some((0, 3))), plain);
+        assert_eq!(split_selected(text, 4, 7, Some((8, 11))), plain);
+    }
+
+    #[test]
+    fn split_selected_starts_before_the_row_and_ends_inside() {
+        assert_eq!(
+            split_selected("abc\ndef", 4, 7, Some((2, 5))),
+            [("", false), ("d", true), ("ef", false)]
+        );
+    }
+
+    /// Convierte el búfer de un terminal de prueba en una cadena por fila.
+    fn screen_rows(term: &Terminal<TestBackend>, w: u16) -> Vec<String> {
+        term.backend()
+            .buffer()
+            .content
+            .chunks(usize::from(w).max(1))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect()
+    }
+
+    /// Pinta `render_crush` y devuelve sus filas de pantalla.
+    fn crush_rows(c: &Composer, w: u16, h: u16, theme: &Theme) -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| {
+            render_crush(
+                f,
+                f.area(),
+                c,
+                true,
+                "Describe what you want to build…",
+                theme,
+            )
+        })
+        .unwrap();
+        screen_rows(&term, w)
+    }
+
+    /// Pinta `render_focused_with_model` (Classic) y devuelve sus filas.
+    fn classic_rows(c: &Composer, w: u16, h: u16, theme: &Theme) -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| render_focused_with_model(f, f.area(), c, true, "", theme))
+            .unwrap();
+        screen_rows(&term, w)
+    }
+
+    #[test]
+    fn crush_view_top_stays_when_cursor_moves_inside_the_viewport() {
+        let theme = Theme::preset(crate::widgets::ThemePreset::Crush);
+        let mut c = Composer::new();
+        c.set_text("1\n2\n3\n4\n5\n6\n7\n8");
+        c.set_cursor(8); // línea "5", fila 4
+        c.set_view_top(3);
+        let _ = crush_rows(&c, 20, 3, &theme);
+        assert_eq!(c.view_top(), 3);
+        // Se mueve a la fila 3 (dentro de la vista): la vista no debe desplazarse.
+        c.set_cursor(6);
+        let rows = crush_rows(&c, 20, 3, &theme);
+        assert_eq!(c.view_top(), 3);
+        assert!(rows[0].contains('4'), "{rows:?}");
+    }
+
+    #[test]
+    fn crush_view_top_follows_the_cursor_past_the_edges() {
+        let theme = Theme::preset(crate::widgets::ThemePreset::Crush);
+        let mut c = Composer::new();
+        c.set_text("1\n2\n3\n4\n5\n6\n7\n8");
+        c.set_view_top(3);
+        c.set_cursor(0); // por encima de la vista
+        let rows = crush_rows(&c, 20, 3, &theme);
+        assert_eq!(c.view_top(), 0);
+        assert!(rows[0].contains('1'), "{rows:?}");
+        c.set_cursor(14); // línea "8", por debajo de la vista
+        let rows = crush_rows(&c, 20, 3, &theme);
+        assert_eq!(c.view_top(), 5);
+        assert!(rows[2].contains('8'), "{rows:?}");
+    }
+
+    #[test]
+    fn crush_typing_at_the_end_scrolls_like_before() {
+        let theme = Theme::preset(crate::widgets::ThemePreset::Crush);
+        let mut c = Composer::new();
+        for step in 0..10 {
+            c.insert_str(&format!("{step}\n"));
+            let _ = crush_rows(&c, 20, 3, &theme);
+            let row = crush_layout(&c, 20).cursor.0;
+            // Cálculo anterior a la tarea: el cursor queda en la última fila.
+            assert_eq!(c.view_top(), row.saturating_sub(2), "paso {step}");
+        }
+    }
+
+    #[test]
+    fn classic_view_top_stays_when_cursor_moves_inside_the_viewport() {
+        let theme = Theme::test();
+        let mut c = Composer::new();
+        c.set_text("1\n2\n3\n4\n5\n6\n7\n8");
+        c.set_cursor(8); // línea "5", fila lógica 4
+        c.set_view_top(3);
+        let _ = classic_rows(&c, 20, 5, &theme); // 3 filas útiles dentro del marco
+        assert_eq!(c.view_top(), 3);
+        c.set_cursor(6); // línea "4", dentro de la vista
+        let rows = classic_rows(&c, 20, 5, &theme);
+        assert_eq!(c.view_top(), 3);
+        assert!(rows[1].contains('4'), "{rows:?}");
+    }
+
+    #[test]
+    fn classic_typing_at_the_end_scrolls_like_before() {
+        let theme = Theme::test();
+        let mut c = Composer::new();
+        for step in 0..10 {
+            c.insert_str(&format!("{step}\n"));
+            let _ = classic_rows(&c, 20, 5, &theme);
+            let (row, _) = c.cursor_row_col();
+            assert_eq!(c.view_top(), row.saturating_sub(2), "paso {step}");
+        }
+    }
+
+    #[test]
+    fn crush_selection_is_highlighted_with_the_selection_style() {
+        let theme = Theme::preset(crate::widgets::ThemePreset::Crush);
+        let sel_bg = theme.style(StyleToken::Selection).bg;
+        assert!(sel_bg.is_some());
+        let mut c = Composer::new();
+        c.set_text("uno dos");
+        c.select_range(0, 3); // "uno"
+        let mut term = Terminal::new(TestBackend::new(20, 3)).unwrap();
+        term.draw(|f| {
+            render_crush(f, f.area(), &c, true, "", &theme);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        for x in 2..5 {
+            assert_eq!(buf[(x, 0)].bg, sel_bg.unwrap(), "celda {x} seleccionada");
+        }
+        for x in 5..8 {
+            assert_ne!(buf[(x, 0)].bg, sel_bg.unwrap(), "celda {x} sin seleccionar");
+        }
+    }
+
+    #[test]
+    fn classic_selection_is_highlighted() {
+        let theme = Theme::test();
+        let sel_bg = theme.style(StyleToken::Selection).bg;
+        assert!(sel_bg.is_some());
+        let mut c = Composer::new();
+        c.set_text("ab\ncd");
+        c.select_range(1, 4); // "b\nc"
+        let mut term = Terminal::new(TestBackend::new(20, 4)).unwrap();
+        term.draw(|f| render_focused_with_model(f, f.area(), &c, true, "", &theme))
+            .unwrap();
+        let buf = term.backend().buffer();
+        let selected = |x: u16, y: u16| buf[(x, y)].bg == sel_bg.unwrap();
+        // Fila 1: "❯ ab" (la «b» y el salto de línea seleccionado, tras él no).
+        assert!(!selected(3, 1), "la «a» no está seleccionada");
+        assert!(selected(4, 1), "la «b» sí");
+        assert!(selected(5, 1), "el salto de línea se marca con una celda");
+        assert!(!selected(6, 1));
+        // Fila 2: "│ cd" (solo la «c»).
+        assert!(selected(3, 2));
+        assert!(!selected(4, 2));
     }
 }

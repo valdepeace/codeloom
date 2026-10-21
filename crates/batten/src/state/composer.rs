@@ -1,5 +1,6 @@
 //! Composer: buffer multilínea con cursor. Puro (sin ratatui).
 
+use std::cell::Cell;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -7,17 +8,33 @@ use unicode_width::UnicodeWidthStr;
 /// se normaliza a `None`), y se expresa en grafemas, igual que `cursor()`.
 /// Toda operación que altere el texto la limpia, así que nunca apunta fuera
 /// de rango.
+///
+/// `view_top` es estado de vista, no de edición: la fila superior visible que
+/// dejó el último render (filas visuales en Crush, líneas lógicas en Classic).
+/// Va en una `Cell` para que el render la actualice con `&Composer`.
 #[derive(Debug, Default)]
 pub struct Composer {
     buf: String,
     cursor: usize,
     preferred_col: Option<usize>,
     anchor: Option<usize>,
+    view_top: Cell<usize>,
 }
 
 impl Composer {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Fila superior visible que recordó el último render.
+    pub fn view_top(&self) -> usize {
+        self.view_top.get()
+    }
+
+    /// Fija la fila superior visible. El render la acota a la altura real, así
+    /// que un valor fuera de rango no provoca un desplazamiento incorrecto.
+    pub fn set_view_top(&self, top: usize) {
+        self.view_top.set(top);
     }
 
     /// Convierte un índice de grafema en índice de byte. Posiciones fuera de
