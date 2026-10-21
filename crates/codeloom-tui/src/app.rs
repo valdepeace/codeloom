@@ -872,6 +872,21 @@ impl App {
             Focus::Transcript => Focus::Composer,
             _ => Focus::Composer,
         };
+        if self.focus == Focus::Transcript {
+            self.ensure_block();
+        }
+    }
+
+    /// Con el chrome `Flat`, si el transcript no tiene bloque activo y hay entradas,
+    /// activa el último. Así siempre hay un bloque marcado al entrar en él. Con
+    /// Classic, o sin entradas, no hace nada.
+    fn ensure_block(&mut self) {
+        if self.theme.look.chrome != batten::widgets::ChromeStyle::Flat || self.block.is_some() {
+            return;
+        }
+        if let Some(last) = self.transcript.entry_count().checked_sub(1) {
+            self.block = Some(last);
+        }
     }
 
     /// Ventana bajo la celda (x, y) del último fotograma. El composer tiene
@@ -914,6 +929,7 @@ impl App {
         if pane == Focus::Transcript {
             self.mouse_drag = None;
             self.transcript_mouse_down(x, y);
+            self.ensure_block();
             return;
         }
         let area = self.composer_area.filter(|_| pane == Focus::Composer);

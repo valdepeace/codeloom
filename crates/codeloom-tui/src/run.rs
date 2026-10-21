@@ -86,7 +86,7 @@ impl Drop for RawGuard {
 }
 
 /// Teclas con el foco en el transcript (como Crush).
-fn transcript_key(app: &mut App, code: KeyCode) {
+fn transcript_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
     let len = app.transcript.len();
     if let Some(mut s) = app.selection {
         match code {
@@ -112,6 +112,21 @@ fn transcript_key(app: &mut App, code: KeyCode) {
         app.text_sel = None;
         app.selection = Some(batten::state::Selection::at(len - 1));
         return;
+    }
+    // Con el chrome `Flat` (Crush), flechas y j/k avanzan por bloques; Ctrl+flecha y
+    // Ctrl+j siguen desplazando por líneas. Con Classic, todo igual que siempre.
+    let by_block = app.theme.look.chrome == batten::widgets::ChromeStyle::Flat
+        && !mods.contains(KeyModifiers::CONTROL);
+    match code {
+        KeyCode::Up | KeyCode::Char('k') if by_block => {
+            app.block_prev();
+            return;
+        }
+        KeyCode::Down | KeyCode::Char('j') if by_block => {
+            app.block_next();
+            return;
+        }
+        _ => {}
     }
     // Navegación y copia por bloques: no alteran el desplazamiento por líneas.
     match code {
@@ -499,7 +514,7 @@ pub fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Option<St
         app.focus = Focus::Composer;
     }
     if app.focus == Focus::Transcript {
-        transcript_key(app, code);
+        transcript_key(app, code, mods);
         return None;
     }
     // Escribir, borrar o ampliar la selección en el composer anula la del transcript.
@@ -1669,6 +1684,24 @@ mod tests {
         app
     }
 
+    /// Aplicación con look Crush (chrome `Flat`), un mensaje de usuario por texto y
+    /// pintada. El foco queda en el composer.
+    fn crush_app(texts: &[&str]) -> App {
+        use batten::widgets::{Theme, ThemePreset};
+        let mut app = transcript_app(texts);
+        app.theme_preset = ThemePreset::Crush;
+        app.theme = Theme::preset(ThemePreset::Crush);
+        paint_sized(&mut app, 100, 30);
+        app
+    }
+
+    /// Como `crush_app`, con `n` bloques de texto para poder desplazarse.
+    fn crush_app_n(n: usize) -> App {
+        let texts: Vec<String> = (0..n).map(|i| format!("bloque-{i:02}")).collect();
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        crush_app(&refs)
+    }
+
     #[test]
     fn bracket_keys_move_the_active_block() {
         let mut app = block_app(3);
@@ -1761,6 +1794,114 @@ mod tests {
         handle_key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
         assert_eq!(app.viewport.top(), before, "j baja una fila");
         assert_eq!(app.block, None, "j/k no mueven el bloque activo");
+    }
+
+    #[test]
+    fn arrows_and_jk_move_blocks_in_crush() {
+        let mut app = crush_app(&["uno", "dos", "tres"]);
+        app.focus = Focus::Transcript;
+        handle_key(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(
+            app.block,
+            Some(2),
+            "sin bloque activo, la flecha activa el último"
+        );
+        handle_key(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.block, Some(1));
+        handle_key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+        assert_eq!(app.block, Some(0));
+        handle_key(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.block, Some(0), "acotado al primero");
+        handle_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.block, Some(1));
+        handle_key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(app.block, Some(2));
+        handle_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.block, Some(2), "acotado al último");
+    }
+
+    #[test]
+    fn ctrl_arrows_and_ctrl_j_scroll_one_line_in_crush() {
+        let mut app = crush_app_n(60);
+        app.focus = Focus::Transcript;
+        let before = app.viewport.top();
+        handle_key(&mut app, KeyCode::Up, KeyModifiers::CONTROL);
+        assert_eq!(
+            app.viewport.top(),
+            before - 1,
+            "Ctrl+flecha arriba sube una fila"
+        );
+        handle_key(&mut app, KeyCode::Down, KeyModifiers::CONTROL);
+        assert_eq!(
+            app.viewport.top(),
+            before,
+            "Ctrl+flecha abajo baja una fila"
+        );
+        // Al volver al final el seguimiento se activa: subimos dos para tener margen.
+        handle_key(&mut app, KeyCode::Up, KeyModifiers::CONTROL);
+        handle_key(&mut app, KeyCode::Up, KeyModifiers::CONTROL);
+        assert_eq!(app.viewport.top(), before - 2);
+        handle_key(&mut app, KeyCode::Char('j'), KeyModifiers::CONTROL);
+        assert_eq!(app.viewport.top(), before - 1, "Ctrl+j baja una fila");
+        assert_eq!(
+            app.block, None,
+            "el desplazamiento no mueve el bloque activo"
+        );
+    }
+
+    #[test]
+    fn line_selection_mode_jk_still_extends_lines() {
+        let mut app = crush_app_n(10);
+        app.focus = Focus::Transcript;
+        handle_key(&mut app, KeyCode::Char('v'), KeyModifiers::NONE);
+        let lines = |app: &App| app.selection.map(|s| s.range().count());
+        assert_eq!(lines(&app), Some(1));
+        handle_key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+        assert_eq!(
+            lines(&app),
+            Some(2),
+            "con selección activa, k extiende por líneas"
+        );
+        handle_key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+        assert_eq!(lines(&app), Some(3));
+        assert_eq!(app.block, None, "la selección de líneas no mueve bloques");
+    }
+
+    #[test]
+    fn tab_into_transcript_selects_last_block_in_crush() {
+        let mut app = crush_app(&["uno", "dos", "tres"]);
+        app.focus = Focus::Composer;
+        handle_key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(app.focus, Focus::Transcript);
+        assert_eq!(
+            app.block,
+            Some(2),
+            "al entrar, el último bloque queda marcado"
+        );
+    }
+
+    #[test]
+    fn tab_into_transcript_keeps_classic_without_block() {
+        let mut app = transcript_app(&["uno", "dos", "tres"]);
+        paint_sized(&mut app, 100, 30);
+        app.focus = Focus::Composer;
+        handle_key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(app.focus, Focus::Transcript);
+        assert_eq!(app.block, None, "Classic no marca bloque al entrar");
+    }
+
+    #[test]
+    fn focus_with_empty_transcript_does_not_panic() {
+        let mut app = crush_app(&[]);
+        app.focus = Focus::Composer;
+        handle_key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(app.focus, Focus::Transcript);
+        assert_eq!(app.block, None);
+        handle_key(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('['), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char(']'), KeyModifiers::NONE);
+        assert_eq!(app.block, None);
     }
 
     #[test]

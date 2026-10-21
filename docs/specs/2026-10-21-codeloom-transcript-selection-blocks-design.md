@@ -115,3 +115,20 @@ Limitaciones conocidas:
 - Sin prueba del bloque más alto que la vista; la prueba de la rama sin margen
   es débil.
 - Validación visual en terminal real: pendiente.
+
+## Ajuste al estilo Crush (2026-10-21)
+
+Tras contrastarlo con el código de Crush (`internal/ui/chat/user.go`,
+`styles/quickstyle.go`, `model/chat.go`), el look con chrome `Flat` se alinea con
+él; Classic no cambia:
+
+- Línea fina `│` permanente solo en los bloques de usuario (acento). Asistente,
+  herramientas y demás no llevan línea mientras no estén activos.
+- El bloque activo lleva `▌` en todas sus filas: acento si es de usuario y el
+  estilo `success` del tema en el resto.
+- Con el foco en la conversación, `↑/↓` y `j/k` mueven de bloque; `Ctrl+↑/↓` y
+  `Ctrl+j` desplazan una línea. `[`/`]` quedan como alias. Al enfocar el
+  transcript sin bloque activo se selecciona el último.
+
+Limitaciones: `Ctrl+k` no desplaza por líneas porque lo ocupa el alternador
+global de la cola; en Flat, Shift y Alt también mueven bloques con las flechas.
