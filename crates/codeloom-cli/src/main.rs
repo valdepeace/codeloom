@@ -195,6 +195,7 @@ async fn main() -> Result<()> {
     report_herdr(&mut herdr, AgentState::Idle, "ready").await;
 
     let (prompt_tx, mut prompt_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (wake_tx, mut wake_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     let (settings_tx, mut settings_rx) =
         tokio::sync::mpsc::unbounded_channel::<codeloom_tui::run::ProviderSettingsCommand>();
     let (session_command_tx, mut session_command_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -209,6 +210,7 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         let mut herdr = herdr;
         let mut session = None;
+        let mut wake_open = true;
         loop {
             tokio::select! {
                 command = session_command_rx.recv() => match command {
@@ -270,6 +272,29 @@ async fn main() -> Result<()> {
                         }
                     }
                     None => break,
+                },
+                // Despertar del padre ocioso. Sin sesión activa se ignora. El informe a
+                // herdr solo cambia si el despertar ejecutó turno: `run_woken` no dice de
+                // antemano si lo hará, así que no se emite `Working` previo; un `Ok(None)`
+                // no toca el estado (el padre seguía ocioso) y `Ok(Some)` cierra con `Idle`.
+                wake = wake_rx.recv(), if wake_open => match wake {
+                    Some(()) => {
+                        let Some(session_id) = session else { continue; };
+                        let cancel = CancellationToken::new();
+                        *worker_active_turn.lock().unwrap() = Some(cancel.clone());
+                        let result = agent_task.run_woken(session_id, cancel).await;
+                        *worker_active_turn.lock().unwrap() = None;
+                        match result {
+                            Ok(Some(_)) => report_herdr(&mut herdr, AgentState::Idle, "ready").await,
+                            Ok(None) => {}
+                            Err(error) => {
+                                report_herdr(&mut herdr, AgentState::Blocked, "error").await;
+                                eprintln!("{}: {error}", env!("CARGO_BIN_NAME"));
+                            }
+                        }
+                    }
+                    // Canal cerrado: no volver a entrar en esta rama (evita busy-loop).
+                    None => wake_open = false,
                 }
             }
         }
@@ -281,6 +306,7 @@ async fn main() -> Result<()> {
     codeloom_tui::run::run(
         app,
         prompt_tx,
+        wake_tx,
         settings_tx,
         bus_rx,
         perm_rx,

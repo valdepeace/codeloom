@@ -767,6 +767,8 @@ fn cancel_active_turn(app: &mut App, active_turn: &ActiveTurn) {
 pub async fn run(
     mut app: App,
     prompt_tx: UnboundedSender<String>,
+    // Canal de despertares del padre ocioso: lo usará la lógica de despertar (tarea 3).
+    _wake_tx: UnboundedSender<()>,
     settings_tx: UnboundedSender<ProviderSettingsCommand>,
     mut bus_rx: tokio::sync::broadcast::Receiver<codeloom_core::event::LiveEvent>,
     mut perm_rx: tokio::sync::mpsc::Receiver<(
