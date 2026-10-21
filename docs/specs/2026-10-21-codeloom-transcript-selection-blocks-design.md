@@ -78,3 +78,40 @@ Pruebas puras de: normalización y rango de la selección, traducción celda →
 `(fila, columna)` con scroll, resaltado en `TestBackend`, extracción de texto
 (multifila, ancho, prefijos), navegación de bloques, enrutado del ratón y del
 teclado. Validación visual en terminal real: imprescindible y pendiente.
+
+## Estado (2026-10-21)
+
+Implementada y commiteada, con 329 pruebas en `batten` y 236 en `codeloom-tui`,
+`clippy -D warnings` y `rustfmt` limpios:
+
+- `TextSelection`/`CellPos` en coordenadas de documento; `hit_cell`,
+  `paint_text_selection` (parcheo del búfer, sin re-render) y `selected_text`
+  (dibujado fuera de pantalla línea a línea, solo al copiar).
+- Enrutado del ratón: clic enfoca el transcript y activa el bloque pulsado;
+  arrastrar selecciona, con autodesplazamiento de una fila por evento en los
+  bordes; al soltar se copia con `Copied N chars` y la selección permanece;
+  clic simple la descarta; Ctrl+C copia sin salir; Esc la limpia sin contar
+  para la doble Esc.
+- Bloque activo: `[` y `]` navegan, `y`/`c` copian el bloque; la vista se
+  desplaza para mostrarlo.
+
+Decisiones tomadas al implementar:
+
+- El extremo de la selección es **inclusivo** (la celda donde se suelta entra),
+  como en las terminales.
+- Un carácter ancho solo se copia si empieza dentro del rango.
+- El marcador del bloque activo es `█` de acento en el margen (con chrome
+  `Flat`), porque el `▎` ya lo usa el filete de foco del transcript y sería
+  indistinguible; sin margen se recolorea la primera celda de cada fila.
+- La selección se anula al cambiar el ancho del diseño, al cargar sesión y al
+  editar el composer; las teclas de navegación no la anulan.
+
+Limitaciones conocidas:
+
+- Las filas partidas por ajuste de línea se copian separadas por `\n`.
+- Si el transcript pasa de caber a desbordar durante un stream, la scrollbar
+  estrecha el diseño y la selección se descarta en ese instante.
+- Ctrl+C copia la selección aunque haya un diálogo abierto.
+- Sin prueba del bloque más alto que la vista; la prueba de la rama sin margen
+  es débil.
+- Validación visual en terminal real: pendiente.

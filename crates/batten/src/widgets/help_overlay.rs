@@ -36,6 +36,7 @@ pub fn render_pawan(frame: &mut Frame, screen: Rect) -> Rect {
         key_line("Tab     ", "Switch focus (input/messages)", key),
         key_line("j/k     ", "Scroll up/down", key),
         key_line("g/G     ", "Jump to top/bottom", key),
+        key_line("[ / ]   ", "Previous/next block (y: copy block)", key),
         key_line("/       ", "Search in messages", key),
         Line::raw(""),
         Line::from(Span::styled("  Commands", section)),
