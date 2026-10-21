@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+pub mod ask_user;
 pub mod bash;
 pub mod edit;
 pub mod glob;
@@ -16,6 +17,7 @@ pub mod job_start;
 pub mod subagent;
 pub mod subagent_control;
 pub mod subagent_list;
+pub mod todo_write;
 pub mod view;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

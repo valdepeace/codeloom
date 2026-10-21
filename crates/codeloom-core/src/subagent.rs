@@ -65,7 +65,8 @@ impl InProcessSubagentLauncher {
                 tools
                     .without("subagent")
                     .without("subagent_control")
-                    .without("subagent_list"),
+                    .without("subagent_list")
+                    .without("ask_user"),
             ),
             permission,
             config,
@@ -334,5 +335,37 @@ mod tests {
             .control(parent, child, "interrupt", None)
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn child_registry_hides_ask_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SqliteStore::open(dir.path().join("subagents.db").to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+        let provider: Arc<dyn Provider> = Arc::new(ScriptedProvider { script: vec![] });
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(crate::tools::ask_user::AskUserTool));
+        assert!(tools.get("ask_user").is_some());
+        let runtime = InProcessSubagentLauncher::new(
+            Arc::new(RwLock::new(provider)),
+            store,
+            Arc::new(tools),
+            Arc::new(PermissionService::allow_all()),
+            Arc::new(RwLock::new(CodeLoomConfig {
+                provider: ProviderConfig {
+                    kind: ProviderKind::OpenAiCompat,
+                    base_url: "http://localhost".into(),
+                    api_key_env: "KEY".into(),
+                },
+                model: "test".into(),
+                max_steps: 2,
+            })),
+            dir.path().to_path_buf(),
+            Arc::new(LocalJobRegistry::default()),
+        );
+        assert!(runtime.tools.get("ask_user").is_none());
     }
 }

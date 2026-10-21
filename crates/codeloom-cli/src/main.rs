@@ -9,6 +9,7 @@ use codeloom_core::provider::openai::OpenAiCompatProvider;
 use codeloom_core::provider::Provider;
 use codeloom_core::session::sqlite::SqliteStore;
 use codeloom_core::session::SessionStore;
+use codeloom_core::tools::ask_user::AskUserTool;
 use codeloom_core::tools::bash::BashTool;
 use codeloom_core::tools::edit::EditTool;
 use codeloom_core::tools::glob::GlobTool;
@@ -20,6 +21,7 @@ use codeloom_core::tools::job_start::JobStartTool;
 use codeloom_core::tools::subagent::SubagentTool;
 use codeloom_core::tools::subagent_control::SubagentControlTool;
 use codeloom_core::tools::subagent_list::SubagentListTool;
+use codeloom_core::tools::todo_write::TodoWriteTool;
 use codeloom_core::tools::view::ViewTool;
 use codeloom_core::tools::ToolRegistry;
 use codeloom_herdr::{AgentState, HerdrContext};
@@ -114,6 +116,8 @@ fn build_tools() -> ToolRegistry {
     tools.register(Arc::new(SubagentTool));
     tools.register(Arc::new(SubagentControlTool));
     tools.register(Arc::new(SubagentListTool));
+    tools.register(Arc::new(TodoWriteTool));
+    tools.register(Arc::new(AskUserTool));
     tools
 }
 
@@ -158,6 +162,7 @@ async fn main() -> Result<()> {
     let bus = EventBus::new(1024);
     let bus_rx = bus.subscribe();
     let (perm_tx, perm_rx) = tokio::sync::mpsc::channel(8);
+    let (ask_tx, ask_rx) = tokio::sync::mpsc::channel(4);
     let permission = Arc::new(if cli.print.is_some() {
         // limitación: `-p` no es interactivo; sin `--yolo` se deniega todo.
         if cli.yolo {
@@ -166,7 +171,9 @@ async fn main() -> Result<()> {
             PermissionService::with_responder(Box::new(DenyAll))
         }
     } else {
-        PermissionService::with_responder(Box::new(UiPermissionResponder::new(perm_tx, cli.yolo)))
+        PermissionService::with_responder(Box::new(
+            UiPermissionResponder::new(perm_tx, cli.yolo).with_questions(ask_tx),
+        ))
     });
     let agent = Arc::new(AgentLoop::new(
         provider,
@@ -277,6 +284,7 @@ async fn main() -> Result<()> {
         settings_tx,
         bus_rx,
         perm_rx,
+        ask_rx,
         active_turn,
         session_command_tx,
         session_update_rx,

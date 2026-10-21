@@ -39,6 +39,10 @@ pub enum LiveEvent {
     },
     JobChanged(crate::job::JobSnapshot),
     SubagentChanged(crate::session::SubagentDescriptor),
+    TodosChanged {
+        session: crate::session::SessionId,
+        items: Vec<crate::todo::TodoItem>,
+    },
     Error {
         message: String,
     },
