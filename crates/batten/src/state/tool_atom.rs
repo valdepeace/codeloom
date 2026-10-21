@@ -71,15 +71,18 @@ enum Part {
     Removed,
 }
 
-/// Único punto donde se elige el estilo de cada parte del resumen. La Tarea 5
-/// lo sustituye por los tokens propios de pieza (`ToolPath`, `ToolCommand`…).
+/// Único punto donde se elige el estilo de cada parte del resumen. Ruta y patrón
+/// usan `ToolPath`, el comando `ToolCommand` y los recuentos `ToolCount`; los
+/// valores por defecto de esos tokens coinciden con los estilos previos
+/// (`accent`, `default` y `dim`), salvo en los presets que los redefinen.
 fn style_of(part: Part) -> StyleToken {
     match part {
         Part::Name => StyleToken::ToolName,
-        Part::Command | Part::Text => StyleToken::Default,
-        Part::Path | Part::Pattern => StyleToken::Accent,
+        Part::Command => StyleToken::ToolCommand,
+        Part::Text => StyleToken::Default,
+        Part::Path | Part::Pattern => StyleToken::ToolPath,
         Part::Detail => StyleToken::Muted,
-        Part::Count => StyleToken::Dim,
+        Part::Count => StyleToken::ToolCount,
         Part::Added => StyleToken::DiffInsert,
         Part::Removed => StyleToken::DiffDelete,
     }
@@ -946,5 +949,60 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Token del span de `line` que cubre exactamente `text`, si lo hay.
+    fn token_of(line: &Line, text: &str) -> Option<StyleToken> {
+        line.spans
+            .iter()
+            .find(|span| line.text.get(span.start..span.start + span.len) == Some(text))
+            .map(|span| span.token)
+    }
+
+    #[test]
+    fn bash_command_span_uses_tool_command_token() {
+        let item = ToolItem::new("c1", "bash");
+        let lines = tool_lines_with(&item, &primary("cargo test -p batten"));
+        assert_eq!(
+            token_of(&lines[0], "cargo test -p batten"),
+            Some(StyleToken::ToolCommand)
+        );
+    }
+
+    #[test]
+    fn view_path_span_uses_tool_path_token() {
+        let item = ToolItem::new("c1", "view");
+        let facts = ToolFacts {
+            range: Some((10, 29)),
+            ..primary("src/lib.rs")
+        };
+        let lines = tool_lines_with(&item, &facts);
+        assert_eq!(
+            token_of(&lines[0], "src/lib.rs"),
+            Some(StyleToken::ToolPath)
+        );
+        // El rango es un dato secundario, no la ruta.
+        assert_eq!(token_of(&lines[0], "L10-29"), Some(StyleToken::Muted));
+    }
+
+    #[test]
+    fn grep_count_span_uses_tool_count_token() {
+        let mut item = ToolItem::new("c1", "grep");
+        item.set_result(false);
+        item.set_output("a\nb\nc");
+        let lines = tool_lines_with(&item, &primary("TODO"));
+        let last = lines.last().unwrap();
+        assert_eq!(token_of(last, "3 matches"), Some(StyleToken::ToolCount));
+        assert_eq!(token_of(&lines[0], "TODO"), Some(StyleToken::ToolPath));
+    }
+
+    #[test]
+    fn edit_path_span_uses_tool_path_token() {
+        let item = edit_item();
+        let lines = tool_lines_with(&item, &edit_facts("src/lib.rs", "a\n", "b\n"));
+        assert_eq!(
+            token_of(&lines[0], "src/lib.rs"),
+            Some(StyleToken::ToolPath)
+        );
     }
 }

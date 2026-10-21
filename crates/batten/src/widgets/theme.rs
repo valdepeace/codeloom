@@ -46,6 +46,9 @@ pub struct Styles {
     pub warning: Style,
     pub success: Style,
     pub tool_name: Style,
+    pub tool_path: Style,
+    pub tool_command: Style,
+    pub tool_count: Style,
     pub tool_pending: Style,
     pub tool_running: Style,
     pub tool_success: Style,
@@ -87,6 +90,10 @@ impl Default for Styles {
             tool_name: Style::default()
                 .fg(Color::Indexed(252))
                 .add_modifier(Modifier::BOLD),
+            // Derivados: ruta ← accent, comando ← default, recuento ← dim.
+            tool_path: Style::default().fg(Color::Rgb(0, 212, 255)),
+            tool_command: Style::default(),
+            tool_count: Style::default().fg(Color::Indexed(240)),
             tool_pending: Style::default().fg(Color::Indexed(244)),
             tool_running: Style::default().fg(Color::Cyan),
             tool_success: Style::default().fg(Color::Green),
@@ -384,9 +391,18 @@ impl Theme {
         theme.styles.diff_delete = Style::default().fg(error);
         theme.styles.diff_hunk = Style::default().fg(accent);
         theme.styles.code = Style::default().fg(accent);
+        // Tokens de pieza: por defecto derivados de los existentes del preset.
+        // Deben ir después de `accent`, `default` y `dim`, que se fijan arriba.
+        theme.styles.tool_path = theme.styles.accent;
+        theme.styles.tool_command = theme.styles.default;
+        theme.styles.tool_count = theme.styles.dim;
         theme.glyphs.tool_pending = '●';
         if preset == Crush {
             theme.look = Look::crush();
+            // Crush rompe el derivado de la ruta con su verde menta (`success`,
+            // 0,255,178), que no compite con el violeta de `accent`. El recuento
+            // conserva el `dim` derivado y el comando, el `default`.
+            theme.styles.tool_path = theme.styles.success;
         }
         theme
     }
@@ -456,6 +472,9 @@ impl Theme {
             StyleToken::Warning => s.warning,
             StyleToken::Success => s.success,
             StyleToken::ToolName => s.tool_name,
+            StyleToken::ToolPath => s.tool_path,
+            StyleToken::ToolCommand => s.tool_command,
+            StyleToken::ToolCount => s.tool_count,
             StyleToken::ToolPending => s.tool_pending,
             StyleToken::ToolRunning => s.tool_running,
             StyleToken::ToolSuccess => s.tool_success,
@@ -494,6 +513,9 @@ impl Theme {
             "warning" => s.warning = style,
             "success" => s.success = style,
             "tool_name" => s.tool_name = style,
+            "tool_path" => s.tool_path = style,
+            "tool_command" => s.tool_command = style,
+            "tool_count" => s.tool_count = style,
             "tool_pending" => s.tool_pending = style,
             "tool_running" => s.tool_running = style,
             "tool_success" => s.tool_success = style,
@@ -549,6 +571,9 @@ fn token_to_key(t: StyleToken) -> &'static str {
         StyleToken::Warning => "warning",
         StyleToken::Success => "success",
         StyleToken::ToolName => "tool_name",
+        StyleToken::ToolPath => "tool_path",
+        StyleToken::ToolCommand => "tool_command",
+        StyleToken::ToolCount => "tool_count",
         StyleToken::ToolPending => "tool_pending",
         StyleToken::ToolRunning => "tool_running",
         StyleToken::ToolSuccess => "tool_success",
@@ -769,5 +794,72 @@ mod tests {
         assert_eq!(Look::classic().chrome, ChromeStyle::Panels);
         assert_eq!(Look::crush().layout, LayoutStyle::ContextRail);
         assert_eq!(Look::crush().chrome, ChromeStyle::Flat);
+    }
+
+    #[test]
+    fn new_tokens_resolve_in_every_preset() {
+        for preset in ThemePreset::ALL {
+            let theme = Theme::preset(preset);
+            let name = preset.name();
+            assert!(
+                theme.style(StyleToken::ToolPath).fg.is_some(),
+                "{name}: ToolPath sin color"
+            );
+            assert!(
+                theme.style(StyleToken::ToolCount).fg.is_some(),
+                "{name}: ToolCount sin color"
+            );
+            assert_eq!(
+                theme.style(StyleToken::ToolCommand),
+                theme.style(StyleToken::Default),
+                "{name}: ToolCommand debe resolver al estilo por defecto"
+            );
+        }
+    }
+
+    #[test]
+    fn defaults_are_derived_from_existing_styles() {
+        // Martty no define valores propios de pieza: hereda los derivados.
+        let theme = Theme::preset(ThemePreset::Martty);
+        assert_eq!(
+            theme.style(StyleToken::ToolPath),
+            theme.style(StyleToken::Accent)
+        );
+        assert_eq!(
+            theme.style(StyleToken::ToolCommand),
+            theme.style(StyleToken::Default)
+        );
+        assert_eq!(
+            theme.style(StyleToken::ToolCount),
+            theme.style(StyleToken::Dim)
+        );
+
+        // Y el tema por defecto, sin preset, sigue la misma regla.
+        let theme = Theme::test();
+        assert_eq!(
+            theme.style(StyleToken::ToolPath),
+            theme.style(StyleToken::Accent)
+        );
+        assert_eq!(
+            theme.style(StyleToken::ToolCount),
+            theme.style(StyleToken::Dim)
+        );
+    }
+
+    #[test]
+    fn crush_overrides_tool_path_or_count() {
+        let crush = Theme::preset(ThemePreset::Crush);
+        let differs = crush.style(StyleToken::ToolPath) != crush.style(StyleToken::Accent)
+            || crush.style(StyleToken::ToolCount) != crush.style(StyleToken::Dim);
+        assert!(differs, "Crush debe definir su propia ruta o recuento");
+    }
+
+    #[test]
+    fn tool_piece_tokens_can_be_overridden() {
+        let th = Theme::from_toml("[styles]\ntool_path = \"magenta\"\ntool_count = \"green\"\n")
+            .unwrap();
+        assert_eq!(th.style(StyleToken::ToolPath).fg, Some(Color::Magenta));
+        assert_eq!(th.style(StyleToken::ToolCount).fg, Some(Color::Green));
+        assert!(th.extensions.is_empty());
     }
 }

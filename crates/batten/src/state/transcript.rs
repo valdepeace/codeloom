@@ -43,6 +43,12 @@ pub enum StyleToken {
     Warning,
     Success,
     ToolName,
+    /// Ruta o patrón del dato principal de una pieza de herramienta.
+    ToolPath,
+    /// Comando de una pieza de herramienta (`bash`, `job_start`).
+    ToolCommand,
+    /// Recuento de una pieza de herramienta («3 matches», «2 options»).
+    ToolCount,
     ToolPending,
     ToolRunning,
     ToolSuccess,
