@@ -1,15 +1,17 @@
 //! Proyección hacia los estados de tarea de A2A; el modelo interno no cambia.
+//!
+//! Cabe señalar que este módulo no fija los nombres del cable (en la v1.0 son
+//! `TASK_STATE_*`; en la 0.3, `input-required` y compañía): esa traducción
+//! corresponde al adaptador del borde.
 
 use crate::job::JobStatus;
 use crate::session::SubagentStatus;
-use serde::{Deserialize, Serialize};
 
-/// Estado de una tarea según A2A v1.0.
+/// Estado de una tarea según A2A.
 ///
 /// Cabe señalar que se omite a propósito el valor `unspecified` de protobuf,
 /// que es el valor cero del enumerado y no un estado real de la tarea.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TaskState {
     Submitted,
     Working,
@@ -31,20 +33,6 @@ impl TaskState {
             self,
             Self::Completed | Self::Failed | Self::Canceled | Self::Rejected
         )
-    }
-
-    /// Literal del protocolo; coincide con la serialización de `serde`.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Submitted => "submitted",
-            Self::Working => "working",
-            Self::InputRequired => "input-required",
-            Self::AuthRequired => "auth-required",
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-            Self::Canceled => "canceled",
-            Self::Rejected => "rejected",
-        }
     }
 }
 
@@ -77,47 +65,6 @@ impl From<SubagentStatus> for TaskState {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn serializes_with_protocol_names() {
-        assert_eq!(
-            serde_json::to_string(&TaskState::InputRequired).unwrap(),
-            "\"input-required\""
-        );
-        assert_eq!(
-            serde_json::to_string(&TaskState::AuthRequired).unwrap(),
-            "\"auth-required\""
-        );
-        assert_eq!(
-            serde_json::to_string(&TaskState::Canceled).unwrap(),
-            "\"canceled\""
-        );
-        assert_eq!(
-            serde_json::to_string(&TaskState::Submitted).unwrap(),
-            "\"submitted\""
-        );
-        let back: TaskState = serde_json::from_str("\"input-required\"").unwrap();
-        assert_eq!(back, TaskState::InputRequired);
-    }
-
-    #[test]
-    fn as_str_matches_serialization() {
-        for s in [
-            TaskState::Submitted,
-            TaskState::Working,
-            TaskState::InputRequired,
-            TaskState::AuthRequired,
-            TaskState::Completed,
-            TaskState::Failed,
-            TaskState::Canceled,
-            TaskState::Rejected,
-        ] {
-            assert_eq!(
-                serde_json::to_string(&s).unwrap(),
-                format!("\"{}\"", s.as_str())
-            );
-        }
-    }
 
     #[test]
     fn terminal_states_are_exactly_the_settled_ones() {
