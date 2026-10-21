@@ -106,6 +106,26 @@ pub(crate) fn reasoning_sample_catalog() -> Arc<Catalog> {
     Arc::new(Catalog::from_json(REASONING_SAMPLE_JSON).expect("el JSON de muestra es válido"))
 }
 
+/// Catálogo de muestra con precios: `acme` publica su `api` con barra final; `priced` tiene
+/// ambos precios, `half` solo el de entrada y `plain` ninguno.
+#[cfg(test)]
+const PRICED_SAMPLE_JSON: &str = r#"{
+    "acme": {"id": "acme", "name": "Acme", "npm": "@ai-sdk/openai-compatible",
+        "api": "https://acme.example/v1/", "env": ["ACME_KEY"],
+        "models": {
+            "priced": {"id": "priced", "name": "Priced", "tool_call": true,
+                "cost": {"input": 3, "output": 15}},
+            "half": {"id": "half", "name": "Half", "tool_call": true,
+                "cost": {"input": 3}},
+            "plain": {"id": "plain", "name": "Plain", "tool_call": true}}}
+}"#;
+
+/// Catálogo de muestra con precios ya construido, listo para `App::set_catalog`.
+#[cfg(test)]
+pub(crate) fn priced_sample_catalog() -> Arc<Catalog> {
+    Arc::new(Catalog::from_json(PRICED_SAMPLE_JSON).expect("el JSON de muestra es válido"))
+}
+
 /// Posición del campo «Effort» en `/settings`. Solo existe si el modelo admite niveles;
 /// sin él, «Save» ocupa esta misma posición.
 pub const SETTINGS_EFFORT_FIELD: usize = 4;
@@ -1770,6 +1790,30 @@ impl App {
                     output.saturating_add(stats.output_tokens),
                 )
             })
+    }
+
+    /// Precios `(entrada, salida)` por millón de tokens del modelo actual, buscados en el
+    /// catálogo. `None` si falta el catálogo, el proveedor, el modelo o alguno de los dos precios.
+    pub fn model_prices(&self) -> Option<(f64, f64)> {
+        let provider = self.model_catalog_provider()?;
+        let model = provider
+            .models
+            .iter()
+            .find(|model| model.id == self.model)?;
+        Some((model.input_cost?, model.output_cost?))
+    }
+
+    /// Coste estimado en dólares de la sesión abierta: tokens propios más los de los hijos,
+    /// por el precio del modelo. `None` sin precio o si no hay ningún token que valorar.
+    pub fn estimated_cost(&self) -> Option<f64> {
+        let (price_in, price_out) = self.model_prices()?;
+        let (child_in, child_out) = self.hierarchy_tokens();
+        let input = self.input_tokens.saturating_add(child_in);
+        let output = self.output_tokens.saturating_add(child_out);
+        if input == 0 && output == 0 {
+            return None;
+        }
+        Some(input as f64 * price_in / 1e6 + output as f64 * price_out / 1e6)
     }
 
     /// Número de subagentes de la sesión abierta que siguen en marcha.
@@ -4191,6 +4235,79 @@ mod tests {
         assert_eq!(app.turn_in_flight, in_flight);
         assert_eq!(app.transcript.entry_count(), entries);
         assert_eq!(app.phase, phase);
+    }
+
+    /// App con el catálogo de precios y unos ajustes que apuntan a `acme` con el modelo dado.
+    fn priced_app(model: &str, base_url: &str) -> App {
+        let mut app = App::new();
+        app.set_catalog(priced_sample_catalog());
+        app.set_provider_settings(ProviderSettings {
+            kind: codeloom_core::config::ProviderKind::OpenAiCompat,
+            model: model.into(),
+            base_url: base_url.into(),
+            api_key_env: "ACME_KEY".into(),
+            effort: None,
+        });
+        app
+    }
+
+    #[test]
+    fn model_prices_match_provider_by_url_ignoring_trailing_slash() {
+        // La `api` del catálogo lleva barra final; los ajustes, no. Debe casar en ambos sentidos.
+        assert_eq!(
+            priced_app("priced", "https://acme.example/v1").model_prices(),
+            Some((3.0, 15.0))
+        );
+        assert_eq!(
+            priced_app("priced", "https://acme.example/v1/").model_prices(),
+            Some((3.0, 15.0))
+        );
+    }
+
+    #[test]
+    fn model_prices_none_without_catalog() {
+        let mut app = App::new();
+        app.set_provider_settings(ProviderSettings {
+            kind: codeloom_core::config::ProviderKind::OpenAiCompat,
+            model: "priced".into(),
+            base_url: "https://acme.example/v1".into(),
+            api_key_env: "ACME_KEY".into(),
+            effort: None,
+        });
+        assert_eq!(app.model_prices(), None, "sin catálogo no hay precio");
+    }
+
+    #[test]
+    fn model_prices_none_when_a_price_is_missing() {
+        let url = "https://acme.example/v1";
+        assert_eq!(priced_app("half", url).model_prices(), None);
+        assert_eq!(priced_app("plain", url).model_prices(), None);
+        assert_eq!(priced_app("ausente", url).model_prices(), None);
+    }
+
+    #[test]
+    fn estimated_cost_adds_children() {
+        let mut app = priced_app("priced", "https://acme.example/v1");
+        app.session_id = Some(SessionId(1));
+        app.input_tokens = 1_000_000;
+        app.output_tokens = 100_000;
+        app.apply(child_event(
+            SessionId(1),
+            9,
+            LiveEvent::Usage {
+                input_tokens: 1_000_000,
+                output_tokens: 0,
+            },
+        ));
+        // Entrada: 2.000.000 a 3 $/M = 6. Salida: 100.000 a 15 $/M = 1,5.
+        let cost = app.estimated_cost().expect("hay precio y tokens");
+        assert!((cost - 7.5).abs() < 1e-9, "coste inesperado: {cost}");
+    }
+
+    #[test]
+    fn estimated_cost_none_with_zero_tokens() {
+        let app = priced_app("priced", "https://acme.example/v1");
+        assert_eq!(app.estimated_cost(), None, "sin tokens no hay estimación");
     }
 
     #[test]

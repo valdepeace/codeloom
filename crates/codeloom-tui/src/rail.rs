@@ -89,6 +89,13 @@ fn rail_lines(app: &App, width: usize) -> Vec<Line<'_>> {
         format!("↑{} ↓{}", app.input_tokens, app.output_tokens),
         app.theme.styles.muted,
     )));
+    // Estimación de coste bajo los tokens: solo con precio y tokens, y recortada al rail.
+    if let Some(cost) = app.estimated_cost() {
+        out.push(Line::from(Span::styled(
+            recortar(&format_cost(cost), width),
+            app.theme.styles.muted,
+        )));
+    }
 
     if !app.todos.is_empty() {
         push_gap(&mut out);
@@ -285,6 +292,26 @@ pub fn format_tokens(n: u64) -> String {
         }
     }
     format!("{entero}{unidad}")
+}
+
+/// Coste estimado en dólares, siempre con el prefijo `≈` de estimación: `≈ $0.0123` por
+/// debajo de uno (cuatro decimales), `≈ $1.23` hasta cien y `≈ $123` desde ahí. Un valor
+/// positivo pero menor que una diezmilésima se muestra como `≈ < $0.0001`. Los umbrales
+/// de redondeo evitan salidas como «1.0000» o «100.00».
+pub fn format_cost(dollars: f64) -> String {
+    if dollars <= 0.0 {
+        return "≈ $0".to_owned();
+    }
+    if dollars < 0.0001 {
+        return "≈ < $0.0001".to_owned();
+    }
+    if dollars < 0.99995 {
+        format!("≈ ${dollars:.4}")
+    } else if dollars < 99.995 {
+        format!("≈ ${dollars:.2}")
+    } else {
+        format!("≈ ${dollars:.0}")
+    }
 }
 
 /// Tiempo transcurrido compacto: `7s`, `1m05s` (menos de una hora) o `1h01m`.
@@ -731,5 +758,88 @@ mod tests {
             !rows.iter().any(|row| row.contains("effort")),
             "sin esfuerzo no hay línea en el rail: {rows:?}"
         );
+    }
+
+    #[test]
+    fn format_cost_ranges() {
+        assert_eq!(format_cost(0.00005), "≈ < $0.0001");
+        assert_eq!(format_cost(0.0001), "≈ $0.0001");
+        assert_eq!(format_cost(0.0123), "≈ $0.0123");
+        assert_eq!(format_cost(1.234), "≈ $1.23");
+        assert_eq!(format_cost(123.4), "≈ $123");
+    }
+
+    #[test]
+    fn format_cost_rounding_edges_and_zero() {
+        // El redondeo no debe producir «1.0000» ni «100.00».
+        assert_eq!(format_cost(0.99996), "≈ $1.00");
+        assert_eq!(format_cost(99.996), "≈ $100");
+        assert_eq!(format_cost(0.0), "≈ $0");
+    }
+
+    /// Ajustes de `acme` con el modelo dado, con el catálogo de precios cargado.
+    fn priced_rail_app(model: &str) -> App {
+        let mut app = App::new();
+        app.set_catalog(crate::app::priced_sample_catalog());
+        app.set_provider_settings(crate::app::ProviderSettings {
+            kind: codeloom_core::config::ProviderKind::OpenAiCompat,
+            model: model.into(),
+            base_url: "https://acme.example/v1".into(),
+            api_key_env: "ACME_KEY".into(),
+            effort: None,
+        });
+        app
+    }
+
+    #[test]
+    fn rail_shows_cost_line_when_priced() {
+        let mut app = priced_rail_app("priced");
+        app.input_tokens = 1_000_000;
+
+        let rows = rows_of(&app, 40, 24);
+        let idx = rows
+            .iter()
+            .position(|row| row.contains("↑1000000"))
+            .expect("el rail muestra la línea de tokens");
+        assert!(
+            rows[idx + 1].contains("≈ $3.00"),
+            "falta el coste justo bajo los tokens: {:?}",
+            rows[idx + 1]
+        );
+    }
+
+    #[test]
+    fn rail_has_no_cost_line_without_prices() {
+        let mut app = App::new();
+        app.input_tokens = 1_000_000;
+        let rows = rows_of(&app, 40, 24);
+        assert!(
+            !rows.iter().any(|row| row.contains('≈')),
+            "línea de coste sin precio: {rows:?}"
+        );
+
+        // Con catálogo, pero el modelo no tiene precio completo: tampoco.
+        let mut app = priced_rail_app("plain");
+        app.input_tokens = 1_000_000;
+        let rows = rows_of(&app, 40, 24);
+        assert!(
+            !rows.iter().any(|row| row.contains('≈')),
+            "línea de coste sin precio del modelo: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn rail_clips_huge_cost_to_width() {
+        // Tres mil millones de dólares: la cifra no debe desbordar un rail de 11 columnas.
+        let mut app = priced_rail_app("priced");
+        app.input_tokens = 1_000_000_000_000_000;
+
+        let rows = rows_of(&app, 12, 24);
+        let fila = rows
+            .iter()
+            .find(|row| row.contains('≈'))
+            .expect("la línea de coste aparece también en un rail estrecho");
+        assert_eq!(fila.chars().count(), 12, "la fila ocupa el ancho del rail");
+        assert!(fila.contains('…'), "la línea no se recorta: {fila:?}");
     }
 }
