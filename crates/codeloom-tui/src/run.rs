@@ -330,6 +330,9 @@ pub fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Option<St
         } else {
             app.last_escape = Some(now);
             app.cancel_requested = app.turn_in_flight;
+            if app.cancel_requested {
+                app.wake_pending = false;
+            }
         }
         return None;
     }
@@ -386,7 +389,7 @@ pub fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Option<St
             (KeyCode::Char(' '), false) => app.queue_paused = !app.queue_paused,
             (KeyCode::Char('x'), true) if app.turn_in_flight => {
                 app.queue_paused = true;
-                app.cancel_requested = true;
+                app.request_cancel();
             }
             (KeyCode::Enter, false) if len > 0 => {
                 app.queue_editor
@@ -531,7 +534,7 @@ fn execute_slash_command(app: &mut App, command: crate::commands::Command) -> Op
         Command::Sidebar => handle_key(app, KeyCode::Char('b'), KeyModifiers::CONTROL),
         Command::Cancel => {
             app.queue_paused = true;
-            app.cancel_requested = true;
+            app.request_cancel();
             None
         }
         Command::Pause | Command::Resume => {
@@ -709,17 +712,30 @@ pub fn handle_event(app: &mut App, ev: Event) -> Option<String> {
     }
 }
 
-/// Encola prompts y mantiene un solo turno enviado al worker.
+/// Encola prompts y mantiene un solo turno enviado al worker. Un mensaje del
+/// usuario rearma el presupuesto de turnos automáticos.
 fn send(app: &mut App, tx: &UnboundedSender<String>, prompt: Option<String>) {
     if let Some(text) = prompt {
+        app.rearm_auto_turns();
         app.pending_prompts.push_back(text);
         app.queued = app.pending_prompts.len();
     }
     dispatch_next(app, tx);
 }
 
+/// Pide un despertar del padre si la interfaz lo permite. Si el canal del
+/// trabajador está cerrado, suelta la marca para no bloquear la cola de prompts.
+fn dispatch_wake(app: &mut App, wake_tx: &UnboundedSender<()>) {
+    if app.take_wake() && wake_tx.send(()).is_err() {
+        app.wake_in_flight = false;
+        app.status = "error: wake channel closed".into();
+    }
+}
+
 fn dispatch_next(app: &mut App, tx: &UnboundedSender<String>) {
+    // Un despertar en vuelo ocupa el turno: no se solapa un prompt con él.
     if app.turn_in_flight
+        || app.wake_in_flight
         || app.queue_open
         || app.queue_paused
         || app.session_loading
@@ -767,8 +783,8 @@ fn cancel_active_turn(app: &mut App, active_turn: &ActiveTurn) {
 pub async fn run(
     mut app: App,
     prompt_tx: UnboundedSender<String>,
-    // Canal de despertares del padre ocioso: lo usará la lógica de despertar (tarea 3).
-    _wake_tx: UnboundedSender<()>,
+    // Canal de despertares del padre ocioso: el trabajador ejecuta un turno sin mensaje de usuario.
+    wake_tx: UnboundedSender<()>,
     settings_tx: UnboundedSender<ProviderSettingsCommand>,
     mut bus_rx: tokio::sync::broadcast::Receiver<codeloom_core::event::LiveEvent>,
     mut perm_rx: tokio::sync::mpsc::Receiver<(
@@ -856,6 +872,7 @@ pub async fn run(
                             Err(_) => break,
                         }
                     }
+                    dispatch_wake(&mut app, &wake_tx);
                     frames.request(Urgency::Input);
                 }
                 Some(Err(error)) => return Err(error),
@@ -895,12 +912,14 @@ pub async fn run(
                     }
                 }
                 dispatch_next(&mut app, &prompt_tx);
+                dispatch_wake(&mut app, &wake_tx);
                 frames.request(Urgency::Input);
             },
             saved = async { pending_settings.as_mut().unwrap().await }, if pending_settings.is_some() => {
                 pending_settings = None;
                 app.settings_saved(saved.unwrap_or_else(|_| Err("Settings update failed".into())));
                 dispatch_next(&mut app, &prompt_tx);
+                dispatch_wake(&mut app, &wake_tx);
                 frames.request(Urgency::Input);
             },
             ev = bus_rx.recv(), if bus_open => {
@@ -913,6 +932,7 @@ pub async fn run(
                     app.apply(ev);
                 }
                 dispatch_next(&mut app, &prompt_tx);
+                dispatch_wake(&mut app, &wake_tx);
                 frames.request(Urgency::Background);
             }
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
@@ -1952,5 +1972,80 @@ mod tests {
         app.composer.set_text("uno\ndos");
         handle_key(&mut app, KeyCode::Up, KeyModifiers::NONE);
         assert_eq!(app.composer.cursor_row_col().0, 0);
+    }
+
+    #[test]
+    fn budget_exhausted_stops_waking_until_user_writes() {
+        use codeloom_core::session::{SessionId, SubagentStatus};
+        let mut app = App::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.session_id = Some(SessionId(1));
+        app.auto_turns_left = 0;
+        app.apply(codeloom_core::event::LiveEvent::SubagentSettled {
+            parent: SessionId(1),
+            child: SessionId(9),
+            status: SubagentStatus::Completed,
+        });
+
+        assert!(!app.take_wake());
+        assert_eq!(app.status, "auto-turns exhausted — write to continue");
+        assert!(!app.wake_pending);
+        assert!(!app.wake_in_flight);
+        assert_eq!(app.auto_turns_left, 0);
+
+        // Solo un mensaje del usuario rearma el presupuesto.
+        send(&mut app, &tx, Some("hola".into()));
+        assert_eq!(app.auto_turns_left, crate::app::MAX_AUTO_TURNS);
+        assert_eq!(rx.try_recv().unwrap(), "hola");
+    }
+
+    #[test]
+    fn queued_prompt_waits_while_a_wake_is_in_flight() {
+        let mut app = App::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.wake_in_flight = true;
+        send(&mut app, &tx, Some("después".into()));
+        assert!(
+            rx.try_recv().is_err(),
+            "no se solapa un turno con el despertar en vuelo"
+        );
+        assert_eq!(app.pending_prompts.len(), 1);
+
+        app.apply(codeloom_core::event::LiveEvent::WakeIdle);
+        dispatch_next(&mut app, &tx);
+        assert_eq!(rx.try_recv().unwrap(), "después");
+    }
+
+    #[test]
+    fn dispatch_wake_releases_the_flag_when_the_worker_is_gone() {
+        let mut app = App::new();
+        app.wake_pending = true;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        drop(rx);
+        dispatch_wake(&mut app, &tx);
+        assert!(!app.wake_in_flight);
+        assert_eq!(app.status, "error: wake channel closed");
+    }
+
+    #[test]
+    fn cancel_clears_pending_wake() {
+        use codeloom_core::session::{SessionId, SubagentStatus};
+        let mut app = App::new();
+        app.session_id = Some(SessionId(1));
+        app.turn_in_flight = true;
+        app.apply(codeloom_core::event::LiveEvent::SubagentSettled {
+            parent: SessionId(1),
+            child: SessionId(9),
+            status: SubagentStatus::Completed,
+        });
+        assert!(app.wake_pending);
+
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!app.wake_pending);
+        app.apply(codeloom_core::event::LiveEvent::TurnEnded);
+        assert!(
+            !app.take_wake(),
+            "cancelar no rearma el despertar del mismo evento"
+        );
     }
 }

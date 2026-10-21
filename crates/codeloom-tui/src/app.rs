@@ -147,6 +147,9 @@ fn subagent_tool_status(
 /// no tiene tarjeta en el transcript: la lista se pinta como elemento propio.
 const TODO_TOOL: &str = "todo_write";
 
+/// Turnos automáticos que puede encadenar el padre tras cada mensaje del usuario.
+pub const MAX_AUTO_TURNS: u32 = 8;
+
 pub struct App {
     /// Transcript persistente: se actualiza con los eventos, no por frame.
     pub transcript: batten::state::Transcript,
@@ -219,6 +222,12 @@ pub struct App {
     pub queue_editing: bool,
     pub queue_editor: batten::state::Composer,
     pub turn_in_flight: bool,
+    /// Hay un despertar pedido por un hijo (pregunta o cierre) que aún no se ha lanzado.
+    pub wake_pending: bool,
+    /// Despertar ya pedido al trabajador, sin turno iniciado ni `WakeIdle` de respuesta.
+    pub wake_in_flight: bool,
+    /// Turnos automáticos que quedan antes de exigir un mensaje del usuario.
+    pub auto_turns_left: u32,
     /// Diálogo de permiso abierto, si hay.
     pub permission: Option<PendingPermission>,
     /// Peticiones esperando a que se cierre la actual.
@@ -343,6 +352,9 @@ impl App {
             queue_editing: false,
             queue_editor: batten::state::Composer::new(),
             turn_in_flight: false,
+            wake_pending: false,
+            wake_in_flight: false,
+            auto_turns_left: MAX_AUTO_TURNS,
             permission: None,
             permission_queue: VecDeque::new(),
             question: None,
@@ -408,6 +420,47 @@ impl App {
             .copied()
             .filter(|(_, name, _)| name.starts_with(query))
             .collect()
+    }
+
+    /// Decide si debe pedirse un despertar del padre ahora. Solo lo pide con el
+    /// padre ocioso: sin turno, sin diálogos, sin colas ni ajustes en curso y con
+    /// presupuesto. Si el presupuesto se agotó, avisa una vez y descarta el despertar.
+    pub fn take_wake(&mut self) -> bool {
+        if !self.wake_pending
+            || self.wake_in_flight
+            || self.turn_in_flight
+            || !self.pending_prompts.is_empty()
+            || self.permission.is_some()
+            || self.question.is_some()
+            || self.queue_open
+            || self.queue_paused
+            || self.session_loading
+            || self.session_picker_open
+            || self.settings_open
+            || self.settings_saving
+        {
+            return false;
+        }
+        if self.auto_turns_left == 0 {
+            self.wake_pending = false;
+            self.status = "auto-turns exhausted — write to continue".into();
+            return false;
+        }
+        self.wake_pending = false;
+        self.wake_in_flight = true;
+        true
+    }
+
+    /// Rearma el presupuesto de turnos automáticos; lo llama el envío de cada
+    /// mensaje del usuario.
+    pub fn rearm_auto_turns(&mut self) {
+        self.auto_turns_left = MAX_AUTO_TURNS;
+    }
+
+    /// Cancelación pedida por el usuario: un despertar pendiente deja de tener sentido.
+    pub fn request_cancel(&mut self) {
+        self.cancel_requested = true;
+        self.wake_pending = false;
     }
 
     pub fn set_provider_settings(&mut self, settings: ProviderSettings) {
@@ -634,6 +687,10 @@ impl App {
     }
 
     pub fn load_session(&mut self, session: SessionId, messages: Vec<Message>) {
+        // Un aviso de la sesión anterior no debe despertar a la nueva.
+        if self.session_id != Some(session) {
+            self.wake_pending = false;
+        }
         self.session_id = Some(session);
         self.subagents.clear();
         self.awaiting_input.clear();
@@ -813,8 +870,13 @@ impl App {
     pub fn apply(&mut self, ev: LiveEvent) {
         match ev {
             LiveEvent::TurnStarted => {
+                // Solo un turno despertado gasta presupuesto; un turno del usuario no.
+                let woken = std::mem::take(&mut self.wake_in_flight);
+                if woken {
+                    self.auto_turns_left = self.auto_turns_left.saturating_sub(1);
+                }
                 self.turn_in_flight = true;
-                self.status = "working".into();
+                self.status = if woken { "auto-turn" } else { "working" }.into();
                 self.finish_phase();
                 self.phase_durations.clear();
                 self.phase = "preparing".into();
@@ -835,6 +897,7 @@ impl App {
             }
             LiveEvent::TurnEnded => {
                 self.turn_in_flight = false;
+                self.wake_in_flight = false;
                 self.cancel_requested = false;
                 self.status = "ready".into();
                 self.finish_phase();
@@ -896,6 +959,7 @@ impl App {
             }
             LiveEvent::Error { message } => {
                 self.turn_in_flight = false;
+                self.wake_in_flight = false;
                 self.cancel_requested = false;
                 self.status = format!("error: {message}");
                 self.finish_phase();
@@ -961,13 +1025,27 @@ impl App {
             LiveEvent::SubagentInputRequested { parent, child, .. } => {
                 if Some(parent) == self.session_id {
                     self.awaiting_input.insert(child.0);
+                    // Una pregunta del hijo pide que el padre lea el aviso.
+                    self.wake_pending = true;
                 }
             }
             LiveEvent::SubagentInputResolved { child, .. } => {
                 self.awaiting_input.remove(&child.0);
             }
-            // Los despertares llegan en la tarea 3; por ahora no alteran la vista.
-            LiveEvent::WakeIdle | LiveEvent::SubagentSettled { .. } => {}
+            LiveEvent::WakeIdle => self.wake_in_flight = false,
+            LiveEvent::SubagentSettled { parent, status, .. } => {
+                // Un hijo que termina bien o con fallo despierta al padre; uno matado
+                // por el usuario o interrumpido no.
+                if Some(parent) == self.session_id
+                    && matches!(
+                        status,
+                        codeloom_core::session::SubagentStatus::Completed
+                            | codeloom_core::session::SubagentStatus::Failed
+                    )
+                {
+                    self.wake_pending = true;
+                }
+            }
         }
     }
 
@@ -2600,5 +2678,163 @@ mod tests {
             SessionId(1),
         )));
         assert!(!app.awaiting_input.contains(&9));
+    }
+
+    /// App en reposo con la sesión 1 abierta, que es el padre de los hijos de los tests.
+    fn idle_parent_app() -> App {
+        let mut app = App::new();
+        app.session_id = Some(SessionId(1));
+        app
+    }
+
+    /// Evento de cierre de un hijo (sesión 9) de la sesión 1 con el estado dado.
+    fn settled(status: SubagentStatus) -> LiveEvent {
+        LiveEvent::SubagentSettled {
+            parent: SessionId(1),
+            child: SessionId(9),
+            status,
+        }
+    }
+
+    #[test]
+    fn wake_requested_on_child_question() {
+        let mut app = idle_parent_app();
+        app.apply(LiveEvent::SubagentInputRequested {
+            parent: SessionId(1),
+            child: SessionId(9),
+            label: "review".into(),
+        });
+        assert!(app.wake_pending);
+        assert!(app.take_wake());
+    }
+
+    #[test]
+    fn wake_requested_on_completed_or_failed_but_not_killed() {
+        for status in [SubagentStatus::Completed, SubagentStatus::Failed] {
+            let mut app = idle_parent_app();
+            app.apply(settled(status));
+            assert!(app.wake_pending, "{status:?} debe despertar al padre");
+        }
+        for status in [SubagentStatus::Killed, SubagentStatus::Interrupted] {
+            let mut app = idle_parent_app();
+            app.apply(settled(status));
+            assert!(!app.wake_pending, "{status:?} no debe despertar al padre");
+        }
+    }
+
+    #[test]
+    fn no_wake_while_turn_in_flight_or_dialog_open_or_prompt_queued() {
+        type Blocker = (&'static str, fn(&mut App));
+        let blockers: [Blocker; 11] = [
+            ("wake_in_flight", |app| app.wake_in_flight = true),
+            ("turn_in_flight", |app| app.turn_in_flight = true),
+            ("pending_prompts", |app| {
+                app.pending_prompts.push_back("en cola".into())
+            }),
+            ("permission", |app| {
+                let (reply, _rx) = tokio::sync::oneshot::channel();
+                app.enqueue_permission(
+                    PermissionRequest {
+                        tool: "bash".into(),
+                        action: "run".into(),
+                        detail: "{}".into(),
+                    },
+                    reply,
+                );
+            }),
+            ("question", |app| {
+                let (reply, _rx) = tokio::sync::oneshot::channel();
+                app.enqueue_questions(vec![ask_question("¿Cuál?", &["a", "b"], false)], reply);
+            }),
+            ("queue_open", |app| app.queue_open = true),
+            ("queue_paused", |app| app.queue_paused = true),
+            ("session_loading", |app| app.session_loading = true),
+            ("session_picker_open", |app| app.session_picker_open = true),
+            ("settings_open", |app| app.settings_open = true),
+            ("settings_saving", |app| app.settings_saving = true),
+        ];
+        for (name, block) in blockers {
+            let mut app = idle_parent_app();
+            app.wake_pending = true;
+            block(&mut app);
+            assert!(!app.take_wake(), "{name} debe impedir el despertar");
+            assert!(app.wake_pending, "{name}: el despertar queda pendiente");
+        }
+        let mut app = idle_parent_app();
+        app.wake_pending = true;
+        assert!(app.take_wake(), "sin bloqueos el despertar se pide");
+    }
+
+    #[test]
+    fn wake_spends_budget_only_when_a_turn_starts() {
+        let mut app = idle_parent_app();
+        app.wake_pending = true;
+        assert!(app.take_wake());
+        app.apply(LiveEvent::TurnStarted);
+        assert_eq!(app.auto_turns_left, MAX_AUTO_TURNS - 1);
+        assert_eq!(app.status, "auto-turn");
+        assert!(!app.wake_in_flight);
+        app.apply(LiveEvent::TurnEnded);
+
+        // Un turno iniciado por el usuario no gasta presupuesto ni se marca como automático.
+        app.apply(LiveEvent::TurnStarted);
+        assert_eq!(app.auto_turns_left, MAX_AUTO_TURNS - 1);
+        assert_eq!(app.status, "working");
+    }
+
+    #[test]
+    fn wake_idle_clears_in_flight_and_spends_nothing() {
+        let mut app = idle_parent_app();
+        app.wake_pending = true;
+        assert!(app.take_wake());
+        app.apply(LiveEvent::WakeIdle);
+        assert!(!app.wake_in_flight);
+        assert!(!app.turn_in_flight);
+        assert_eq!(app.auto_turns_left, MAX_AUTO_TURNS);
+    }
+
+    #[test]
+    fn wake_error_clears_in_flight() {
+        let mut app = idle_parent_app();
+        app.wake_pending = true;
+        assert!(app.take_wake());
+        app.apply(LiveEvent::Error {
+            message: "proveedor caído".into(),
+        });
+        assert!(!app.wake_in_flight);
+        assert!(!app.turn_in_flight);
+        assert_eq!(app.auto_turns_left, MAX_AUTO_TURNS);
+        // Tras el error, un nuevo aviso del hijo vuelve a poder despertar al padre.
+        app.apply(settled(SubagentStatus::Completed));
+        assert!(app.take_wake());
+    }
+
+    #[test]
+    fn wake_ignores_other_sessions() {
+        let mut app = idle_parent_app();
+        app.apply(LiveEvent::SubagentInputRequested {
+            parent: SessionId(2),
+            child: SessionId(9),
+            label: "review".into(),
+        });
+        app.apply(LiveEvent::SubagentSettled {
+            parent: SessionId(2),
+            child: SessionId(9),
+            status: SubagentStatus::Completed,
+        });
+        assert!(!app.wake_pending);
+
+        let mut sin_sesion = App::new();
+        sin_sesion.apply(settled(SubagentStatus::Completed));
+        assert!(!sin_sesion.wake_pending);
+    }
+
+    #[test]
+    fn opening_another_session_drops_the_pending_wake() {
+        let mut app = idle_parent_app();
+        app.apply(settled(SubagentStatus::Completed));
+        assert!(app.wake_pending);
+        app.load_session(SessionId(2), Vec::new());
+        assert!(!app.wake_pending);
     }
 }
