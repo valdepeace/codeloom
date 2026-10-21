@@ -14,6 +14,7 @@ pub enum Command {
     Cancel,
     Pause,
     Resume,
+    Parent,
     Sidebar,
     Mouse,
     Quit,
@@ -40,6 +41,7 @@ pub const COMMANDS: &[(Command, &str, &str)] = &[
     ),
     (Command::Pause, "/pause", "Pause pending prompts"),
     (Command::Resume, "/resume", "Resume pending prompts"),
+    (Command::Parent, "/parent", "Back to the parent session"),
     (Command::Sidebar, "/sidebar", "Toggle workspace sidebar"),
     (
         Command::Mouse,

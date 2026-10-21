@@ -513,6 +513,32 @@ pub fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Option<St
     {
         app.focus = Focus::Composer;
     }
+    // Alt+← vuelve a la sesión padre con cualquier foco.
+    if code == KeyCode::Left && mods.contains(KeyModifiers::ALT) {
+        app.go_parent();
+        return None;
+    }
+    // Con el foco en el rail y al menos un subagente, ↑/↓ mueven la selección y Enter
+    // abre el subagente marcado. Sin subagentes, las teclas siguen en el composer.
+    if app.focus == Focus::Rail && !app.subagents.is_empty() {
+        match code {
+            KeyCode::Up => {
+                app.rail_move(-1);
+                return None;
+            }
+            KeyCode::Down => {
+                app.rail_move(1);
+                return None;
+            }
+            KeyCode::Enter => {
+                if let Some(child) = app.rail_selected {
+                    app.open_child(child);
+                }
+                return None;
+            }
+            _ => {}
+        }
+    }
     if app.focus == Focus::Transcript {
         transcript_key(app, code, mods);
         return None;
@@ -670,6 +696,12 @@ fn execute_slash_command(app: &mut App, command: crate::commands::Command) -> Op
             None
         }
         Command::Quit => handle_key(app, KeyCode::Char('q'), KeyModifiers::CONTROL),
+        Command::Parent => {
+            if !app.go_parent() {
+                app.status = "no parent session".into();
+            }
+            None
+        }
         Command::New => {
             app.session_choice = Some(SessionChoice::New);
             app.session_loading = true;
@@ -3023,5 +3055,89 @@ mod tests {
         app.focus = Focus::Rail;
         handle_key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
         assert_eq!(app.focus, Focus::Composer);
+    }
+
+    /// Sesión 1 con los hijos 3 y 5 en el rail, con el foco en el rail.
+    fn rail_app() -> App {
+        use codeloom_core::session::{SessionId, SubagentDescriptor, SubagentStatus};
+        let parent = SessionId(1);
+        let mut app = App::new();
+        app.session_id = Some(parent);
+        app.subagents = [3, 5]
+            .into_iter()
+            .map(|id| {
+                (
+                    id,
+                    SubagentDescriptor {
+                        parent,
+                        child: SessionId(id),
+                        job_id: format!("subagent-{id}"),
+                        label: "review".into(),
+                        status: SubagentStatus::Running,
+                        result: None,
+                        notice_delivered: false,
+                    },
+                )
+            })
+            .collect();
+        app.focus = Focus::Rail;
+        app
+    }
+
+    #[test]
+    fn rail_keys_select_and_open_child() {
+        use codeloom_core::session::SessionId;
+        let mut app = rail_app();
+        handle_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.rail_selected, Some(3));
+        handle_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.rail_selected, Some(5));
+        handle_key(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.rail_selected, Some(3));
+        assert!(app.composer.is_empty());
+
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            app.session_choice,
+            Some(SessionChoice::Resume(SessionId(3)))
+        );
+        assert_eq!(app.parent_stack, vec![SessionId(1)]);
+        assert!(app.composer.is_empty());
+    }
+
+    #[test]
+    fn rail_enter_without_subagents_still_submits_composer() {
+        let mut app = App::new();
+        app.focus = Focus::Rail;
+        app.push_char('h');
+        app.push_char('i');
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE),
+            Some("hi".to_string())
+        );
+    }
+
+    #[test]
+    fn alt_left_goes_to_parent_with_any_focus() {
+        use codeloom_core::session::SessionId;
+        for focus in [Focus::Composer, Focus::Transcript, Focus::Rail] {
+            let mut app = rail_app();
+            assert!(app.open_child(3));
+            app.session_choice = None;
+            app.focus = focus;
+            handle_key(&mut app, KeyCode::Left, KeyModifiers::ALT);
+            assert_eq!(
+                app.session_choice,
+                Some(SessionChoice::Resume(SessionId(1))),
+                "con foco {focus:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parent_command_without_stack_sets_status() {
+        let mut app = App::new();
+        execute_slash_command(&mut app, crate::commands::Command::Parent);
+        assert_eq!(app.status, "no parent session");
     }
 }

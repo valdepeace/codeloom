@@ -246,6 +246,14 @@ pub struct App {
     /// Métricas de los hijos de la sesión abierta, por id interno del hijo. Solo
     /// contiene hijos de esa sesión: se filtra al recibir y se limpia al cargarla.
     pub agent_stats: HashMap<i64, AgentStats>,
+    /// Subagente resaltado en el rail (clave de `subagents`), si hay. Solo se mueve
+    /// con el foco en el rail y se descarta si el hijo deja de existir.
+    pub rail_selected: Option<i64>,
+    /// Sesiones desde las que se entró en un subagente, de la más antigua a la más reciente.
+    pub parent_stack: Vec<SessionId>,
+    /// Navegación en curso (`open_child` o `go_parent`): la siguiente carga de sesión
+    /// conserva la pila en vez de vaciarla.
+    nav_keep_stack: bool,
     pub tools_open: bool,
     pub tool_selected: usize,
     pub tool_scroll: (u16, u16),
@@ -455,6 +463,9 @@ impl App {
             subagents: BTreeMap::new(),
             awaiting_input: HashSet::new(),
             agent_stats: HashMap::new(),
+            rail_selected: None,
+            parent_stack: Vec::new(),
+            nav_keep_stack: false,
             tools_open: false,
             tool_selected: 0,
             tool_scroll: (0, 0),
@@ -831,6 +842,12 @@ impl App {
             self.wake_pending = false;
         }
         self.session_id = Some(session);
+        // Una navegación con `open_child` o `go_parent` conserva la pila de padres;
+        // cualquier otra carga (p. ej. el selector de sesiones) la vacía.
+        if !std::mem::take(&mut self.nav_keep_stack) {
+            self.parent_stack.clear();
+        }
+        self.rail_selected = None;
         self.subagents.clear();
         self.awaiting_input.clear();
         self.agent_stats.clear();
@@ -859,11 +876,70 @@ impl App {
                 .into_iter()
                 .map(|subagent| (subagent.child.0, subagent))
                 .collect();
+            // Un hijo que ya no existe no puede seguir marcado en el rail.
+            if self
+                .rail_selected
+                .is_some_and(|selected| !self.subagents.contains_key(&selected))
+            {
+                self.rail_selected = None;
+            }
         }
+    }
+
+    /// Mueve la selección del rail entre los hijos de la sesión abierta, sin dar la
+    /// vuelta. Sin hijos la quita; sin selección (o con una que ya no existe) elige el primero.
+    pub fn rail_move(&mut self, delta: isize) {
+        let children: Vec<i64> = self.subagents.keys().copied().collect();
+        let Some(&first) = children.first() else {
+            self.rail_selected = None;
+            return;
+        };
+        let current = self
+            .rail_selected
+            .and_then(|selected| children.iter().position(|&child| child == selected));
+        self.rail_selected = Some(match current {
+            None => first,
+            Some(index) => {
+                let last = children.len() - 1;
+                children[index.saturating_add_signed(delta).min(last)]
+            }
+        });
+    }
+
+    /// Entra en el hijo `child` del rail: apila la sesión actual y pide cargar el hijo.
+    /// No tiene efecto (y devuelve `false`) con un turno en curso, sin sesión abierta
+    /// o si `child` no es hijo de la sesión abierta.
+    pub fn open_child(&mut self, child: i64) -> bool {
+        let Some(current) = self.session_id else {
+            return false;
+        };
+        if self.turn_in_flight || !self.subagents.contains_key(&child) {
+            return false;
+        }
+        self.parent_stack.push(current);
+        self.nav_keep_stack = true;
+        self.session_choice = Some(SessionChoice::Resume(SessionId(child)));
+        true
+    }
+
+    /// Vuelve a la sesión desde la que se entró en el subagente actual. No tiene efecto
+    /// (y devuelve `false`) con un turno en curso o con la pila de padres vacía.
+    pub fn go_parent(&mut self) -> bool {
+        if self.turn_in_flight {
+            return false;
+        }
+        let Some(parent) = self.parent_stack.pop() else {
+            return false;
+        };
+        self.nav_keep_stack = true;
+        self.session_choice = Some(SessionChoice::Resume(parent));
+        true
     }
 
     pub fn session_load_failed(&mut self) {
         self.session_loading = false;
+        // Una navegación fallida no debe dejar la pila «encendida» para la siguiente carga.
+        self.nav_keep_stack = false;
         self.session_picker_open = !self.sessions.is_empty();
         self.session_picker_return_to_chat = false;
     }
@@ -2150,6 +2226,171 @@ mod tests {
 
         app.load_session(SessionId(3), Vec::new());
         assert!(app.subagents.is_empty());
+    }
+
+    fn rail_child(parent: SessionId, child: i64) -> SubagentDescriptor {
+        SubagentDescriptor {
+            parent,
+            child: SessionId(child),
+            job_id: format!("subagent-{child}"),
+            label: "review".into(),
+            status: SubagentStatus::Running,
+            result: None,
+            notice_delivered: false,
+        }
+    }
+
+    /// Sesión `parent` abierta con los hijos `children` ya cargados en el rail.
+    fn app_with_children(parent: SessionId, children: &[i64]) -> App {
+        let mut app = App::new();
+        app.load_session(parent, Vec::new());
+        app.load_subagents(
+            parent,
+            children
+                .iter()
+                .map(|&child| rail_child(parent, child))
+                .collect(),
+        );
+        app
+    }
+
+    #[test]
+    fn open_child_pushes_parent_and_requests_resume() {
+        let parent = SessionId(1);
+        let mut app = app_with_children(parent, &[7]);
+        assert!(app.open_child(7));
+        assert_eq!(app.parent_stack, vec![parent]);
+        assert_eq!(
+            app.session_choice,
+            Some(SessionChoice::Resume(SessionId(7)))
+        );
+    }
+
+    #[test]
+    fn open_child_refuses_while_turn_in_flight() {
+        let parent = SessionId(1);
+        let mut app = app_with_children(parent, &[7]);
+        app.turn_in_flight = true;
+        assert!(!app.open_child(7));
+        assert!(app.parent_stack.is_empty());
+        assert_eq!(app.session_choice, None);
+    }
+
+    #[test]
+    fn open_child_refuses_unknown_child() {
+        let parent = SessionId(1);
+        let mut app = app_with_children(parent, &[7]);
+        assert!(!app.open_child(99));
+        assert!(app.parent_stack.is_empty());
+        assert_eq!(app.session_choice, None);
+
+        // Sin sesión abierta tampoco hay a dónde volver: se niega.
+        assert!(!App::new().open_child(7));
+    }
+
+    #[test]
+    fn go_parent_pops_and_requests_resume() {
+        let parent = SessionId(1);
+        let mut app = app_with_children(parent, &[7]);
+        assert!(app.open_child(7));
+        // La selección ya se despachó: el worker carga el hijo.
+        app.session_choice = None;
+        app.load_session(SessionId(7), Vec::new());
+
+        assert!(app.go_parent());
+        assert!(app.parent_stack.is_empty());
+        assert_eq!(app.session_choice, Some(SessionChoice::Resume(parent)));
+    }
+
+    #[test]
+    fn go_parent_refuses_with_empty_stack() {
+        let mut app = App::new();
+        assert!(!app.go_parent());
+        assert_eq!(app.session_choice, None);
+    }
+
+    #[test]
+    fn go_parent_refuses_while_turn_in_flight() {
+        let parent = SessionId(1);
+        let mut app = app_with_children(parent, &[7]);
+        assert!(app.open_child(7));
+        app.session_choice = None;
+        app.load_session(SessionId(7), Vec::new());
+        app.turn_in_flight = true;
+
+        assert!(!app.go_parent());
+        assert_eq!(app.parent_stack, vec![parent]);
+        assert_eq!(app.session_choice, None);
+    }
+
+    #[test]
+    fn normal_load_session_clears_parent_stack() {
+        let mut app = App::new();
+        app.parent_stack.push(SessionId(1));
+        app.rail_selected = Some(3);
+        app.load_session(SessionId(5), Vec::new());
+        assert!(app.parent_stack.is_empty());
+        assert_eq!(app.rail_selected, None);
+    }
+
+    #[test]
+    fn navigation_load_keeps_parent_stack() {
+        let parent = SessionId(1);
+        let mut app = app_with_children(parent, &[7]);
+        assert!(app.open_child(7));
+        app.session_choice = None;
+
+        // La carga que pide `open_child` conserva la pila...
+        app.load_session(SessionId(7), Vec::new());
+        assert_eq!(app.parent_stack, vec![parent]);
+
+        // ...pero cualquier otra carga posterior la vacía.
+        app.load_session(SessionId(8), Vec::new());
+        assert!(app.parent_stack.is_empty());
+    }
+
+    #[test]
+    fn rail_move_walks_children_without_wrapping() {
+        let mut app = app_with_children(SessionId(1), &[3, 5, 9]);
+        assert_eq!(app.rail_selected, None);
+
+        app.rail_move(1);
+        assert_eq!(app.rail_selected, Some(3));
+        app.rail_move(1);
+        assert_eq!(app.rail_selected, Some(5));
+        app.rail_move(1);
+        assert_eq!(app.rail_selected, Some(9));
+        // Al final no da la vuelta.
+        app.rail_move(1);
+        assert_eq!(app.rail_selected, Some(9));
+
+        app.rail_move(-1);
+        assert_eq!(app.rail_selected, Some(5));
+        app.rail_move(-1);
+        assert_eq!(app.rail_selected, Some(3));
+        app.rail_move(-1);
+        assert_eq!(app.rail_selected, Some(3));
+    }
+
+    #[test]
+    fn rail_move_without_children_clears_selection() {
+        let mut app = App::new();
+        app.rail_selected = Some(3);
+        app.rail_move(1);
+        assert_eq!(app.rail_selected, None);
+    }
+
+    #[test]
+    fn rail_selection_dropped_when_child_disappears() {
+        let parent = SessionId(1);
+        let mut app = app_with_children(parent, &[3, 5]);
+        app.rail_selected = Some(5);
+        app.load_subagents(parent, vec![rail_child(parent, 3)]);
+        assert_eq!(app.rail_selected, None);
+
+        app.rail_selected = Some(3);
+        app.load_subagents(parent, vec![rail_child(parent, 3)]);
+        assert_eq!(app.rail_selected, Some(3));
     }
 
     #[test]
