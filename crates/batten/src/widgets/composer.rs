@@ -180,11 +180,13 @@ fn classic_inner(area: Rect) -> Rect {
 /// cursor, para un interior de `inner_width` celdas (descontado el prefijo).
 /// El render y la traducción posición→cursor usan esta misma función.
 fn classic_windows(composer: &Composer, inner_width: u16) -> (Vec<(usize, usize)>, usize) {
-    let (row, _) = composer.cursor_row_col();
+    // Se usa el cursor pintado por última vez, no el vivo: así la traducción de
+    // una celda coincide con lo que se ve aunque el cursor se haya movido.
+    let cursor = composer.painted_cursor();
     horizontal_windows(
         composer.text(),
-        row,
-        composer.cursor(),
+        composer.row_of_grapheme(cursor),
+        cursor,
         usize::from(inner_width.saturating_sub(CLASSIC_PREFIX)),
     )
 }
@@ -265,6 +267,7 @@ pub fn render_focused_with_model(
         line_count,
     );
     composer.set_view_top(scroll);
+    composer.mark_painted();
     let source = composer.text();
     let (ranges, col) = classic_windows(composer, inner.width);
     let input = theme.style(StyleToken::Default);
@@ -331,9 +334,16 @@ fn crush_gutter(row: &VisualRow) -> &'static str {
 /// Layout de filas del composer Crush para un ancho de área dado. El ancho
 /// descontado depende del prefijo de cada línea lógica (`> ` o `::: `).
 fn crush_layout(composer: &Composer, width: u16) -> ComposerLayout {
+    crush_layout_at(composer, composer.cursor(), width)
+}
+
+/// Como `crush_layout`, pero con el cursor indicado. El cursor influye en las
+/// filas (un cursor al final de una fila llena baja a una fila propia), así que
+/// la traducción de celdas usa el pintado y el render, el vivo.
+fn crush_layout_at(composer: &Composer, cursor: usize, width: u16) -> ComposerLayout {
     crate::state::composer_layout(
         composer.text(),
-        composer.cursor(),
+        cursor,
         usize::from(width.saturating_sub(2)),
         usize::from(width.saturating_sub(4)),
     )
@@ -414,6 +424,7 @@ pub fn render_crush(
     }
 
     let layout = crush_layout(composer, area.width);
+    composer.mark_painted();
     let (cursor_row, cursor_col) = layout.cursor;
     let scroll = stable_top(composer.view_top(), cursor_row, height, layout.rows.len());
     composer.set_view_top(scroll);
@@ -668,7 +679,7 @@ fn grapheme_count(text: &str, byte: usize) -> usize {
 /// el último render (consulta pura: no lo recalcula ni lo escribe).
 fn hit_crush(composer: &Composer, area: Rect, x: u16, y: u16) -> usize {
     let text = composer.text();
-    let layout = crush_layout(composer, area.width);
+    let layout = crush_layout_at(composer, composer.painted_cursor(), area.width);
     let index = visible_index(
         composer.view_top(),
         usize::from(area.height),
@@ -1275,6 +1286,41 @@ mod tests {
         assert_eq!(hit_index(&theme, &c, area, 10, 1), Some(3)); // fin de la línea 0
         assert_eq!(hit_index(&theme, &c, area, 3, 2), Some(4)); // inicio de la línea 1
         assert_eq!(hit_index(&theme, &c, area, 5, 2), Some(6)); // antes de la «f»
+    }
+
+    #[test]
+    fn classic_hit_follows_the_cursor_painted_last() {
+        let theme = Theme::test();
+        let mut c = Composer::new();
+        // Línea más ancha que el interior: el recorte horizontal sigue al cursor.
+        c.set_text("abcdefghijklmnopqrstuvwxyz0123456789");
+        let area = Rect::new(0, 0, 20, 5);
+        let _ = cursor_after_render(&c, area, &theme);
+        // Primera celda visible de la ventana pintada (prefijo de 2 columnas).
+        let first = hit_index(&theme, &c, area, 3, 1).unwrap();
+        assert!(first > 0, "el render recorta la línea alrededor del cursor");
+        // Movemos el cursor sin repintar: la ventana pintada no debe cambiar.
+        c.set_cursor(0);
+        for col in 0..15 {
+            assert_eq!(
+                hit_index(&theme, &c, area, 3 + col, 1),
+                Some(first + usize::from(col)),
+                "la celda {col} debe corresponder a lo último pintado"
+            );
+        }
+    }
+
+    #[test]
+    fn crush_hit_follows_the_layout_painted_last() {
+        let theme = Theme::preset(crate::widgets::ThemePreset::Crush);
+        let mut c = Composer::new();
+        // Con el cursor al final de una fila llena, el layout añade una fila propia.
+        c.set_text("abcd");
+        let area = Rect::new(0, 0, 6, 3);
+        let _ = cursor_after_render(&c, area, &theme);
+        c.set_cursor(0);
+        // La fila 1 es la del cursor pintado: su sangría de 2 celdas cae al final.
+        assert_eq!(hit_index(&theme, &c, area, 2, 1), Some(4));
     }
 
     #[test]

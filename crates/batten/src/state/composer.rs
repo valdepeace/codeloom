@@ -12,6 +12,10 @@ use unicode_width::UnicodeWidthStr;
 /// `view_top` es estado de vista, no de edición: la fila superior visible que
 /// dejó el último render (filas visuales en Crush, líneas lógicas en Classic).
 /// Va en una `Cell` para que el render la actualice con `&Composer`.
+///
+/// `painted` guarda el cursor con el que se pintó por última vez. La traducción
+/// de una celda a un índice (`hit_index`) debe usar esa misma geometría y no el
+/// cursor vivo: durante un arrastre el cursor se mueve antes del siguiente repintado.
 #[derive(Debug, Default)]
 pub struct Composer {
     buf: String,
@@ -19,6 +23,7 @@ pub struct Composer {
     preferred_col: Option<usize>,
     anchor: Option<usize>,
     view_top: Cell<usize>,
+    painted: Cell<Option<usize>>,
 }
 
 impl Composer {
@@ -35,6 +40,23 @@ impl Composer {
     /// que un valor fuera de rango no provoca un desplazamiento incorrecto.
     pub fn set_view_top(&self, top: usize) {
         self.view_top.set(top);
+    }
+
+    /// Recuerda que el render acaba de pintar con el cursor actual.
+    pub fn mark_painted(&self) {
+        self.painted.set(Some(self.cursor()));
+    }
+
+    /// Cursor (en grafemas) con el que se pintó por última vez. Sin ningún
+    /// pintado previo, equivale al cursor actual.
+    pub fn painted_cursor(&self) -> usize {
+        self.painted.get().unwrap_or_else(|| self.cursor())
+    }
+
+    /// Fila lógica que contiene el grafema `pos` (los saltos de línea cuentan
+    /// para la fila en la que quedan, como en `row_of_cursor`).
+    pub fn row_of_grapheme(&self, pos: usize) -> usize {
+        self.buf[..self.grapheme_to_byte(pos)].matches('\n').count()
     }
 
     /// Convierte un índice de grafema en índice de byte. Posiciones fuera de

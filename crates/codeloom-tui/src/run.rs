@@ -4,7 +4,7 @@ use crate::frame::{FrameScheduler, Urgency, MIN_FRAME};
 use crate::render::render;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
+    KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -153,6 +153,15 @@ pub fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Option<St
         .is_some_and(|text| text != app.composer.text())
     {
         app.slash_dismissed = None;
+    }
+    // Ctrl+C con una selección del composer la copia y no sale. Sin selección,
+    // conserva su salida de siempre.
+    if code == KeyCode::Char('c')
+        && mods.contains(KeyModifiers::CONTROL)
+        && app.composer.selection().is_some()
+    {
+        app.copy_composer_selection();
+        return None;
     }
     if matches!(code, KeyCode::Char('c' | 'q')) && mods.contains(KeyModifiers::CONTROL) {
         app.should_quit = true;
@@ -320,6 +329,13 @@ pub fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Option<St
     // pregunta en vez de contar para la salida por doble Esc.
     let question_has_keys = app.question.is_some() && app.permission.is_none();
     if code == KeyCode::Esc && !question_has_keys {
+        // Con una selección del composer, Esc solo la limpia y no cuenta para la
+        // doble Esc que sale de la aplicación.
+        if app.composer.selection().is_some() && app.permission.is_none() {
+            app.composer.clear_selection();
+            app.last_escape = None;
+            return None;
+        }
         if app.queue_open {
             app.queue_open = false;
             return None;
@@ -482,6 +498,31 @@ pub fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Option<St
         }
         KeyCode::Delete => {
             app.delete();
+            None
+        }
+        // Shift+flechas y Shift+Inicio/Fin amplían la selección del composer.
+        KeyCode::Left if mods.contains(KeyModifiers::SHIFT) => {
+            app.composer.extend_left();
+            None
+        }
+        KeyCode::Right if mods.contains(KeyModifiers::SHIFT) => {
+            app.composer.extend_right();
+            None
+        }
+        KeyCode::Up if mods.contains(KeyModifiers::SHIFT) => {
+            app.composer.extend_up();
+            None
+        }
+        KeyCode::Down if mods.contains(KeyModifiers::SHIFT) => {
+            app.composer.extend_down();
+            None
+        }
+        KeyCode::Home if mods.contains(KeyModifiers::SHIFT) => {
+            app.composer.extend_home();
+            None
+        }
+        KeyCode::End if mods.contains(KeyModifiers::SHIFT) => {
+            app.composer.extend_end();
             None
         }
         KeyCode::Left => {
@@ -694,6 +735,10 @@ fn toggle_provider(app: &mut App) {
 
 /// Aplica un evento de terminal. Devuelve el prompt a enviar, si lo hay.
 pub fn handle_event(app: &mut App, ev: Event) -> Option<String> {
+    // Teclado y pegado pueden cambiar el texto: cualquiera anula el arrastre en curso.
+    if matches!(ev, Event::Key(_) | Event::Paste(_)) {
+        app.mouse_drag = None;
+    }
     match ev {
         Event::Key(k) if k.kind == KeyEventKind::Press => handle_key(app, k.code, k.modifiers),
         Event::Key(k)
@@ -738,8 +783,19 @@ pub fn handle_event(app: &mut App, ev: Event) -> Option<String> {
             match mouse.kind {
                 MouseEventKind::ScrollUp => app.viewport.scroll_up(3),
                 MouseEventKind::ScrollDown => app.viewport.scroll_down(3),
+                MouseEventKind::Down(MouseButton::Left) => app.mouse_down(mouse.column, mouse.row),
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    app.mouse_drag_to(mouse.column, mouse.row);
+                }
+                MouseEventKind::Up(MouseButton::Left) => app.mouse_up(),
                 _ => {}
             }
+            None
+        }
+        // Con un diálogo abierto el ratón no llega a la interfaz: un arrastre
+        // pendiente se descarta para que no sobreviva al diálogo.
+        Event::Mouse(_) => {
+            app.mouse_drag = None;
             None
         }
         Event::Paste(text)
@@ -1304,6 +1360,257 @@ mod tests {
             );
         }
         assert_eq!(app.composer.text().len(), 2000);
+    }
+
+    /// Pinta la aplicación una vez en un terminal de prueba para que registre
+    /// sus ventanas (`pane_rects`) y el área del composer.
+    fn paint(app: &mut App) {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| render(f, app)).unwrap();
+    }
+
+    fn mouse_event(app: &mut App, kind: crossterm::event::MouseEventKind, x: u16, y: u16) {
+        use crossterm::event::MouseEvent;
+        handle_event(
+            app,
+            Event::Mouse(MouseEvent {
+                kind,
+                column: x,
+                row: y,
+                modifiers: KeyModifiers::NONE,
+            }),
+        );
+    }
+
+    /// Celda (x, y) de la primera línea del composer Classic, en la columna `col`
+    /// del texto (el prefijo ocupa dos celdas tras el borde).
+    fn composer_cell(app: &App, col: u16) -> (u16, u16) {
+        let area = app
+            .composer_area
+            .expect("el composer se registra al pintar");
+        (area.x + 1 + 2 + col, area.y + 1)
+    }
+
+    #[test]
+    fn click_in_the_composer_moves_the_cursor_and_focuses_it() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = App::new();
+        app.composer.set_text("hello world");
+        app.focus = Focus::Transcript;
+        paint(&mut app);
+        let (x, y) = composer_cell(&app, 4);
+        mouse_event(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
+        assert_eq!(app.focus, Focus::Composer);
+        assert_eq!(app.composer.cursor(), 4);
+        assert_eq!(app.composer.selection(), None);
+    }
+
+    #[test]
+    fn click_in_another_pane_changes_focus_and_does_not_select() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = App::new();
+        app.composer.set_text("hello world");
+        app.composer.set_cursor(3);
+        paint(&mut app);
+        let transcript = app
+            .pane_rects
+            .iter()
+            .find(|(pane, _)| *pane == Focus::Transcript)
+            .map(|(_, area)| *area)
+            .expect("el transcript se registra");
+        mouse_event(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            transcript.x + 2,
+            transcript.y + 2,
+        );
+        mouse_event(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            transcript.x + 4,
+            transcript.y + 2,
+        );
+        mouse_event(
+            &mut app,
+            MouseEventKind::Up(MouseButton::Left),
+            transcript.x + 4,
+            transcript.y + 2,
+        );
+        assert_eq!(app.focus, Focus::Transcript);
+        assert_eq!(app.composer.cursor(), 3);
+        assert_eq!(app.composer.selection(), None);
+        assert!(app.clipboard.is_none());
+    }
+
+    #[test]
+    fn drag_in_the_composer_selects_text() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = App::new();
+        app.composer.set_text("hello world");
+        paint(&mut app);
+        let (x0, y) = composer_cell(&app, 0);
+        let (x5, _) = composer_cell(&app, 5);
+        mouse_event(&mut app, MouseEventKind::Down(MouseButton::Left), x0, y);
+        mouse_event(&mut app, MouseEventKind::Drag(MouseButton::Left), x5, y);
+        assert_eq!(app.composer.selection(), Some((0, 5)));
+        assert_eq!(app.composer.selected_text(), Some("hello"));
+    }
+
+    #[test]
+    fn drag_outside_the_composer_is_clamped_to_it() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = App::new();
+        app.composer.set_text("hello world");
+        paint(&mut app);
+        let (x6, y) = composer_cell(&app, 6);
+        mouse_event(&mut app, MouseEventKind::Down(MouseButton::Left), x6, y);
+        // Hacia arriba y a la izquierda: se acota al inicio del texto.
+        mouse_event(&mut app, MouseEventKind::Drag(MouseButton::Left), 0, 0);
+        assert_eq!(app.composer.selected_text(), Some("hello "));
+        // Hacia abajo y a la derecha, muy lejos: se acota al final del texto.
+        mouse_event(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            u16::MAX,
+            u16::MAX,
+        );
+        assert_eq!(app.composer.selected_text(), Some("world"));
+    }
+
+    #[test]
+    fn release_copies_the_selection_to_the_clipboard() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = App::new();
+        app.composer.set_text("hello world");
+        paint(&mut app);
+        let (x0, y) = composer_cell(&app, 0);
+        let (x5, _) = composer_cell(&app, 5);
+        mouse_event(&mut app, MouseEventKind::Down(MouseButton::Left), x0, y);
+        mouse_event(&mut app, MouseEventKind::Drag(MouseButton::Left), x5, y);
+        assert!(app.clipboard.is_none(), "copiar solo al soltar");
+        mouse_event(&mut app, MouseEventKind::Up(MouseButton::Left), x5, y);
+        assert_eq!(app.clipboard.as_deref(), Some("hello"));
+        assert_eq!(app.slash_feedback.as_deref(), Some("Copied 5 chars"));
+    }
+
+    #[test]
+    fn click_without_drag_copies_nothing() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = App::new();
+        app.composer.set_text("hello world");
+        paint(&mut app);
+        let (x, y) = composer_cell(&app, 3);
+        mouse_event(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
+        mouse_event(&mut app, MouseEventKind::Up(MouseButton::Left), x, y);
+        assert!(app.clipboard.is_none());
+        assert_eq!(app.slash_feedback, None);
+    }
+
+    #[test]
+    fn shift_arrows_extend_the_selection() {
+        let mut app = App::new();
+        app.composer.set_text("abc");
+        handle_key(&mut app, KeyCode::Left, KeyModifiers::SHIFT);
+        handle_key(&mut app, KeyCode::Left, KeyModifiers::SHIFT);
+        assert_eq!(app.composer.selected_text(), Some("bc"));
+        handle_key(&mut app, KeyCode::Home, KeyModifiers::SHIFT);
+        assert_eq!(app.composer.selected_text(), Some("abc"));
+
+        let mut app = App::new();
+        app.composer.set_text("abc");
+        app.composer.set_cursor(0);
+        handle_key(&mut app, KeyCode::End, KeyModifiers::SHIFT);
+        assert_eq!(app.composer.selected_text(), Some("abc"));
+        handle_key(&mut app, KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(
+            app.composer.selection(),
+            None,
+            "sin Shift, el movimiento limpia"
+        );
+    }
+
+    #[test]
+    fn ctrl_c_with_selection_copies_and_does_not_quit() {
+        let mut app = App::new();
+        app.composer.set_text("abc");
+        app.composer.select_range(0, 2);
+        handle_key(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(!app.should_quit);
+        assert_eq!(app.clipboard.as_deref(), Some("ab"));
+    }
+
+    #[test]
+    fn ctrl_c_without_selection_keeps_its_behavior() {
+        let mut app = App::new();
+        app.composer.set_text("abc");
+        handle_key(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(app.should_quit);
+        assert!(app.clipboard.is_none());
+    }
+
+    #[test]
+    fn esc_with_selection_clears_it_and_does_not_count_for_double_esc() {
+        let mut app = App::new();
+        app.composer.set_text("abc");
+        app.composer.select_range(0, 2);
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.composer.selection(), None);
+        assert_eq!(app.last_escape, None);
+        assert!(!app.should_quit);
+        // La primera Esc sin selección cuenta, pero no basta para salir.
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!app.should_quit);
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn mouse_is_ignored_while_a_dialog_is_open() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = App::new();
+        app.composer.set_text("hello world");
+        app.composer.set_cursor(2);
+        app.focus = Focus::Transcript;
+        paint(&mut app);
+        let _reply = open_dialog(&mut app);
+        let (x, y) = composer_cell(&app, 6);
+        mouse_event(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
+        mouse_event(&mut app, MouseEventKind::Drag(MouseButton::Left), x + 3, y);
+        mouse_event(&mut app, MouseEventKind::Up(MouseButton::Left), x + 3, y);
+        assert_eq!(app.focus, Focus::Transcript);
+        assert_eq!(app.composer.cursor(), 2);
+        assert_eq!(app.composer.selection(), None);
+        assert!(app.clipboard.is_none());
+    }
+
+    #[test]
+    fn typing_after_selecting_replaces_the_selected_text() {
+        let mut app = App::new();
+        app.composer.set_text("hello world");
+        app.composer.select_range(0, 5);
+        handle_key(&mut app, KeyCode::Char('X'), KeyModifiers::NONE);
+        assert_eq!(app.composer.text(), "X world");
+        assert_eq!(app.composer.selection(), None);
+    }
+
+    #[test]
+    fn typing_during_a_drag_cancels_it() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = App::new();
+        app.composer.set_text("hello world");
+        paint(&mut app);
+        let (x0, y) = composer_cell(&app, 0);
+        let (x5, _) = composer_cell(&app, 5);
+        mouse_event(&mut app, MouseEventKind::Down(MouseButton::Left), x0, y);
+        handle_event(
+            &mut app,
+            Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Char('x'),
+                KeyModifiers::NONE,
+            )),
+        );
+        mouse_event(&mut app, MouseEventKind::Drag(MouseButton::Left), x5, y);
+        assert_eq!(app.composer.selection(), None);
     }
 
     #[test]

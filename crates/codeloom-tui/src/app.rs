@@ -1,4 +1,5 @@
 use crate::permission_flow::{dialog_for, spec_for, PermissionReply, QuestionReply};
+use batten::widgets::composer::hit_index;
 use codeloom_core::config::{CodeLoomConfig, ProviderKind};
 use codeloom_core::event::LiveEvent;
 use codeloom_core::message::{ContentPart, Message, Role};
@@ -265,6 +266,9 @@ pub struct App {
     pub pane_rects: Vec<(Focus, Rect)>,
     /// Área del composer del último fotograma, si se pintó.
     pub composer_area: Option<Rect>,
+    /// Ancla (en grafemas) del arrastre de ratón en curso dentro del composer.
+    /// `None` si no hay arrastre; cualquier tecla o pegado lo anula.
+    pub mouse_drag: Option<usize>,
     /// Líneas seleccionadas del transcript, si hay.
     pub selection: Option<batten::state::Selection>,
     /// Texto pendiente de enviar al portapapeles (lo consume el bucle).
@@ -454,6 +458,7 @@ impl App {
             focus: Focus::Composer,
             pane_rects: Vec::new(),
             composer_area: None,
+            mouse_drag: None,
             selection: None,
             clipboard: None,
             queued: 0,
@@ -859,6 +864,65 @@ impl App {
             .iter()
             .find(|(_, area)| rect_contains(*area, x, y))
             .map(|(pane, _)| *pane)
+    }
+
+    /// Copia la selección del composer al portapapeles (lo vuelca el bucle con
+    /// OSC 52) y avisa del número de caracteres. Devuelve `false` sin selección.
+    pub fn copy_composer_selection(&mut self) -> bool {
+        let Some(text) = self.composer.selected_text() else {
+            return false;
+        };
+        let chars = text.chars().count();
+        self.clipboard = Some(text.to_owned());
+        self.slash_feedback = Some(format!("Copied {chars} chars"));
+        true
+    }
+
+    /// Pulsación del botón izquierdo. Dirige el foco a la ventana pulsada; en el
+    /// composer coloca el cursor y queda listo para arrastrar. Fuera de cualquier
+    /// ventana no hace nada, y en otra ventana anula el arrastre en curso.
+    pub fn mouse_down(&mut self, x: u16, y: u16) {
+        let Some(pane) = self.pane_at(x, y) else {
+            self.mouse_drag = None;
+            return;
+        };
+        self.focus = pane;
+        let area = self.composer_area.filter(|_| pane == Focus::Composer);
+        let Some(area) = area else {
+            self.mouse_drag = None;
+            return;
+        };
+        match hit_index(&self.theme, &self.composer, area, x, y) {
+            Some(index) => {
+                self.composer.set_cursor(index);
+                self.mouse_drag = Some(index);
+            }
+            None => self.mouse_drag = None,
+        }
+    }
+
+    /// Arrastre con el botón izquierdo: selecciona desde el ancla hasta la celda,
+    /// acotada al área del composer. Sin arrastre en curso, no hace nada.
+    pub fn mouse_drag_to(&mut self, x: u16, y: u16) {
+        let (Some(anchor), Some(area)) = (self.mouse_drag, self.composer_area) else {
+            return;
+        };
+        if area.is_empty() {
+            return;
+        }
+        let x = x.clamp(area.x, area.right() - 1);
+        let y = y.clamp(area.y, area.bottom() - 1);
+        if let Some(head) = hit_index(&self.theme, &self.composer, area, x, y) {
+            self.composer.select_range(anchor, head);
+        }
+    }
+
+    /// Soltar el botón. Solo si hubo un arrastre que empezó en el composer se
+    /// copia la selección: un clic simple no copia nada.
+    pub fn mouse_up(&mut self) {
+        if self.mouse_drag.take().is_some() {
+            self.copy_composer_selection();
+        }
     }
 
     /// Encola una petición; si no hay diálogo abierto, la muestra ya.
