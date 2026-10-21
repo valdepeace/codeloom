@@ -1,8 +1,9 @@
-use crate::app::App;
+use crate::app::{App, Focus};
 use crate::rail;
 use batten::widgets::{ChromeStyle, LayoutStyle};
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::Modifier;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
@@ -149,7 +150,8 @@ fn draw_flat_footer(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(line), area);
 }
 
-fn draw_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
+fn draw_transcript(frame: &mut Frame, area: Rect, app: &mut App, panes: &mut Vec<(Focus, Rect)>) {
+    panes.push((Focus::Transcript, area));
     // El chrome `Flat` no usa caja: el chat ocupa el área con un margen de una columna.
     let flat = app.theme.look.chrome == ChromeStyle::Flat;
     let inner = if flat {
@@ -215,6 +217,8 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
         Constraint::Length(composer_height),
     ])
     .split(inner);
+    app.composer_area = Some(rows[4]);
+    panes.push((Focus::Composer, rows[4]));
     if !flat {
         frame.render_widget(
             Paragraph::new(Line::from(vec![
@@ -290,13 +294,22 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
-fn draw_workspace_metrics(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_workspace_metrics(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    panes: &mut Vec<(Focus, Rect)>,
+) {
     let rows = Layout::vertical([
         Constraint::Length(6),
         Constraint::Length(5),
         Constraint::Min(3),
     ])
     .split(area);
+    // «Token usage» (rows[1]) pertenece a la misma ventana Agent.
+    panes.push((Focus::Agent, rows[0]));
+    panes.push((Focus::Agent, rows[1]));
+    panes.push((Focus::Activity, rows[2]));
     let (agent_info, agent_tone) = if app.status.starts_with("error:") {
         ("error", batten::state::Tone::Error)
     } else if app.status == "working" {
@@ -386,7 +399,13 @@ fn draw_workspace_metrics(frame: &mut Frame, area: Rect, app: &App) {
     batten::widgets::queue::render_pawan(frame, activity, &entries, app.animation.frame);
 }
 
-fn draw_workspace_sidebar(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_workspace_sidebar(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    panes: &mut Vec<(Focus, Rect)>,
+) {
+    panes.push((Focus::Sidebar, area));
     let changes_height = if app.changes.is_empty() {
         0
     } else {
@@ -873,9 +892,82 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+/// Glifos de borde que el indicador de foco recolorea (nunca el texto del título).
+const BORDER_GLYPHS: [&str; 6] = ["─", "│", "╭", "╮", "╰", "╯"];
+
+/// Recolorea con el acento del tema el borde de la celda (x, y), si lo es.
+fn recolor_border_cell(buf: &mut Buffer, x: u16, y: u16, accent: Style) {
+    if let Some(cell) = buf.cell_mut((x, y)) {
+        if BORDER_GLYPHS.contains(&cell.symbol()) {
+            cell.set_style(accent);
+        }
+    }
+}
+
+/// Recolorea el borde izquierdo de una ventana (sidebar y rail solo tienen ese).
+fn recolor_left_edge(buf: &mut Buffer, area: Rect, accent: Style) {
+    for y in area.top()..area.bottom() {
+        if let Some(cell) = buf.cell_mut((area.left(), y)) {
+            if cell.symbol() == "│" {
+                cell.set_style(accent);
+            }
+        }
+    }
+}
+
+/// Recolorea el marco completo de una ventana con caja.
+fn recolor_frame(buf: &mut Buffer, area: Rect, accent: Style) {
+    if area.width < 2 || area.height < 2 {
+        return;
+    }
+    let (left, right) = (area.left(), area.right() - 1);
+    let (top, bottom) = (area.top(), area.bottom() - 1);
+    for x in left..=right {
+        recolor_border_cell(buf, x, top, accent);
+        recolor_border_cell(buf, x, bottom, accent);
+    }
+    for y in top..=bottom {
+        recolor_border_cell(buf, left, y, accent);
+        recolor_border_cell(buf, right, y, accent);
+    }
+}
+
+/// Marca con un filete de acento la columna de margen de una ventana sin caja.
+fn mark_margin(buf: &mut Buffer, area: Rect, accent: Style) {
+    for y in area.top()..area.bottom() {
+        if let Some(cell) = buf.cell_mut((area.left(), y)) {
+            cell.set_symbol("▎");
+            cell.set_style(accent);
+        }
+    }
+}
+
+/// Indicador de foco: resalta la ventana con `app.focus`. El composer no se
+/// marca, porque ya muestra su propio cursor. Con el chrome `Flat` (Crush) no
+/// hay caja: el margen del transcript recibe un filete y el rail recolorea su
+/// borde izquierdo.
+fn mark_focused_panes(frame: &mut Frame, panes: &[(Focus, Rect)], app: &App, flat: bool) {
+    let accent = app.theme.styles.accent;
+    let buf = frame.buffer_mut();
+    for (pane, area) in panes {
+        if *pane != app.focus || *pane == Focus::Composer || area.is_empty() {
+            continue;
+        }
+        match pane {
+            Focus::Sidebar | Focus::Rail => recolor_left_edge(buf, *area, accent),
+            _ if flat => mark_margin(buf, *area, accent),
+            _ => recolor_frame(buf, *area, accent),
+        }
+    }
+}
+
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     app.matrix_rain.render(frame, area);
+    // El mapa de ventanas reutiliza el mismo `Vec` en cada fotograma.
+    let mut panes = std::mem::take(&mut app.pane_rects);
+    panes.clear();
+    app.composer_area = None;
     let flat = app.theme.look.chrome == ChromeStyle::Flat;
     let rows = Layout::vertical([
         Constraint::Length(if flat { 1 } else { 2 }),
@@ -893,10 +985,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         if rows[1].width >= 80 && !app.rail_hidden {
             let [chat, context] =
                 Layout::horizontal([Constraint::Min(1), Constraint::Length(32)]).areas(rows[1]);
-            draw_transcript(frame, chat, app);
+            draw_transcript(frame, chat, app, &mut panes);
             rail::draw_context_rail(frame, context, app);
+            panes.push((Focus::Rail, context));
         } else {
-            draw_transcript(frame, rows[1], app);
+            draw_transcript(frame, rows[1], app, &mut panes);
         }
     } else if rows[1].width >= 105 {
         let [left, center, right] = Layout::horizontal([
@@ -905,24 +998,26 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             Constraint::Length(30),
         ])
         .areas(rows[1]);
-        draw_workspace_sidebar(frame, left, app);
-        draw_transcript(frame, center, app);
-        draw_workspace_metrics(frame, right, app);
+        draw_workspace_sidebar(frame, left, app, &mut panes);
+        draw_transcript(frame, center, app, &mut panes);
+        draw_workspace_metrics(frame, right, app, &mut panes);
     } else if rows[1].width >= 68 {
         if app.sidebar_expanded {
             let [left, center] =
                 Layout::horizontal([Constraint::Length(23), Constraint::Min(1)]).areas(rows[1]);
-            draw_workspace_sidebar(frame, left, app);
-            draw_transcript(frame, center, app);
+            draw_workspace_sidebar(frame, left, app, &mut panes);
+            draw_transcript(frame, center, app, &mut panes);
         } else {
             let [center, right] =
                 Layout::horizontal([Constraint::Min(1), Constraint::Length(28)]).areas(rows[1]);
-            draw_transcript(frame, center, app);
-            draw_workspace_metrics(frame, right, app);
+            draw_transcript(frame, center, app, &mut panes);
+            draw_workspace_metrics(frame, right, app, &mut panes);
         }
     } else {
-        draw_transcript(frame, rows[1], app);
+        draw_transcript(frame, rows[1], app, &mut panes);
     }
+    mark_focused_panes(frame, &panes, app, flat);
+    app.pane_rects = panes;
     if flat {
         draw_flat_footer(frame, rows[2], app);
     } else {
@@ -1790,5 +1885,94 @@ mod tests {
         let content = buffer_of(&mut app, 120, 40);
         assert!(content.contains("… +12 more"));
         assert!(!content.contains("tarea 20"));
+    }
+
+    /// Renderiza y devuelve el terminal, para inspeccionar celdas concretas.
+    fn terminal_of(app: &mut App, w: u16, h: u16) -> Terminal<TestBackend> {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| render(f, app)).unwrap();
+        term
+    }
+
+    /// Rectángulo registrado en el último fotograma para una ventana.
+    fn rect_of(app: &App, pane: Focus) -> Rect {
+        app.pane_rects
+            .iter()
+            .find(|(p, _)| *p == pane)
+            .map(|(_, r)| *r)
+            .unwrap_or_else(|| panic!("falta la ventana {pane:?}"))
+    }
+
+    #[test]
+    fn render_records_pane_rects_classic_wide() {
+        let mut app = App::new();
+        let _ = terminal_of(&mut app, 120, 40);
+        let panes: Vec<Focus> = app.pane_rects.iter().map(|(p, _)| *p).collect();
+        for pane in [
+            Focus::Sidebar,
+            Focus::Transcript,
+            Focus::Agent,
+            Focus::Activity,
+            Focus::Composer,
+        ] {
+            assert!(panes.contains(&pane), "falta {pane:?}");
+        }
+        assert!(!panes.contains(&Focus::Rail));
+        assert_eq!(app.composer_area, Some(rect_of(&app, Focus::Composer)));
+    }
+
+    #[test]
+    fn render_records_pane_rects_crush_with_and_without_rail() {
+        let mut app = crush_ctx();
+        let _ = terminal_of(&mut app, 120, 40);
+        let panes: Vec<Focus> = app.pane_rects.iter().map(|(p, _)| *p).collect();
+        assert!(panes.contains(&Focus::Rail));
+        assert!(panes.contains(&Focus::Transcript));
+        assert!(panes.contains(&Focus::Composer));
+        assert!(!panes.contains(&Focus::Sidebar));
+        assert!(!panes.contains(&Focus::Agent) && !panes.contains(&Focus::Activity));
+        // Sin ancho para el rail, el mapa se reescribe y ya no lo lista.
+        let _ = terminal_of(&mut app, 70, 24);
+        let panes: Vec<Focus> = app.pane_rects.iter().map(|(p, _)| *p).collect();
+        assert!(!panes.contains(&Focus::Rail));
+        assert!(panes.contains(&Focus::Transcript) && panes.contains(&Focus::Composer));
+    }
+
+    #[test]
+    fn focused_panel_border_uses_the_accent_style() {
+        let mut app = App::new();
+        let _ = terminal_of(&mut app, 120, 40);
+        let agent = rect_of(&app, Focus::Agent);
+        let edge = (agent.x, agent.y + 1);
+        let accent = app.theme.styles.accent.fg.expect("el acento tiene color");
+
+        let unfocused = terminal_of(&mut app, 120, 40);
+        assert_ne!(unfocused.backend().buffer()[edge].fg, accent);
+
+        app.focus = Focus::Agent;
+        let focused = terminal_of(&mut app, 120, 40);
+        assert_eq!(focused.backend().buffer()[edge].fg, accent);
+    }
+
+    #[test]
+    fn focused_rail_marks_its_edge_in_crush() {
+        let mut app = crush_ctx();
+        let _ = terminal_of(&mut app, 120, 40);
+        let rail = rect_of(&app, Focus::Rail);
+        let accent = app.theme.styles.accent.fg.expect("el acento tiene color");
+        app.focus = Focus::Rail;
+        let term = terminal_of(&mut app, 120, 40);
+        assert_eq!(term.backend().buffer()[(rail.x, rail.y + 1)].fg, accent);
+    }
+
+    #[test]
+    fn crush_transcript_focus_marks_the_margin_column() {
+        let mut app = crush_ctx();
+        let _ = terminal_of(&mut app, 120, 40);
+        let transcript = rect_of(&app, Focus::Transcript);
+        app.focus = Focus::Transcript;
+        let term = terminal_of(&mut app, 120, 40);
+        let cell = &term.backend().buffer()[(transcript.x, transcript.y + 1)];
+        assert_eq!(cell.symbol(), "▎");
     }
 }

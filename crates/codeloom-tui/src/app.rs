@@ -5,6 +5,7 @@ use codeloom_core::message::{ContentPart, Message, Role};
 use codeloom_core::permission::{Decision, PermissionRequest};
 use codeloom_core::question::{Answer, Question};
 use codeloom_core::session::{SessionId, SessionInfo};
+use ratatui::layout::Rect;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -17,6 +18,32 @@ pub enum Focus {
     #[default]
     Composer,
     Transcript,
+    /// Panel lateral izquierdo (look Classic, si se pinta).
+    Sidebar,
+    /// Panel «Agent» de métricas; «Token usage» comparte esta ventana.
+    Agent,
+    /// Panel «Activity» de herramientas (look Classic).
+    Activity,
+    /// Rail derecho del look Crush.
+    Rail,
+}
+
+impl Focus {
+    /// Ventanas laterales: no escriben, y una tecla imprimible las devuelve al composer.
+    pub fn is_side_pane(self) -> bool {
+        matches!(
+            self,
+            Focus::Sidebar | Focus::Agent | Focus::Activity | Focus::Rail
+        )
+    }
+}
+
+/// `true` si la celda (x, y) cae dentro del rectángulo (bordes derecho e inferior excluidos).
+fn rect_contains(area: Rect, x: u16, y: u16) -> bool {
+    x >= area.x
+        && y >= area.y
+        && u32::from(x) < u32::from(area.x) + u32::from(area.width)
+        && u32::from(y) < u32::from(area.y) + u32::from(area.height)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -233,6 +260,11 @@ pub struct App {
     pub viewport: batten::state::Viewport,
     pub layout: batten::widgets::transcript::Layout,
     pub focus: Focus,
+    /// Ventanas del último fotograma, en orden de pintado. `render` lo reescribe
+    /// en cada frame reutilizando el mismo `Vec`.
+    pub pane_rects: Vec<(Focus, Rect)>,
+    /// Área del composer del último fotograma, si se pintó.
+    pub composer_area: Option<Rect>,
     /// Líneas seleccionadas del transcript, si hay.
     pub selection: Option<batten::state::Selection>,
     /// Texto pendiente de enviar al portapapeles (lo consume el bucle).
@@ -420,6 +452,8 @@ impl App {
             viewport: batten::state::Viewport::new(),
             layout: batten::widgets::transcript::Layout::new(),
             focus: Focus::Composer,
+            pane_rects: Vec::new(),
+            composer_area: None,
             selection: None,
             clipboard: None,
             queued: 0,
@@ -802,12 +836,29 @@ impl App {
         self.session_picker_return_to_chat = false;
     }
 
-    /// Alterna el foco entre composer y transcript.
+    /// Alterna el foco entre composer y transcript. Desde un panel lateral, Tab
+    /// devuelve el foco al composer.
     pub fn toggle_focus(&mut self) {
         self.focus = match self.focus {
             Focus::Composer => Focus::Transcript,
             Focus::Transcript => Focus::Composer,
+            _ => Focus::Composer,
         };
+    }
+
+    /// Ventana bajo la celda (x, y) del último fotograma. El composer tiene
+    /// prioridad sobre el transcript, cuya área lo contiene.
+    pub fn pane_at(&self, x: u16, y: u16) -> Option<Focus> {
+        if self
+            .composer_area
+            .is_some_and(|area| rect_contains(area, x, y))
+        {
+            return Some(Focus::Composer);
+        }
+        self.pane_rects
+            .iter()
+            .find(|(_, area)| rect_contains(*area, x, y))
+            .map(|(pane, _)| *pane)
     }
 
     /// Encola una petición; si no hay diálogo abierto, la muestra ya.
@@ -3391,5 +3442,27 @@ mod tests {
             .as_deref()
             .unwrap()
             .starts_with("Mouse setting not saved"));
+    }
+
+    #[test]
+    fn pane_at_prefers_the_composer_over_the_transcript() {
+        let mut app = App::new();
+        let transcript = Rect::new(0, 0, 40, 20);
+        let composer = Rect::new(0, 15, 40, 5);
+        // El transcript va primero a propósito: el composer debe ganar igualmente.
+        app.pane_rects = vec![(Focus::Transcript, transcript), (Focus::Composer, composer)];
+        app.composer_area = Some(composer);
+        assert_eq!(app.pane_at(5, 16), Some(Focus::Composer));
+        assert_eq!(app.pane_at(5, 3), Some(Focus::Transcript));
+    }
+
+    #[test]
+    fn pane_at_returns_none_outside_any_pane() {
+        let mut app = App::new();
+        app.pane_rects = vec![(Focus::Transcript, Rect::new(0, 0, 40, 20))];
+        assert_eq!(app.pane_at(50, 3), None);
+        // Los bordes derecho e inferior quedan fuera del rectángulo.
+        assert_eq!(app.pane_at(40, 0), None);
+        assert_eq!(app.pane_at(3, 20), None);
     }
 }

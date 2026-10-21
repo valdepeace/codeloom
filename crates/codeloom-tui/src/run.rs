@@ -324,6 +324,13 @@ pub fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Option<St
             app.queue_open = false;
             return None;
         }
+        // Con foco en un panel lateral, Esc solo devuelve el foco al composer.
+        // No cuenta para la doble Esc que sale de la aplicación.
+        if app.focus.is_side_pane() && app.permission.is_none() {
+            app.focus = Focus::Composer;
+            app.last_escape = None;
+            return None;
+        }
         let now = Instant::now();
         if app
             .last_escape
@@ -440,6 +447,14 @@ pub fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Option<St
             app.sync_tool(&call_id);
         }
         return None;
+    }
+    // Una tecla imprimible con foco en un panel lateral devuelve el foco al
+    // composer, y el carácter se escribe en él a continuación.
+    if matches!(code, KeyCode::Char(_))
+        && !mods.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        && app.focus.is_side_pane()
+    {
+        app.focus = Focus::Composer;
     }
     if app.focus == Focus::Transcript {
         transcript_key(app, code);
@@ -2148,5 +2163,48 @@ mod tests {
             app.slash_feedback.as_deref(),
             Some("Mouse capture on (wheel scrolls)")
         );
+    }
+
+    #[test]
+    fn esc_returns_focus_from_side_panes_to_the_composer() {
+        let mut app = App::new();
+        app.focus = Focus::Sidebar;
+        assert_eq!(handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE), None);
+        assert_eq!(app.focus, Focus::Composer);
+        // Esc que solo devuelve el foco no cuenta para la doble Esc de salida.
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn printable_key_in_a_side_pane_refocuses_and_types() {
+        let mut app = App::new();
+        app.focus = Focus::Agent;
+        handle_key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+        assert_eq!(app.focus, Focus::Composer);
+        assert_eq!(app.composer.text(), "h");
+    }
+
+    #[test]
+    fn printable_key_with_a_dialog_open_does_not_refocus() {
+        let mut app = App::new();
+        app.focus = Focus::Activity;
+        let _rx = open_dialog(&mut app);
+        handle_key(&mut app, KeyCode::Char('z'), KeyModifiers::NONE);
+        assert_eq!(app.focus, Focus::Activity);
+        assert!(app.composer.is_empty());
+    }
+
+    #[test]
+    fn tab_still_cycles_composer_and_transcript_only() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(app.focus, Focus::Transcript);
+        handle_key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(app.focus, Focus::Composer);
+        // Desde un panel lateral, Tab vuelve al composer en vez de entrar en él.
+        app.focus = Focus::Rail;
+        handle_key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(app.focus, Focus::Composer);
     }
 }
