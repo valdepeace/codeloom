@@ -1,7 +1,7 @@
 //! Rail derecho de contexto del look Crush: modelo, ficheros, herramientas,
 //! jobs y subagentes de la sesión abierta.
 
-use crate::app::App;
+use crate::app::{AgentStats, App};
 use batten::state::ToolStatus;
 use codeloom_core::job::JobStatus;
 use codeloom_core::session::SubagentStatus;
@@ -11,6 +11,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
+use std::time::{Duration, Instant};
 
 /// Máximo de tareas mostradas; el resto se resume en una línea.
 const TODO_LIMIT: usize = 8;
@@ -34,12 +35,17 @@ pub fn draw_context_rail(frame: &mut Frame, area: Rect, app: &App) {
     if inner.is_empty() {
         return;
     }
-    frame.render_widget(Paragraph::new(rail_lines(app)), inner);
+    frame.render_widget(
+        Paragraph::new(rail_lines(app, usize::from(inner.width))),
+        inner,
+    );
 }
 
-/// Construye las líneas del rail. Cada lista se limita antes de construir
-/// sus líneas, así que el coste no crece con el número de elementos.
-fn rail_lines(app: &App) -> Vec<Line<'_>> {
+/// Construye las líneas del rail. `width` es la anchura útil del área interior
+/// y solo se usa para recortar las métricas de los subagentes. Cada lista se
+/// limita antes de construir sus líneas, así que el coste no crece con el
+/// número de elementos.
+fn rail_lines(app: &App, width: usize) -> Vec<Line<'_>> {
     let mut out: Vec<Line<'_>> = Vec::new();
 
     out.push(title("CODELOOM", app));
@@ -159,7 +165,9 @@ fn rail_lines(app: &App) -> Vec<Line<'_>> {
     let subagent_total = subagents().count();
     if subagent_total > 0 {
         push_gap(&mut out);
-        out.push(title("SUBAGENTS", app));
+        out.push(subagents_title(app));
+        // Un único `Instant::now()` por dibujado: el tiempo transcurrido de todos los hijos.
+        let ahora = Instant::now();
         for subagent in subagents().take(SUBAGENT_LIMIT) {
             let style = match subagent.status {
                 SubagentStatus::Running => app.theme.styles.tool_running,
@@ -176,6 +184,16 @@ fn rail_lines(app: &App) -> Vec<Line<'_>> {
                     .push(Span::styled(" ?", app.theme.styles.warning));
             }
             out.push(line);
+            // Segunda línea tenue con las métricas, solo si el hijo tiene estadísticas.
+            if let Some(stats) = app.agent_stats.get(&subagent.child.0) {
+                let metricas = metrics_line(stats, ahora, width.saturating_sub(2));
+                if !metricas.is_empty() {
+                    out.push(Line::from(Span::styled(
+                        format!("  {metricas}"),
+                        app.theme.styles.muted,
+                    )));
+                }
+            }
         }
         more(&mut out, subagent_total, SUBAGENT_LIMIT, app);
     }
@@ -194,6 +212,121 @@ fn title<'a>(text: &'a str, app: &App) -> Line<'a> {
 /// Línea con un glifo `●` del color indicado y la etiqueta.
 fn glyph_line<'a>(label: &'a str, style: Style) -> Line<'a> {
     Line::from(vec![Span::styled("● ", style), Span::raw(label)])
+}
+
+/// Título de SUBAGENTS. Con actividad o tokens acumulados añade el número de
+/// agentes en marcha y los totales de la jerarquía: `SUBAGENTS · 2 · 2k/400`.
+fn subagents_title(app: &App) -> Line<'static> {
+    let (input, output) = app.hierarchy_tokens();
+    let activos = app.active_agents();
+    let texto = if (input, output) != (0, 0) || activos > 0 {
+        format!(
+            "SUBAGENTS · {activos} · {}/{}",
+            format_tokens(input),
+            format_tokens(output)
+        )
+    } else {
+        "SUBAGENTS".to_owned()
+    };
+    Line::from(Span::styled(
+        texto,
+        app.theme.styles.accent.add_modifier(Modifier::BOLD),
+    ))
+}
+
+/// Cifra compacta de tokens: `999`, `1.2k`, `15k`, `1.5M`, `2G`. El redondeo es
+/// hacia abajo (`1_999` → `1.9k`). La decimal solo aparece con una cifra entera
+/// y es distinta de cero; a partir de diez se muestra solo la parte entera.
+pub fn format_tokens(n: u64) -> String {
+    if n < 1_000 {
+        return n.to_string();
+    }
+    let (unidad, divisor) = if n < 1_000_000 {
+        ('k', 1_000)
+    } else if n < 1_000_000_000 {
+        ('M', 1_000_000)
+    } else {
+        ('G', 1_000_000_000)
+    };
+    let entero = n / divisor;
+    if entero < 10 {
+        let decima = (n % divisor) / (divisor / 10);
+        if decima > 0 {
+            return format!("{entero}.{decima}{unidad}");
+        }
+    }
+    format!("{entero}{unidad}")
+}
+
+/// Tiempo transcurrido compacto: `7s`, `1m05s` (menos de una hora) o `1h01m`.
+pub fn format_elapsed(d: Duration) -> String {
+    let total = d.as_secs();
+    if total < 60 {
+        format!("{total}s")
+    } else if total < 3_600 {
+        format!("{}m{:02}s", total / 60, total % 60)
+    } else {
+        format!("{}h{:02}m", total / 3_600, (total % 3_600) / 60)
+    }
+}
+
+/// Línea de métricas de un subagente, p. ej. `2/5 read_file · 1.2k/300 · 7s`.
+/// Omite lo que no exista: el paso sin `max_steps`, la herramienta sin curso y
+/// los tokens y el tiempo sin `started_at`. Recorta por columnas, terminando en `…`.
+fn metrics_line(stats: &AgentStats, now: Instant, width: usize) -> String {
+    let mut grupos: Vec<String> = Vec::new();
+
+    let mut paso = Vec::new();
+    if stats.max_steps > 0 {
+        paso.push(format!("{}/{}", stats.step, stats.max_steps));
+    }
+    if let Some(tool) = &stats.tool {
+        paso.push(tool.clone());
+    }
+    if !paso.is_empty() {
+        grupos.push(paso.join(" "));
+    }
+
+    if let Some(inicio) = stats.started_at {
+        let fin = stats.finished_at.unwrap_or(now);
+        grupos.push(format!(
+            "{}/{}",
+            format_tokens(stats.input_tokens),
+            format_tokens(stats.output_tokens)
+        ));
+        grupos.push(format_elapsed(fin.saturating_duration_since(inicio)));
+    }
+
+    recortar(&grupos.join(" · "), width)
+}
+
+/// Anchura en columnas de `texto`, medida con la misma lógica que ratatui.
+fn anchura(texto: &str) -> usize {
+    Span::raw(texto).width()
+}
+
+/// Recorta `texto` para que ocupe como mucho `width` columnas. Si recorta, el
+/// último carácter visible es `…`, que cuenta como una columna.
+fn recortar(texto: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if anchura(texto) <= width {
+        return texto.to_owned();
+    }
+    let mut out = String::new();
+    let mut usado = 0;
+    let mut buf = [0u8; 4];
+    for c in texto.chars() {
+        let ancho = anchura(c.encode_utf8(&mut buf));
+        if usado + ancho > width - 1 {
+            break;
+        }
+        out.push(c);
+        usado += ancho;
+    }
+    out.push('…');
+    out
 }
 
 /// Resumen `… +n more` cuando la lista tiene más elementos que el límite.
@@ -278,5 +411,163 @@ mod tests {
             "falta la marca de espera: {review:?}"
         );
         assert!(!tests.contains(" ?"), "marca de espera de más: {tests:?}");
+    }
+
+    /// Estadísticas de un hijo con paso, herramienta y tokens; `started` fija el arranque.
+    fn stats(
+        step: usize,
+        max_steps: usize,
+        tool: Option<&str>,
+        input: u64,
+        output: u64,
+        started: Option<Instant>,
+    ) -> AgentStats {
+        AgentStats {
+            step,
+            max_steps,
+            tool: tool.map(str::to_owned),
+            input_tokens: input,
+            output_tokens: output,
+            started_at: started,
+            finished_at: None,
+        }
+    }
+
+    #[test]
+    fn format_tokens_scales() {
+        assert_eq!(format_tokens(0), "0");
+        assert_eq!(format_tokens(999), "999");
+        assert_eq!(format_tokens(1_200), "1.2k");
+        assert_eq!(format_tokens(1_999), "1.9k", "el redondeo es hacia abajo");
+        assert_eq!(format_tokens(9_999), "9.9k");
+        assert_eq!(format_tokens(15_000), "15k");
+        assert_eq!(
+            format_tokens(999_999),
+            "999k",
+            "el límite de k no se desborda"
+        );
+        assert_eq!(format_tokens(1_000_000), "1M");
+        assert_eq!(format_tokens(1_500_000), "1.5M");
+        assert_eq!(format_tokens(10_000_000), "10M");
+        assert_eq!(format_tokens(2_000_000_000), "2G");
+    }
+
+    #[test]
+    fn format_elapsed_scales() {
+        assert_eq!(format_elapsed(Duration::from_secs(0)), "0s");
+        assert_eq!(format_elapsed(Duration::from_secs(7)), "7s");
+        assert_eq!(format_elapsed(Duration::from_secs(59)), "59s");
+        assert_eq!(format_elapsed(Duration::from_secs(65)), "1m05s");
+        assert_eq!(format_elapsed(Duration::from_secs(3_599)), "59m59s");
+        assert_eq!(format_elapsed(Duration::from_secs(3_600)), "1h00m");
+        assert_eq!(format_elapsed(Duration::from_secs(3_700)), "1h01m");
+    }
+
+    #[test]
+    fn metrics_line_omits_missing_parts() {
+        let start = Instant::now();
+        let now = start + Duration::from_secs(7);
+
+        let full = stats(2, 5, Some("read_file"), 1_200, 300, Some(start));
+        assert_eq!(
+            metrics_line(&full, now, 80),
+            "2/5 read_file · 1.2k/300 · 7s"
+        );
+
+        let sin_paso = stats(0, 0, Some("read_file"), 1_200, 300, Some(start));
+        assert_eq!(
+            metrics_line(&sin_paso, now, 80),
+            "read_file · 1.2k/300 · 7s"
+        );
+
+        let sin_herramienta = stats(2, 5, None, 1_200, 300, Some(start));
+        assert_eq!(
+            metrics_line(&sin_herramienta, now, 80),
+            "2/5 · 1.2k/300 · 7s"
+        );
+
+        let sin_arranque = stats(2, 5, None, 1_200, 300, None);
+        assert_eq!(metrics_line(&sin_arranque, now, 80), "2/5");
+
+        let terminado = AgentStats {
+            finished_at: Some(start + Duration::from_secs(3)),
+            ..stats(2, 5, None, 0, 0, Some(start))
+        };
+        assert_eq!(metrics_line(&terminado, now, 80), "2/5 · 0/0 · 3s");
+    }
+
+    #[test]
+    fn metrics_line_truncates_to_width() {
+        let start = Instant::now();
+        let now = start + Duration::from_secs(7);
+        let herramienta = "t".repeat(50);
+        let largo = stats(2, 5, Some(&herramienta), 1_200, 300, Some(start));
+
+        let linea = metrics_line(&largo, now, 30);
+        assert!(linea.chars().count() <= 30, "supera la anchura: {linea:?}");
+        assert!(linea.ends_with('…'), "no acaba en elipsis: {linea:?}");
+    }
+
+    #[test]
+    fn rail_shows_metrics_second_line_for_a_subagent_with_stats() {
+        let mut app = App::new();
+        app.session_id = Some(SessionId(1));
+        app.subagents.insert(9, running(9, "review"));
+        app.subagents.insert(10, running(10, "tests"));
+        app.agent_stats.insert(
+            9,
+            stats(2, 5, Some("read_file"), 1_200, 300, Some(Instant::now())),
+        );
+
+        let rows = rows_of(&app, 40, 24);
+        let idx_review = rows
+            .iter()
+            .position(|row| row.contains("review"))
+            .expect("el rail lista el subagente review");
+        let idx_tests = rows
+            .iter()
+            .position(|row| row.contains("tests"))
+            .expect("el rail lista el subagente tests");
+        assert!(
+            rows[idx_review + 1].contains("2/5 read_file"),
+            "falta la línea de métricas bajo review: {:?}",
+            rows[idx_review + 1]
+        );
+        assert!(
+            !rows[idx_tests + 1].contains('·'),
+            "métricas bajo un subagente sin stats: {:?}",
+            rows[idx_tests + 1]
+        );
+    }
+
+    #[test]
+    fn rail_title_shows_hierarchy_totals() {
+        let mut app = App::new();
+        app.session_id = Some(SessionId(1));
+        app.subagents.insert(9, running(9, "review"));
+        app.subagents.insert(10, running(10, "tests"));
+        let now = Some(Instant::now());
+        app.agent_stats
+            .insert(9, stats(1, 0, None, 1_200, 300, now));
+        app.agent_stats.insert(10, stats(1, 0, None, 800, 100, now));
+
+        let rows = rows_of(&app, 40, 24);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("SUBAGENTS · 2 · 2k/400")),
+            "el título no muestra los totales: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn rail_without_subagents_is_unchanged() {
+        let mut app = App::new();
+        app.session_id = Some(SessionId(1));
+
+        let rows = rows_of(&app, 40, 24);
+        assert!(
+            !rows.iter().any(|row| row.contains("SUBAGENTS")),
+            "aparece la sección SUBAGENTS sin subagentes: {rows:?}"
+        );
     }
 }
