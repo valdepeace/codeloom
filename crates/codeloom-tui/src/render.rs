@@ -975,16 +975,86 @@ fn mark_focused_panes(frame: &mut Frame, panes: &[(Focus, Rect)], app: &App, fla
         }
         match pane {
             Focus::Sidebar | Focus::Rail => recolor_left_edge(buf, *area, accent),
+            // Con `Flat` el transcript no pinta filete: sus líneas por bloque ya marcan el foco.
+            Focus::Transcript if flat => {}
             _ if flat => mark_margin(buf, *area, accent),
             _ => recolor_frame(buf, *area, accent),
         }
     }
 }
 
+/// Color de la línea vertical de margen según el rol del bloque (el `LineKind`
+/// de su primera línea). `None` para los bloques sin rol visible: banner y sistema.
+fn rail_style(kind: batten::state::LineKind, app: &App) -> Option<Style> {
+    use batten::state::LineKind;
+    let styles = &app.theme.styles;
+    match kind {
+        LineKind::User => Some(styles.accent),
+        LineKind::Assistant | LineKind::Thinking => Some(styles.muted),
+        LineKind::Plan | LineKind::Todo => Some(styles.heading),
+        LineKind::Error => Some(styles.error),
+        LineKind::ToolCall
+        | LineKind::ToolResult
+        | LineKind::ToolHead(_)
+        | LineKind::ActivityHead(_)
+        | LineKind::TodoItem(_)
+        | LineKind::ToolBody
+        | LineKind::ToolMore => Some(styles.tool_name),
+        LineKind::System | LineKind::Banner => None,
+    }
+}
+
+/// Pinta una línea vertical en la columna de margen por cada bloque visible del
+/// transcript, coloreada con el rol de su primera línea. Solo con el chrome
+/// `Flat`. Recorre únicamente las entradas que caen en la vista y parchea sus
+/// celdas: no re-renderiza nada.
+fn mark_block_rails(frame: &mut Frame, app: &App, flat: bool) {
+    if !flat {
+        return;
+    }
+    let Some(area) = app
+        .transcript_area
+        .filter(|area| !area.is_empty() && area.x > 0)
+    else {
+        return;
+    };
+    let margin = area.x - 1;
+    let top = app.viewport.top();
+    let bottom = top + usize::from(area.height);
+    let Some((line, _)) = app.layout.line_at_row(top) else {
+        return;
+    };
+    let Some((first, _)) = app.transcript.locate(line) else {
+        return;
+    };
+    let buf = frame.buffer_mut();
+    for entry in first..app.transcript.entry_count() {
+        let first_line = app.transcript.entry_start(entry);
+        let start = app.layout.row_of(first_line);
+        if start >= bottom {
+            break;
+        }
+        let lines = app.transcript.entry_lines(entry);
+        let end = app.layout.row_of(first_line + lines.len());
+        let Some(style) = lines.first().and_then(|line| rail_style(line.kind, app)) else {
+            continue;
+        };
+        for row in start.max(top)..end.min(bottom) {
+            let Ok(dy) = u16::try_from(row - top) else {
+                break;
+            };
+            if let Some(cell) = buf.cell_mut((margin, area.y + dy)) {
+                cell.set_symbol("│").set_style(style);
+            }
+        }
+    }
+}
+
 /// Marca las filas visibles del bloque activo del transcript. Solo con el
-/// transcript enfocado. Con el chrome `Flat` pinta un marcador en la columna de
-/// margen; sin margen recolorea la primera celda de cada fila con el acento. Solo
-/// parchea el búfer ya pintado: no re-renderiza nada.
+/// transcript enfocado. Con el chrome `Flat` pinta un marcador grueso `▌` de
+/// acento en la columna de margen, sobre la línea por rol; sin margen recolorea la
+/// primera celda de cada fila con el acento. Solo parchea el búfer ya pintado: no
+/// re-renderiza nada.
 fn mark_active_block(frame: &mut Frame, app: &App, flat: bool) {
     if app.focus != Focus::Transcript {
         return;
@@ -1013,7 +1083,7 @@ fn mark_active_block(frame: &mut Frame, app: &App, flat: bool) {
         if flat {
             // El margen es la columna que deja `draw_transcript` a la izquierda.
             if let Some(cell) = buf.cell_mut((area.x.saturating_sub(1), y)) {
-                cell.set_symbol("█").set_style(accent);
+                cell.set_symbol("▌").set_style(accent);
             }
         } else if let (Some(cell), Some(fg)) = (buf.cell_mut((area.x, y)), accent.fg) {
             cell.set_fg(fg);
@@ -1077,7 +1147,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         draw_transcript(frame, rows[1], app, &mut panes);
     }
     mark_focused_panes(frame, &panes, app, flat);
-    // Tras el filete de foco: este repinta la columna de margen entera.
+    // Una línea por bloque en el margen; después el bloque activo, que la sobreescribe.
+    mark_block_rails(frame, app, flat);
     mark_active_block(frame, app, flat);
     app.pane_rects = panes;
     if flat {
@@ -2053,14 +2124,22 @@ mod tests {
     }
 
     #[test]
-    fn crush_transcript_focus_marks_the_margin_column() {
+    fn transcript_focus_no_longer_paints_the_full_margin_filete() {
         let mut app = crush_ctx();
+        app.push_user("hola");
         let _ = terminal_of(&mut app, 120, 40);
-        let transcript = rect_of(&app, Focus::Transcript);
         app.focus = Focus::Transcript;
         let term = terminal_of(&mut app, 120, 40);
-        let cell = &term.backend().buffer()[(transcript.x, transcript.y + 1)];
-        assert_eq!(cell.symbol(), "▎");
+        let area = app.transcript_area.expect("el transcript fija su área");
+        let margin = area.x - 1;
+        // La fila 0 es el bloque: lleva su línea por rol, no el filete de foco.
+        assert_eq!(term.backend().buffer()[(margin, area.y)].symbol(), "│");
+        // Una fila por debajo del contenido no pertenece a ningún bloque: sin filete.
+        let below = area.y + area.height - 1;
+        assert_eq!(term.backend().buffer()[(margin, below)].symbol(), " ");
+        for y in area.y..area.bottom() {
+            assert_ne!(term.backend().buffer()[(margin, y)].symbol(), "▎");
+        }
     }
 
     /// Filas `[inicio, fin)` de un bloque, según el diseño del último fotograma.
@@ -2092,14 +2171,14 @@ mod tests {
             let y = area.y + (row - top) as u16;
             assert_eq!(
                 term.backend().buffer()[(margin, y)].symbol(),
-                "█",
-                "la fila {row} del bloque activo lleva marcador"
+                "▌",
+                "la fila {row} del bloque activo lleva marcador grueso"
             );
         }
         assert_eq!(
             term.backend().buffer()[(margin, area.y)].symbol(),
-            "▎",
-            "fuera del bloque sigue el filete de foco"
+            "│",
+            "fuera del bloque sigue su línea por rol, sin filete de foco"
         );
     }
 
@@ -2137,5 +2216,164 @@ mod tests {
         let y = area.y + (start - app.viewport.top()) as u16;
         let accent = app.theme.styles.accent.fg.expect("el acento tiene color");
         assert_eq!(term.backend().buffer()[(area.x, y)].fg, accent);
+    }
+
+    /// Celda de la columna de margen en la fila global `row` del transcript.
+    fn margin_cell(term: &Terminal<TestBackend>, app: &App, row: usize) -> ratatui::buffer::Cell {
+        let area = app.transcript_area.expect("el transcript fija su área");
+        let y = area.y + (row - app.viewport.top()) as u16;
+        term.backend().buffer()[(area.x - 1, y)].clone()
+    }
+
+    #[test]
+    fn every_block_gets_a_vertical_rail_in_flat_chrome() {
+        let mut app = crush_ctx();
+        app.push_user("pregunta");
+        app.push_assistant("respuesta");
+        app.push_user("otra pregunta");
+        let term = terminal_of(&mut app, 120, 40);
+        assert_eq!(app.transcript.entry_count(), 3);
+        for entry in 0..3 {
+            let (start, end) = block_rows(&app, entry);
+            assert!(end > start, "el bloque {entry} ocupa filas");
+            for row in start..end {
+                assert_eq!(margin_cell(&term, &app, row).symbol(), "│");
+            }
+        }
+        let (user, _) = block_rows(&app, 0);
+        let (assistant, _) = block_rows(&app, 1);
+        let user_fg = margin_cell(&term, &app, user).fg;
+        let assistant_fg = margin_cell(&term, &app, assistant).fg;
+        assert_eq!(
+            user_fg,
+            app.theme.styles.accent.fg.expect("acento con color")
+        );
+        assert_eq!(
+            assistant_fg,
+            app.theme.styles.muted.fg.expect("muted con color")
+        );
+        assert_ne!(user_fg, assistant_fg);
+    }
+
+    #[test]
+    fn blocks_without_role_have_no_rail() {
+        let mut app = crush_ctx();
+        app.transcript.push_entry(
+            batten::state::LineKind::Banner,
+            batten::state::Format::Plain,
+            "banner",
+        );
+        app.push_user("hola");
+        app.transcript.push_entry(
+            batten::state::LineKind::System,
+            batten::state::Format::Plain,
+            "sistema",
+        );
+        let term = terminal_of(&mut app, 120, 40);
+        for entry in [0, 2] {
+            let (start, end) = block_rows(&app, entry);
+            for row in start..end {
+                assert_eq!(margin_cell(&term, &app, row).symbol(), " ");
+            }
+        }
+        let (start, end) = block_rows(&app, 1);
+        assert!(end > start);
+        for row in start..end {
+            assert_eq!(margin_cell(&term, &app, row).symbol(), "│");
+        }
+    }
+
+    #[test]
+    fn active_block_rail_is_thick_and_accent() {
+        let mut app = crush_ctx();
+        app.push_user("a");
+        app.push_assistant("b");
+        app.push_user("c");
+        let _ = terminal_of(&mut app, 120, 40);
+        app.focus = Focus::Transcript;
+        app.block = Some(1);
+        let term = terminal_of(&mut app, 120, 40);
+        let accent = app.theme.styles.accent.fg.expect("acento con color");
+        let (start, end) = block_rows(&app, 1);
+        for row in start..end {
+            let cell = margin_cell(&term, &app, row);
+            assert_eq!(cell.symbol(), "▌", "la fila {row} del activo es gruesa");
+            assert_eq!(cell.fg, accent, "la fila {row} del activo es de acento");
+        }
+        for entry in [0, 2] {
+            let (start, end) = block_rows(&app, entry);
+            for row in start..end {
+                assert_eq!(margin_cell(&term, &app, row).symbol(), "│");
+            }
+        }
+    }
+
+    #[test]
+    fn rail_spans_every_row_of_a_wrapped_block() {
+        let mut app = crush_ctx();
+        app.push_user(&"palabra ".repeat(60));
+        app.push_user("corto");
+        let term = terminal_of(&mut app, 60, 30);
+        let (start, end) = block_rows(&app, 0);
+        assert!(end - start > 1, "el bloque ocupa varias filas");
+        for row in start..end {
+            assert_eq!(margin_cell(&term, &app, row).symbol(), "│");
+        }
+    }
+
+    #[test]
+    fn no_rails_in_classic_chrome() {
+        let mut app = App::new();
+        app.push_user("primera");
+        app.push_assistant("segunda");
+        let term = terminal_of(&mut app, 100, 30);
+        assert_ne!(app.theme.look.chrome, ChromeStyle::Flat);
+        let border = app.theme.styles.border.fg.expect("el borde tiene color");
+        for entry in 0..2 {
+            let (start, end) = block_rows(&app, entry);
+            for row in start..end {
+                let cell = margin_cell(&term, &app, row);
+                assert_eq!(cell.fg, border, "el margen clásico es el borde del panel");
+            }
+        }
+    }
+
+    #[test]
+    fn rails_follow_the_viewport_scroll() {
+        let mut app = crush_ctx();
+        for i in 0..20 {
+            if i % 2 == 0 {
+                app.push_user(&format!("pregunta {i}"));
+            } else {
+                app.transcript.push_entry(
+                    batten::state::LineKind::Assistant,
+                    batten::state::Format::Plain,
+                    &format!("respuesta {i}"),
+                );
+            }
+        }
+        let term = terminal_of(&mut app, 60, 15);
+        let area = app.transcript_area.expect("el transcript fija su área");
+        let user = app.theme.styles.accent.fg.expect("acento con color");
+        let assistant = app.theme.styles.muted.fg.expect("muted con color");
+        let (last, _) = block_rows(&app, 19);
+        assert_eq!(
+            margin_cell(&term, &app, last).fg,
+            assistant,
+            "al final se ve el último bloque"
+        );
+        for y in area.y..area.bottom() {
+            let cell = &term.backend().buffer()[(area.x - 1, y)];
+            assert_eq!(cell.symbol(), "│", "toda fila visible lleva línea");
+        }
+        app.viewport.to_top();
+        let term = terminal_of(&mut app, 60, 15);
+        assert_eq!(app.viewport.top(), 0);
+        let (first, _) = block_rows(&app, 0);
+        assert_eq!(
+            margin_cell(&term, &app, first).fg,
+            user,
+            "tras subir, el primer bloque es del usuario"
+        );
     }
 }
