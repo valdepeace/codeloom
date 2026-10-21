@@ -5,6 +5,11 @@ Relacionado: `2026-10-15-loom-agent-profile-a2a.md` (§5, §8 y hallazgos de la
 lectura de la especificación oficial), `2026-10-21-codeloom-subagent-input-required-design.md`,
 `2026-10-13-loom-design.md` (§6, subagentes y jobs).
 
+> **Orden de ejecución (2026-10-21):** la observabilidad
+> (`2026-10-21-codeloom-agent-observability-design.md`) precede a las fases B y C
+> de este documento: dar más autonomía a agentes que no se ven es trabajar a
+> ciegas. La Fase A y la Fase O1 están implementadas.
+
 ## Intención
 
 Hoy el padre lanza un subagente, este trabaja en un job y, al terminar, deja un

@@ -69,3 +69,37 @@ Pruebas del reenvío (etiquetado, filtro, cierre al terminar el hijo), de
 `AgentStats` (pasos, herramienta en curso, tokens acumulados, limpieza) y del
 rail (líneas de métricas y recorte). Validación visual en terminal real:
 pendiente.
+
+## Estado (2026-10-21)
+
+Fase O1 implementada y commiteada, con 562 tests, clippy `-D warnings` y
+rustfmt limpios:
+
+- `LiveEvent::ChildEvent { parent, child, event }` y `is_child_relevant`; el
+  lanzador conserva el bus aislado de cada hijo (ahora de 256 plazas) y una
+  tarea de reenvío traslada al padre los siete eventos relevantes, que termina
+  al soltarse el bus del hijo.
+- `AgentStats` por hijo en la interfaz, con `hierarchy_tokens` y
+  `active_agents`; los eventos del hijo no tocan el estado, el transcript ni
+  los contadores del turno del padre y se ignoran si son de otra sesión.
+- Rail: segunda línea tenue por subagente (`2/5 herramienta · 1.2k/300 · 7s`),
+  recortada por columnas, y título `SUBAGENTS · activos · tokens`.
+
+Decisiones tomadas al implementar:
+
+- Un nuevo turno de un hijo reinicia paso, herramienta y tiempos, pero conserva
+  los tokens acumulados, para que el coste de la jerarquía no mienta.
+- `format_tokens` añade el tramo `G` y redondea hacia abajo.
+- La anchura se mide con `Span::width()` de ratatui, sin añadir dependencias.
+- Si un hijo carece de datos mostrables, no se pinta la segunda línea.
+
+Limitaciones conocidas:
+
+- El tiempo no avanza por sí solo: se refresca con cualquier otro redibujado.
+- Las métricas no se persisten ni se restauran al reabrir la sesión.
+- En el look Classic no hay rail, de modo que estas métricas no se ven.
+- El texto en streaming de los hijos no se reenvía.
+- Validación visual en terminal real: pendiente.
+
+Pendientes de la línea: Fase O2 (vista de árbol y entrada al transcript de un
+hijo) y Fase O3 (causalidad y artefactos).
