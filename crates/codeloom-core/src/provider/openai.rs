@@ -133,6 +133,9 @@ impl OpenAiCompatProvider {
             "messages": messages,
             "tools": tools,
             "stream": true,
+            // Sin esta petición expresa, los servidores de tipo OpenAI no envían el
+            // uso de tokens en el flujo y las métricas quedarían siempre a cero.
+            "stream_options": { "include_usage": true },
             "temperature": req.temperature,
             "max_tokens": req.max_tokens
         })
@@ -407,5 +410,20 @@ mod wire_tests {
         let tool = msgs.iter().find(|m| m["role"] == "tool").unwrap();
         assert_eq!(tool["tool_call_id"], "c1");
         assert_eq!(tool["content"], "ok");
+    }
+
+    #[test]
+    fn body_requests_usage_in_the_stream() {
+        let p = OpenAiCompatProvider::new("http://x", "k");
+        let req = ProviderRequest {
+            model: "m".into(),
+            system: String::new(),
+            messages: vec![],
+            tools: vec![],
+            temperature: 0.0,
+            max_tokens: 16,
+        };
+        let body = p.build_body(&req);
+        assert_eq!(body["stream_options"]["include_usage"], true);
     }
 }
