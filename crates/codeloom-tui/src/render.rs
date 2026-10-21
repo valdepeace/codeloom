@@ -152,6 +152,7 @@ fn draw_flat_footer(frame: &mut Frame, area: Rect, app: &App) {
 
 fn draw_transcript(frame: &mut Frame, area: Rect, app: &mut App, panes: &mut Vec<(Focus, Rect)>) {
     panes.push((Focus::Transcript, area));
+    app.transcript_area = None;
     // El chrome `Flat` no usa caja: el chat ocupa el área con un margen de una columna.
     let flat = app.theme.look.chrome == ChromeStyle::Flat;
     let inner = if flat {
@@ -232,6 +233,7 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &mut App, panes: &mut Vec
             rows[0],
         );
     }
+    app.transcript_area = Some(rows[1]);
     batten::widgets::transcript::render(
         frame,
         rows[1],
@@ -241,6 +243,24 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &mut App, panes: &mut Vec
         app.selection.as_ref(),
         &app.theme,
     );
+    // Una selección de texto deja de valer si el diseño cambió de ancho o si ya no
+    // cabe en el transcript (p. ej. tras una sesión más corta).
+    let stale = app.text_sel.is_some_and(|sel| {
+        app.text_sel_width != app.layout.width() || sel.ordered().0.row >= app.layout.total_rows()
+    });
+    if stale {
+        app.text_sel = None;
+    }
+    if let Some(sel) = app.text_sel.as_ref() {
+        batten::widgets::transcript::paint_text_selection(
+            frame.buffer_mut(),
+            rows[1],
+            &app.layout,
+            &app.viewport,
+            sel,
+            app.theme.styles.selection,
+        );
+    }
     if app.thinking {
         let line = app.reasoning.lines().last().unwrap_or("Thinking…");
         batten::widgets::thinking::render(frame, rows[2], line, &app.animation, &app.theme);
@@ -1963,6 +1983,31 @@ mod tests {
         app.focus = Focus::Rail;
         let term = terminal_of(&mut app, 120, 40);
         assert_eq!(term.backend().buffer()[(rail.x, rail.y + 1)].fg, accent);
+    }
+
+    #[test]
+    fn selected_transcript_cells_carry_the_selection_style() {
+        use batten::state::{CellPos, TextSelection};
+        let mut app = App::new();
+        for i in 0..40 {
+            app.push_user(&format!("linea {i:02}"));
+        }
+        let _ = terminal_of(&mut app, 100, 30);
+        let area = app.transcript_area.expect("el transcript fija su área");
+        let last = app.layout.total_rows() - 1;
+        let mut sel = TextSelection::new(CellPos { row: 0, col: 0 });
+        sel.set_head(CellPos { row: last, col: 0 });
+        app.text_sel = Some(sel);
+        app.text_sel_width = app.layout.width();
+        let term = terminal_of(&mut app, 100, 30);
+        let sel_bg = app
+            .theme
+            .styles
+            .selection
+            .bg
+            .expect("la selección tiene fondo");
+        let cell = &term.backend().buffer()[(area.x, area.y)];
+        assert_eq!(cell.bg, sel_bg);
     }
 
     #[test]

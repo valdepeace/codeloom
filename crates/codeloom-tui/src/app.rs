@@ -271,6 +271,16 @@ pub struct App {
     pub mouse_drag: Option<usize>,
     /// Líneas seleccionadas del transcript, si hay.
     pub selection: Option<batten::state::Selection>,
+    /// Selección de texto por caracteres del transcript, si la hay. Excluyente con
+    /// `selection` y con la del composer: crear una anula las otras.
+    pub text_sel: Option<batten::state::TextSelection>,
+    /// Ancho de texto del transcript cuando se creó `text_sel`. Si el diseño cambia
+    /// de ancho, las columnas guardadas dejan de valer y la selección se descarta.
+    pub text_sel_width: u16,
+    /// Arrastre de ratón en curso sobre el transcript.
+    pub text_drag: bool,
+    /// Área en la que se pintó el texto del transcript en el último fotograma.
+    pub transcript_area: Option<Rect>,
     /// Texto pendiente de enviar al portapapeles (lo consume el bucle).
     pub clipboard: Option<String>,
     /// Número de prompts pendientes en `pending_prompts`.
@@ -460,6 +470,10 @@ impl App {
             composer_area: None,
             mouse_drag: None,
             selection: None,
+            text_sel: None,
+            text_sel_width: 0,
+            text_drag: false,
+            transcript_area: None,
             clipboard: None,
             queued: 0,
             pending_prompts: VecDeque::new(),
@@ -819,6 +833,9 @@ impl App {
         self.session_loading = false;
         self.session_picker_open = false;
         self.session_picker_return_to_chat = false;
+        // Una selección del transcript pertenece a la sesión anterior.
+        self.text_sel = None;
+        self.text_drag = false;
         self.restore_messages(messages);
     }
 
@@ -882,16 +899,24 @@ impl App {
     /// composer coloca el cursor y queda listo para arrastrar. Fuera de cualquier
     /// ventana no hace nada, y en otra ventana anula el arrastre en curso.
     pub fn mouse_down(&mut self, x: u16, y: u16) {
+        self.text_drag = false;
         let Some(pane) = self.pane_at(x, y) else {
             self.mouse_drag = None;
             return;
         };
         self.focus = pane;
+        if pane == Focus::Transcript {
+            self.mouse_drag = None;
+            self.transcript_mouse_down(x, y);
+            return;
+        }
         let area = self.composer_area.filter(|_| pane == Focus::Composer);
         let Some(area) = area else {
             self.mouse_drag = None;
             return;
         };
+        // El composer y el transcript no comparten selección.
+        self.text_sel = None;
         match hit_index(&self.theme, &self.composer, area, x, y) {
             Some(index) => {
                 self.composer.set_cursor(index);
@@ -904,6 +929,10 @@ impl App {
     /// Arrastre con el botón izquierdo: selecciona desde el ancla hasta la celda,
     /// acotada al área del composer. Sin arrastre en curso, no hace nada.
     pub fn mouse_drag_to(&mut self, x: u16, y: u16) {
+        if self.text_drag {
+            self.transcript_mouse_drag_to(x, y);
+            return;
+        }
         let (Some(anchor), Some(area)) = (self.mouse_drag, self.composer_area) else {
             return;
         };
@@ -920,9 +949,93 @@ impl App {
     /// Soltar el botón. Solo si hubo un arrastre que empezó en el composer se
     /// copia la selección: un clic simple no copia nada.
     pub fn mouse_up(&mut self) {
+        if self.text_drag {
+            self.transcript_mouse_up();
+            return;
+        }
         if self.mouse_drag.take().is_some() {
             self.copy_composer_selection();
         }
+    }
+
+    /// Pulsación dentro del área de texto del transcript: enfoca el transcript y
+    /// empieza una selección de texto en la celda pulsada. Fuera de esa área solo
+    /// enfoca. Anula la selección de líneas y la del composer.
+    pub fn transcript_mouse_down(&mut self, x: u16, y: u16) {
+        self.text_sel = None;
+        self.text_drag = false;
+        self.selection = None;
+        self.composer.clear_selection();
+        let Some(area) = self
+            .transcript_area
+            .filter(|area| rect_contains(*area, x, y))
+        else {
+            return;
+        };
+        let Some(at) =
+            batten::widgets::transcript::hit_cell(&self.layout, &self.viewport, area, x, y)
+        else {
+            return;
+        };
+        self.text_sel = Some(batten::state::TextSelection::new(at));
+        self.text_sel_width = self.layout.width();
+        self.text_drag = true;
+    }
+
+    /// Arrastre sobre el transcript: mueve la cabeza de la selección. Si el puntero
+    /// sale por arriba o por abajo del área, el transcript se desplaza una fila por
+    /// evento hacia ese lado y la cabeza queda acotada a la fila visible.
+    pub fn transcript_mouse_drag_to(&mut self, x: u16, y: u16) {
+        if !self.text_drag {
+            return;
+        }
+        let (Some(area), Some(mut sel)) = (
+            self.transcript_area.filter(|area| !area.is_empty()),
+            self.text_sel,
+        ) else {
+            return;
+        };
+        if y <= area.y {
+            self.viewport.scroll_up(1);
+        } else if y.saturating_add(1) >= area.bottom() {
+            self.viewport.scroll_down(1);
+        }
+        if let Some(head) =
+            batten::widgets::transcript::hit_cell(&self.layout, &self.viewport, area, x, y)
+        {
+            sel.set_head(head);
+            self.text_sel = Some(sel);
+        }
+    }
+
+    /// Soltar tras un arrastre sobre el transcript: copia si la selección no está
+    /// vacía. Un clic simple (selección vacía) la descarta. La selección queda
+    /// resaltada tras copiar.
+    pub fn transcript_mouse_up(&mut self) {
+        self.text_drag = false;
+        if self.text_sel.is_some_and(|sel| sel.is_empty()) {
+            self.text_sel = None;
+            return;
+        }
+        self.copy_transcript_selection();
+    }
+
+    /// Copia la selección de texto del transcript al portapapeles y avisa del número
+    /// de caracteres. Devuelve `false` si no hay selección no vacía.
+    pub fn copy_transcript_selection(&mut self) -> bool {
+        let Some(sel) = self.text_sel.filter(|sel| !sel.is_empty()) else {
+            return false;
+        };
+        let text = batten::widgets::transcript::selected_text(
+            &self.transcript,
+            &self.layout,
+            &self.theme,
+            &sel,
+        );
+        let chars = text.chars().count();
+        self.clipboard = Some(text);
+        self.slash_feedback = Some(format!("Copied {chars} chars"));
+        true
     }
 
     /// Encola una petición; si no hay diálogo abierto, la muestra ya.

@@ -108,6 +108,8 @@ fn transcript_key(app: &mut App, code: KeyCode) {
         return;
     }
     if code == KeyCode::Char('v') && len > 0 {
+        // La selección de líneas y la de texto son excluyentes.
+        app.text_sel = None;
         app.selection = Some(batten::state::Selection::at(len - 1));
         return;
     }
@@ -161,6 +163,14 @@ pub fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Option<St
         && app.composer.selection().is_some()
     {
         app.copy_composer_selection();
+        return None;
+    }
+    // Igual con una selección de texto del transcript: la copia y no sale.
+    if code == KeyCode::Char('c')
+        && mods.contains(KeyModifiers::CONTROL)
+        && app.text_sel.is_some_and(|sel| !sel.is_empty())
+    {
+        app.copy_transcript_selection();
         return None;
     }
     if matches!(code, KeyCode::Char('c' | 'q')) && mods.contains(KeyModifiers::CONTROL) {
@@ -329,6 +339,13 @@ pub fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Option<St
     // pregunta en vez de contar para la salida por doble Esc.
     let question_has_keys = app.question.is_some() && app.permission.is_none();
     if code == KeyCode::Esc && !question_has_keys {
+        // Con una selección de texto del transcript, Esc la limpia sin contar para
+        // la doble Esc, igual que la del composer.
+        if app.text_sel.is_some() && app.permission.is_none() {
+            app.text_sel = None;
+            app.last_escape = None;
+            return None;
+        }
         // Con una selección del composer, Esc solo la limpia y no cuenta para la
         // doble Esc que sale de la aplicación.
         if app.composer.selection().is_some() && app.permission.is_none() {
@@ -475,6 +492,14 @@ pub fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Option<St
     if app.focus == Focus::Transcript {
         transcript_key(app, code);
         return None;
+    }
+    // Escribir, borrar o ampliar la selección en el composer anula la del transcript.
+    if matches!(
+        code,
+        KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete | KeyCode::Enter
+    ) || mods.contains(KeyModifiers::SHIFT)
+    {
+        app.text_sel = None;
     }
     match code {
         KeyCode::Enter => {
@@ -796,6 +821,7 @@ pub fn handle_event(app: &mut App, ev: Event) -> Option<String> {
         // pendiente se descarta para que no sobreviva al diálogo.
         Event::Mouse(_) => {
             app.mouse_drag = None;
+            app.text_drag = false;
             None
         }
         Event::Paste(text)
@@ -814,6 +840,7 @@ pub fn handle_event(app: &mut App, ev: Event) -> Option<String> {
             } else if app.queue_open && app.queue_editing {
                 app.queue_editor.insert_str(&text);
             } else if !app.queue_open {
+                app.text_sel = None;
                 app.paste(&text);
             }
             None
@@ -1504,6 +1531,225 @@ mod tests {
         mouse_event(&mut app, MouseEventKind::Up(MouseButton::Left), x, y);
         assert!(app.clipboard.is_none());
         assert_eq!(app.slash_feedback, None);
+    }
+
+    /// Pinta a `w`×`h` y devuelve el búfer resultante, para localizar texto en pantalla.
+    fn paint_sized(app: &mut App, w: u16, h: u16) -> ratatui::buffer::Buffer {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| render(f, app)).unwrap();
+        term.backend().buffer().clone()
+    }
+
+    /// Celda (x, y) donde aparece por primera vez `needle` en la pantalla pintada.
+    fn screen_pos_of(buf: &ratatui::buffer::Buffer, needle: &str) -> (u16, u16) {
+        let area = buf.area;
+        for y in area.y..area.bottom() {
+            let row: String = (area.x..area.right())
+                .map(|x| buf[(x, y)].symbol())
+                .collect();
+            if let Some(byte) = row.find(needle) {
+                return (area.x + row[..byte].chars().count() as u16, y);
+            }
+        }
+        panic!("«{needle}» no aparece en pantalla");
+    }
+
+    /// Aplicación con un mensaje de usuario por cada texto.
+    fn transcript_app(texts: &[&str]) -> App {
+        let mut app = App::new();
+        for text in texts {
+            app.push_user(text);
+        }
+        app
+    }
+
+    /// Arrastra con el botón izquierdo desde `from` hasta `to` y suelta.
+    fn drag_select(app: &mut App, from: (u16, u16), to: (u16, u16)) {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        mouse_event(app, MouseEventKind::Down(MouseButton::Left), from.0, from.1);
+        mouse_event(app, MouseEventKind::Drag(MouseButton::Left), to.0, to.1);
+        mouse_event(app, MouseEventKind::Up(MouseButton::Left), to.0, to.1);
+    }
+
+    #[test]
+    fn click_in_transcript_focuses_and_starts_selection() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = transcript_app(&["hola mundo"]);
+        app.focus = Focus::Composer;
+        let buf = paint_sized(&mut app, 100, 30);
+        let (x, y) = screen_pos_of(&buf, "hola");
+        mouse_event(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
+        assert_eq!(app.focus, Focus::Transcript);
+        let sel = app.text_sel.expect("el clic empieza una selección");
+        assert!(sel.is_empty());
+        assert!(app.text_drag);
+    }
+
+    #[test]
+    fn drag_selects_text_and_mouse_up_copies_with_notice() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = transcript_app(&["hola mundo"]);
+        let buf = paint_sized(&mut app, 100, 30);
+        let (x, y) = screen_pos_of(&buf, "hola");
+        mouse_event(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
+        mouse_event(&mut app, MouseEventKind::Drag(MouseButton::Left), x + 3, y);
+        assert!(app.clipboard.is_none(), "copiar solo al soltar");
+        mouse_event(&mut app, MouseEventKind::Up(MouseButton::Left), x + 3, y);
+        assert_eq!(app.clipboard.as_deref(), Some("hola"));
+        assert_eq!(app.slash_feedback.as_deref(), Some("Copied 4 chars"));
+        assert!(app.text_sel.is_some(), "la selección sigue resaltada");
+    }
+
+    #[test]
+    fn dragging_backwards_selects_the_same_text() {
+        let mut app = transcript_app(&["hola mundo"]);
+        let buf = paint_sized(&mut app, 100, 30);
+        let (hx, y) = screen_pos_of(&buf, "hola");
+        let (mx, _) = screen_pos_of(&buf, "mundo");
+        // Del final hacia el principio: el rango se normaliza.
+        drag_select(&mut app, (mx + 4, y), (hx, y));
+        assert_eq!(app.clipboard.as_deref(), Some("hola mundo"));
+    }
+
+    #[test]
+    fn simple_click_clears_selection_and_copies_nothing() {
+        let mut app = transcript_app(&["hola mundo"]);
+        let buf = paint_sized(&mut app, 100, 30);
+        let (x, y) = screen_pos_of(&buf, "hola");
+        drag_select(&mut app, (x, y), (x + 3, y));
+        assert!(app.text_sel.is_some());
+        app.clipboard = None;
+        // Un clic simple, sin arrastre, descarta la selección anterior.
+        drag_select(&mut app, (x, y), (x, y));
+        assert!(app.text_sel.is_none());
+        assert!(app.clipboard.is_none());
+    }
+
+    #[test]
+    fn drag_above_area_autoscrolls_and_clamps() {
+        let texts: Vec<String> = (0..60).map(|i| format!("msg-{i:02}")).collect();
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let mut app = transcript_app(&refs);
+        paint_sized(&mut app, 100, 30);
+        assert!(app.viewport.is_following());
+        let area = app.transcript_area.expect("el transcript fija su área");
+        let (x, y) = (area.x, area.y + 2);
+        let top = app.viewport.top();
+        mouse_event_down_left(&mut app, x, y);
+        for _ in 0..3 {
+            mouse_event_drag_left(&mut app, x, 0);
+        }
+        assert_eq!(app.viewport.top(), top - 3, "una fila por evento");
+        assert!(!app.viewport.is_following());
+        let (start, _) = app.text_sel.expect("hay selección").ordered();
+        assert_eq!(start.row, app.viewport.top(), "la cabeza se acota al área");
+        // Por debajo del área también desplaza, sin salirse del transcript.
+        let before = app.viewport.top();
+        mouse_event_drag_left(&mut app, x, u16::MAX);
+        assert_eq!(app.viewport.top(), before + 1);
+    }
+
+    /// Botón izquierdo pulsado en (x, y), para los tests que arrastran por pasos.
+    fn mouse_event_down_left(app: &mut App, x: u16, y: u16) {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        mouse_event(app, MouseEventKind::Down(MouseButton::Left), x, y);
+    }
+
+    /// Arrastre del botón izquierdo hasta (x, y).
+    fn mouse_event_drag_left(app: &mut App, x: u16, y: u16) {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        mouse_event(app, MouseEventKind::Drag(MouseButton::Left), x, y);
+    }
+
+    #[test]
+    fn esc_clears_text_selection_without_double_esc() {
+        let mut app = transcript_app(&["hola mundo"]);
+        let buf = paint_sized(&mut app, 100, 30);
+        let (x, y) = screen_pos_of(&buf, "hola");
+        drag_select(&mut app, (x, y), (x + 3, y));
+        assert!(app.text_sel.is_some());
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.text_sel.is_none());
+        assert_eq!(app.last_escape, None);
+        assert!(!app.should_quit);
+        // La Esc que limpió no cuenta: hacen falta dos más para salir.
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!app.should_quit);
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn ctrl_c_with_text_selection_copies_and_does_not_quit() {
+        let mut app = transcript_app(&["hola mundo"]);
+        let buf = paint_sized(&mut app, 100, 30);
+        let (x, y) = screen_pos_of(&buf, "hola");
+        drag_select(&mut app, (x, y), (x + 3, y));
+        app.clipboard = None;
+        handle_key(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(!app.should_quit);
+        assert_eq!(app.clipboard.as_deref(), Some("hola"));
+    }
+
+    #[test]
+    fn width_change_clears_text_selection() {
+        let mut app = transcript_app(&["hola mundo"]);
+        let buf = paint_sized(&mut app, 100, 30);
+        let (x, y) = screen_pos_of(&buf, "hola");
+        drag_select(&mut app, (x, y), (x + 3, y));
+        assert!(app.text_sel.is_some());
+        paint_sized(&mut app, 60, 30);
+        assert!(app.text_sel.is_none());
+    }
+
+    #[test]
+    fn text_selection_excludes_line_selection() {
+        let mut app = transcript_app(&["uno", "dos", "tres"]);
+        app.focus = Focus::Transcript;
+        let buf = paint_sized(&mut app, 100, 30);
+        handle_key(&mut app, KeyCode::Char('v'), KeyModifiers::NONE);
+        assert!(app.selection.is_some());
+        let (x, y) = screen_pos_of(&buf, "dos");
+        drag_select(&mut app, (x, y), (x + 1, y));
+        assert!(
+            app.selection.is_none(),
+            "la selección de texto anula la de líneas"
+        );
+        assert!(app.text_sel.is_some());
+        handle_key(&mut app, KeyCode::Char('v'), KeyModifiers::NONE);
+        assert!(app.text_sel.is_none(), "la de líneas anula la de texto");
+        // Y la del composer, también excluyente.
+        app.composer.set_text("hola");
+        app.composer.select_range(0, 2);
+        drag_select(&mut app, (x, y), (x + 1, y));
+        assert_eq!(app.composer.selection(), None);
+    }
+
+    #[test]
+    fn dialog_open_ignores_transcript_mouse() {
+        let mut app = transcript_app(&["hola mundo"]);
+        app.focus = Focus::Composer;
+        let buf = paint_sized(&mut app, 100, 30);
+        let _reply = open_dialog(&mut app);
+        let (x, y) = screen_pos_of(&buf, "hola");
+        drag_select(&mut app, (x, y), (x + 3, y));
+        assert_eq!(app.focus, Focus::Composer);
+        assert!(app.text_sel.is_none());
+        assert!(!app.text_drag);
+        assert!(app.clipboard.is_none());
+    }
+
+    #[test]
+    fn drag_on_empty_transcript_does_not_panic() {
+        let mut app = App::new();
+        paint_sized(&mut app, 100, 30);
+        drag_select(&mut app, (10, 10), (20, 5));
+        assert!(app.text_sel.is_none());
+        // Un terminal de una sola fila de transcript tampoco debe romper.
+        let mut app = transcript_app(&["uno", "dos", "tres"]);
+        paint_sized(&mut app, 100, 6);
+        drag_select(&mut app, (10, 3), (12, 0));
+        mouse_event_drag_left(&mut app, 5, u16::MAX);
     }
 
     #[test]
