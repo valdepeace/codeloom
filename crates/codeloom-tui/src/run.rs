@@ -113,6 +113,15 @@ fn transcript_key(app: &mut App, code: KeyCode) {
         app.selection = Some(batten::state::Selection::at(len - 1));
         return;
     }
+    // Navegación y copia por bloques: no alteran el desplazamiento por líneas.
+    match code {
+        KeyCode::Char('[') => app.block_prev(),
+        KeyCode::Char(']') => app.block_next(),
+        KeyCode::Char('y') | KeyCode::Char('c') => {
+            app.copy_block();
+        }
+        _ => {}
+    }
     let vp = &mut app.viewport;
     match code {
         KeyCode::Up | KeyCode::Char('k') => vp.scroll_up(1),
@@ -1647,6 +1656,120 @@ mod tests {
         let before = app.viewport.top();
         mouse_event_drag_left(&mut app, x, u16::MAX);
         assert_eq!(app.viewport.top(), before + 1);
+    }
+
+    /// Aplicación con `n` bloques (mensajes de usuario), pintada y con el foco en
+    /// el transcript.
+    fn block_app(n: usize) -> App {
+        let texts: Vec<String> = (0..n).map(|i| format!("bloque-{i:02}")).collect();
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let mut app = transcript_app(&refs);
+        paint_sized(&mut app, 100, 30);
+        app.focus = Focus::Transcript;
+        app
+    }
+
+    #[test]
+    fn bracket_keys_move_the_active_block() {
+        let mut app = block_app(3);
+        handle_key(&mut app, KeyCode::Char('['), KeyModifiers::NONE);
+        assert_eq!(app.block, Some(2), "sin bloque activo, [ activa el último");
+        handle_key(&mut app, KeyCode::Char('['), KeyModifiers::NONE);
+        assert_eq!(app.block, Some(1));
+        handle_key(&mut app, KeyCode::Char('['), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('['), KeyModifiers::NONE);
+        assert_eq!(app.block, Some(0), "acotado al primero");
+        handle_key(&mut app, KeyCode::Char(']'), KeyModifiers::NONE);
+        assert_eq!(app.block, Some(1));
+        handle_key(&mut app, KeyCode::Char(']'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char(']'), KeyModifiers::NONE);
+        assert_eq!(app.block, Some(2), "acotado al último");
+    }
+
+    #[test]
+    fn block_nav_is_clamped_and_noop_on_empty_transcript() {
+        let mut app = App::new();
+        app.focus = Focus::Transcript;
+        paint_sized(&mut app, 100, 30);
+        handle_key(&mut app, KeyCode::Char('['), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char(']'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+        assert_eq!(app.block, None);
+        assert!(app.clipboard.is_none());
+    }
+
+    #[test]
+    fn block_nav_scrolls_block_into_view() {
+        let mut app = block_app(60);
+        // La primera pulsación activa el último; 54 más llevan al bloque 5.
+        for _ in 0..55 {
+            handle_key(&mut app, KeyCode::Char('['), KeyModifiers::NONE);
+        }
+        assert_eq!(app.block, Some(5));
+        assert!(
+            !app.viewport.is_following(),
+            "navegar hacia atrás suelta el final"
+        );
+        let start = app.layout.row_of(app.transcript.entry_start(5));
+        assert!(app.viewport.window().contains(&start), "el bloque 5 se ve");
+        // Hacia el final, el último bloque vuelve a verse.
+        for _ in 0..60 {
+            handle_key(&mut app, KeyCode::Char(']'), KeyModifiers::NONE);
+        }
+        assert_eq!(app.block, Some(59));
+        let last = app.layout.row_of(app.transcript.entry_start(59));
+        assert!(app.viewport.window().contains(&last), "el último se ve");
+    }
+
+    #[test]
+    fn copy_block_copies_entry_text_with_notice() {
+        let mut app = block_app(2);
+        handle_key(&mut app, KeyCode::Char('['), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+        let clip = app.clipboard.clone().expect("y copia el bloque activo");
+        assert!(clip.contains("bloque-01"));
+        assert!(!clip.contains("bloque-00"));
+        let chars = clip.chars().count();
+        assert_eq!(
+            app.slash_feedback.as_deref(),
+            Some(format!("Copied {chars} chars").as_str())
+        );
+        app.clipboard = None;
+        handle_key(&mut app, KeyCode::Char('c'), KeyModifiers::NONE);
+        assert!(app.clipboard.is_some(), "c copia igual que y");
+    }
+
+    #[test]
+    fn click_on_transcript_activates_the_clicked_block() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = block_app(3);
+        app.focus = Focus::Composer;
+        let buf = paint_sized(&mut app, 100, 30);
+        let (x, y) = screen_pos_of(&buf, "bloque-01");
+        mouse_event(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
+        assert_eq!(app.focus, Focus::Transcript);
+        assert_eq!(app.block, Some(1));
+        assert!(app.text_sel.is_some(), "el clic sigue creando la selección");
+    }
+
+    #[test]
+    fn j_k_still_scroll_by_lines() {
+        let mut app = block_app(60);
+        let before = app.viewport.top();
+        handle_key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+        assert_eq!(app.viewport.top(), before - 1, "k sube una fila");
+        handle_key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(app.viewport.top(), before, "j baja una fila");
+        assert_eq!(app.block, None, "j/k no mueven el bloque activo");
+    }
+
+    #[test]
+    fn block_cleared_on_session_load() {
+        let mut app = block_app(3);
+        handle_key(&mut app, KeyCode::Char('['), KeyModifiers::NONE);
+        assert!(app.block.is_some());
+        app.load_session(codeloom_core::session::SessionId(9), Vec::new());
+        assert_eq!(app.block, None);
     }
 
     /// Botón izquierdo pulsado en (x, y), para los tests que arrastran por pasos.

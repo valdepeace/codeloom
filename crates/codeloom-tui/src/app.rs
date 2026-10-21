@@ -281,6 +281,9 @@ pub struct App {
     pub text_drag: bool,
     /// Área en la que se pintó el texto del transcript en el último fotograma.
     pub transcript_area: Option<Rect>,
+    /// Bloque activo del transcript: índice de entrada (`Transcript::entry`). Se
+    /// navega con `[` y `]` y se fija con un clic; `None` si no hay ninguno.
+    pub block: Option<usize>,
     /// Texto pendiente de enviar al portapapeles (lo consume el bucle).
     pub clipboard: Option<String>,
     /// Número de prompts pendientes en `pending_prompts`.
@@ -474,6 +477,7 @@ impl App {
             text_sel_width: 0,
             text_drag: false,
             transcript_area: None,
+            block: None,
             clipboard: None,
             queued: 0,
             pending_prompts: VecDeque::new(),
@@ -836,6 +840,8 @@ impl App {
         // Una selección del transcript pertenece a la sesión anterior.
         self.text_sel = None;
         self.text_drag = false;
+        // El bloque activo pertenece también a la sesión anterior.
+        self.block = None;
         self.restore_messages(messages);
     }
 
@@ -980,6 +986,90 @@ impl App {
         self.text_sel = Some(batten::state::TextSelection::new(at));
         self.text_sel_width = self.layout.width();
         self.text_drag = true;
+        // El clic activa el bloque pulsado; la selección de texto no cambia.
+        self.block = self.entry_at_row(at.row);
+    }
+
+    /// Entrada del transcript que ocupa la fila de documento `row`, si la hay.
+    fn entry_at_row(&self, row: usize) -> Option<usize> {
+        let (line, _) = self.layout.line_at_row(row)?;
+        self.transcript.locate(line).map(|(entry, _)| entry)
+    }
+
+    /// Bloque activo acotado a las entradas existentes: `None` sin transcript.
+    pub fn block_index(&self) -> Option<usize> {
+        let count = self.transcript.entry_count();
+        self.block.filter(|_| count > 0).map(|b| b.min(count - 1))
+    }
+
+    /// Bloque anterior (`[`). Sin bloque activo, activa el último.
+    pub fn block_prev(&mut self) {
+        let Some(last) = self.transcript.entry_count().checked_sub(1) else {
+            self.block = None;
+            return;
+        };
+        let target = self
+            .block_index()
+            .map_or(last, |current| current.saturating_sub(1));
+        self.focus_block(target, true);
+    }
+
+    /// Bloque siguiente (`]`). Sin bloque activo, activa el último.
+    pub fn block_next(&mut self) {
+        let Some(last) = self.transcript.entry_count().checked_sub(1) else {
+            self.block = None;
+            return;
+        };
+        let target = self
+            .block_index()
+            .map_or(last, |current| (current + 1).min(last));
+        self.focus_block(target, false);
+    }
+
+    /// Activa la entrada `entry` y desplaza lo mínimo para verla entera; si no cabe,
+    /// deja visible su comienzo. Al retroceder suelta el seguimiento del final.
+    fn focus_block(&mut self, entry: usize, backwards: bool) {
+        self.block = Some(entry);
+        if backwards {
+            // `scroll_up(0)` solo suelta el seguimiento del final sin mover la vista.
+            self.viewport.scroll_up(0);
+        }
+        let first = self.transcript.entry_start(entry);
+        let start = self.layout.row_of(first);
+        let height = self
+            .layout
+            .row_of(first + self.transcript.entry_lines(entry).len())
+            .saturating_sub(start);
+        let view = self
+            .transcript_area
+            .map_or(1, |area| usize::from(area.height).max(1));
+        self.viewport
+            .ensure_visible(start, start + height.min(view));
+    }
+
+    /// Texto plano del bloque activo: las líneas de la entrada unidas por `\n`.
+    pub fn block_text(&self) -> Option<String> {
+        let entry = self.block_index()?;
+        let text = self
+            .transcript
+            .entry_lines(entry)
+            .iter()
+            .map(|line| line.plain())
+            .collect::<Vec<_>>()
+            .join("\n");
+        Some(text)
+    }
+
+    /// Copia el bloque activo al portapapeles y avisa del número de caracteres.
+    /// Devuelve `false` si no hay bloque activo.
+    pub fn copy_block(&mut self) -> bool {
+        let Some(text) = self.block_text() else {
+            return false;
+        };
+        let chars = text.chars().count();
+        self.clipboard = Some(text);
+        self.slash_feedback = Some(format!("Copied {chars} chars"));
+        true
     }
 
     /// Arrastre sobre el transcript: mueve la cabeza de la selección. Si el puntero
