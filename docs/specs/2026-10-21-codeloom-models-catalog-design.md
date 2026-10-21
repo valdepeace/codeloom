@@ -81,3 +81,36 @@ tolerancia a campos ausentes, JSON corrupto), de la caché (caducidad, escritura
 atómica, lectura de un fichero corrupto) y del selector (filtrado, elección que
 rellena los campos, edición manual intacta). Sin red en los tests. Validación
 visual en terminal real: pendiente.
+
+## Estado (2026-10-21)
+
+Implementado, cada tarea en su commit: marca de cambios sin guardar en
+`/settings` (`ff79a17`), módulo `catalog` del núcleo (`0354aba`), carga en
+segundo plano (`2f06275`) y selectores de proveedor y modelo (commit de la
+tarea 4). Con el JSON real del 2026-10-21 el catálogo queda en 204 proveedores y
+5667 modelos útiles.
+
+Cómo se usa: en `/settings`, `Ctrl+L` (o `Enter` sobre «Provider») abre la lista
+del campo enfocado; escribir filtra, `↑`/`↓` mueven, `Enter` elige y `Esc` cierra
+solo la lista. Elegir proveedor rellena tipo, URL y variable de la clave; elegir
+modelo rellena el modelo, mostrando `ctx 200k · $3/$15`. Lo elegido cuenta como
+cambio sin guardar y la edición a mano sigue disponible.
+
+Decisiones tomadas al implementar:
+
+- `Enter` sobre «Provider» abre el selector; el tipo se sigue cambiando con `←`/`→`.
+- El selector se cierra al elegir; no pasa solo a la lista de modelos.
+- Si el proveedor del catálogo no trae variable de clave, se conserva la actual.
+- La ruta de la caché usa `USERPROFILE`/`HOME`, sin añadir `dirs` al núcleo.
+- Si falla la escritura de la caché, se avisa en el registro y el catálogo se
+  entrega igualmente.
+
+Limitaciones conocidas:
+
+- Pegar texto no alimenta el filtro del selector.
+- El selector del modelo exige que la URL actual coincida con un proveedor del
+  catálogo; si no, avisa y hay que escribirlo a mano.
+- El brazo del bucle que recibe el catálogo no tiene prueba automática (necesita
+  terminal real); el canal y su aplicación sí.
+- Los costes ya están en el catálogo, pero aún no se muestran en el rail.
+- Validación visual en terminal real: pendiente.
