@@ -11,5 +11,6 @@ pub mod provider;
 pub mod question;
 pub mod session;
 pub mod subagent;
+pub mod task;
 pub mod todo;
 pub mod tools;

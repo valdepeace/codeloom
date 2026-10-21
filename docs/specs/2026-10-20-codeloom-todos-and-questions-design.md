@@ -93,3 +93,13 @@ Decisiones tomadas al implementar:
   viceversa.
 - El diálogo de preguntas no usa el efecto de aparición (`fx_pending`) de los
   permisos.
+
+### Nota sobre subagentes (2026-10-21)
+
+`ask_user` es el análogo local del estado A2A `input-required` (véase la §5 de
+la spec de agentes en `2026-10-15-loom-agent-profile-a2a.md`). Hoy los
+subagentes no lo tienen: `InProcessSubagentLauncher::new` lo retira con
+`.without("ask_user")`. Levantar esa restricción queda como trabajo posterior,
+con las condiciones enumeradas en «Fuera de este plan» del plan
+`docs/plans/2026-10-21-codeloom-a2a-task-state.md`; cabe señalar que no se
+implementa aquí.

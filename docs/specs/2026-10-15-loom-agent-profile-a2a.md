@@ -210,6 +210,24 @@ La card es la **vista externa**; el `AgentProfile` es la **vista interna**.
 - **Versionado**: se pinea `A2A-Version` (`1.0`) y se envuelve en tipos propios
   (`AgentCard`, `Task`); un cambio del spec se absorbe en el crate.
 
+### Estado de tarea (2026-10-21)
+
+Ciertamente, ya existe `codeloom_core::task::TaskState`, que reproduce los
+nombres y la serialización del protocolo (`input-required`, `auth-required`,
+`canceled`, etc.) y que se obtiene por proyección desde los estados internos:
+
+| Estado interno                                       | `TaskState`  |
+|------------------------------------------------------|--------------|
+| `JobStatus::Running`, `JobStatus::Stopping`          | `working`    |
+| `JobStatus::Completed`, `SubagentStatus::Completed`  | `completed`  |
+| `JobStatus::Failed`, `SubagentStatus::Failed`, `SubagentStatus::Interrupted` | `failed` |
+| `JobStatus::Killed`, `SubagentStatus::Killed`        | `canceled`   |
+
+Cabe señalar que `Interrupted -> failed` es decisión nuestra: A2A carece de un
+equivalente a «interrumpida», de modo que la tarea se proyecta a fallo por haber
+quedado sin terminar. El modelo interno (`JobStatus`, `SubagentStatus` y el
+esquema SQLite) no cambia; la traducción vive solo en el borde.
+
 ## 6. Frontera con el core
 
 - El core define **traits puros**: `AgentProfile` (dato), `AgentRegistry`
