@@ -156,6 +156,27 @@ impl Catalog {
     pub fn is_empty(&self) -> bool {
         self.providers.is_empty()
     }
+
+    /// Precios `(entrada, salida)` por millón de tokens del modelo `model` del proveedor cuya
+    /// URL base coincide con `base_url`. `None` si falta el proveedor, el modelo o alguno de
+    /// los dos precios. La URL se compara sin espacios, sin barra final y en minúsculas.
+    pub fn prices(&self, base_url: &str, model: &str) -> Option<(f64, f64)> {
+        let wanted = normalize_base_url(base_url);
+        let provider = self
+            .providers
+            .iter()
+            .find(|provider| normalize_base_url(&provider.base_url) == wanted)?;
+        let model = provider
+            .models
+            .iter()
+            .find(|candidate| candidate.id == model)?;
+        Some((model.input_cost?, model.output_cost?))
+    }
+}
+
+/// Forma comparable de una URL base: sin espacios, sin barras finales y en minúsculas.
+fn normalize_base_url(url: &str) -> String {
+    url.trim().trim_end_matches('/').to_ascii_lowercase()
 }
 
 /// Traduce el paquete `npm` de models.dev al tipo de proveedor de CodeLoom.
@@ -700,5 +721,70 @@ mod tests {
         let catalog = catalog_with_model(r#"{"id": "m", "tool_call": true, "reasoning": true}"#);
         let model = &catalog.provider("p").expect("p debe estar").models[0];
         assert_eq!(model.reasoning, Some(Reasoning::default()));
+    }
+
+    /// Catálogo con `openrouter` (URL con barra final) y tres modelos: con precios,
+    /// con solo el de entrada y sin ningún coste.
+    fn priced_catalog() -> Catalog {
+        Catalog::from_json(
+            r#"{"openrouter": {"id": "openrouter", "npm": "@openrouter/ai-sdk-provider",
+                "api": "https://openrouter.ai/api/v1/", "env": ["OPENROUTER_API_KEY"],
+                "models": {
+                    "mistralai/mistral-nemo": {"id": "mistralai/mistral-nemo", "tool_call": true,
+                        "cost": {"input": 0.02, "output": 0.04}},
+                    "solo-entrada": {"id": "solo-entrada", "tool_call": true,
+                        "cost": {"input": 1}},
+                    "sin-coste": {"id": "sin-coste", "tool_call": true}
+                }}}"#,
+        )
+        .expect("el JSON de precios es válido")
+    }
+
+    #[test]
+    fn prices_match_url_ignoring_slash_and_case() {
+        let catalog = priced_catalog();
+        let expected = Some((0.02, 0.04));
+        assert_eq!(
+            catalog.prices("https://openrouter.ai/api/v1", "mistralai/mistral-nemo"),
+            expected,
+            "sin barra final"
+        );
+        assert_eq!(
+            catalog.prices("https://openrouter.ai/api/v1/", "mistralai/mistral-nemo"),
+            expected,
+            "con barra final"
+        );
+        assert_eq!(
+            catalog.prices("HTTPS://OpenRouter.ai/API/v1", "mistralai/mistral-nemo"),
+            expected,
+            "en mayúsculas"
+        );
+    }
+
+    #[test]
+    fn prices_none_when_model_or_price_missing() {
+        let catalog = priced_catalog();
+        let url = "https://openrouter.ai/api/v1";
+        assert_eq!(catalog.prices(url, "desconocido"), None, "modelo ausente");
+        assert_eq!(
+            catalog.prices(url, "solo-entrada"),
+            None,
+            "falta el precio de salida"
+        );
+        assert_eq!(
+            catalog.prices(url, "sin-coste"),
+            None,
+            "sin coste publicado"
+        );
+        assert_eq!(
+            catalog.prices("https://otro.example/v1", "mistralai/mistral-nemo"),
+            None,
+            "URL de otro proveedor"
+        );
+        assert_eq!(
+            Catalog::default().prices(url, "mistralai/mistral-nemo"),
+            None,
+            "sin catálogo"
+        );
     }
 }

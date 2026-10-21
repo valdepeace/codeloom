@@ -1,4 +1,5 @@
 use crate::agent::AgentLoop;
+use crate::catalog::Catalog;
 use crate::config::CodeLoomConfig;
 use crate::error::{CoreError, Result};
 use crate::event::{EventBus, LiveEvent};
@@ -66,6 +67,8 @@ pub struct InProcessSubagentLauncher {
     active: Arc<Semaphore>,
     bus: EventBus,
     broker: Arc<InputBroker>,
+    /// Catálogo compartido con el agente padre; cada hijo lo usa para sus apuntes de consumo.
+    catalog: Arc<RwLock<Catalog>>,
 }
 
 /// Descarta la pregunta pendiente del hijo al terminar su trabajo, sea cual sea la
@@ -109,7 +112,14 @@ impl InProcessSubagentLauncher {
             active: Arc::new(Semaphore::new(8)),
             bus,
             broker: Arc::new(InputBroker::default()),
+            catalog: Arc::new(RwLock::new(Catalog::default())),
         }
+    }
+
+    /// Comparte el catálogo del agente padre con los hijos que lance.
+    pub fn with_catalog(mut self, catalog: Arc<RwLock<Catalog>>) -> Self {
+        self.catalog = catalog;
+        self
     }
 
     /// Preguntas pendientes de los hijos de un padre (`input-required`).
@@ -156,6 +166,7 @@ impl SubagentLauncher for InProcessSubagentLauncher {
         let child_config = self.config.read().unwrap().clone();
         let child_cwd = self.cwd.clone();
         let child_jobs = self.jobs.clone();
+        let child_catalog = self.catalog.clone();
         let descriptor_label = label.clone();
         // El bus del hijo se crea y se suscribe antes de lanzarlo, para no perder ningún
         // evento de su arranque. Su canal se cierra cuando se sueltan todos sus emisores.
@@ -182,7 +193,8 @@ impl SubagentLauncher for InProcessSubagentLauncher {
                         child_config,
                         child_cwd,
                     )
-                    .with_jobs(child_jobs);
+                    .with_jobs(child_jobs)
+                    .with_catalog(child_catalog);
                     let child_cancel = CancellationToken::new();
                     let outcome = tokio::select! {
                         result = child_agent.run(child, prompt, child_cancel.clone()) => result?,

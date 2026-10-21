@@ -1,4 +1,6 @@
-use super::{SessionId, SessionInfo, SessionStore, SubagentDescriptor, SubagentStatus};
+use super::{
+    SessionId, SessionInfo, SessionStore, SubagentDescriptor, SubagentStatus, UsageRecord,
+};
 use crate::error::{CoreError, Result};
 use crate::message::{self, Message};
 use async_trait::async_trait;
@@ -45,6 +47,21 @@ impl SqliteStore {
                 status TEXT NOT NULL,
                 result TEXT,
                 notice_delivered INTEGER NOT NULL DEFAULT 0,
+                created_at_ms INTEGER NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .map_err(|e| CoreError::Store(e.to_string()))?;
+        // Libro de consumo. Una base anterior no la tiene: `IF NOT EXISTS` la añade sin tocar el resto.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL,
+                model TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL,
+                output_tokens INTEGER NOT NULL,
+                input_price REAL,
+                output_price REAL,
                 created_at_ms INTEGER NOT NULL)",
         )
         .execute(&pool)
@@ -268,6 +285,59 @@ impl SessionStore for SqliteStore {
             .map_err(|e| CoreError::Store(e.to_string()))?;
         Ok(true)
     }
+
+    async fn record_usage(&self, session: SessionId, record: &UsageRecord) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO usage (session_id, model, input_tokens, output_tokens, input_price, output_price, created_at_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(session.0)
+        .bind(&record.model)
+        .bind(to_sql_int(record.input_tokens)?)
+        .bind(to_sql_int(record.output_tokens)?)
+        .bind(record.input_price)
+        .bind(record.output_price)
+        .bind(record.created_at_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CoreError::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn session_usage(&self, session: SessionId) -> Result<Vec<UsageRecord>> {
+        let rows = sqlx::query(
+            "SELECT model, input_tokens, output_tokens, input_price, output_price, created_at_ms
+             FROM usage
+             WHERE session_id = ? OR session_id IN (SELECT child_session_id FROM subagents WHERE parent_session_id = ?)
+             ORDER BY id",
+        )
+        .bind(session.0)
+        .bind(session.0)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CoreError::Store(e.to_string()))?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(UsageRecord {
+                    model: row.get("model"),
+                    input_tokens: from_sql_int(row.get("input_tokens"))?,
+                    output_tokens: from_sql_int(row.get("output_tokens"))?,
+                    input_price: row.get("input_price"),
+                    output_price: row.get("output_price"),
+                    created_at_ms: row.get("created_at_ms"),
+                })
+            })
+            .collect()
+    }
+}
+
+/// Los tokens se guardan como INTEGER de SQLite (i64); un valor fuera de rango es un error.
+fn to_sql_int(value: u64) -> Result<i64> {
+    i64::try_from(value).map_err(|_| CoreError::Store(format!("token count out of range: {value}")))
+}
+
+fn from_sql_int(value: i64) -> Result<u64> {
+    u64::try_from(value).map_err(|_| CoreError::Store(format!("negative token count: {value}")))
 }
 
 fn subagent_status(status: SubagentStatus) -> &'static str {
@@ -401,5 +471,162 @@ mod tests {
             reopened.list_subagents(parent).await.unwrap()[0].status,
             SubagentStatus::Interrupted
         );
+    }
+
+    /// Apunte de prueba con precios opcionales `(entrada, salida)` por millón.
+    fn usage(model: &str, input: u64, output: u64, prices: Option<(f64, f64)>) -> UsageRecord {
+        UsageRecord {
+            model: model.into(),
+            input_tokens: input,
+            output_tokens: output,
+            input_price: prices.map(|(input, _)| input),
+            output_price: prices.map(|(_, output)| output),
+            created_at_ms: crate::message::now_ms(),
+        }
+    }
+
+    #[tokio::test]
+    async fn usage_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(dir.path().join("u.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let sid = store.create_session("/p").await.unwrap();
+        let priced = UsageRecord {
+            model: "mistral-nemo".into(),
+            input_tokens: 1200,
+            output_tokens: 300,
+            input_price: Some(0.02),
+            output_price: Some(0.04),
+            created_at_ms: 1_000,
+        };
+        let unpriced = UsageRecord {
+            model: "sin-precio".into(),
+            input_tokens: 5,
+            output_tokens: 7,
+            input_price: None,
+            output_price: None,
+            created_at_ms: 2_000,
+        };
+        store.record_usage(sid, &priced).await.unwrap();
+        store.record_usage(sid, &unpriced).await.unwrap();
+        assert_eq!(
+            store.session_usage(sid).await.unwrap(),
+            vec![priced, unpriced]
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_is_isolated_per_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(dir.path().join("iso.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let first = store.create_session("/p").await.unwrap();
+        let second = store.create_session("/p").await.unwrap();
+        store
+            .record_usage(first, &usage("a", 10, 1, Some((1.0, 2.0))))
+            .await
+            .unwrap();
+        store
+            .record_usage(second, &usage("b", 20, 2, None))
+            .await
+            .unwrap();
+
+        let of_first = store.session_usage(first).await.unwrap();
+        assert_eq!(of_first.len(), 1);
+        assert_eq!(of_first[0].model, "a");
+        let of_second = store.session_usage(second).await.unwrap();
+        assert_eq!(of_second.len(), 1);
+        assert_eq!(of_second[0].model, "b");
+    }
+
+    #[tokio::test]
+    async fn session_usage_includes_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(dir.path().join("hijos.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let parent = store.create_session("/p").await.unwrap();
+        let child = store.create_session("/p").await.unwrap();
+        let stranger = store.create_session("/p").await.unwrap();
+        store
+            .save_subagent(&SubagentDescriptor {
+                parent,
+                child,
+                job_id: "subagent-1".into(),
+                label: "review".into(),
+                status: SubagentStatus::Completed,
+                result: None,
+                notice_delivered: false,
+            })
+            .await
+            .unwrap();
+
+        store
+            .record_usage(parent, &usage("p1", 1, 1, None))
+            .await
+            .unwrap();
+        store
+            .record_usage(child, &usage("c1", 2, 2, None))
+            .await
+            .unwrap();
+        store
+            .record_usage(parent, &usage("p2", 3, 3, None))
+            .await
+            .unwrap();
+        store
+            .record_usage(stranger, &usage("otra", 9, 9, None))
+            .await
+            .unwrap();
+
+        let models: Vec<String> = store
+            .session_usage(parent)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|record| record.model)
+            .collect();
+        assert_eq!(
+            models,
+            vec!["p1", "c1", "p2"],
+            "por id, sin la sesión ajena"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_migrates_an_existing_database_without_usage_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("viejo.db");
+        {
+            // Base anterior al libro de consumo: solo la tabla de sesiones, con una fila.
+            let pool =
+                sqlx::SqlitePool::connect(&format!("sqlite://{}?mode=rwc", path.to_str().unwrap()))
+                    .await
+                    .unwrap();
+            sqlx::query(
+                "CREATE TABLE sessions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project TEXT NOT NULL,
+                    created_at_ms INTEGER NOT NULL)",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO sessions (project, created_at_ms) VALUES ('/p', 1)")
+                .execute(&pool)
+                .await
+                .unwrap();
+            pool.close().await;
+        }
+
+        let store = SqliteStore::open(path.to_str().unwrap()).await.unwrap();
+        let old = SessionId(1);
+        assert!(store.session_usage(old).await.unwrap().is_empty());
+        store
+            .record_usage(old, &usage("nuevo", 4, 4, Some((1.0, 1.0))))
+            .await
+            .unwrap();
+        assert_eq!(store.session_usage(old).await.unwrap().len(), 1);
     }
 }

@@ -2,13 +2,14 @@ pub mod changes;
 pub mod dispatch;
 pub mod stop;
 
+use crate::catalog::Catalog;
 use crate::config::CodeLoomConfig;
 use crate::error::Result;
 use crate::event::{EventBus, LiveEvent};
 use crate::message::{ContentPart, FinishReason, Message, Role, Usage};
 use crate::permission::PermissionService;
 use crate::provider::{Provider, ProviderRequest, StreamChunk};
-use crate::session::{SessionId, SessionStore};
+use crate::session::{SessionId, SessionStore, UsageRecord};
 use crate::tools::{ToolCtx, ToolRegistry};
 use futures::StreamExt;
 use std::path::PathBuf;
@@ -32,6 +33,8 @@ pub struct AgentLoop {
     changes: crate::agent::changes::ChangeTracker,
     jobs: Arc<dyn crate::job::JobRegistry>,
     subagents: Option<Arc<dyn crate::subagent::SubagentLauncher>>,
+    /// Catálogo compartido de modelos y precios; vacío hasta que `with_catalog` lo sustituye.
+    catalog: Arc<RwLock<Catalog>>,
 }
 
 impl AgentLoop {
@@ -48,19 +51,8 @@ impl AgentLoop {
         let config = Arc::new(RwLock::new(config));
         let jobs: Arc<dyn crate::job::JobRegistry> =
             Arc::new(crate::job::LocalJobRegistry::default());
-        let subagents = tools.get("subagent").map(|_| {
-            Arc::new(crate::subagent::InProcessSubagentLauncher::new(
-                provider.clone(),
-                store.clone(),
-                tools.clone(),
-                permission.clone(),
-                config.clone(),
-                cwd.clone(),
-                jobs.clone(),
-                bus.clone(),
-            )) as Arc<dyn crate::subagent::SubagentLauncher>
-        });
-        Self {
+        let has_subagents = tools.get("subagent").is_some();
+        let mut agent = Self {
             provider,
             store,
             tools,
@@ -69,14 +61,72 @@ impl AgentLoop {
             config,
             changes: crate::agent::changes::ChangeTracker::detect(cwd.clone()),
             jobs,
-            subagents,
+            subagents: None,
+            catalog: Arc::new(RwLock::new(Catalog::default())),
             cwd,
+        };
+        if has_subagents {
+            agent.subagents = Some(agent.subagent_launcher());
         }
+        agent
     }
 
     pub fn with_jobs(mut self, jobs: Arc<dyn crate::job::JobRegistry>) -> Self {
         self.jobs = jobs;
         self
+    }
+
+    /// Comparte el catálogo de modelos con el agente y con sus subagentes, que apuntan el
+    /// precio vigente de cada respuesta. Sin catálogo, los apuntes se guardan con precio `NULL`.
+    pub fn with_catalog(mut self, catalog: Arc<RwLock<Catalog>>) -> Self {
+        self.catalog = catalog;
+        // El lanzador guarda su propia copia del `Arc`: si ya existía, se reconstruye con el nuevo.
+        if self.subagents.is_some() {
+            self.subagents = Some(self.subagent_launcher());
+        }
+        self
+    }
+
+    /// Lanzador de subagentes con el estado actual de este agente, catálogo incluido.
+    fn subagent_launcher(&self) -> Arc<dyn crate::subagent::SubagentLauncher> {
+        Arc::new(
+            crate::subagent::InProcessSubagentLauncher::new(
+                self.provider.clone(),
+                self.store.clone(),
+                self.tools.clone(),
+                self.permission.clone(),
+                self.config.clone(),
+                self.cwd.clone(),
+                self.jobs.clone(),
+                self.bus.clone(),
+            )
+            .with_catalog(self.catalog.clone()),
+        )
+    }
+
+    /// Guarda el apunte de consumo de una respuesta, con el modelo y la URL de la configuración
+    /// vigente y los precios del catálogo en ese instante. Un fallo se registra y no corta el turno.
+    async fn record_usage(&self, session: SessionId, usage: &crate::message::Usage) {
+        let (model, base_url) = {
+            let config = self.config.read().unwrap();
+            (config.model.clone(), config.provider.base_url.clone())
+        };
+        let prices = self
+            .catalog
+            .read()
+            .ok()
+            .and_then(|catalog| catalog.prices(&base_url, &model));
+        let record = UsageRecord {
+            model,
+            input_tokens: u64::from(usage.input_tokens),
+            output_tokens: u64::from(usage.output_tokens),
+            input_price: prices.map(|(input, _)| input),
+            output_price: prices.map(|(_, output)| output),
+            created_at_ms: crate::message::now_ms(),
+        };
+        if let Err(error) = self.store.record_usage(session, &record).await {
+            tracing::warn!(error = %error, "no se pudo guardar el apunte de consumo");
+        }
     }
 
     pub fn jobs(&self) -> Arc<dyn crate::job::JobRegistry> {
@@ -234,6 +284,12 @@ impl AgentLoop {
                     StreamChunk::Done(r) => finish = r,
                     _ => {}
                 }
+            }
+
+            // Un apunte por respuesta: el proveedor puede repartir su uso en varios fragmentos,
+            // así que se guarda el total acumulado al cerrar el flujo.
+            if let Some(total) = &usage {
+                self.record_usage(session, total).await;
             }
 
             if cancel.is_cancelled() {
@@ -1009,6 +1065,185 @@ mod tests {
         assert!(
             published,
             "el aviso debería publicarse como SessionMessageAdded"
+        );
+    }
+
+    /// Catálogo con `acme` (`https://acme.example/v1`) y dos modelos con precios distintos.
+    fn priced_catalog() -> Arc<RwLock<crate::catalog::Catalog>> {
+        let catalog = crate::catalog::Catalog::from_json(
+            r#"{"acme": {"id": "acme", "npm": "@ai-sdk/openai-compatible",
+                "api": "https://acme.example/v1", "env": ["ACME_KEY"],
+                "models": {
+                    "m-caro": {"id": "m-caro", "tool_call": true, "cost": {"input": 3, "output": 15}},
+                    "m-barato": {"id": "m-barato", "tool_call": true, "cost": {"input": 0.5, "output": 1}}
+                }}}"#,
+        )
+        .expect("el JSON de precios es válido");
+        Arc::new(RwLock::new(catalog))
+    }
+
+    /// Configuración del proveedor `acme` con el modelo indicado.
+    fn acme_config(model: &str) -> CodeLoomConfig {
+        CodeLoomConfig {
+            provider: crate::config::ProviderConfig {
+                kind: crate::config::ProviderKind::OpenAiCompat,
+                base_url: "https://acme.example/v1".into(),
+                api_key_env: "K".into(),
+            },
+            model: model.into(),
+            max_steps: 5,
+            effort: None,
+        }
+    }
+
+    fn usage_chunk(input: u32, output: u32) -> StreamChunk {
+        StreamChunk::Usage(crate::message::Usage {
+            input_tokens: input,
+            output_tokens: output,
+        })
+    }
+
+    #[tokio::test]
+    async fn agent_records_one_usage_row_per_response_with_current_model_and_price() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SqliteStore::open(dir.path().join("a.db").to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+        let sid = store.create_session("/p").await.unwrap();
+        // Como Anthropic: dos fragmentos de uso en una misma respuesta.
+        let provider = Arc::new(QueueProvider {
+            scripts: Mutex::new(
+                vec![vec![
+                    StreamChunk::TextDelta("hola".into()),
+                    usage_chunk(10, 1),
+                    usage_chunk(0, 5),
+                    StreamChunk::Done(FinishReason::Stop),
+                ]]
+                .into(),
+            ),
+        });
+        let agent = AgentLoop::new(
+            provider,
+            store.clone(),
+            Arc::new(ToolRegistry::new()),
+            EventBus::new(64),
+            Arc::new(PermissionService::allow_all()),
+            acme_config("m-caro"),
+            dir.path().to_path_buf(),
+        )
+        .with_catalog(priced_catalog());
+        agent
+            .run(sid, "hi".into(), CancellationToken::new())
+            .await
+            .unwrap();
+
+        let rows = store.session_usage(sid).await.unwrap();
+        assert_eq!(rows.len(), 1, "una respuesta, un apunte");
+        assert_eq!(rows[0].model, "m-caro");
+        assert_eq!(rows[0].input_tokens, 10);
+        assert_eq!(rows[0].output_tokens, 6);
+        assert_eq!(
+            (rows[0].input_price, rows[0].output_price),
+            (Some(3.0), Some(15.0))
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_records_null_prices_without_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SqliteStore::open(dir.path().join("sin.db").to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+        let sid = store.create_session("/p").await.unwrap();
+        let provider = Arc::new(QueueProvider {
+            scripts: Mutex::new(
+                vec![vec![
+                    usage_chunk(7, 3),
+                    StreamChunk::Done(FinishReason::Stop),
+                ]]
+                .into(),
+            ),
+        });
+        let agent = AgentLoop::new(
+            provider,
+            store.clone(),
+            Arc::new(ToolRegistry::new()),
+            EventBus::new(64),
+            Arc::new(PermissionService::allow_all()),
+            acme_config("m-caro"),
+            dir.path().to_path_buf(),
+        );
+        agent
+            .run(sid, "hi".into(), CancellationToken::new())
+            .await
+            .unwrap();
+
+        let rows = store.session_usage(sid).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (7, 3));
+        assert_eq!((rows[0].input_price, rows[0].output_price), (None, None));
+        assert_eq!(rows[0].cost(), None);
+    }
+
+    #[tokio::test]
+    async fn model_switch_mid_session_keeps_each_price() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SqliteStore::open(dir.path().join("cambio.db").to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+        let sid = store.create_session("/p").await.unwrap();
+        let provider = Arc::new(QueueProvider {
+            scripts: Mutex::new(
+                vec![
+                    vec![usage_chunk(100, 10), StreamChunk::Done(FinishReason::Stop)],
+                    vec![usage_chunk(200, 20), StreamChunk::Done(FinishReason::Stop)],
+                ]
+                .into(),
+            ),
+        });
+        let agent = AgentLoop::new(
+            provider.clone(),
+            store.clone(),
+            Arc::new(ToolRegistry::new()),
+            EventBus::new(64),
+            Arc::new(PermissionService::allow_all()),
+            acme_config("m-caro"),
+            dir.path().to_path_buf(),
+        )
+        .with_catalog(priced_catalog());
+        agent
+            .run(sid, "uno".into(), CancellationToken::new())
+            .await
+            .unwrap();
+        agent.update_provider(provider.clone(), acme_config("m-barato"));
+        agent
+            .run(sid, "dos".into(), CancellationToken::new())
+            .await
+            .unwrap();
+
+        let rows = store.session_usage(sid).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].model, "m-caro");
+        assert_eq!(
+            (rows[0].input_price, rows[0].output_price),
+            (Some(3.0), Some(15.0))
+        );
+        assert_eq!(rows[1].model, "m-barato");
+        assert_eq!(
+            (rows[1].input_price, rows[1].output_price),
+            (Some(0.5), Some(1.0))
+        );
+        // 100·3 + 10·15 + 200·0.5 + 20·1, todo por millón: 0.00057 dólares.
+        let total: f64 = rows.iter().filter_map(|row| row.cost()).sum();
+        assert!(
+            (total - 0.00057).abs() < 1e-12,
+            "total de la sesión: {total}"
         );
     }
 }
