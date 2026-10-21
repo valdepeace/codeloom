@@ -128,7 +128,7 @@ impl OpenAiCompatProvider {
                 })
             })
             .collect();
-        serde_json::json!({
+        let mut cuerpo = serde_json::json!({
             "model": req.model,
             "messages": messages,
             "tools": tools,
@@ -138,7 +138,17 @@ impl OpenAiCompatProvider {
             "stream_options": { "include_usage": true },
             "temperature": req.temperature,
             "max_tokens": req.max_tokens
-        })
+        });
+        // Sin esfuerzo, el cuerpo queda exactamente como antes de existir este campo.
+        if let Some(nivel) = req.effort.as_deref() {
+            // OpenRouter no entiende `reasoning_effort`: su forma nativa anida el nivel.
+            if self.base_url.contains("openrouter.ai") {
+                cuerpo["reasoning"] = serde_json::json!({ "effort": nivel });
+            } else {
+                cuerpo["reasoning_effort"] = serde_json::json!(nivel);
+            }
+        }
+        cuerpo
     }
 }
 
@@ -428,5 +438,75 @@ mod wire_tests {
         };
         let body = p.build_body(&req);
         assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+}
+
+#[cfg(test)]
+mod effort_tests {
+    use super::*;
+    use crate::provider::ToolSpec;
+    use serde_json::json;
+
+    /// Petición de prueba con una herramienta, para que el cuerpo sea representativo.
+    fn peticion(effort: Option<&str>) -> ProviderRequest {
+        ProviderRequest {
+            model: "m".into(),
+            system: "sys".into(),
+            messages: vec![],
+            tools: vec![ToolSpec {
+                name: "view".into(),
+                description: "Ve un fichero".into(),
+                input_schema: json!({ "type": "object" }),
+            }],
+            temperature: 0.5,
+            max_tokens: 16,
+            effort: effort.map(String::from),
+        }
+    }
+
+    #[test]
+    fn openai_body_without_effort_is_unchanged() {
+        // Cuerpo exacto que enviaba `build_body` antes de existir el esfuerzo.
+        let previo = json!({
+            "model": "m",
+            "messages": [{ "role": "system", "content": "sys" }],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "view",
+                    "description": "Ve un fichero",
+                    "parameters": { "type": "object" }
+                }
+            }],
+            "stream": true,
+            "stream_options": { "include_usage": true },
+            "temperature": 0.5,
+            "max_tokens": 16
+        });
+        let p = OpenAiCompatProvider::new("http://x", "k");
+        assert_eq!(p.build_body(&peticion(None)), previo);
+    }
+
+    #[test]
+    fn openai_body_sends_reasoning_effort() {
+        let p = OpenAiCompatProvider::new("http://x", "k");
+        let con = p.build_body(&peticion(Some("high")));
+        assert_eq!(con["reasoning_effort"], "high");
+        assert!(con.get("reasoning").is_none());
+        // Salvo el campo nuevo, el cuerpo es idéntico al de «default».
+        let mut sin_campo = con.clone();
+        sin_campo
+            .as_object_mut()
+            .unwrap()
+            .remove("reasoning_effort");
+        assert_eq!(sin_campo, p.build_body(&peticion(None)));
+    }
+
+    #[test]
+    fn openrouter_body_nests_effort_under_reasoning() {
+        let p = OpenAiCompatProvider::new("https://openrouter.ai/api/v1", "k");
+        let con = p.build_body(&peticion(Some("high")));
+        assert_eq!(con["reasoning"]["effort"], "high");
+        assert!(con.get("reasoning_effort").is_none());
     }
 }
