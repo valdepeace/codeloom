@@ -5,8 +5,11 @@
 //! que vive fuera de `batten` (`codeloom-tui`), de modo que la pieza solo pinta
 //! hechos y estado.
 
-use super::tool_lines::{body_lines, truncate_graphemes, SUMMARY_GRAPHEMES};
-use super::{tool_lines, Line, LineKind, SpanSpec, StyleToken, ToolItem};
+use super::tool_lines::{body_lines, more_line, truncate_graphemes, SUMMARY_GRAPHEMES};
+use super::{
+    tool_lines, Diff, DiffKind, DiffLine, Line, LineKind, SpanSpec, StyleToken, ToolItem,
+    ToolStatus,
+};
 use unicode_segmentation::UnicodeSegmentation;
 
 /// Hechos tipados de una llamada a herramienta, ya extraídos de su entrada.
@@ -60,6 +63,10 @@ enum Part {
     /// Dato secundario y corto: rango de líneas, filtro `glob`.
     Detail,
     Count,
+    /// Líneas añadidas de un `edit` (`+N`).
+    Added,
+    /// Líneas borradas de un `edit` (`-N`).
+    Removed,
 }
 
 /// Único punto donde se elige el estilo de cada parte del resumen. La Tarea 5
@@ -71,11 +78,19 @@ fn style_of(part: Part) -> StyleToken {
         Part::Path | Part::Pattern => StyleToken::Accent,
         Part::Detail => StyleToken::Muted,
         Part::Count => StyleToken::Dim,
+        Part::Added => StyleToken::DiffInsert,
+        Part::Removed => StyleToken::DiffDelete,
     }
 }
 
 /// Longitud máxima en grafemas de la cola de un resumen (`in {glob}`, rango).
 const TAIL_GRAPHEMES: usize = 40;
+
+/// Líneas de contexto alrededor de cada cambio del diff de `edit`.
+const DIFF_CONTEXT: usize = 2;
+
+/// Líneas de diff visibles mientras la llamada no está expandida.
+const DIFF_LINES: usize = 12;
 
 /// Primera línea no vacía de `text`, sin espacios sobrantes.
 fn first_line(text: &str) -> Option<&str> {
@@ -99,6 +114,17 @@ fn with_tail(main: &str, main_part: Part, tail: Option<String>) -> Vec<(Part, St
     parts
 }
 
+/// Añade `text` al final de `line` con el token de `part`.
+fn push_text(line: &mut Line, text: &str, part: Part) {
+    let start = line.text.len();
+    line.text.push_str(text);
+    line.spans.push(SpanSpec {
+        start,
+        len: text.len(),
+        token: style_of(part),
+    });
+}
+
 /// Cabecera con el nombre de la herramienta, su estado y las partes del resumen.
 /// Mismo formato que la cabecera genérica: nombre, dos espacios y resumen.
 fn head_line(item: &ToolItem, parts: &[(Part, String)]) -> Line {
@@ -112,13 +138,7 @@ fn head_line(item: &ToolItem, parts: &[(Part, String)]) -> Line {
     }
     for (index, (part, text)) in parts.iter().enumerate() {
         head.text.push_str(if index == 0 { "  " } else { " " });
-        let start = head.text.len();
-        head.text.push_str(text);
-        head.spans.push(SpanSpec {
-            start,
-            len: text.len(),
-            token: style_of(*part),
-        });
+        push_text(&mut head, text, *part);
     }
     head
 }
@@ -205,8 +225,96 @@ impl ToolAtom for SearchAtom {
     }
 }
 
+/// Cabecera de `edit`: la ruta y, tras dos espacios, las líneas añadidas y
+/// borradas. La ruta se trunca dejando sitio a ese recuento.
+fn edit_head(item: &ToolItem, path: &str, diff: &Diff) -> Line {
+    let (added, removed) = (diff.added(), diff.removed());
+    let stats = format!("+{added} -{removed}");
+    // Se reservan los dos espacios separadores y el recuento.
+    let reserved = stats.graphemes(true).count() + 2;
+    let path = truncate_graphemes(path, SUMMARY_GRAPHEMES - reserved);
+    let mut head = head_line(item, &[(Part::Path, path)]);
+    head.text.push_str("  ");
+    push_text(&mut head, &format!("+{added}"), Part::Added);
+    head.text.push(' ');
+    push_text(&mut head, &format!("-{removed}"), Part::Removed);
+    head
+}
+
+/// Token de una línea de diff según su tipo.
+fn diff_token(kind: DiffKind) -> StyleToken {
+    match kind {
+        DiffKind::Insert => StyleToken::DiffInsert,
+        DiffKind::Delete => StyleToken::DiffDelete,
+        DiffKind::Hunk => StyleToken::DiffHunk,
+        DiffKind::Context => StyleToken::Muted,
+    }
+}
+
+/// Línea de diff con su marca delante del texto: `+` o `-` en los cambios y un
+/// espacio en el contexto. La cabecera de hunk va sin marca.
+fn diff_line(line: &DiffLine) -> Line {
+    let text = match line.kind {
+        DiffKind::Hunk => line.text.clone(),
+        DiffKind::Context => format!("  {}", line.text),
+        DiffKind::Insert => format!("+ {}", line.text),
+        DiffKind::Delete => format!("- {}", line.text),
+    };
+    let len = text.len();
+    let mut out = Line::new(LineKind::ToolDiff(line.kind), text);
+    out.spans.push(SpanSpec {
+        start: 0,
+        len,
+        token: diff_token(line.kind),
+    });
+    out
+}
+
+/// Líneas del diff, acotadas a `DIFF_LINES` salvo que la llamada esté expandida.
+fn diff_body(item: &ToolItem, diff: &Diff) -> Vec<Line> {
+    let all = diff.lines();
+    let shown = if item.expanded {
+        all.len()
+    } else {
+        all.len().min(DIFF_LINES)
+    };
+    let mut lines: Vec<Line> = all[..shown].iter().map(diff_line).collect();
+    if shown < all.len() {
+        lines.push(more_line(all.len() - shown));
+    }
+    lines
+}
+
+/// Pieza de `edit`: la ruta con las líneas añadidas y borradas, y el diff como
+/// cuerpo. Con error, la salida del error va tras el diff. Sin texto previo y
+/// nuevo, o sin cambios, degrada a la genérica.
+struct EditAtom;
+
+impl ToolAtom for EditAtom {
+    fn lines(&self, item: &ToolItem, facts: &ToolFacts) -> Vec<Line> {
+        let (Some(path), Some(before), Some(after)) = (
+            facts.primary.as_deref().and_then(first_line),
+            facts.before.as_deref(),
+            facts.after.as_deref(),
+        ) else {
+            return tool_lines(item);
+        };
+        let diff = Diff::new(before, after, DIFF_CONTEXT);
+        if diff.is_empty() {
+            return tool_lines(item);
+        }
+        let mut lines = vec![edit_head(item, path, &diff)];
+        lines.extend(diff_body(item, &diff));
+        if item.status() == ToolStatus::Error {
+            lines.extend(body_lines(item));
+        }
+        lines
+    }
+}
+
 static SHELL: ShellAtom = ShellAtom;
 static FILE: FileAtom = FileAtom;
+static EDIT: EditAtom = EditAtom;
 static GREP: SearchAtom = SearchAtom { label: "matches" };
 static GLOB: SearchAtom = SearchAtom { label: "files" };
 
@@ -216,6 +324,7 @@ pub fn atom_for(name: &str) -> &'static dyn ToolAtom {
     match name {
         "bash" => &SHELL,
         "view" => &FILE,
+        "edit" => &EDIT,
         "grep" => &GREP,
         "glob" => &GLOB,
         _ => &GENERIC,
@@ -230,7 +339,7 @@ pub fn tool_lines_with(item: &ToolItem, facts: &ToolFacts) -> Vec<Line> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{LineKind, ToolStatus};
+    use crate::state::{Diff, DiffKind, LineKind, StyleToken, ToolStatus};
     use unicode_segmentation::UnicodeSegmentation;
 
     /// Llamadas representativas de cada estado que `tool_lines` distingue.
@@ -477,5 +586,130 @@ mod tests {
             .count();
         assert_eq!(body, 2);
         assert_eq!(lines.last().unwrap().kind, LineKind::ToolMore);
+    }
+
+    /// Hechos de una edición de `path` de `before` a `after`.
+    fn edit_facts(path: &str, before: &str, after: &str) -> ToolFacts {
+        ToolFacts {
+            primary: Some(path.to_string()),
+            before: Some(before.to_string()),
+            after: Some(after.to_string()),
+            ..ToolFacts::default()
+        }
+    }
+
+    /// Llamada `edit` terminada con éxito.
+    fn edit_item() -> ToolItem {
+        let mut item = ToolItem::new("c1", "edit");
+        item.set_result(false);
+        item.set_output("edit applied");
+        item
+    }
+
+    fn diff_count(lines: &[Line]) -> usize {
+        lines
+            .iter()
+            .filter(|l| matches!(l.kind, LineKind::ToolDiff(_)))
+            .count()
+    }
+
+    #[test]
+    fn edit_summary_shows_path_and_counts() {
+        let item = edit_item();
+        let facts = edit_facts("src/lib.rs", "a\nb\nc\n", "a\nB\nc\nd\n");
+        let lines = tool_lines_with(&item, &facts);
+        assert_eq!(lines[0].plain(), "edit  src/lib.rs  +2 -1");
+        assert_eq!(lines[0].kind, LineKind::ToolHead(ToolStatus::Success));
+    }
+
+    #[test]
+    fn edit_body_has_diff_lines_with_kinds() {
+        let item = edit_item();
+        let facts = edit_facts("a.txt", "a\nb\n", "a\nB\n");
+        let lines = tool_lines_with(&item, &facts);
+        let body: Vec<(LineKind, &str)> = lines[1..].iter().map(|l| (l.kind, l.plain())).collect();
+        assert_eq!(
+            body,
+            vec![
+                (LineKind::ToolDiff(DiffKind::Hunk), "@@ -1,2 +1,2 @@"),
+                (LineKind::ToolDiff(DiffKind::Context), "  a"),
+                (LineKind::ToolDiff(DiffKind::Delete), "- b"),
+                (LineKind::ToolDiff(DiffKind::Insert), "+ B"),
+            ]
+        );
+        assert_eq!(lines[3].spans[0].token, StyleToken::DiffDelete);
+        assert_eq!(lines[4].spans[0].token, StyleToken::DiffInsert);
+    }
+
+    #[test]
+    fn edit_diff_is_capped_and_expandable() {
+        let before: String = (0..30).map(|i| format!("viejo {i}\n")).collect();
+        let after: String = (0..30).map(|i| format!("nuevo {i}\n")).collect();
+        let total = Diff::new(&before, &after, DIFF_CONTEXT).lines().len();
+        assert!(
+            total > DIFF_LINES + 1,
+            "precondición: el diff supera el tope"
+        );
+        let facts = edit_facts("a.txt", &before, &after);
+
+        let mut item = edit_item();
+        let lines = tool_lines_with(&item, &facts);
+        assert_eq!(diff_count(&lines), DIFF_LINES);
+        let more = lines.last().unwrap();
+        assert_eq!(more.kind, LineKind::ToolMore);
+        assert_eq!(
+            more.plain(),
+            format!("… ({} lines hidden) [Ctrl+O to expand]", total - DIFF_LINES)
+        );
+
+        item.toggle_expanded();
+        let lines = tool_lines_with(&item, &facts);
+        assert_eq!(diff_count(&lines), total);
+        assert!(lines.iter().all(|l| l.kind != LineKind::ToolMore));
+    }
+
+    #[test]
+    fn edit_without_before_after_falls_back() {
+        let mut item = edit_item();
+        item.set_summary("src/lib.rs");
+        let only_path = primary("src/lib.rs");
+        let without_after = ToolFacts {
+            before: Some("x".to_string()),
+            ..primary("src/lib.rs")
+        };
+        for facts in [only_path, without_after] {
+            assert_eq!(tool_lines_with(&item, &facts), tool_lines(&item));
+        }
+    }
+
+    #[test]
+    fn empty_diff_falls_back() {
+        let item = edit_item();
+        let facts = edit_facts("a.txt", "igual\n", "igual\n");
+        assert_eq!(tool_lines_with(&item, &facts), tool_lines(&item));
+    }
+
+    #[test]
+    fn edit_error_keeps_error_output_after_the_diff() {
+        let mut item = ToolItem::new("c1", "edit");
+        item.set_result(true);
+        item.set_output("old text not found");
+        let lines = tool_lines_with(&item, &edit_facts("a.txt", "a\n", "b\n"));
+        assert_eq!(lines[0].kind, LineKind::ToolHead(ToolStatus::Error));
+        let last = lines.last().unwrap();
+        assert_eq!(last.kind, LineKind::ToolBody);
+        assert_eq!(last.plain(), "old text not found");
+        assert_eq!(diff_count(&lines[..lines.len() - 1]), 3);
+    }
+
+    #[test]
+    fn edit_running_shows_diff_from_input() {
+        let mut item = ToolItem::new("c1", "edit");
+        item.start();
+        let lines = tool_lines_with(&item, &edit_facts("a.txt", "a\n", "b\n"));
+        assert_eq!(lines[0].kind, LineKind::ToolHead(ToolStatus::Running));
+        assert!(lines
+            .iter()
+            .any(|l| l.kind == LineKind::ToolDiff(DiffKind::Insert)));
     }
 }

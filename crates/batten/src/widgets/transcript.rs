@@ -1,7 +1,8 @@
 //! Vista del transcript: ventana visible + scroll + wraps CJK-aware.
 
 use crate::state::{
-    CellPos, Line, LineKind, Selection, StyleToken, TextSelection, ToolStatus, Transcript, Viewport,
+    CellPos, DiffKind, Line, LineKind, Selection, StyleToken, TextSelection, ToolStatus,
+    Transcript, Viewport,
 };
 use crate::widgets::Theme;
 use ratatui::buffer::{Buffer, CellDiffOption};
@@ -28,7 +29,7 @@ fn prefix(kind: LineKind) -> &'static str {
         LineKind::TodoItem(ToolStatus::Running) => "◐ ",
         LineKind::TodoItem(ToolStatus::Success) => "☑ ",
         LineKind::TodoItem(_) => "☐ ",
-        LineKind::ToolBody => "│ ",
+        LineKind::ToolBody | LineKind::ToolDiff(_) => "│ ",
         LineKind::ToolMore => "  ",
     }
 }
@@ -49,6 +50,10 @@ fn kind_token(kind: LineKind) -> StyleToken {
         LineKind::TodoItem(ToolStatus::Success) => StyleToken::TodoCompleted,
         LineKind::TodoItem(_) => StyleToken::TodoPending,
         LineKind::ToolBody => StyleToken::Muted,
+        LineKind::ToolDiff(DiffKind::Insert) => StyleToken::DiffInsert,
+        LineKind::ToolDiff(DiffKind::Delete) => StyleToken::DiffDelete,
+        LineKind::ToolDiff(DiffKind::Hunk) => StyleToken::DiffHunk,
+        LineKind::ToolDiff(DiffKind::Context) => StyleToken::Muted,
         LineKind::ToolMore => StyleToken::Dim,
     }
 }
@@ -762,6 +767,50 @@ mod tests {
         assert!(out.contains("│ uno"), "falta el cuerpo de la tool");
         assert!(!t.line(0).unwrap().plain().contains('●'));
         assert!(!t.line(1).unwrap().plain().contains('│'));
+    }
+
+    #[test]
+    fn diff_lines_render_with_insert_and_delete_styles() {
+        use crate::state::{DiffKind, StyleToken};
+        let theme = Theme::test();
+        let mut t = Transcript::new();
+        let line = |kind: DiffKind, text: &str| {
+            let mut l = Line::new(LineKind::ToolDiff(kind), text);
+            l.spans.push(crate::state::SpanSpec {
+                start: 0,
+                len: text.len(),
+                token: match kind {
+                    DiffKind::Insert => StyleToken::DiffInsert,
+                    DiffKind::Delete => StyleToken::DiffDelete,
+                    _ => StyleToken::DiffHunk,
+                },
+            });
+            l
+        };
+        t.push_lines(vec![
+            line(DiffKind::Delete, "- uno"),
+            line(DiffKind::Insert, "+ dos"),
+        ]);
+        let mut term = Terminal::new(TestBackend::new(20, 3)).unwrap();
+        term.draw(|f| {
+            render(
+                f,
+                f.area(),
+                &t,
+                &mut Viewport::new(),
+                &mut Layout::new(),
+                None,
+                &theme,
+            )
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        // Con el prefijo «│ » el texto empieza en la columna 2.
+        let deleted = theme.style(StyleToken::DiffDelete);
+        let inserted = theme.style(StyleToken::DiffInsert);
+        assert_ne!(deleted.fg, inserted.fg, "precondición: estilos distintos");
+        assert_eq!(Some(buf[(2, 0)].fg), deleted.fg);
+        assert_eq!(Some(buf[(2, 1)].fg), inserted.fg);
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use super::diff::DiffKind;
 use super::tool::ToolStatus;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,6 +21,9 @@ pub enum LineKind {
     TodoItem(ToolStatus),
     /// Línea de salida de una herramienta.
     ToolBody,
+    /// Línea de diff bajo una herramienta `edit`: cabecera de hunk, contexto,
+    /// inserción o borrado.
+    ToolDiff(DiffKind),
     /// Indicación de salida oculta bajo una herramienta.
     ToolMore,
 }

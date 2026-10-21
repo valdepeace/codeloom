@@ -63,14 +63,19 @@ pub(crate) fn body_lines(item: &ToolItem) -> Vec<Line> {
                 .map(|l| Line::new(LineKind::ToolBody, *l)),
         );
         if shown < body.len() {
-            let hidden = body.len() - shown;
-            lines.push(Line::new(
-                LineKind::ToolMore,
-                format!("… ({hidden} lines hidden) [Ctrl+O to expand]"),
-            ));
+            lines.push(more_line(body.len() - shown));
         }
     }
     lines
+}
+
+/// Indicación de `hidden` líneas ocultas bajo una herramienta. La comparten el
+/// cuerpo plegado y el diff de `edit` para que el aviso sea el mismo.
+pub(crate) fn more_line(hidden: usize) -> Line {
+    Line::new(
+        LineKind::ToolMore,
+        format!("… ({hidden} lines hidden) [Ctrl+O to expand]"),
+    )
 }
 
 /// Recorta `text` a `max` grafemas, terminando en `…` si se corta.
