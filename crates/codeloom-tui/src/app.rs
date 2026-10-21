@@ -150,6 +150,22 @@ const TODO_TOOL: &str = "todo_write";
 /// Turnos automáticos que puede encadenar el padre tras cada mensaje del usuario.
 pub const MAX_AUTO_TURNS: u32 = 8;
 
+/// Métricas vivas de un subagente. Se alimentan solo de `LiveEvent::ChildEvent`
+/// y no se persisten: al cambiar de sesión desaparecen.
+#[derive(Debug, Clone, Default)]
+pub struct AgentStats {
+    /// Paso en curso del hijo dentro de su turno.
+    pub step: usize,
+    pub max_steps: usize,
+    /// Herramienta que el hijo está ejecutando ahora, si hay alguna.
+    pub tool: Option<String>,
+    /// Tokens acumulados por el hijo; no suman al contador del turno del padre.
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub started_at: Option<Instant>,
+    pub finished_at: Option<Instant>,
+}
+
 pub struct App {
     /// Transcript persistente: se actualiza con los eventos, no por frame.
     pub transcript: batten::state::Transcript,
@@ -192,6 +208,9 @@ pub struct App {
     /// Hijos de la sesión abierta que esperan una respuesta de su padre (`input-required`).
     /// La clave es el id interno del hijo, como en `subagents`.
     pub awaiting_input: HashSet<i64>,
+    /// Métricas de los hijos de la sesión abierta, por id interno del hijo. Solo
+    /// contiene hijos de esa sesión: se filtra al recibir y se limpia al cargarla.
+    pub agent_stats: HashMap<i64, AgentStats>,
     pub tools_open: bool,
     pub tool_selected: usize,
     pub tool_scroll: (u16, u16),
@@ -327,6 +346,7 @@ impl App {
             jobs: BTreeMap::new(),
             subagents: BTreeMap::new(),
             awaiting_input: HashSet::new(),
+            agent_stats: HashMap::new(),
             tools_open: false,
             tool_selected: 0,
             tool_scroll: (0, 0),
@@ -694,6 +714,7 @@ impl App {
         self.session_id = Some(session);
         self.subagents.clear();
         self.awaiting_input.clear();
+        self.agent_stats.clear();
         self.session_selected = 0;
         self.session_query.clear();
         self.session_searching = false;
@@ -867,6 +888,74 @@ impl App {
         }
     }
 
+    /// Tokens de entrada y salida sumados de todos los hijos de la sesión abierta.
+    pub fn hierarchy_tokens(&self) -> (u64, u64) {
+        self.agent_stats
+            .values()
+            .fold((0, 0), |(input, output), stats| {
+                (
+                    input.saturating_add(stats.input_tokens),
+                    output.saturating_add(stats.output_tokens),
+                )
+            })
+    }
+
+    /// Número de subagentes de la sesión abierta que siguen en marcha.
+    pub fn active_agents(&self) -> usize {
+        self.subagents
+            .values()
+            .filter(|subagent| {
+                Some(subagent.parent) == self.session_id
+                    && subagent.status == codeloom_core::session::SubagentStatus::Running
+            })
+            .count()
+    }
+
+    /// Actualiza las métricas de un hijo de la sesión abierta. Solo toca `agent_stats`:
+    /// el turno, el transcript y los contadores del padre quedan intactos.
+    fn apply_child_event(&mut self, child: SessionId, event: LiveEvent) {
+        // Los eventos que no se reenvían no crean métricas.
+        if !event.is_child_relevant() {
+            return;
+        }
+        let now = Instant::now();
+        let stats = self
+            .agent_stats
+            .entry(child.0)
+            .or_insert_with(|| AgentStats {
+                started_at: Some(now),
+                ..AgentStats::default()
+            });
+        match event {
+            LiveEvent::TurnStarted => {
+                // Un turno nuevo reinicia el progreso, pero conserva los tokens acumulados.
+                stats.step = 0;
+                stats.max_steps = 0;
+                stats.tool = None;
+                stats.started_at = Some(now);
+                stats.finished_at = None;
+            }
+            LiveEvent::StepStarted { step, max_steps } => {
+                stats.step = step;
+                stats.max_steps = max_steps;
+            }
+            LiveEvent::ToolStarted { name, .. } => stats.tool = Some(name),
+            LiveEvent::ToolFinished { .. } => stats.tool = None,
+            LiveEvent::Usage {
+                input_tokens,
+                output_tokens,
+            } => {
+                stats.input_tokens = stats.input_tokens.saturating_add(u64::from(input_tokens));
+                stats.output_tokens = stats.output_tokens.saturating_add(u64::from(output_tokens));
+            }
+            LiveEvent::TurnEnded | LiveEvent::Error { .. } => {
+                stats.finished_at = Some(now);
+                stats.tool = None;
+            }
+            _ => {}
+        }
+    }
+
     pub fn apply(&mut self, ev: LiveEvent) {
         match ev {
             LiveEvent::TurnStarted => {
@@ -1033,8 +1122,15 @@ impl App {
                 self.awaiting_input.remove(&child.0);
             }
             LiveEvent::WakeIdle => self.wake_in_flight = false,
-            // Provisional: la interfaz aún no muestra lo que hacen los hijos (tarea 2).
-            LiveEvent::ChildEvent { .. } => {}
+            LiveEvent::ChildEvent {
+                parent,
+                child,
+                event,
+            } => {
+                if Some(parent) == self.session_id {
+                    self.apply_child_event(child, *event);
+                }
+            }
             LiveEvent::SubagentSettled { parent, status, .. } => {
                 // Un hijo que termina bien o con fallo despierta al padre; uno matado
                 // por el usuario o interrumpido no.
@@ -2838,5 +2934,294 @@ mod tests {
         assert!(app.wake_pending);
         app.load_session(SessionId(2), Vec::new());
         assert!(!app.wake_pending);
+    }
+
+    /// Evento de un hijo tal como lo reenvía el lanzador al bus del padre.
+    fn child_event(parent: SessionId, child: i64, event: LiveEvent) -> LiveEvent {
+        LiveEvent::ChildEvent {
+            parent,
+            child: SessionId(child),
+            event: Box::new(event),
+        }
+    }
+
+    /// Descriptor de un hijo con identificador y estado concretos.
+    fn child_descriptor(
+        child: i64,
+        status: SubagentStatus,
+        parent: SessionId,
+    ) -> SubagentDescriptor {
+        SubagentDescriptor {
+            parent,
+            child: SessionId(child),
+            job_id: format!("subagent-{child}"),
+            label: format!("hijo-{child}"),
+            status,
+            result: None,
+            notice_delivered: false,
+        }
+    }
+
+    #[test]
+    fn child_events_feed_the_stats() {
+        let mut app = crush_app();
+        app.session_id = Some(SessionId(1));
+
+        app.apply(child_event(SessionId(1), 9, LiveEvent::TurnStarted));
+        let stats = &app.agent_stats[&9];
+        assert!(stats.started_at.is_some());
+        assert!(stats.finished_at.is_none());
+
+        app.apply(child_event(
+            SessionId(1),
+            9,
+            LiveEvent::StepStarted {
+                step: 2,
+                max_steps: 5,
+            },
+        ));
+        app.apply(child_event(
+            SessionId(1),
+            9,
+            LiveEvent::ToolStarted {
+                call_id: "c1".into(),
+                name: "glob".into(),
+            },
+        ));
+        let stats = &app.agent_stats[&9];
+        assert_eq!(stats.step, 2);
+        assert_eq!(stats.max_steps, 5);
+        assert_eq!(stats.tool.as_deref(), Some("glob"));
+
+        app.apply(child_event(
+            SessionId(1),
+            9,
+            LiveEvent::Usage {
+                input_tokens: 100,
+                output_tokens: 7,
+            },
+        ));
+        app.apply(child_event(
+            SessionId(1),
+            9,
+            LiveEvent::ToolFinished {
+                call_id: "c1".into(),
+                is_error: false,
+            },
+        ));
+        let stats = &app.agent_stats[&9];
+        assert_eq!(stats.tool, None);
+        assert_eq!(stats.input_tokens, 100);
+        assert_eq!(stats.output_tokens, 7);
+
+        app.apply(child_event(SessionId(1), 9, LiveEvent::TurnEnded));
+        let stats = &app.agent_stats[&9];
+        assert!(stats.finished_at.is_some());
+        assert_eq!(stats.tool, None);
+    }
+
+    #[test]
+    fn child_stats_without_turn_start_get_a_start_time() {
+        let mut app = crush_app();
+        app.session_id = Some(SessionId(1));
+        app.apply(child_event(
+            SessionId(1),
+            9,
+            LiveEvent::StepStarted {
+                step: 1,
+                max_steps: 4,
+            },
+        ));
+        let stats = &app.agent_stats[&9];
+        assert!(stats.started_at.is_some());
+        assert_eq!(stats.step, 1);
+    }
+
+    #[test]
+    fn child_usage_accumulates_and_does_not_touch_the_parents_counters() {
+        let mut app = crush_app();
+        app.session_id = Some(SessionId(1));
+        app.turn_input_tokens = 40;
+        app.turn_output_tokens = 3;
+
+        app.apply(child_event(
+            SessionId(1),
+            9,
+            LiveEvent::Usage {
+                input_tokens: 10,
+                output_tokens: 2,
+            },
+        ));
+        app.apply(child_event(
+            SessionId(1),
+            9,
+            LiveEvent::Usage {
+                input_tokens: 5,
+                output_tokens: 1,
+            },
+        ));
+
+        let stats = &app.agent_stats[&9];
+        assert_eq!((stats.input_tokens, stats.output_tokens), (15, 3));
+        assert_eq!(app.turn_input_tokens, 40);
+        assert_eq!(app.turn_output_tokens, 3);
+        assert_eq!(app.input_tokens, 0);
+        assert_eq!(app.output_tokens, 0);
+    }
+
+    #[test]
+    fn child_turn_restart_keeps_the_token_totals() {
+        let mut app = crush_app();
+        app.session_id = Some(SessionId(1));
+        app.apply(child_event(
+            SessionId(1),
+            9,
+            LiveEvent::Usage {
+                input_tokens: 10,
+                output_tokens: 2,
+            },
+        ));
+        app.apply(child_event(SessionId(1), 9, LiveEvent::TurnEnded));
+        app.apply(child_event(SessionId(1), 9, LiveEvent::TurnStarted));
+
+        let stats = &app.agent_stats[&9];
+        assert_eq!((stats.input_tokens, stats.output_tokens), (10, 2));
+        assert!(stats.started_at.is_some());
+        assert!(stats.finished_at.is_none());
+    }
+
+    #[test]
+    fn child_events_of_another_session_are_ignored() {
+        let mut app = crush_app();
+        app.session_id = Some(SessionId(1));
+        app.apply(child_event(SessionId(2), 9, LiveEvent::TurnStarted));
+        app.apply(child_event(
+            SessionId(2),
+            9,
+            LiveEvent::Usage {
+                input_tokens: 10,
+                output_tokens: 2,
+            },
+        ));
+        assert!(app.agent_stats.is_empty());
+        assert_eq!(app.hierarchy_tokens(), (0, 0));
+    }
+
+    #[test]
+    fn child_events_do_not_touch_transcript_or_status() {
+        let mut app = crush_app();
+        app.session_id = Some(SessionId(1));
+        // El turno del padre está en marcha cuando llegan los eventos de los hijos.
+        app.apply(LiveEvent::TurnStarted);
+        app.apply(LiveEvent::Delta {
+            text: "respuesta".into(),
+        });
+        let status = app.status.clone();
+        let in_flight = app.turn_in_flight;
+        let entries = app.transcript.entry_count();
+        let phase = app.phase.clone();
+
+        app.apply(child_event(SessionId(1), 9, LiveEvent::TurnStarted));
+        app.apply(child_event(
+            SessionId(1),
+            9,
+            LiveEvent::ToolStarted {
+                call_id: "c1".into(),
+                name: "glob".into(),
+            },
+        ));
+        app.apply(child_event(
+            SessionId(1),
+            9,
+            LiveEvent::ToolFinished {
+                call_id: "c1".into(),
+                is_error: true,
+            },
+        ));
+        app.apply(child_event(
+            SessionId(1),
+            9,
+            LiveEvent::Error {
+                message: "fallo del hijo".into(),
+            },
+        ));
+        app.apply(child_event(SessionId(1), 9, LiveEvent::TurnEnded));
+
+        assert_eq!(app.status, status);
+        assert_eq!(app.turn_in_flight, in_flight);
+        assert_eq!(app.transcript.entry_count(), entries);
+        assert_eq!(app.phase, phase);
+    }
+
+    #[test]
+    fn hierarchy_tokens_sums_all_children() {
+        let mut app = crush_app();
+        app.session_id = Some(SessionId(1));
+        app.apply(child_event(
+            SessionId(1),
+            9,
+            LiveEvent::Usage {
+                input_tokens: 100,
+                output_tokens: 10,
+            },
+        ));
+        app.apply(child_event(
+            SessionId(1),
+            10,
+            LiveEvent::Usage {
+                input_tokens: 20,
+                output_tokens: 5,
+            },
+        ));
+        // Un hijo de otra sesión no entra en el total.
+        app.apply(child_event(
+            SessionId(2),
+            11,
+            LiveEvent::Usage {
+                input_tokens: 1000,
+                output_tokens: 1000,
+            },
+        ));
+        assert_eq!(app.hierarchy_tokens(), (120, 15));
+    }
+
+    #[test]
+    fn active_agents_counts_only_running_children_of_the_open_session() {
+        let mut app = crush_app();
+        app.session_id = Some(SessionId(1));
+        app.subagents.insert(
+            9,
+            child_descriptor(9, SubagentStatus::Running, SessionId(1)),
+        );
+        app.subagents.insert(
+            10,
+            child_descriptor(10, SubagentStatus::Completed, SessionId(1)),
+        );
+        app.subagents.insert(
+            11,
+            child_descriptor(11, SubagentStatus::Running, SessionId(1)),
+        );
+        app.subagents.insert(
+            12,
+            child_descriptor(12, SubagentStatus::Running, SessionId(2)),
+        );
+        assert_eq!(app.active_agents(), 2);
+    }
+
+    #[test]
+    fn stats_are_cleared_on_session_load() {
+        let mut app = crush_app();
+        app.session_id = Some(SessionId(1));
+        app.apply(child_event(
+            SessionId(1),
+            9,
+            LiveEvent::Usage {
+                input_tokens: 10,
+                output_tokens: 2,
+            },
+        ));
+        assert!(!app.agent_stats.is_empty());
+        app.load_session(SessionId(2), Vec::new());
+        assert!(app.agent_stats.is_empty());
     }
 }
