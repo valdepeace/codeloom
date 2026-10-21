@@ -75,6 +75,7 @@ fn config_from_provider_settings(
     candidate.provider.kind = settings.kind;
     candidate.provider.base_url = settings.base_url.trim().to_string();
     candidate.provider.api_key_env = settings.api_key_env.trim().to_string();
+    candidate.effort = settings.effort;
 
     if candidate.model.is_empty() {
         return Err("Model cannot be empty".into());
@@ -398,6 +399,7 @@ mod tests {
             model: "  claude-test  ".into(),
             base_url: "https://api.anthropic.com/v1".into(),
             api_key_env: "ANTHROPIC_API_KEY".into(),
+            effort: None,
         };
         let updated = config_from_provider_settings(settings.clone(), &current).unwrap();
         assert_eq!(updated.model, "claude-test");
@@ -406,5 +408,19 @@ mod tests {
         let mut invalid = settings;
         invalid.base_url = "https://".into();
         assert!(config_from_provider_settings(invalid, &current).is_err());
+    }
+
+    #[test]
+    fn settings_effort_reaches_the_config() {
+        let current = test_config();
+        let settings = ProviderSettings {
+            kind: ProviderKind::Anthropic,
+            model: "claude-think".into(),
+            base_url: "https://api.anthropic.com/v1".into(),
+            api_key_env: "ANTHROPIC_API_KEY".into(),
+            effort: Some("high".into()),
+        };
+        let updated = config_from_provider_settings(settings, &current).unwrap();
+        assert_eq!(updated.effort.as_deref(), Some("high"));
     }
 }

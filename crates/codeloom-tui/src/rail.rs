@@ -64,6 +64,17 @@ fn rail_lines(app: &App, width: usize) -> Vec<Line<'_>> {
     push_gap(&mut out);
     out.push(title("MODEL", app));
     out.push(Line::from(app.model.as_str()));
+    // El nivel se lee de la copia guardada, la misma que `app.model`.
+    if let Some(level) = app
+        .settings_baseline
+        .as_ref()
+        .and_then(|settings| settings.effort.as_deref())
+    {
+        out.push(Line::from(Span::styled(
+            format!("effort {level}"),
+            app.theme.styles.muted,
+        )));
+    }
     out.push(Line::from(Span::styled(
         format!("{} · {:.1}s", app.phase, app.phase_duration().as_secs_f64()),
         app.theme.styles.muted,
@@ -690,6 +701,35 @@ mod tests {
         assert!(
             !fila.contains("Alt"),
             "la línea desborda la anchura del rail: {fila:?}"
+        );
+    }
+
+    /// Ajustes guardados con el modelo `claude-think` y el esfuerzo `effort`.
+    fn saved_settings(effort: Option<&str>) -> crate::app::ProviderSettings {
+        crate::app::ProviderSettings {
+            kind: codeloom_core::config::ProviderKind::Anthropic,
+            model: "claude-think".into(),
+            base_url: "https://api.anthropic.com/v1".into(),
+            api_key_env: "ANTHROPIC_API_KEY".into(),
+            effort: effort.map(String::from),
+        }
+    }
+
+    #[test]
+    fn rail_shows_effort_when_set() {
+        let mut app = App::new();
+        app.set_provider_settings(saved_settings(Some("high")));
+        let rows = rows_of(&app, 40, 20);
+        assert!(
+            rows.iter().any(|row| row.contains("effort high")),
+            "el rail muestra el esfuerzo bajo el modelo: {rows:?}"
+        );
+
+        app.set_provider_settings(saved_settings(None));
+        let rows = rows_of(&app, 40, 20);
+        assert!(
+            !rows.iter().any(|row| row.contains("effort")),
+            "sin esfuerzo no hay línea en el rail: {rows:?}"
         );
     }
 }

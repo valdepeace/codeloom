@@ -1,5 +1,5 @@
 use crate::app::Focus;
-use crate::app::{App, ProviderSettings, SessionChoice, SettingsPicker};
+use crate::app::{App, ProviderSettings, SessionChoice, SettingsPicker, SETTINGS_EFFORT_FIELD};
 use crate::frame::{FrameScheduler, Urgency, MIN_FRAME};
 use crate::render::render;
 use codeloom_core::catalog::Catalog;
@@ -803,15 +803,22 @@ fn handle_settings_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             app.close_settings();
         }
         KeyCode::Up => app.settings_field = app.settings_field.saturating_sub(1),
-        KeyCode::Down => app.settings_field = (app.settings_field + 1).min(4),
+        KeyCode::Down => {
+            app.settings_field = (app.settings_field + 1).min(app.settings_save_field())
+        }
         KeyCode::Left | KeyCode::Right if app.settings_field == 0 => toggle_provider(app),
+        KeyCode::Left if app.settings_field == SETTINGS_EFFORT_FIELD => app.cycle_effort(false),
+        KeyCode::Right if app.settings_field == SETTINGS_EFFORT_FIELD => app.cycle_effort(true),
         KeyCode::Enter if app.settings_field == 0 => app.open_picker(SettingsPicker::Provider),
         // Con catálogo, «Model» abre la lista de su proveedor; sin él, se edita a mano.
         KeyCode::Enter if app.settings_field == 1 && !app.catalog.is_empty() => {
             app.open_picker(SettingsPicker::Model)
         }
         KeyCode::Enter if (1..=3).contains(&app.settings_field) => app.edit_settings_value(),
-        KeyCode::Enter if app.settings_field == 4 => app.request_settings_save(),
+        KeyCode::Enter if app.settings_field == app.settings_save_field() => {
+            app.request_settings_save()
+        }
+        KeyCode::Enter if app.settings_field == SETTINGS_EFFORT_FIELD => app.cycle_effort(true),
         KeyCode::Char('l') if mods.contains(KeyModifiers::CONTROL) => match app.settings_field {
             0 => app.open_picker(SettingsPicker::Provider),
             1 => app.open_picker(SettingsPicker::Model),
@@ -2234,6 +2241,7 @@ mod tests {
             model: "old-model".into(),
             base_url: "https://example.test/v1".into(),
             api_key_env: "API_KEY".into(),
+            effort: None,
         });
         app.open_settings();
         app.provider_settings.as_mut().unwrap().model = "new-model".into();
@@ -2337,6 +2345,7 @@ mod tests {
             model: "old-model".into(),
             base_url: "https://example.test/v1".into(),
             api_key_env: "API_KEY".into(),
+            effort: None,
         });
         handle_key(&mut app, KeyCode::F(2), KeyModifiers::NONE);
         handle_key(&mut app, KeyCode::Right, KeyModifiers::NONE);
@@ -2510,6 +2519,7 @@ mod tests {
             model: "test".into(),
             base_url: "https://example.test".into(),
             api_key_env: "KEY".into(),
+            effort: None,
         });
         assert_eq!(
             handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE),
@@ -3219,6 +3229,7 @@ mod tests {
             model: "old-model".into(),
             base_url: "https://example.test/v1".into(),
             api_key_env: "API_KEY".into(),
+            effort: None,
         });
         app.open_settings();
         app.provider_settings.as_mut().unwrap().model = "new-model".into();
@@ -3262,6 +3273,7 @@ mod tests {
             model: "model-a".into(),
             base_url: "https://api.anthropic.com".into(),
             api_key_env: "ANTHROPIC_API_KEY".into(),
+            effort: None,
         });
         app.set_catalog(crate::app::picker_sample_catalog());
         app.open_settings();
@@ -3334,5 +3346,54 @@ mod tests {
         // Elegido el proveedor, se abre la lista de sus modelos.
         assert_eq!(app.settings_picker, Some(SettingsPicker::Model));
         assert!(app.settings_open);
+    }
+
+    /// Diálogo abierto sobre `model` del catálogo de razonamiento, sin esfuerzo.
+    fn reasoning_settings_app(model: &str) -> App {
+        let mut app = App::new();
+        app.set_catalog(crate::app::reasoning_sample_catalog());
+        app.set_provider_settings(ProviderSettings {
+            kind: codeloom_core::config::ProviderKind::Anthropic,
+            model: model.into(),
+            base_url: "https://api.anthropic.com/v1".into(),
+            api_key_env: "ANTHROPIC_API_KEY".into(),
+            effort: None,
+        });
+        app.open_settings();
+        app
+    }
+
+    #[test]
+    fn effort_field_is_reached_with_arrows_and_cycled_with_left_right() {
+        let mut app = reasoning_settings_app("claude-think");
+        app.settings_field = 3;
+        handle_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.settings_field, SETTINGS_EFFORT_FIELD);
+        handle_key(&mut app, KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(
+            app.provider_settings.as_ref().unwrap().effort.as_deref(),
+            Some("low")
+        );
+        handle_key(&mut app, KeyCode::Left, KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Left, KeyModifiers::NONE);
+        assert_eq!(
+            app.provider_settings.as_ref().unwrap().effort.as_deref(),
+            Some("high"),
+            "←/→ cicla también hacia atrás, desde «default»"
+        );
+        handle_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.settings_field, SETTINGS_EFFORT_FIELD + 1);
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.settings_save_requested, "Enter sobre Save guarda");
+    }
+
+    #[test]
+    fn settings_without_effort_field_go_straight_to_save() {
+        let mut app = reasoning_settings_app("claude-plain");
+        app.settings_field = 3;
+        handle_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.settings_field, SETTINGS_EFFORT_FIELD);
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.settings_save_requested);
     }
 }

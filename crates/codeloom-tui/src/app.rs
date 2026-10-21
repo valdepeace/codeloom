@@ -84,12 +84,40 @@ pub(crate) fn picker_sample_catalog() -> Arc<Catalog> {
     Arc::new(Catalog::from_json(PICKER_SAMPLE_JSON).expect("el JSON de muestra es válido"))
 }
 
+/// Catálogo de muestra con modelos que razonan (uno admite tres niveles, otro dos) y
+/// uno que no razona, para las pruebas del campo «Effort».
+#[cfg(test)]
+const REASONING_SAMPLE_JSON: &str = r#"{
+    "anthropic": {"id": "anthropic", "name": "Anthropic", "npm": "@ai-sdk/anthropic",
+        "api": "https://api.anthropic.com/v1", "env": ["ANTHROPIC_API_KEY"],
+        "models": {
+            "claude-think": {"id": "claude-think", "name": "Claude Think", "tool_call": true,
+                "reasoning": true,
+                "reasoning_options": [{"type": "effort", "values": ["low", "medium", "high"]}]},
+            "claude-mid": {"id": "claude-mid", "name": "Claude Mid", "tool_call": true,
+                "reasoning": true,
+                "reasoning_options": [{"type": "effort", "values": ["low", "medium"]}]},
+            "claude-plain": {"id": "claude-plain", "name": "Claude Plain", "tool_call": true}}}
+}"#;
+
+/// Catálogo de muestra con razonamiento ya construido, listo para `App::set_catalog`.
+#[cfg(test)]
+pub(crate) fn reasoning_sample_catalog() -> Arc<Catalog> {
+    Arc::new(Catalog::from_json(REASONING_SAMPLE_JSON).expect("el JSON de muestra es válido"))
+}
+
+/// Posición del campo «Effort» en `/settings`. Solo existe si el modelo admite niveles;
+/// sin él, «Save» ocupa esta misma posición.
+pub const SETTINGS_EFFORT_FIELD: usize = 4;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProviderSettings {
     pub kind: ProviderKind,
     pub model: String,
     pub base_url: String,
     pub api_key_env: String,
+    /// Nivel de esfuerzo de razonamiento; `None` equivale a «default».
+    pub effort: Option<String>,
 }
 
 /// Selector abierto sobre un campo de `/settings`.
@@ -131,6 +159,7 @@ impl From<&CodeLoomConfig> for ProviderSettings {
             model: config.model.clone(),
             base_url: config.provider.base_url.clone(),
             api_key_env: config.provider.api_key_env.clone(),
+            effort: config.effort.clone(),
         }
     }
 }
@@ -720,8 +749,9 @@ impl App {
         }
     }
 
-    /// `true` si el campo `index` (0 proveedor, 1 modelo, 2 URL, 3 variable de clave)
-    /// difiere de la copia guardada.
+    /// `true` si el campo `index` (0 proveedor, 1 modelo, 2 URL, 3 variable de clave,
+    /// 4 esfuerzo) difiere de la copia guardada. El esfuerzo solo cuenta mientras el
+    /// campo existe: un cambio que el modelo actual no puede mostrar no se marca.
     pub fn settings_field_changed(&self, index: usize) -> bool {
         match (&self.provider_settings, &self.settings_baseline) {
             (Some(current), Some(baseline)) => match index {
@@ -729,6 +759,9 @@ impl App {
                 1 => current.model != baseline.model,
                 2 => current.base_url != baseline.base_url,
                 3 => current.api_key_env != baseline.api_key_env,
+                SETTINGS_EFFORT_FIELD => {
+                    self.settings_effort_visible() && current.effort != baseline.effort
+                }
                 _ => false,
             },
             _ => false,
@@ -737,9 +770,86 @@ impl App {
 
     /// Número de campos con cambios sin guardar.
     pub fn settings_change_count(&self) -> usize {
-        (0..4)
+        (0..=SETTINGS_EFFORT_FIELD)
             .filter(|&index| self.settings_field_changed(index))
             .count()
+    }
+
+    /// Niveles de esfuerzo que admite el modelo de los ajustes, según el catálogo (proveedor
+    /// con la misma URL base y modelo con el mismo identificador). Vacío si no hay catálogo,
+    /// si el modelo no razona o si no publica niveles con nombre.
+    pub fn effort_options(&self) -> Vec<String> {
+        let Some(settings) = &self.provider_settings else {
+            return Vec::new();
+        };
+        let Some(provider) = self.model_catalog_provider() else {
+            return Vec::new();
+        };
+        provider
+            .models
+            .iter()
+            .find(|model| model.id == settings.model)
+            .and_then(|model| model.reasoning.as_ref())
+            .map(|reasoning| reasoning.efforts.clone())
+            .unwrap_or_default()
+    }
+
+    /// `true` si `/settings` muestra el campo «Effort» (el modelo admite niveles).
+    pub fn settings_effort_visible(&self) -> bool {
+        !self.effort_options().is_empty()
+    }
+
+    /// Posición de «Save»: justo tras «Effort» si ese campo existe, o en su lugar si no.
+    pub fn settings_save_field(&self) -> usize {
+        if self.settings_effort_visible() {
+            SETTINGS_EFFORT_FIELD + 1
+        } else {
+            SETTINGS_EFFORT_FIELD
+        }
+    }
+
+    /// Avanza (o retrocede) el nivel de esfuerzo entre «default» y los niveles del modelo,
+    /// dando la vuelta al final. Sin niveles disponibles no hace nada.
+    pub fn cycle_effort(&mut self, forward: bool) {
+        let options = self.effort_options();
+        if options.is_empty() {
+            return;
+        }
+        let Some(settings) = self.provider_settings.as_mut() else {
+            return;
+        };
+        // La posición 0 es «default»; la i + 1 corresponde al nivel `options[i]`.
+        let len = options.len() + 1;
+        let current = settings
+            .effort
+            .as_ref()
+            .and_then(|level| options.iter().position(|option| option == level))
+            .map_or(0, |index| index + 1);
+        let next = if forward {
+            (current + 1) % len
+        } else {
+            (current + len - 1) % len
+        };
+        settings.effort = next.checked_sub(1).map(|index| options[index].clone());
+    }
+
+    /// Tras cambiar el modelo o la URL, descarta el nivel si el modelo nuevo no lo admite
+    /// y lo deja anotado en `settings_feedback`.
+    fn reconcile_effort(&mut self) {
+        let options = self.effort_options();
+        let unsupported = self.provider_settings.as_ref().is_some_and(|settings| {
+            settings
+                .effort
+                .as_ref()
+                .is_some_and(|level| !options.contains(level))
+        });
+        if !unsupported {
+            return;
+        }
+        if let Some(settings) = self.provider_settings.as_mut() {
+            settings.effort = None;
+        }
+        self.settings_feedback = Some("Effort reset: not supported by this model".into());
     }
 
     /// Proveedor del catálogo cuya URL base coincide con la de los ajustes actuales.
@@ -848,6 +958,7 @@ impl App {
             }
             self.close_picker();
             self.settings_feedback = None;
+            self.reconcile_effort();
             return;
         }
         if let (Some(item), Some(settings)) = (
@@ -869,6 +980,7 @@ impl App {
         }
         self.close_picker();
         self.settings_feedback = None;
+        self.reconcile_effort();
         // Tras elegir proveedor se pasa directamente a sus modelos.
         if picker == SettingsPicker::Provider {
             self.settings_field = 1;
@@ -929,6 +1041,9 @@ impl App {
                 3 => settings.api_key_env = value,
                 _ => {}
             }
+        }
+        if matches!(self.settings_field, 1 | 2) {
+            self.reconcile_effort();
         }
         self.settings_editing = false;
     }
@@ -4288,6 +4403,7 @@ mod tests {
             model: "model-a".into(),
             base_url: "https://example.test/v1".into(),
             api_key_env: "API_KEY".into(),
+            effort: None,
         }
     }
 
@@ -4397,6 +4513,7 @@ mod tests {
             model: "model-a".into(),
             base_url: "https://api.anthropic.com".into(),
             api_key_env: "ANTHROPIC_API_KEY".into(),
+            effort: None,
         });
         app.set_catalog(picker_sample_catalog());
         app.open_settings();
@@ -4543,5 +4660,122 @@ mod tests {
             app.provider_settings.as_ref().unwrap().model,
             "model-manual"
         );
+    }
+
+    /// Diálogo abierto sobre `model` del catálogo de razonamiento, sin esfuerzo.
+    fn reasoning_app(model: &str) -> App {
+        let mut app = App::new();
+        app.set_catalog(reasoning_sample_catalog());
+        app.set_provider_settings(ProviderSettings {
+            kind: codeloom_core::config::ProviderKind::Anthropic,
+            model: model.into(),
+            base_url: "https://api.anthropic.com/v1".into(),
+            api_key_env: "ANTHROPIC_API_KEY".into(),
+            effort: None,
+        });
+        app.open_settings();
+        app
+    }
+
+    fn effort_of(app: &App) -> Option<String> {
+        app.provider_settings.as_ref().unwrap().effort.clone()
+    }
+
+    #[test]
+    fn effort_options_follow_the_catalog_model() {
+        let mut app = reasoning_app("claude-think");
+        assert_eq!(app.effort_options(), ["low", "medium", "high"]);
+        app.provider_settings.as_mut().unwrap().model = "claude-plain".into();
+        assert!(app.effort_options().is_empty());
+    }
+
+    #[test]
+    fn cycle_effort_walks_default_and_values() {
+        let mut app = reasoning_app("claude-think");
+        app.cycle_effort(true);
+        assert_eq!(effort_of(&app).as_deref(), Some("low"));
+        app.cycle_effort(true);
+        app.cycle_effort(true);
+        assert_eq!(effort_of(&app).as_deref(), Some("high"));
+        app.cycle_effort(true);
+        assert_eq!(effort_of(&app), None, "tras el último vuelve a «default»");
+        app.cycle_effort(false);
+        assert_eq!(effort_of(&app).as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn cycle_effort_does_nothing_without_options() {
+        let mut app = reasoning_app("claude-plain");
+        app.cycle_effort(true);
+        assert_eq!(effort_of(&app), None);
+        assert!(!app.settings_effort_visible());
+    }
+
+    #[test]
+    fn effort_field_hidden_for_non_reasoning_model() {
+        let mut app = reasoning_app("claude-plain");
+        assert_eq!(app.settings_save_field(), SETTINGS_EFFORT_FIELD);
+        app.provider_settings.as_mut().unwrap().model = "claude-think".into();
+        assert!(app.settings_effort_visible());
+        assert_eq!(app.settings_save_field(), SETTINGS_EFFORT_FIELD + 1);
+    }
+
+    #[test]
+    fn changing_model_drops_unsupported_effort() {
+        let mut app = reasoning_app("claude-think");
+        app.provider_settings.as_mut().unwrap().effort = Some("high".into());
+        app.open_picker(SettingsPicker::Model);
+        app.picker_query = "mid".into();
+        app.picker_choose();
+        assert_eq!(effort_of(&app), None);
+        assert_eq!(
+            app.settings_feedback.as_deref(),
+            Some("Effort reset: not supported by this model")
+        );
+
+        // Un nivel que el modelo nuevo sí admite se conserva.
+        app.provider_settings.as_mut().unwrap().effort = Some("medium".into());
+        app.open_picker(SettingsPicker::Model);
+        app.picker_query = "think".into();
+        app.picker_choose();
+        assert_eq!(effort_of(&app).as_deref(), Some("medium"));
+        assert_eq!(app.settings_feedback, None);
+
+        // La edición manual del modelo también descarta el nivel no admitido.
+        app.provider_settings.as_mut().unwrap().effort = Some("high".into());
+        app.settings_field = 1;
+        app.edit_settings_value();
+        app.settings_editor.set_text("claude-mid");
+        app.commit_settings_value();
+        assert_eq!(effort_of(&app), None);
+    }
+
+    #[test]
+    fn effort_change_counts_as_unsaved() {
+        let mut app = reasoning_app("claude-think");
+        app.cycle_effort(true);
+        assert!(app.settings_dirty());
+        assert!(app.settings_field_changed(SETTINGS_EFFORT_FIELD));
+        assert_eq!(app.settings_change_count(), 1);
+        assert!(
+            !app.close_settings(),
+            "el esfuerzo cuenta como cambio sin guardar"
+        );
+    }
+
+    #[test]
+    fn initial_settings_take_effort_from_config() {
+        let config = CodeLoomConfig {
+            provider: codeloom_core::config::ProviderConfig {
+                kind: ProviderKind::Anthropic,
+                base_url: "https://api.anthropic.com/v1".into(),
+                api_key_env: "ANTHROPIC_API_KEY".into(),
+            },
+            model: "claude-think".into(),
+            max_steps: 8,
+            effort: Some("low".into()),
+        };
+        let settings = ProviderSettings::from(&config);
+        assert_eq!(settings.effort.as_deref(), Some("low"));
     }
 }

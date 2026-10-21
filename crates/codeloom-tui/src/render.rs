@@ -602,21 +602,31 @@ fn draw_provider_settings(frame: &mut Frame, area: Rect, app: &App) {
         1 => "Save and apply (1 change)".to_string(),
         n => format!("Save and apply ({n} changes)"),
     };
-    let rows = [
+    let mut rows: Vec<(&str, String)> = vec![
         ("Provider", kind.to_string()),
         ("Model", value(1, &settings.model)),
         ("Base URL", value(2, &settings.base_url)),
         ("API key env", value(3, &settings.api_key_env)),
-        (
-            save_label.as_str(),
-            if app.settings_saving {
-                "Applying…"
-            } else {
-                "Enter"
-            }
-            .to_string(),
-        ),
     ];
+    // «Effort» solo aparece si el modelo admite niveles; si no, «Save» ocupa su posición.
+    if app.settings_effort_visible() {
+        rows.push((
+            "Effort",
+            settings
+                .effort
+                .clone()
+                .unwrap_or_else(|| "default".to_string()),
+        ));
+    }
+    rows.push((
+        save_label.as_str(),
+        if app.settings_saving {
+            "Applying…"
+        } else {
+            "Enter"
+        }
+        .to_string(),
+    ));
     let mut lines = rows
         .iter()
         .enumerate()
@@ -637,7 +647,7 @@ fn draw_provider_settings(frame: &mut Frame, area: Rect, app: &App) {
                 ),
                 Span::styled(value.as_str(), app.theme.styles.default),
             ];
-            if index < 4 && app.settings_field_changed(index) {
+            if app.settings_field_changed(index) {
                 spans.push(Span::styled(" ● unsaved", app.theme.styles.warning));
             }
             Line::from(spans)
@@ -654,7 +664,7 @@ fn draw_provider_settings(frame: &mut Frame, area: Rect, app: &App) {
         } else if app.settings_picker.is_some() {
             "type to filter · ↑/↓ select · Enter choose · Esc close list"
         } else {
-            "↑/↓ select · ←/→ provider · Enter edit/apply · Ctrl+L catalog · Ctrl+S save (idle) · Esc close"
+            "↑/↓ select · ←/→ provider/effort · Enter edit/apply · Ctrl+L catalog · Ctrl+S save (idle) · Esc close"
         },
         app.theme.styles.muted,
     ));
@@ -668,6 +678,7 @@ fn draw_provider_settings(frame: &mut Frame, area: Rect, app: &App) {
             "Model: ".len(),
             "Base URL: ".len(),
             "API key env: ".len(),
+            "Effort: ".len(),
             "Save and apply: ".len(),
         ][app.settings_field];
         let (_, col) = app.settings_editor.cursor_row_col();
@@ -1738,6 +1749,7 @@ mod tests {
                         model: "test-model".into(),
                         base_url: "https://example.test/v1".into(),
                         api_key_env: "API_KEY".into(),
+                        effort: None,
                     });
                     app.open_settings();
                 }
@@ -1780,6 +1792,7 @@ mod tests {
             model: "test-model".into(),
             base_url: "https://example.test/v1".into(),
             api_key_env: "API_KEY".into(),
+            effort: None,
         });
         app.open_settings();
         app.settings_saving = true;
@@ -2531,6 +2544,7 @@ mod tests {
             model: "test-model".into(),
             base_url: "https://example.test/v1".into(),
             api_key_env: "API_KEY".into(),
+            effort: None,
         });
         app.open_settings();
         assert!(!buffer_of(&mut app, 120, 40).contains("unsaved"));
@@ -2551,6 +2565,7 @@ mod tests {
             model: "model-a".into(),
             base_url: "https://api.anthropic.com".into(),
             api_key_env: "ANTHROPIC_API_KEY".into(),
+            effort: None,
         });
         app.set_catalog(crate::app::picker_sample_catalog());
         app.open_settings();
@@ -2559,5 +2574,28 @@ mod tests {
         assert!(content.contains("Claude Sonnet"));
         assert!(content.contains("ctx 200k · $3/$15"));
         assert!(content.contains("ctx 200k · -"));
+    }
+
+    #[test]
+    fn settings_dialog_shows_effort_only_for_reasoning_models() {
+        let mut app = App::new();
+        app.set_catalog(crate::app::reasoning_sample_catalog());
+        app.set_provider_settings(crate::app::ProviderSettings {
+            kind: codeloom_core::config::ProviderKind::Anthropic,
+            model: "claude-think".into(),
+            base_url: "https://api.anthropic.com/v1".into(),
+            api_key_env: "ANTHROPIC_API_KEY".into(),
+            effort: None,
+        });
+        app.open_settings();
+        assert!(buffer_of(&mut app, 120, 40).contains("Effort: default"));
+
+        app.cycle_effort(true);
+        let content = buffer_of(&mut app, 120, 40);
+        assert!(content.contains("Effort: low"));
+        assert_eq!(content.matches("● unsaved").count(), 1);
+
+        app.provider_settings.as_mut().unwrap().model = "claude-plain".into();
+        assert!(!buffer_of(&mut app, 120, 40).contains("Effort:"));
     }
 }
