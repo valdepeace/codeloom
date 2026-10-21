@@ -1,7 +1,7 @@
 //! Rail derecho de contexto del look Crush: modelo, ficheros, herramientas,
 //! jobs y subagentes de la sesión abierta.
 
-use crate::app::{AgentStats, App};
+use crate::app::{AgentStats, App, Focus};
 use batten::state::ToolStatus;
 use codeloom_core::job::JobStatus;
 use codeloom_core::session::SubagentStatus;
@@ -53,6 +53,13 @@ fn rail_lines(app: &App, width: usize) -> Vec<Line<'_>> {
         app.cwd.as_str(),
         app.theme.styles.muted,
     )));
+    // Dentro de un subagente, recordatorio de cómo volver al padre. Se recorta al rail.
+    if !app.parent_stack.is_empty() {
+        out.push(Line::from(Span::styled(
+            recortar("↩ /parent · Alt+←", width),
+            app.theme.styles.muted,
+        )));
+    }
 
     push_gap(&mut out);
     out.push(title("MODEL", app));
@@ -177,7 +184,18 @@ fn rail_lines(app: &App, width: usize) -> Vec<Line<'_>> {
                     app.theme.styles.tool_canceled
                 }
             };
-            let mut line = glyph_line(subagent.label.as_str(), style);
+            // Con el foco en el rail, el hijo elegido con ↑/↓ lleva `›` de acento en vez de `●`.
+            // Ambos glifos ocupan dos columnas, así que la línea no cambia de anchura.
+            let seleccionado =
+                app.focus == Focus::Rail && app.rail_selected == Some(subagent.child.0);
+            let mut line = if seleccionado {
+                Line::from(vec![
+                    Span::styled("› ", app.theme.styles.accent),
+                    Span::raw(subagent.label.as_str()),
+                ])
+            } else {
+                glyph_line(subagent.label.as_str(), style)
+            };
             // Marca de espera: un «?» de acento tras la etiqueta. Solo una consulta al conjunto.
             if app.awaiting_input.contains(&subagent.child.0) {
                 line.spans
@@ -568,6 +586,110 @@ mod tests {
         assert!(
             !rows.iter().any(|row| row.contains("SUBAGENTS")),
             "aparece la sección SUBAGENTS sin subagentes: {rows:?}"
+        );
+    }
+
+    /// Columna (en caracteres) donde empieza `texto` dentro de `fila`.
+    fn columna(fila: &str, texto: &str) -> usize {
+        let byte = fila.find(texto).expect("el texto debe estar en la fila");
+        fila[..byte].chars().count()
+    }
+
+    #[test]
+    fn selected_subagent_shows_marker_only_when_rail_focused() {
+        let mut app = App::new();
+        app.session_id = Some(SessionId(1));
+        app.subagents.insert(9, running(9, "review"));
+        app.subagents.insert(10, running(10, "tests"));
+        app.rail_selected = Some(9);
+
+        app.focus = crate::app::Focus::Composer;
+        let sin_foco = rows_of(&app, 40, 24);
+        let fila_sin_foco = sin_foco
+            .iter()
+            .find(|row| row.contains("review"))
+            .expect("el rail lista review");
+        assert!(
+            !fila_sin_foco.contains('›'),
+            "marcador de selección sin foco en el rail: {fila_sin_foco:?}"
+        );
+        assert!(fila_sin_foco.contains("● review"));
+
+        app.focus = crate::app::Focus::Rail;
+        let con_foco = rows_of(&app, 40, 24);
+        let fila_review = con_foco
+            .iter()
+            .find(|row| row.contains("review"))
+            .expect("el rail lista review");
+        let fila_tests = con_foco
+            .iter()
+            .find(|row| row.contains("tests"))
+            .expect("el rail lista tests");
+        assert!(
+            fila_review.contains("› review"),
+            "falta el marcador con foco en el rail: {fila_review:?}"
+        );
+        assert!(
+            fila_tests.contains("● tests") && !fila_tests.contains('›'),
+            "marcador en un subagente no seleccionado: {fila_tests:?}"
+        );
+        assert_eq!(
+            columna(fila_review, "review"),
+            columna(fila_sin_foco, "review"),
+            "el marcador cambia la anchura de la línea"
+        );
+    }
+
+    #[test]
+    fn rail_shows_return_hint_inside_a_child() {
+        let mut app = App::new();
+        app.session_id = Some(SessionId(9));
+        app.cwd = "/proj".into();
+        app.parent_stack.push(SessionId(1));
+
+        let rows = rows_of(&app, 40, 24);
+        let idx = rows
+            .iter()
+            .position(|row| row.contains("CODELOOM"))
+            .expect("el rail muestra el título CODELOOM");
+        assert!(rows[idx + 1].contains("/proj"), "falta el cwd: {rows:?}");
+        assert!(
+            rows[idx + 2].contains("↩ /parent · Alt+←"),
+            "falta la línea de retorno bajo el cwd: {:?}",
+            rows[idx + 2]
+        );
+    }
+
+    #[test]
+    fn rail_has_no_return_hint_at_top_level() {
+        let mut app = App::new();
+        app.session_id = Some(SessionId(1));
+        app.cwd = "/proj".into();
+
+        let rows = rows_of(&app, 40, 24);
+        assert!(
+            !rows.iter().any(|row| row.contains('↩')),
+            "línea de retorno en el nivel superior: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn return_hint_is_clipped_to_rail_width() {
+        let mut app = App::new();
+        app.session_id = Some(SessionId(9));
+        app.cwd = "/proj".into();
+        app.parent_stack.push(SessionId(1));
+
+        // Con un borde izquierdo, la anchura útil del rail es 11 columnas.
+        let rows = rows_of(&app, 12, 24);
+        let fila = rows
+            .iter()
+            .find(|row| row.contains('↩'))
+            .expect("la línea de retorno aparece también en un rail estrecho");
+        assert!(fila.contains('…'), "la línea no se recorta: {fila:?}");
+        assert!(
+            !fila.contains("Alt"),
+            "la línea desborda la anchura del rail: {fila:?}"
         );
     }
 }

@@ -63,3 +63,29 @@ plan.
 Pruebas de `open_child`/`go_parent` (pila, negativa con turno en curso, la
 carga normal vacía la pila), de las teclas del rail y del dibujado del
 marcador y de la línea de retorno. Validación visual en terminal real: pendiente.
+
+## Estado
+
+Implementado (tareas 1 y 2 del plan):
+
+- Navegación entre padre e hijo: `open_child`, `go_parent`, pila de padres,
+  `Alt+←` y `/parent`, con las negativas previstas (turno en curso, pila vacía,
+  hijo desconocido).
+- Rail: `↑`/`↓` y `Enter` con el foco en `Rail`; el hijo elegido lleva el
+  marcador `›` de acento solo con el foco en el rail; dentro de un hijo aparece
+  bajo el título la línea `↩ /parent · Alt+←`, recortada a la anchura del rail.
+- Ayuda (`F1`): lista `↑/↓ + Enter` y `Alt+←/parent`. El recuadro pasó de 19 a
+  21 filas máximas para que quepan las dos líneas nuevas; en terminales de 19 o
+  20 filas la ayuda muestra ahora el aviso de tamaño en lugar de recortarse.
+
+Decisiones tomadas en la implementación:
+
+- No existe una sección «rail» en la ayuda; las dos líneas nuevas se añaden a la
+  lista general de atajos, junto a `Tab/Shift+Tab`.
+- La línea de retorno ocupa la fila tras el `cwd`, no una sección propia.
+
+Limitaciones conocidas:
+
+- El transcript de un hijo no está vivo: se carga del almacén al entrar.
+- El rail no dibuja árbol; solo lista los hijos directos de la sesión abierta.
+- La validación visual en una terminal real sigue pendiente.

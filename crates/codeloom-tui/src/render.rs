@@ -870,8 +870,9 @@ fn draw_tool_inspector(frame: &mut Frame, area: Rect, app: &mut App) {
 
 fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
     let width = area.width.min(78).saturating_sub(2);
-    let height = area.height.min(19).saturating_sub(2);
-    if width < 54 || height < 17 {
+    // Diecisiete líneas de contenido más el marco; por eso el recuadro crece a 21 filas.
+    let height = area.height.min(21).saturating_sub(2);
+    if width < 54 || height < 19 {
         draw_resize_hint(frame, area, "Keyboard shortcuts", app);
         return;
     }
@@ -894,6 +895,8 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
             Line::from("Enter       Send prompt"),
             Line::from("Ctrl+J      Insert newline"),
             Line::from("Tab/Shift+Tab Switch composer/transcript"),
+            Line::from("↑/↓ + Enter Open subagent (rail focused)"),
+            Line::from("Alt+←/parent Back to the parent session"),
             Line::from("Mouse wheel Scroll transcript"),
             Line::from("Ctrl+B      Toggle sidebar at medium width"),
             Line::from("Ctrl+K      Open prompt queue"),
@@ -1353,6 +1356,20 @@ mod tests {
         assert!(content.contains("Keyboard shortcuts"));
         assert!(content.contains("Ctrl+J"));
         assert!(content.contains("Ctrl+B"));
+    }
+
+    #[test]
+    fn help_overlay_lists_subagent_navigation() {
+        let mut app = App::new();
+        app.help_open = true;
+        let content = buffer_of(&mut app, 80, 24);
+        assert!(content.contains("Alt+←"), "falta Alt+←: {content}");
+        assert!(content.contains("/parent"), "falta /parent: {content}");
+        assert!(content.contains("↑/↓"), "falta ↑/↓ del rail: {content}");
+        assert!(
+            content.contains("Press F1 or Esc to close"),
+            "la ayuda no cabe con las líneas nuevas: {content}"
+        );
     }
 
     #[test]
