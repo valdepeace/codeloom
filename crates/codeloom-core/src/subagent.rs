@@ -35,6 +35,24 @@ pub trait SubagentLauncher: Send + Sync {
     async fn list(&self, parent: SessionId) -> Result<Vec<SubagentDescriptor>>;
 
     async fn deliver_notices(&self, parent: SessionId) -> Result<Vec<crate::message::Message>>;
+
+    /// Responde la pregunta pendiente de un hijo (`input-required`).
+    async fn answer(
+        &self,
+        _parent: SessionId,
+        _child: SessionId,
+        _answers: Vec<String>,
+    ) -> Result<()> {
+        Err(CoreError::Tool("subagent answers unavailable".into()))
+    }
+
+    /// Avisos de las preguntas nuevas de los hijos; cada una sale una sola vez.
+    async fn pending_input_notices(
+        &self,
+        _parent: SessionId,
+    ) -> Result<Vec<crate::message::Message>> {
+        Ok(Vec::new())
+    }
 }
 
 pub struct InProcessSubagentLauncher {
@@ -97,16 +115,6 @@ impl InProcessSubagentLauncher {
     /// Preguntas pendientes de los hijos de un padre (`input-required`).
     pub fn pending_inputs(&self, parent: SessionId) -> Vec<PendingInput> {
         self.broker.pending(parent)
-    }
-
-    /// Responde la pregunta pendiente de un hijo; una respuesta por pregunta, en orden.
-    pub async fn answer(
-        &self,
-        parent: SessionId,
-        child: SessionId,
-        answers: Vec<String>,
-    ) -> Result<()> {
-        self.broker.answer(parent, child, answers)
     }
 }
 
@@ -299,6 +307,44 @@ impl SubagentLauncher for InProcessSubagentLauncher {
             }
         }
         Ok(messages)
+    }
+
+    async fn answer(
+        &self,
+        parent: SessionId,
+        child: SessionId,
+        answers: Vec<String>,
+    ) -> Result<()> {
+        self.broker.answer(parent, child, answers)
+    }
+
+    async fn pending_input_notices(
+        &self,
+        parent: SessionId,
+    ) -> Result<Vec<crate::message::Message>> {
+        Ok(self
+            .broker
+            .take_unannounced(parent)
+            .into_iter()
+            .map(|input| {
+                let mut lines = vec![format!("[Subagent {} needs input]", input.label)];
+                for (index, question) in input.questions.iter().enumerate() {
+                    let options: Vec<&str> = question
+                        .options
+                        .iter()
+                        .map(|option| option.label.as_str())
+                        .collect();
+                    lines.push(format!("{}. {}", index + 1, question.question));
+                    lines.push(format!("   options: {}", options.join(" | ")));
+                }
+                lines.push(format!(
+                    "Reply with subagent_control action=answer child_id={} answers=[<one string per question, in order>]",
+                    input.child.0
+                ));
+                crate::message::Message::user(lines.join("
+"))
+            })
+            .collect())
     }
 }
 
@@ -616,5 +662,98 @@ mod tests {
                 part,
                 crate::message::ContentPart::ToolResult { content, .. } if content.contains("Sí")
             )));
+    }
+
+    #[tokio::test]
+    async fn pending_input_notices_are_delivered_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SqliteStore::open(dir.path().join("notices.db").to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+        let parent = store.create_session("/project").await.unwrap();
+        let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+            scripts: std::sync::Mutex::new(
+                vec![vec![
+                    StreamChunk::ToolCallComplete {
+                        id: "c1".into(),
+                        name: "ask_user".into(),
+                        input: serde_json::json!({"questions": [{
+                            "question": "¿Cuál?",
+                            "options": [{"label": "Sí"}, {"label": "No"}]
+                        }]}),
+                    },
+                    StreamChunk::Done(FinishReason::ToolCalls),
+                ]]
+                .into(),
+            ),
+        });
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(crate::tools::ask_user::AskUserTool));
+        let jobs = Arc::new(LocalJobRegistry::default());
+        let runtime = InProcessSubagentLauncher::new(
+            Arc::new(RwLock::new(provider)),
+            store.clone(),
+            Arc::new(tools),
+            Arc::new(PermissionService::allow_all()),
+            Arc::new(RwLock::new(CodeLoomConfig {
+                provider: ProviderConfig {
+                    kind: ProviderKind::OpenAiCompat,
+                    base_url: "http://localhost".into(),
+                    api_key_env: "KEY".into(),
+                },
+                model: "test".into(),
+                max_steps: 4,
+            })),
+            dir.path().to_path_buf(),
+            jobs.clone(),
+            EventBus::new(64),
+        );
+
+        let (child, job) = runtime
+            .start(
+                parent,
+                "obrero".into(),
+                "decide algo".into(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.pending_inputs(parent).is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("el hijo debería quedar esperando una respuesta");
+
+        let first = runtime.pending_input_notices(parent).await.unwrap();
+        assert_eq!(first.len(), 1);
+        let text = first[0].text();
+        assert!(text.starts_with("[Subagent obrero needs input]"), "{text}");
+        assert!(text.contains("¿Cuál?"), "{text}");
+        assert!(text.contains("Sí") && text.contains("No"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "subagent_control action=answer child_id={}",
+                child.0
+            )),
+            "{text}"
+        );
+        assert!(runtime
+            .pending_input_notices(parent)
+            .await
+            .unwrap()
+            .is_empty());
+
+        runtime
+            .answer(parent, child, vec!["Sí".into()])
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), jobs.wait(parent, &job))
+            .await
+            .expect("el hijo debería terminar tras la respuesta")
+            .unwrap();
     }
 }

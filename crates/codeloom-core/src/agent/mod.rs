@@ -332,6 +332,13 @@ impl AgentLoop {
                 self.bus
                     .publish(LiveEvent::SessionMessageAdded { session, message });
             }
+            // Las preguntas de los hijos se guardan aquí, a diferencia de los avisos
+            // de finalización, que el propio lanzador persiste al entregarlos.
+            for message in subagents.pending_input_notices(session).await? {
+                self.store.append_message(session, &message).await?;
+                self.bus
+                    .publish(LiveEvent::SessionMessageAdded { session, message });
+            }
         }
         Ok(())
     }
@@ -657,5 +664,102 @@ mod tests {
             }
         }
         assert_eq!(found, Some(("a.txt".to_string(), 1, 1)));
+    }
+
+    /// Lanzador de prueba: solo entrega avisos de preguntas de subagentes.
+    struct InputNoticeLauncher {
+        notice: Message,
+    }
+
+    #[async_trait]
+    impl crate::subagent::SubagentLauncher for InputNoticeLauncher {
+        async fn start(
+            &self,
+            _parent: SessionId,
+            _label: String,
+            _prompt: String,
+            _cancel: CancellationToken,
+        ) -> Result<(SessionId, crate::job::JobId)> {
+            Err(crate::error::CoreError::Tool("not used".into()))
+        }
+
+        async fn control(
+            &self,
+            _parent: SessionId,
+            _child: SessionId,
+            _action: &str,
+            _message: Option<String>,
+        ) -> Result<()> {
+            Err(crate::error::CoreError::Tool("not used".into()))
+        }
+
+        async fn list(
+            &self,
+            _parent: SessionId,
+        ) -> Result<Vec<crate::session::SubagentDescriptor>> {
+            Ok(Vec::new())
+        }
+
+        async fn deliver_notices(&self, _parent: SessionId) -> Result<Vec<Message>> {
+            Ok(Vec::new())
+        }
+
+        async fn pending_input_notices(&self, _parent: SessionId) -> Result<Vec<Message>> {
+            Ok(vec![self.notice.clone()])
+        }
+    }
+
+    #[tokio::test]
+    async fn flush_subagent_notices_injects_input_notices() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SqliteStore::open(dir.path().join("n.db").to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+        let sid = store.create_session("/p").await.unwrap();
+        let bus = EventBus::new(64);
+        let mut rx = bus.subscribe();
+        let mut agent = AgentLoop::new(
+            Arc::new(QueueProvider {
+                scripts: Mutex::new(VecDeque::new()),
+            }),
+            store.clone(),
+            Arc::new(ToolRegistry::new()),
+            bus,
+            Arc::new(PermissionService::allow_all()),
+            CodeLoomConfig {
+                provider: crate::config::ProviderConfig {
+                    kind: crate::config::ProviderKind::OpenAiCompat,
+                    base_url: "http://x".into(),
+                    api_key_env: "K".into(),
+                },
+                model: "m".into(),
+                max_steps: 5,
+            },
+            dir.path().to_path_buf(),
+        );
+        let notice = Message::user(
+            "[Subagent obrero needs input]
+1. ¿Cuál?",
+        );
+        agent.subagents = Some(Arc::new(InputNoticeLauncher {
+            notice: notice.clone(),
+        }));
+
+        agent.flush_subagent_notices(sid).await.unwrap();
+
+        let stored = store.messages(sid).await.unwrap();
+        assert!(stored.iter().any(|m| m.text() == notice.text()));
+        let mut published = false;
+        while let Ok(event) = rx.try_recv() {
+            if let LiveEvent::SessionMessageAdded { session, message } = event {
+                published |= session == sid && message.text() == notice.text();
+            }
+        }
+        assert!(
+            published,
+            "el aviso debería publicarse como SessionMessageAdded"
+        );
     }
 }
