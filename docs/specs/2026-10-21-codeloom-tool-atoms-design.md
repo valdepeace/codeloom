@@ -91,3 +91,69 @@ pieza con sus estados, el adaptador con las entradas reales de cada
 herramienta, los tokens y sus valores por defecto, y el catálogo (una entrada por
 herramienta y estado, mismo render que la app). Validación visual en terminal
 real: imprescindible y pendiente.
+
+## Estado (2026-10-21)
+
+Las tareas 1 a 6 del plan están implementadas, cada una en su commit. Queda
+pendiente la validación visual en terminal real.
+
+### Qué se implementó
+
+| Tarea | Contenido | Commit |
+|---|---|---|
+| T1 | Frontera `ToolFacts`, trait `ToolAtom`, registro `atom_for` con la pieza genérica de reserva y adaptador `tool_facts` en `codeloom-tui` | `e615a86` |
+| T2 | Piezas de `bash`, `view`, `grep` y `glob` | `3dae77b` |
+| T3 | Pieza de `edit` con diff y la variante `LineKind::ToolDiff(DiffKind)` | `30c253b` |
+| T4 | Piezas de `ask_user`, `subagent`, `subagent_control`, `subagent_list`, `job_start`, `job_output`, `job_kill` y `job_list` | `afb3070` |
+| T5 | Tokens `ToolPath`, `ToolCommand` y `ToolCount`, con valores por defecto derivados y sobrescribibles por preset | `0ece023` |
+| T6 | Catálogo «CodeLoom tools» en el showcase, con fixtures tras la feature `fixtures` | `ce21ff2` |
+
+Pruebas: `cargo test -p batten --lib` pasa con 370 pruebas y
+`cargo test -p codeloom-tui` pasa con 258.
+
+### Decisiones tomadas al ejecutar
+
+- `grep` usa el campo `glob` de su entrada como `secondary`, porque su entrada
+  no tiene `path`. El resumen queda `patrón in {glob}`.
+- `view` informa de `range` solo cuando hay `limit`. Sin él no hay fin conocido.
+  La numeración empieza en `offset + 1`.
+- La marca del diff (`+`, `-` o un espacio de contexto) viaja en el propio texto
+  de la línea, no en un campo aparte. Las cabeceras de hunk van sin marca.
+- El diff de `edit` se limita a 12 líneas con 2 de contexto. `Ctrl+O` (que
+  alterna `expanded` de la herramienta seleccionada) las muestra todas.
+- Las listas (`subagent_list`, `job_list`) no infieren recuento de una salida de
+  una sola línea, porque el núcleo devuelve JSON compacto. Sin recuento
+  explícito, solo cuentan las salidas de más de una línea.
+- Los fixtures replican a mano lo que extrae el adaptador (`ToolItem` más
+  `ToolFacts`). No pasan por `tool_facts`.
+- `todo_write` no pasa por `atom_for`. Su vista es `todo_lines`, igual que en la
+  app.
+- Las entradas del catálogo van al final de la lista de demos, bajo el proveedor
+  «CodeLoom».
+- Crush redefine solo `ToolPath` (con su `success`, verde menta). `ToolCommand` y
+  `ToolCount` heredan `default` y `dim`. El resto de presets hereda los tres.
+
+### Limitaciones conocidas
+
+- El diff de `edit` se recalcula completo en cada `sync_tool`, es decir, en cada
+  transición de estado. El coste es O(n) en el tamaño del diff.
+- El recuento de `subagent_list` y `job_list` queda pendiente. Hará falta que el
+  núcleo emita formato multilínea o un campo de recuento explícito.
+- Solo Crush da valores propios a los tokens nuevos, y de ellos solo `ToolPath`.
+- `write` no existe aún en `codeloom-core` (solo hay `edit`), y tampoco las
+  herramientas A2A. Cuando existan, serán una pieza más.
+- El catálogo no incluye `job_output` ni `job_kill`. Sus piezas existen y se
+  prueban, pero no tienen entrada de demo.
+- Validación visual en terminal real: pendiente.
+
+### Cómo verlo
+
+Desde la raíz del repositorio:
+
+```
+cargo run -p batten --example showcase
+```
+
+En el selector, busca el proveedor «CodeLoom». Dentro de cada demo, `r` cicla los seis
+estados (pendiente, en curso, éxito, error, esperando permiso y cancelada) y `e`
+alterna entre plegada y expandida.

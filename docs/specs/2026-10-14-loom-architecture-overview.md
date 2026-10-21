@@ -77,6 +77,12 @@ todo lo opcional (host, voz, decisión, compresión) vive **fuera de `codeloom-c
 plugin de herdr). `codeloom-decide`, `codeloom-voice`, `codeloom-compress` y `codeloom-herdr`
 son **opcionales**; el core no los conoce.
 
+Dentro de `codeloom-tui`, el transcript pinta cada herramienta con su pieza de
+render: el registro `atom_for` de `batten::state::tool_atom` elige la pieza según
+el nombre, a partir de los hechos tipados (`ToolFacts`) que extrae el adaptador
+`tool_facts` de `codeloom-tui`. Cuando una herramienta no tiene pieza propia,
+usa la genérica. Detalle en `2026-10-21-codeloom-tool-atoms-design.md`.
+
 ## 3. Flujo de un turno (de punta a punta)
 
 ```
