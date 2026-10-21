@@ -58,6 +58,8 @@ static GENERIC: GenericAtom = GenericAtom;
 enum Part {
     Name,
     Command,
+    /// Texto libre corto: pregunta, etiqueta de hijo o identificador de job.
+    Text,
     Path,
     Pattern,
     /// Dato secundario y corto: rango de líneas, filtro `glob`.
@@ -74,7 +76,7 @@ enum Part {
 fn style_of(part: Part) -> StyleToken {
     match part {
         Part::Name => StyleToken::ToolName,
-        Part::Command => StyleToken::Default,
+        Part::Command | Part::Text => StyleToken::Default,
         Part::Path | Part::Pattern => StyleToken::Accent,
         Part::Detail => StyleToken::Muted,
         Part::Count => StyleToken::Dim,
@@ -171,15 +173,19 @@ fn count_line(count: usize, label: &str) -> Line {
     line
 }
 
-/// Pieza de `bash`: el comando como resumen y la salida plegada como cuerpo.
-struct ShellAtom;
+/// Pieza de una llamada cuyo resumen es un solo dato: el comando de `bash` y
+/// `job_start`, o la etiqueta de `subagent` y el id de `job_output`/`job_kill`.
+/// La salida plegada va como cuerpo.
+struct PrimaryAtom {
+    part: Part,
+}
 
-impl ToolAtom for ShellAtom {
+impl ToolAtom for PrimaryAtom {
     fn lines(&self, item: &ToolItem, facts: &ToolFacts) -> Vec<Line> {
-        let Some(command) = facts.primary.as_deref().and_then(first_line) else {
+        let Some(primary) = facts.primary.as_deref().and_then(first_line) else {
             return tool_lines(item);
         };
-        with_body(item, &with_tail(command, Part::Command, None))
+        with_body(item, &with_tail(primary, self.part, None))
     }
 }
 
@@ -312,21 +318,91 @@ impl ToolAtom for EditAtom {
     }
 }
 
-static SHELL: ShellAtom = ShellAtom;
+/// Pieza de `ask_user`: la primera pregunta y, si la hay, su número de opciones.
+struct AskAtom;
+
+impl ToolAtom for AskAtom {
+    fn lines(&self, item: &ToolItem, facts: &ToolFacts) -> Vec<Line> {
+        let Some(question) = facts.primary.as_deref().and_then(first_line) else {
+            return tool_lines(item);
+        };
+        let question = truncate_graphemes(question, SUMMARY_GRAPHEMES);
+        let mut head = head_line(item, &[(Part::Text, question)]);
+        if let Some(options) = facts.count {
+            // Dos espacios separan la pregunta del recuento, como en `edit`.
+            head.text.push_str("  ");
+            push_text(&mut head, &format!("{options} options"), Part::Count);
+        }
+        let mut lines = vec![head];
+        lines.extend(body_lines(item));
+        lines
+    }
+}
+
+/// Pieza de `subagent_control`: la acción y, tras un espacio, el id del hijo.
+struct ControlAtom;
+
+impl ToolAtom for ControlAtom {
+    fn lines(&self, item: &ToolItem, facts: &ToolFacts) -> Vec<Line> {
+        let Some(action) = facts.primary.as_deref().and_then(first_line) else {
+            return tool_lines(item);
+        };
+        let target = facts
+            .secondary
+            .as_deref()
+            .and_then(first_line)
+            .map(str::to_string);
+        with_body(item, &with_tail(action, Part::Text, target))
+    }
+}
+
+/// Pieza de los listados (`subagent_list`, `job_list`): «N items» en la cabecera.
+/// El recuento es el explícito de los hechos o, si no lo hay, las líneas no
+/// vacías de la salida (si hay más de una); en curso y sin salida no hay recuento.
+struct ListAtom;
+
+impl ToolAtom for ListAtom {
+    fn lines(&self, item: &ToolItem, facts: &ToolFacts) -> Vec<Line> {
+        let count = facts.count.or_else(|| {
+            // Una salida de una sola línea (p. ej. un JSON compacto) no
+            // permite deducir cuántos elementos contiene: sin recuento.
+            item.output
+                .as_deref()
+                .map(count_nonempty)
+                .filter(|&n| n > 1)
+        });
+        let parts: Vec<(Part, String)> = count
+            .map(|count| vec![(Part::Count, format!("{count} items"))])
+            .unwrap_or_default();
+        with_body(item, &parts)
+    }
+}
+
+static SHELL: PrimaryAtom = PrimaryAtom {
+    part: Part::Command,
+};
+static REFERENCE: PrimaryAtom = PrimaryAtom { part: Part::Text };
 static FILE: FileAtom = FileAtom;
 static EDIT: EditAtom = EditAtom;
 static GREP: SearchAtom = SearchAtom { label: "matches" };
 static GLOB: SearchAtom = SearchAtom { label: "files" };
+static ASK: AskAtom = AskAtom;
+static CONTROL: ControlAtom = ControlAtom;
+static LIST: ListAtom = ListAtom;
 
 /// Pieza registrada para `name`. Las herramientas sin pieza propia (y las MCP)
 /// usan la genérica.
 pub fn atom_for(name: &str) -> &'static dyn ToolAtom {
     match name {
-        "bash" => &SHELL,
+        "bash" | "job_start" => &SHELL,
         "view" => &FILE,
         "edit" => &EDIT,
         "grep" => &GREP,
         "glob" => &GLOB,
+        "ask_user" => &ASK,
+        "subagent" | "job_output" | "job_kill" => &REFERENCE,
+        "subagent_control" => &CONTROL,
+        "subagent_list" | "job_list" => &LIST,
         _ => &GENERIC,
     }
 }
@@ -711,5 +787,164 @@ mod tests {
         assert!(lines
             .iter()
             .any(|l| l.kind == LineKind::ToolDiff(DiffKind::Insert)));
+    }
+
+    /// Hechos de `ask_user`: la primera pregunta y el número de opciones.
+    fn ask_facts(question: &str, options: usize) -> ToolFacts {
+        ToolFacts {
+            count: Some(options),
+            ..primary(question)
+        }
+    }
+
+    #[test]
+    fn ask_user_shows_first_question_and_option_count() {
+        let item = ToolItem::new("c1", "ask_user");
+        let lines = tool_lines_with(&item, &ask_facts("¿Qué base de datos usamos?", 3));
+        assert_eq!(
+            lines[0].plain(),
+            "ask_user  ¿Qué base de datos usamos?  3 options"
+        );
+
+        // La pregunta se trunca a 80 grafemas; el recuento va detrás.
+        let lines = tool_lines_with(&item, &ask_facts(&"q".repeat(200), 2));
+        assert_eq!(
+            summary_of(&lines, "ask_user"),
+            format!("{}…  2 options", "q".repeat(79))
+        );
+
+        // Sin opciones conocidas no hay recuento.
+        let lines = tool_lines_with(&item, &primary("¿Seguimos?"));
+        assert_eq!(lines[0].plain(), "ask_user  ¿Seguimos?");
+    }
+
+    #[test]
+    fn subagent_summary_is_the_label() {
+        let mut item = ToolItem::new("c1", "subagent");
+        let facts = primary("revisar los tests");
+        assert_eq!(
+            tool_lines_with(&item, &facts)[0].plain(),
+            "subagent  revisar los tests"
+        );
+
+        // En curso y sin salida: solo la cabecera.
+        item.start();
+        assert_eq!(tool_lines_with(&item, &facts).len(), 1);
+
+        // Con salida, el cuerpo va plegado como en las demás piezas.
+        item.set_result(false);
+        item.set_output("hecho");
+        let lines = tool_lines_with(&item, &facts);
+        assert_eq!(lines.last().unwrap().plain(), "hecho");
+
+        let long = tool_lines_with(&ToolItem::new("c2", "subagent"), &primary(&"x".repeat(200)));
+        let summary = summary_of(&long, "subagent");
+        assert_eq!(summary.graphemes(true).count(), 80);
+        assert!(summary.ends_with('…'));
+    }
+
+    #[test]
+    fn subagent_control_summary_has_action_and_target() {
+        let item = ToolItem::new("c1", "subagent_control");
+        let facts = ToolFacts {
+            secondary: Some("2".to_string()),
+            ..primary("interrupt")
+        };
+        assert_eq!(
+            tool_lines_with(&item, &facts)[0].plain(),
+            "subagent_control  interrupt 2"
+        );
+        assert_eq!(
+            tool_lines_with(&item, &primary("interrupt"))[0].plain(),
+            "subagent_control  interrupt"
+        );
+    }
+
+    #[test]
+    fn list_tools_show_item_counts() {
+        for name in ["subagent_list", "job_list"] {
+            let mut item = ToolItem::new("c1", name);
+            // En curso y sin salida no hay recuento.
+            item.start();
+            let lines = tool_lines_with(&item, &ToolFacts::default());
+            assert_eq!(lines.len(), 1, "{name} en curso no debe mostrar recuento");
+            assert_eq!(lines[0].plain(), name);
+
+            // Con salida, las líneas no vacías cuentan como elementos.
+            item.set_result(false);
+            item.set_output("a\nb\n\nc");
+            let lines = tool_lines_with(&item, &ToolFacts::default());
+            assert_eq!(lines[0].plain(), format!("{name}  3 items"));
+
+            // Un recuento explícito de la pieza prevalece sobre la salida.
+            let facts = ToolFacts {
+                count: Some(7),
+                ..ToolFacts::default()
+            };
+            assert_eq!(
+                tool_lines_with(&item, &facts)[0].plain(),
+                format!("{name}  7 items")
+            );
+        }
+    }
+
+    #[test]
+    fn list_tools_do_not_guess_a_count_from_a_single_line_output() {
+        for name in ["subagent_list", "job_list"] {
+            let mut item = ToolItem::new("c1", name);
+            item.start();
+            item.set_result(false);
+            // El núcleo devuelve un JSON compacto en una línea: no se infiere nada.
+            item.set_output(r#"[{"id":1},{"id":2}]"#);
+            let lines = tool_lines_with(&item, &ToolFacts::default());
+            assert_eq!(lines[0].plain(), name, "{name} sin recuento inventado");
+        }
+    }
+
+    #[test]
+    fn job_tools_show_command_or_id() {
+        let start = ToolItem::new("c1", "job_start");
+        let lines = tool_lines_with(&start, &primary("cargo test -p batten\nsegunda"));
+        assert_eq!(lines[0].plain(), "job_start  cargo test -p batten");
+
+        for name in ["job_output", "job_kill"] {
+            let item = ToolItem::new("c1", name);
+            assert_eq!(
+                tool_lines_with(&item, &primary("job-7"))[0].plain(),
+                format!("{name}  job-7")
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_shape_falls_back() {
+        let blank = ToolFacts {
+            primary: Some(" \n ".to_string()),
+            ..ToolFacts::default()
+        };
+        let count_only = ToolFacts {
+            count: Some(2),
+            ..ToolFacts::default()
+        };
+        for name in [
+            "ask_user",
+            "subagent",
+            "subagent_control",
+            "job_start",
+            "job_output",
+            "job_kill",
+        ] {
+            let mut item = ToolItem::new("c1", name);
+            item.set_summary("{\"raro\":true}");
+            item.set_result(false);
+            item.set_output("salida");
+            for facts in [ToolFacts::default(), blank.clone(), count_only.clone()] {
+                assert_eq!(
+                    tool_lines_with(&item, &facts),
+                    super::super::tool_lines(&item),
+                    "{name}"
+                );
+            }
+        }
     }
 }

@@ -18,6 +18,12 @@ pub fn tool_facts(name: &str, input: &Value) -> ToolFacts {
         "edit" => edit(input),
         "grep" => grep(input),
         "glob" => glob(input),
+        "ask_user" => ask_user(input),
+        "subagent" => subagent(input),
+        "subagent_control" => subagent_control(input),
+        "job_start" => job_start(input),
+        "job_output" | "job_kill" => job_ref(input),
+        // `subagent_list` y `job_list` no reciben datos: su recuento sale de la salida.
         _ => None,
     };
     facts.unwrap_or_default()
@@ -94,6 +100,59 @@ fn grep(input: &Value) -> Option<ToolFacts> {
 fn glob(input: &Value) -> Option<ToolFacts> {
     Some(ToolFacts {
         primary: Some(text(input, "pattern")?),
+        ..ToolFacts::default()
+    })
+}
+
+/// Entrada de `ask_user`: `questions` no vacío. Los hechos son la primera pregunta
+/// y su número de opciones, si `options` está presente (debe ser una lista).
+fn ask_user(input: &Value) -> Option<ToolFacts> {
+    let first = input.get("questions")?.as_array()?.first()?;
+    let count = match first.get("options") {
+        None => None,
+        Some(options) => Some(options.as_array()?.len()),
+    };
+    Some(ToolFacts {
+        primary: Some(text(first, "question")?),
+        count,
+        ..ToolFacts::default()
+    })
+}
+
+/// Entrada de `subagent`: `prompt` obligatorio y `label` opcional. El resumen es
+/// la etiqueta si la hay y no está en blanco; si no, el objetivo.
+fn subagent(input: &Value) -> Option<ToolFacts> {
+    let prompt = text(input, "prompt")?;
+    let label = optional_text(input, "label")?.filter(|label| !label.trim().is_empty());
+    Some(ToolFacts {
+        primary: Some(label.unwrap_or(prompt)),
+        ..ToolFacts::default()
+    })
+}
+
+/// Entrada de `subagent_control`: `child_id` entero positivo y `action` obligatorios.
+/// La acción es el primer dato y el id de destino el segundo.
+fn subagent_control(input: &Value) -> Option<ToolFacts> {
+    let child = input.get("child_id")?.as_u64().filter(|&id| id > 0)?;
+    Some(ToolFacts {
+        primary: Some(text(input, "action")?),
+        secondary: Some(child.to_string()),
+        ..ToolFacts::default()
+    })
+}
+
+/// Entrada de `job_start`: `command` obligatorio; `label` no se muestra.
+fn job_start(input: &Value) -> Option<ToolFacts> {
+    Some(ToolFacts {
+        primary: Some(text(input, "command")?),
+        ..ToolFacts::default()
+    })
+}
+
+/// Entrada de `job_output` y `job_kill`: solo el `id` del job.
+fn job_ref(input: &Value) -> Option<ToolFacts> {
+    Some(ToolFacts {
+        primary: Some(text(input, "id")?),
         ..ToolFacts::default()
     })
 }
@@ -196,5 +255,117 @@ mod tests {
         let facts = tool_facts("glob", &json!({ "pattern": "crates/**/*.rs" }));
         assert_eq!(facts.primary.as_deref(), Some("crates/**/*.rs"));
         assert_eq!(facts.secondary, None);
+    }
+
+    #[test]
+    fn new_tools_extract_the_real_input_shapes() {
+        let facts = tool_facts(
+            "ask_user",
+            &json!({ "questions": [
+                {
+                    "header": "DB",
+                    "question": "¿Qué base de datos?",
+                    "options": [
+                        { "label": "pg" },
+                        { "label": "sqlite", "description": "local" },
+                        { "label": "mysql" }
+                    ],
+                    "multi_select": false
+                },
+                { "question": "¿Y la caché?", "options": [{ "label": "redis" }, { "label": "no" }] }
+            ] }),
+        );
+        assert_eq!(facts.primary.as_deref(), Some("¿Qué base de datos?"));
+        assert_eq!(facts.count, Some(3));
+
+        // La etiqueta del hijo es el resumen; sin ella, el objetivo (prompt).
+        let facts = tool_facts(
+            "subagent",
+            &json!({ "prompt": "revisa los tests", "label": "tests" }),
+        );
+        assert_eq!(facts.primary.as_deref(), Some("tests"));
+        let facts = tool_facts("subagent", &json!({ "prompt": "revisa los tests" }));
+        assert_eq!(facts.primary.as_deref(), Some("revisa los tests"));
+
+        let facts = tool_facts(
+            "subagent_control",
+            &json!({ "child_id": 2, "action": "answer", "answers": ["Sí"] }),
+        );
+        assert_eq!(facts.primary.as_deref(), Some("answer"));
+        assert_eq!(facts.secondary.as_deref(), Some("2"));
+
+        let facts = tool_facts(
+            "job_start",
+            &json!({ "command": "cargo test", "label": "tests" }),
+        );
+        assert_eq!(facts.primary.as_deref(), Some("cargo test"));
+        let facts = tool_facts("job_output", &json!({ "id": "job-7", "from": 0 }));
+        assert_eq!(facts.primary.as_deref(), Some("job-7"));
+        let facts = tool_facts("job_kill", &json!({ "id": "job-7" }));
+        assert_eq!(facts.primary.as_deref(), Some("job-7"));
+
+        // Las listas no reciben datos de entrada: sus hechos quedan vacíos.
+        assert_eq!(
+            tool_facts("subagent_list", &json!({})),
+            ToolFacts::default()
+        );
+        assert_eq!(tool_facts("job_list", &json!({})), ToolFacts::default());
+    }
+
+    #[test]
+    fn malformed_input_for_the_new_tools_yields_default() {
+        let shapes = [json!(null), json!(42), json!([]), json!({})];
+        let names = [
+            "ask_user",
+            "subagent",
+            "subagent_control",
+            "job_start",
+            "job_output",
+            "job_kill",
+        ];
+        for name in names {
+            for input in &shapes {
+                assert_eq!(
+                    tool_facts(name, input),
+                    ToolFacts::default(),
+                    "{name} con {input}"
+                );
+            }
+        }
+
+        let wrong_types = [
+            ("ask_user", json!({ "questions": "x" })),
+            ("ask_user", json!({ "questions": [] })),
+            (
+                "ask_user",
+                json!({ "questions": [{ "question": 5, "options": [] }] }),
+            ),
+            (
+                "ask_user",
+                json!({ "questions": [{ "question": "¿Sí?", "options": "dos" }] }),
+            ),
+            ("subagent", json!({ "prompt": 3 })),
+            ("subagent", json!({ "prompt": "x", "label": 4 })),
+            (
+                "subagent_control",
+                json!({ "child_id": "2", "action": "interrupt" }),
+            ),
+            (
+                "subagent_control",
+                json!({ "child_id": 0, "action": "interrupt" }),
+            ),
+            ("subagent_control", json!({ "child_id": 2 })),
+            ("subagent_control", json!({ "child_id": 2, "action": 5 })),
+            ("job_start", json!({ "command": ["ls"] })),
+            ("job_output", json!({ "id": 7 })),
+            ("job_kill", json!({ "id": null })),
+        ];
+        for (name, input) in wrong_types {
+            assert_eq!(
+                tool_facts(name, &input),
+                ToolFacts::default(),
+                "{name} con {input}"
+            );
+        }
     }
 }
