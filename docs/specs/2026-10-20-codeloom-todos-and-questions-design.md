@@ -39,8 +39,8 @@ dos herramientas del core con presentación propia en la TUI:
 
 ## Anti-objetivos
 
-- Que un subagente pueda bloquear la interfaz del padre (los hijos no tienen
-  `ask_user`).
+- Que un subagente pueda bloquear la interfaz del padre (sus preguntas van al
+  padre, no a la pantalla; véase la nota sobre subagentes).
 - Que el diálogo robe teclas al de permisos: el de permisos tiene prioridad.
 - Que una lista de tareas enorme o una respuesta libre larguísima rompan el
   layout o ralenticen el dibujado.
@@ -97,9 +97,9 @@ Decisiones tomadas al implementar:
 ### Nota sobre subagentes (2026-10-21)
 
 `ask_user` es el análogo local del estado A2A `input-required` (véase la §5 de
-la spec de agentes en `2026-10-15-loom-agent-profile-a2a.md`). Hoy los
-subagentes no lo tienen: `InProcessSubagentLauncher::new` lo retira con
-`.without("ask_user")`. Levantar esa restricción queda como trabajo posterior,
-con las condiciones enumeradas en «Fuera de este plan» del plan
-`docs/plans/2026-10-21-codeloom-a2a-task-state.md`; cabe señalar que no se
-implementa aquí.
+la spec de agentes en `2026-10-15-loom-agent-profile-a2a.md`). Los subagentes
+**sí** disponen ya de la herramienta: su pregunta no llega a la pantalla, sino
+al buzón de su padre, cuyo LLM responde con `subagent_control` (acción
+`answer`) o escala al usuario con su propio `ask_user`. El diseño completo está
+en `2026-10-21-codeloom-subagent-input-required-design.md`; cabe señalar que el
+anti-objetivo de arriba se mantiene, pues el hijo nunca bloquea la interfaz.

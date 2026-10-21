@@ -203,7 +203,8 @@ La card es la **vista externa**; el `AgentProfile` es la **vista interna**.
 - **Roles**: `serve | consume | both`, en `codeloom.toml`, **default off**. El caso
   común (standalone, un proceso) nunca levanta un server.
 - **Mapeo de ciclo de vida**: `Task` A2A <-> subagente/job del núcleo:
-  `working` = step en curso, `input-required` = aviso dormido (`agent.wakeup`),
+  `working` = step en curso, `input-required` = pregunta pendiente en el buzón
+  del padre (`InputBroker`; véase `2026-10-21-codeloom-subagent-input-required-design.md`),
   `completed` = `SubagentResult`, `canceled` = `CancellationToken`.
 - **Streaming**: `SendStreamingMessage`/SSE entra por el mismo camino que
   `provider.stream`; no hay canal de UI paralelo.

@@ -89,3 +89,36 @@ responder del hijo (permisos delegados, preguntas encaminadas), del
 lanzador con un hijo que pregunta y se reanuda, de la acción `answer`, de
 los avisos y de la TUI (marca de espera). Validación visual en terminal
 real: pendiente.
+
+## Estado (2026-10-21)
+
+Implementado y commiteado, con 526 tests, clippy `-D warnings` y rustfmt
+limpios:
+
+- `InputBroker` (`subagent_input.rs`): buzón puro, con sustitución de la
+  pregunta anterior del mismo hijo y limpieza si el futuro se cancela.
+- `ChildResponder`: permisos delegados en el padre; preguntas al buzón. Se
+  publican `SubagentInputRequested` y `SubagentInputResolved` (este último
+  también si la herramienta se cancela).
+- `SubagentLauncher::{answer, pending_input_notices}` y la acción `answer` de
+  `subagent_control` (de 1 a 4 respuestas de hasta 4096 bytes).
+- Marca ` ?` en el rail (solo look Crush) y `subagent_task_state` para la
+  proyección hacia `input-required`.
+
+Decisiones tomadas al implementar:
+
+- El buzón se indexa por el `i64` del hijo, porque `SessionId` no implementa
+  `Hash`.
+- Los avisos de pregunta los persiste el bucle del agente; los de finalización,
+  el propio lanzador.
+- Un estado terminal del hijo, llegue por `SubagentChanged` o por `JobChanged`,
+  retira la marca de espera.
+
+Limitaciones conocidas:
+
+- El aviso se marca como anunciado antes de guardarse: si el guardado fallase,
+  la pregunta no se reanunciaría.
+- El padre ocioso no despierta solo (véase «Preguntas abiertas» y la spec de
+  autonomía).
+- En el look Classic no hay marca visible; solo el aviso al padre.
+- Validación visual en terminal real: pendiente.
