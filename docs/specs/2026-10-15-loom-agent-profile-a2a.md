@@ -212,21 +212,60 @@ La card es la **vista externa**; el `AgentProfile` es la **vista interna**.
 
 ### Estado de tarea (2026-10-21)
 
-Ciertamente, ya existe `codeloom_core::task::TaskState`, que reproduce los
-nombres y la serialización del protocolo (`input-required`, `auth-required`,
-`canceled`, etc.) y que se obtiene por proyección desde los estados internos:
+Ciertamente, ya existe `codeloom_core::task::TaskState`, enumerado puro con los
+estados de tarea de A2A, que se obtiene por proyección desde los estados
+internos. Cabe señalar que **no lleva serialización**: los nombres del cable
+dependen de la versión (v1.0: `TASK_STATE_INPUT_REQUIRED`; v0.3:
+`input-required`) y los fija el adaptador, no el core.
 
 | Estado interno                                       | `TaskState`  |
 |------------------------------------------------------|--------------|
-| `JobStatus::Running`, `JobStatus::Stopping`          | `working`    |
-| `JobStatus::Completed`, `SubagentStatus::Completed`  | `completed`  |
-| `JobStatus::Failed`, `SubagentStatus::Failed`, `SubagentStatus::Interrupted` | `failed` |
-| `JobStatus::Killed`, `SubagentStatus::Killed`        | `canceled`   |
+| `JobStatus::Running`, `JobStatus::Stopping`          | `Working`    |
+| `JobStatus::Completed`, `SubagentStatus::Completed`  | `Completed`  |
+| `JobStatus::Failed`, `SubagentStatus::Failed`, `SubagentStatus::Interrupted` | `Failed` |
+| `JobStatus::Killed`, `SubagentStatus::Killed`        | `Canceled`   |
 
-Cabe señalar que `Interrupted -> failed` es decisión nuestra: A2A carece de un
+Cabe señalar que `Interrupted -> Failed` es decisión nuestra: A2A carece de un
 equivalente a «interrumpida», de modo que la tarea se proyecta a fallo por haber
 quedado sin terminar. El modelo interno (`JobStatus`, `SubagentStatus` y el
 esquema SQLite) no cambia; la traducción vive solo en el borde.
+
+### Hallazgos de la lectura de la especificación oficial (2026-10-21)
+
+Fuente: `a2a-protocol.org/latest/specification/` (v1.0.0) y las páginas de
+conceptos, ciclo de vida de una tarea y streaming. No se leyó el `a2a.proto`
+ni las secciones de bindings (§9–§13), de las que solo se dispone de resumen.
+
+- **Nombres del cable en v1.0**: estados `TASK_STATE_*`, roles `ROLE_USER` /
+  `ROLE_AGENT`, `Part` única con una de las claves `text`, `raw`, `url`,
+  `data`; los eventos de stream se envuelven en `statusUpdate` /
+  `artifactUpdate`; operaciones `SendMessage`, `SendStreamingMessage`,
+  `GetTask`, `ListTasks`, `CancelTask`, `SubscribeToTask`.
+- **`contextId` y `taskId`**: el primero agrupa varias tareas de una misma
+  conversación; el segundo identifica una tarea y lo genera el servidor. Una
+  tarea en estado terminal es **inmutable**: todo refinamiento es una tarea
+  nueva en el mismo contexto, con `referenceTaskIds`.
+- **Reanudar `input-required`**: nuevo mensaje con el mismo `taskId` (y
+  `contextId`).
+- **Resultados**: la especificación indica que los `Message` no deben
+  entregar resultados; estos van en `Artifact`.
+- **Tareas largas**: `returnImmediately` más `SubscribeToTask` o *push*; al
+  recibir la notificación, el cliente llama a `GetTask`. De ahí se sigue que
+  el cliente debe **reaccionar** a `input-required` y a los estados
+  terminales, y no esperar a que el humano vuelva a escribir.
+- **Mensaje o tarea**: un agente puede responder con un `Message` directo
+  para lo trivial y crear tarea solo al comprometerse (agente híbrido).
+- **Cadena de peticiones**: solo `auth-required` tiene regla explícita (el
+  cliente que es agente puede pasar su propia tarea a ese estado). Para
+  `input-required` no existe regla equivalente: el flujo de
+  `2026-10-21-codeloom-subagent-input-required-design.md` es **inferencia
+  nuestra**, no mandato del protocolo.
+- **Discrepancias de la propia documentación**: si el stream se cierra en
+  `input-required` (lo afirma una página, no la especificación); un campo
+  `index` en `artifactUpdate` (lo muestra una página, no la tabla
+  normativa); y «devolver de inmediato» frente al bloqueo por defecto de
+  `SendMessage` (prevalece este último).
+- **Versionado**: cabecera `A2A-Version`; vacía equivale a `0.3`.
 
 ## 6. Frontera con el core
 
