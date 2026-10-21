@@ -1,11 +1,13 @@
-use crate::permission_flow::{dialog_for, PermissionReply};
+use crate::permission_flow::{dialog_for, spec_for, PermissionReply, QuestionReply};
 use codeloom_core::config::{CodeLoomConfig, ProviderKind};
 use codeloom_core::event::LiveEvent;
 use codeloom_core::message::{ContentPart, Message, Role};
 use codeloom_core::permission::{Decision, PermissionRequest};
+use codeloom_core::question::{Answer, Question};
 use codeloom_core::session::{SessionId, SessionInfo};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -48,6 +50,103 @@ pub struct PendingPermission {
     reply: PermissionReply,
 }
 
+/// Diálogo de preguntas abierto, con las preguntas originales y su canal de respuesta.
+pub struct PendingQuestion {
+    pub dialog: batten::state::QuestionDialog,
+    questions: Vec<Question>,
+    reply: QuestionReply,
+}
+
+/// Elemento de actividad (job o subagente) del transcript en el look Crush.
+struct ActivityEntry {
+    /// Clave estable: `job:{id}`, `subagent:{hijo}` o `notice:{n}`.
+    key: String,
+    id: batten::state::EntryId,
+    /// Líneas con las que está sincronizado el elemento, esté o no visible.
+    lines: Vec<batten::state::Line>,
+    kind: &'static str,
+    label: String,
+    /// `true` si el elemento nació de un aviso y no de un evento en vivo.
+    from_notice: bool,
+    /// `true` si un aviso ya se asoció a este elemento en vivo.
+    notice_consumed: bool,
+}
+
+/// Aviso de texto de un job o subagente terminado, ya interpretado.
+enum Notice<'a> {
+    Job {
+        id: &'a str,
+        status: batten::state::ToolStatus,
+        label: &'a str,
+        body: &'a str,
+    },
+    Subagent {
+        label: &'a str,
+        body: &'a str,
+    },
+}
+
+/// Interpreta `[Job {id} {estado}] {etiqueta}\n{cuerpo}` y
+/// `[Subagent {etiqueta} completed]\n{cuerpo}`. Devuelve `None` si el texto no
+/// encaja con ninguno de los dos formatos.
+fn parse_notice(text: &str) -> Option<Notice<'_>> {
+    let (header, body) = text.split_once('\n').unwrap_or((text, ""));
+    if let Some(rest) = header.strip_prefix("[Job ") {
+        let (inside, label) = rest.split_once(']')?;
+        let mut parts = inside.split_whitespace();
+        let (id, status) = (parts.next()?, parts.next()?);
+        if parts.next().is_some() {
+            return None;
+        }
+        let status = match status {
+            "completed" => batten::state::ToolStatus::Success,
+            "killed" => batten::state::ToolStatus::Canceled,
+            "failed" => batten::state::ToolStatus::Error,
+            _ => return None,
+        };
+        return Some(Notice::Job {
+            id,
+            status,
+            label: label.trim(),
+            body,
+        });
+    }
+    let rest = header.strip_prefix("[Subagent ")?;
+    let (inside, _) = rest.split_once(']')?;
+    let label = inside.strip_suffix(" completed")?;
+    Some(Notice::Subagent { label, body })
+}
+
+/// Estado visible de un job, según el mapeo de la especificación.
+fn job_tool_status(status: codeloom_core::job::JobStatus) -> batten::state::ToolStatus {
+    use batten::state::ToolStatus;
+    use codeloom_core::job::JobStatus;
+    match status {
+        JobStatus::Running | JobStatus::Stopping => ToolStatus::Running,
+        JobStatus::Completed => ToolStatus::Success,
+        JobStatus::Failed => ToolStatus::Error,
+        JobStatus::Killed => ToolStatus::Canceled,
+    }
+}
+
+/// Estado visible de un subagente, según el mapeo de la especificación.
+fn subagent_tool_status(
+    status: codeloom_core::session::SubagentStatus,
+) -> batten::state::ToolStatus {
+    use batten::state::ToolStatus;
+    use codeloom_core::session::SubagentStatus;
+    match status {
+        SubagentStatus::Running => ToolStatus::Running,
+        SubagentStatus::Completed => ToolStatus::Success,
+        SubagentStatus::Failed => ToolStatus::Error,
+        SubagentStatus::Killed | SubagentStatus::Interrupted => ToolStatus::Canceled,
+    }
+}
+
+/// Herramienta con la que el modelo reemplaza la lista de tareas. Su llamada
+/// no tiene tarjeta en el transcript: la lista se pinta como elemento propio.
+const TODO_TOOL: &str = "todo_write";
+
 pub struct App {
     /// Transcript persistente: se actualiza con los eventos, no por frame.
     pub transcript: batten::state::Transcript,
@@ -76,6 +175,15 @@ pub struct App {
     /// Entrada del transcript de cada herramienta y las líneas con las que
     /// está sincronizada (usado por el look `Inline`).
     tool_entries: HashMap<String, (batten::state::EntryId, Vec<batten::state::Line>)>,
+    /// Elementos de actividad (jobs y subagentes) del transcript del look Crush.
+    activity_entries: Vec<ActivityEntry>,
+    /// Lista de tareas de la sesión abierta, tal como la dejó el último `todo_write`.
+    pub todos: Vec<codeloom_core::todo::TodoItem>,
+    /// Entrada del transcript de la lista de tareas y las líneas con las que
+    /// está sincronizada.
+    todo_entry: Option<(batten::state::EntryId, Vec<batten::state::Line>)>,
+    /// Llamadas `todo_write` con entrada en `tool_entries`; su tarjeta nunca se pinta.
+    todo_tool_calls: HashSet<String>,
     pub jobs: BTreeMap<codeloom_core::job::JobId, codeloom_core::job::JobSnapshot>,
     pub subagents: BTreeMap<i64, codeloom_core::session::SubagentDescriptor>,
     pub tools_open: bool,
@@ -112,6 +220,10 @@ pub struct App {
     pub permission: Option<PendingPermission>,
     /// Peticiones esperando a que se cierre la actual.
     permission_queue: VecDeque<(PermissionRequest, PermissionReply)>,
+    /// Diálogo de preguntas (`ask_user`) abierto, si hay.
+    pub question: Option<PendingQuestion>,
+    /// Llamadas de preguntas esperando a que se cierre la actual.
+    question_queue: VecDeque<(Vec<Question>, QuestionReply)>,
     /// `true` cuando se acaba de abrir un diálogo y falta lanzar su efecto.
     pub fx_pending: bool,
     /// Sessions list for the session picker UI.
@@ -136,6 +248,8 @@ pub struct App {
     pub session_choice: Option<SessionChoice>,
     /// Whether the sidebar is expanded (visible on all screen widths).
     pub sidebar_expanded: bool,
+    /// Oculta el rail derecho del layout `ContextRail` (look Crush).
+    pub rail_hidden: bool,
     /// `true` when loading a session (shows loading spinner).
     /// Set after user makes a selection and before messages are loaded.
     pub session_loading: bool,
@@ -194,6 +308,10 @@ impl App {
             animation: batten::widgets::Anim::new(),
             tools: VecDeque::new(),
             tool_entries: HashMap::new(),
+            activity_entries: Vec::new(),
+            todos: Vec::new(),
+            todo_entry: None,
+            todo_tool_calls: HashSet::new(),
             jobs: BTreeMap::new(),
             subagents: BTreeMap::new(),
             tools_open: false,
@@ -223,6 +341,8 @@ impl App {
             turn_in_flight: false,
             permission: None,
             permission_queue: VecDeque::new(),
+            question: None,
+            question_queue: VecDeque::new(),
             fx_pending: false,
             sessions: Vec::new(),
             session_selected: 0,
@@ -244,6 +364,7 @@ impl App {
             settings_feedback: None,
             help_open: false,
             sidebar_expanded: false,
+            rail_hidden: false,
         }
     }
 
@@ -425,6 +546,10 @@ impl App {
         self.history = batten::state::History::new();
         self.tools.clear();
         self.tool_entries.clear();
+        self.activity_entries.clear();
+        self.todos.clear();
+        self.todo_entry = None;
+        self.todo_tool_calls.clear();
         self.tools_open = false;
         self.tool_selected = 0;
         self.tool_scroll = (0, 0);
@@ -446,13 +571,19 @@ impl App {
                 Role::User => {
                     let text = message.text();
                     self.history.push(text.clone());
-                    self.push_user(&text);
+                    self.user_message(&text);
                 }
                 Role::Assistant => {
                     for part in message.parts {
                         match part {
                             ContentPart::Text { text } => self.push_assistant(&text),
                             ContentPart::ToolCall { id, name, input } => {
+                                if name == TODO_TOOL {
+                                    if let Ok(items) = codeloom_core::todo::parse_todos(&input) {
+                                        self.todos = items;
+                                        self.sync_todos();
+                                    }
+                                }
                                 self.tool_mut(&id, &name).set_summary(input.to_string());
                                 self.sync_tool(&id);
                             }
@@ -571,6 +702,83 @@ impl App {
                 reply,
             });
             self.fx_pending = true;
+            break;
+        }
+    }
+
+    /// Encola un lote de preguntas; si no hay diálogo abierto, lo muestra ya.
+    /// Sin preguntas responde `None` de inmediato: el diálogo nunca se abre vacío.
+    pub fn enqueue_questions(&mut self, questions: Vec<Question>, reply: QuestionReply) {
+        if questions.is_empty() {
+            let _ = reply.send(None);
+            return;
+        }
+        self.tools_open = false;
+        self.queue_open = false;
+        self.queue_editing = false;
+        self.help_open = false;
+        self.settings_open = false;
+        self.settings_editing = false;
+        self.question_queue.push_back((questions, reply));
+        self.open_next_question();
+    }
+
+    /// Procesa una tecla en el diálogo de preguntas abierto.
+    pub fn question_key(&mut self, key: batten::state::QuestionKey) {
+        use batten::state::QuestionOutcome;
+        let Some(pending) = self.question.as_mut() else {
+            return;
+        };
+        match pending.dialog.handle(key) {
+            QuestionOutcome::Pending => {}
+            QuestionOutcome::Done(selected) => {
+                let answers = pending
+                    .questions
+                    .iter()
+                    .zip(selected)
+                    .map(|(question, selected)| Answer {
+                        question: question.question.clone(),
+                        selected,
+                    })
+                    .collect();
+                self.finish_question(Some(answers));
+            }
+            QuestionOutcome::Cancelled => self.finish_question(None),
+        }
+    }
+
+    /// Cierra todas las preguntas abiertas o encoladas respondiendo `None`.
+    pub fn cancel_question(&mut self) {
+        if let Some(pending) = self.question.take() {
+            let _ = pending.reply.send(None);
+        }
+        for (_, reply) in self.question_queue.drain(..) {
+            let _ = reply.send(None);
+        }
+    }
+
+    /// Responde al diálogo abierto con `answers` y pasa al siguiente de la cola.
+    fn finish_question(&mut self, answers: Option<Vec<Answer>>) {
+        if let Some(pending) = self.question.take() {
+            let _ = pending.reply.send(answers);
+        }
+        self.open_next_question();
+    }
+
+    fn open_next_question(&mut self) {
+        if self.question.is_some() {
+            return;
+        }
+        while let Some((questions, reply)) = self.question_queue.pop_front() {
+            if reply.is_closed() {
+                continue;
+            }
+            let specs = questions.iter().map(spec_for).collect();
+            self.question = Some(PendingQuestion {
+                dialog: batten::state::QuestionDialog::new(specs),
+                questions,
+                reply,
+            });
             break;
         }
     }
@@ -722,11 +930,19 @@ impl App {
                         };
                     }
                 }
+                self.sync_job_activity(&snapshot);
                 self.jobs.insert(snapshot.id.clone(), snapshot);
             }
             LiveEvent::SubagentChanged(subagent) => {
                 if Some(subagent.parent) == self.session_id {
+                    self.sync_subagent_activity(&subagent);
                     self.subagents.insert(subagent.child.0, subagent);
+                }
+            }
+            LiveEvent::TodosChanged { session, items } => {
+                if self.session_id == Some(session) {
+                    self.todos = items;
+                    self.sync_todos();
                 }
             }
         }
@@ -734,7 +950,7 @@ impl App {
 
     fn apply_message_added(&mut self, message: Message) {
         if message.role == Role::User {
-            self.push_user(&message.text());
+            self.user_message(&message.text());
         } else {
             for part in message.parts {
                 match part {
@@ -844,7 +1060,8 @@ impl App {
             return;
         };
         let lines = batten::state::tool_lines(item);
-        let inline = self.tool_inline();
+        let todo = item.name == TODO_TOOL;
+        let inline = self.tool_inline() && !todo;
         match self.tool_entries.get_mut(call_id) {
             Some((id, cache)) => {
                 if *cache == lines {
@@ -861,6 +1078,9 @@ impl App {
                 let shown = if inline { lines.clone() } else { Vec::new() };
                 let id = self.transcript.push_lines(shown);
                 self.tool_entries.insert(call_id.to_string(), (id, lines));
+                if todo {
+                    self.todo_tool_calls.insert(call_id.to_string());
+                }
                 if inline {
                     self.assistant = None;
                 }
@@ -868,10 +1088,27 @@ impl App {
         }
     }
 
-    /// Aplica la visibilidad del look actual a todas las herramientas.
+    /// Aplica la visibilidad del look actual a todas las herramientas, a los
+    /// elementos de actividad y a la lista de tareas.
     pub fn sync_all_tools(&mut self) {
         let inline = self.tool_inline();
-        for (id, lines) in self.tool_entries.values() {
+        for (call_id, (id, lines)) in &self.tool_entries {
+            let shown = if inline && !self.todo_tool_calls.contains(call_id) {
+                lines.clone()
+            } else {
+                Vec::new()
+            };
+            self.transcript.replace(*id, shown);
+        }
+        for entry in &self.activity_entries {
+            let shown = if inline {
+                entry.lines.clone()
+            } else {
+                Vec::new()
+            };
+            self.transcript.replace(entry.id, shown);
+        }
+        if let Some((id, lines)) = &self.todo_entry {
             let shown = if inline { lines.clone() } else { Vec::new() };
             self.transcript.replace(*id, shown);
         }
@@ -879,6 +1116,210 @@ impl App {
         for id in ids {
             self.sync_tool(&id);
         }
+    }
+
+    /// Sincroniza la lista de tareas con su entrada del transcript. Como en
+    /// `sync_tool`, la entrada se crea la primera vez (aunque la lista esté
+    /// vacía) y después solo se reemplaza si cambia la caché. No se llama desde
+    /// el camino de los deltas.
+    fn sync_todos(&mut self) {
+        use batten::state::ToolStatus;
+        use codeloom_core::todo::TodoStatus;
+        let items: Vec<(&str, ToolStatus)> = self
+            .todos
+            .iter()
+            .map(|todo| {
+                let status = match todo.status {
+                    TodoStatus::Pending => ToolStatus::Pending,
+                    TodoStatus::InProgress => ToolStatus::Running,
+                    TodoStatus::Completed => ToolStatus::Success,
+                };
+                (todo.content.as_str(), status)
+            })
+            .collect();
+        let lines = batten::state::todo_lines(&items);
+        let inline = self.tool_inline();
+        match self.todo_entry.as_mut() {
+            Some((id, cache)) => {
+                if *cache == lines {
+                    return;
+                }
+                let shown = if inline { lines.clone() } else { Vec::new() };
+                *cache = lines;
+                self.transcript.replace(*id, shown);
+            }
+            None => {
+                let shown = if inline { lines.clone() } else { Vec::new() };
+                let id = self.transcript.push_lines(shown);
+                self.todo_entry = Some((id, lines));
+                if inline {
+                    self.assistant = None;
+                }
+            }
+        }
+    }
+
+    /// Mensaje del usuario. En Crush, los avisos de jobs y subagentes se pintan
+    /// como elementos de actividad y no como mensajes; el resto sigue igual.
+    fn user_message(&mut self, text: &str) {
+        if self.tool_inline() && self.apply_notice(text) {
+            return;
+        }
+        self.push_user(text);
+    }
+
+    /// Sincroniza un elemento de actividad con su entrada del transcript. Como
+    /// `sync_tool`, solo reemplaza la entrada si sus líneas cambiaron, y no se
+    /// llama desde el camino de los deltas.
+    fn sync_activity(
+        &mut self,
+        key: &str,
+        kind: &'static str,
+        label: &str,
+        lines: Vec<batten::state::Line>,
+        from_notice: bool,
+    ) {
+        let inline = self.tool_inline();
+        if let Some(entry) = self.activity_entries.iter_mut().find(|e| e.key == key) {
+            if entry.lines == lines {
+                return;
+            }
+            entry.label = label.to_string();
+            entry.lines = lines;
+            let shown = if inline {
+                entry.lines.clone()
+            } else {
+                Vec::new()
+            };
+            self.transcript.replace(entry.id, shown);
+            return;
+        }
+        // Como con las herramientas, la entrada se crea siempre para que un
+        // cambio de look la encuentre en su sitio. Con el look clásico nace
+        // vacía y no corta el texto del asistente.
+        let shown = if inline { lines.clone() } else { Vec::new() };
+        let id = self.transcript.push_lines(shown);
+        self.activity_entries.push(ActivityEntry {
+            key: key.to_string(),
+            id,
+            lines,
+            kind,
+            label: label.to_string(),
+            from_notice,
+            notice_consumed: false,
+        });
+        if inline {
+            self.assistant = None;
+        }
+    }
+
+    /// Elemento de actividad de un job de esta sesión. Los jobs de tipo
+    /// `subagent` se muestran desde su propio evento.
+    fn sync_job_activity(&mut self, job: &codeloom_core::job::JobSnapshot) {
+        if job.kind == "subagent" || Some(job.owner) != self.session_id {
+            return;
+        }
+        let status = job_tool_status(job.status);
+        let body = if status == batten::state::ToolStatus::Running {
+            None
+        } else {
+            job.detail
+                .as_deref()
+                .or_else(|| job.result.as_ref().map(|result| result.content.as_str()))
+        };
+        let progress = job
+            .progress
+            .as_ref()
+            .map(|progress| (progress.fraction, progress.label.as_str()));
+        let view = batten::state::ActivityView {
+            kind: "job",
+            label: &job.label,
+            status,
+            progress,
+            body,
+        };
+        let lines = batten::state::activity_lines(&view);
+        let key = format!("job:{}", job.id.0);
+        self.sync_activity(&key, "job", &job.label, lines, false);
+    }
+
+    /// Elemento de actividad de un subagente de esta sesión.
+    fn sync_subagent_activity(&mut self, subagent: &codeloom_core::session::SubagentDescriptor) {
+        let status = subagent_tool_status(subagent.status);
+        let body = if status == batten::state::ToolStatus::Running {
+            None
+        } else {
+            subagent.result.as_deref()
+        };
+        let view = batten::state::ActivityView {
+            kind: "subagent",
+            label: &subagent.label,
+            status,
+            progress: None,
+            body,
+        };
+        let lines = batten::state::activity_lines(&view);
+        let key = format!("subagent:{}", subagent.child.0);
+        self.sync_activity(&key, "subagent", &subagent.label, lines, false);
+    }
+
+    /// Convierte un aviso en elemento de actividad. Devuelve `false` si el texto
+    /// no es un aviso reconocible. Un aviso de job no crea nada si ya existe su
+    /// elemento; uno de subagente reclama el primer elemento en vivo sin consumir
+    /// con su misma etiqueta, o crea uno nuevo si no hay ninguno.
+    fn apply_notice(&mut self, text: &str) -> bool {
+        let Some(notice) = parse_notice(text) else {
+            return false;
+        };
+        match notice {
+            Notice::Job {
+                id,
+                status,
+                label,
+                body,
+            } => {
+                let key = format!("job:{id}");
+                if !self.activity_entries.iter().any(|e| e.key == key) {
+                    self.push_notice_entry("job", status, label, body);
+                }
+            }
+            Notice::Subagent { label, body } => {
+                let live = self.activity_entries.iter_mut().find(|e| {
+                    !e.from_notice && e.kind == "subagent" && e.label == label && !e.notice_consumed
+                });
+                match live {
+                    Some(entry) => entry.notice_consumed = true,
+                    None => self.push_notice_entry(
+                        "subagent",
+                        batten::state::ToolStatus::Success,
+                        label,
+                        body,
+                    ),
+                }
+            }
+        }
+        true
+    }
+
+    /// Crea un elemento nacido de un aviso. Su clave usa el número de elementos
+    /// existentes, que solo crece hasta el próximo `restore_messages`.
+    fn push_notice_entry(
+        &mut self,
+        kind: &'static str,
+        status: batten::state::ToolStatus,
+        label: &str,
+        body: &str,
+    ) {
+        let key = format!("notice:{}", self.activity_entries.len());
+        let view = batten::state::ActivityView {
+            kind,
+            label,
+            status,
+            progress: None,
+            body: Some(body),
+        };
+        let lines = batten::state::activity_lines(&view);
+        self.sync_activity(&key, kind, label, lines, true);
     }
 
     /// Texto pegado (bracketed paste): entra de una vez en el composer y
@@ -952,9 +1393,14 @@ impl App {
         Some(text)
     }
 
-    /// Toggle the sidebar visibility.
+    /// Alterna la visibilidad lateral: el rail con el layout `ContextRail` y
+    /// el sidebar izquierdo con el resto. Cada uno conserva su propio estado.
     pub fn toggle_sidebar(&mut self) {
-        self.sidebar_expanded = !self.sidebar_expanded;
+        if self.theme.look.layout == batten::widgets::LayoutStyle::ContextRail {
+            self.rail_hidden = !self.rail_hidden;
+        } else {
+            self.sidebar_expanded = !self.sidebar_expanded;
+        }
     }
 
     /// Construye el sidebar de batten con la marca y las secciones de sesión.
@@ -1019,6 +1465,11 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use batten::state::ToolStatus;
+    use codeloom_core::job::{JobId, JobProgress, JobResult, JobSnapshot, JobStatus};
+    use codeloom_core::question::QuestionOption;
+    use codeloom_core::session::{SubagentDescriptor, SubagentStatus};
+    use serde_json::json;
 
     #[test]
     fn deltas_accumulate_into_one_item() {
@@ -1535,5 +1986,542 @@ mod tests {
         let tool = texts.iter().position(|t| t.starts_with("View")).unwrap();
         let after = texts.iter().position(|t| t == "despues").unwrap();
         assert!(answer < tool && tool < after);
+    }
+
+    /// Job de prueba con etiqueta `build`, sin progreso ni resultado.
+    fn job(id: &str, status: JobStatus, owner: SessionId) -> JobSnapshot {
+        JobSnapshot {
+            id: JobId(id.into()),
+            kind: "shell".into(),
+            label: "build".into(),
+            owner,
+            status,
+            progress: None,
+            output: String::new(),
+            output_start: 0,
+            output_end: 0,
+            detail: None,
+            result: None,
+        }
+    }
+
+    /// Subagente de prueba (hijo `SessionId(9)`).
+    fn sub(label: &str, status: SubagentStatus, parent: SessionId) -> SubagentDescriptor {
+        SubagentDescriptor {
+            parent,
+            child: SessionId(9),
+            job_id: "subagent-1".into(),
+            label: label.into(),
+            status,
+            result: None,
+            notice_delivered: false,
+        }
+    }
+
+    /// Aviso que llega por la sesión 1.
+    fn notice_for(text: &str) -> LiveEvent {
+        LiveEvent::SessionMessageAdded {
+            session: SessionId(1),
+            message: Message::user(text),
+        }
+    }
+
+    fn texts(app: &App) -> Vec<String> {
+        app.transcript
+            .iter()
+            .map(|l| l.plain().to_string())
+            .collect()
+    }
+
+    /// Cabeceras de actividad con su texto y su estado.
+    fn heads(app: &App) -> Vec<(String, ToolStatus)> {
+        app.transcript
+            .iter()
+            .filter_map(|l| match l.kind {
+                batten::state::LineKind::ActivityHead(status) => {
+                    Some((l.plain().to_string(), status))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn has_user_line(app: &App) -> bool {
+        app.transcript
+            .iter()
+            .any(|l| l.kind == batten::state::LineKind::User)
+    }
+
+    #[test]
+    fn job_activity_appears_and_updates_in_place() {
+        let mut app = crush_app();
+        app.session_id = Some(SessionId(1));
+        let mut running = job("build-1", JobStatus::Running, SessionId(1));
+        running.progress = Some(JobProgress {
+            fraction: 0.5,
+            label: "building".into(),
+        });
+        app.apply(LiveEvent::JobChanged(running));
+        assert_eq!(app.transcript.entry_count(), 1);
+        assert_eq!(
+            heads(&app),
+            vec![("job  build".to_string(), ToolStatus::Running)]
+        );
+        assert!(texts(&app).iter().any(|t| t == "50% building"));
+
+        let mut done = job("build-1", JobStatus::Completed, SessionId(1));
+        done.result = Some(JobResult {
+            content: "ok".into(),
+        });
+        app.apply(LiveEvent::JobChanged(done));
+        assert_eq!(app.transcript.entry_count(), 1);
+        assert_eq!(
+            heads(&app),
+            vec![("job  build".to_string(), ToolStatus::Success)]
+        );
+        let lines = texts(&app);
+        assert!(lines.iter().any(|t| t == "ok"));
+        assert!(!lines.iter().any(|t| t == "50% building"));
+    }
+
+    #[test]
+    fn subagent_activity_shows_label_status_and_result() {
+        let mut app = crush_app();
+        app.session_id = Some(SessionId(1));
+        app.apply(LiveEvent::SubagentChanged(sub(
+            "review",
+            SubagentStatus::Running,
+            SessionId(1),
+        )));
+        assert_eq!(
+            heads(&app),
+            vec![("subagent  review".to_string(), ToolStatus::Running)]
+        );
+
+        let mut done = sub("review", SubagentStatus::Completed, SessionId(1));
+        done.result = Some("listo".into());
+        app.apply(LiveEvent::SubagentChanged(done));
+        assert_eq!(app.transcript.entry_count(), 1);
+        assert_eq!(
+            heads(&app),
+            vec![("subagent  review".to_string(), ToolStatus::Success)]
+        );
+        assert!(texts(&app).iter().any(|t| t == "listo"));
+    }
+
+    #[test]
+    fn foreign_and_subagent_kind_jobs_are_ignored() {
+        let mut app = crush_app();
+        app.session_id = Some(SessionId(1));
+        app.apply(LiveEvent::JobChanged(job(
+            "build-1",
+            JobStatus::Running,
+            SessionId(2),
+        )));
+        let mut subagent_job = job("subagent-2", JobStatus::Running, SessionId(1));
+        subagent_job.kind = "subagent".into();
+        app.apply(LiveEvent::JobChanged(subagent_job));
+        assert!(app.transcript.is_empty());
+        assert_eq!(app.transcript.entry_count(), 0);
+    }
+
+    #[test]
+    fn live_notice_is_suppressed_when_the_item_exists() {
+        let mut app = crush_app();
+        app.session_id = Some(SessionId(1));
+        let mut done = sub("review", SubagentStatus::Completed, SessionId(1));
+        done.result = Some("listo".into());
+        app.apply(LiveEvent::SubagentChanged(done));
+        let count = app.transcript.entry_count();
+        app.apply(notice_for("[Subagent review completed]\nlisto"));
+        assert!(!has_user_line(&app));
+        assert_eq!(app.transcript.entry_count(), count);
+
+        let mut finished = job("build-1", JobStatus::Completed, SessionId(1));
+        finished.result = Some(JobResult {
+            content: "ok".into(),
+        });
+        app.apply(LiveEvent::JobChanged(finished));
+        let count = app.transcript.entry_count();
+        app.apply(notice_for("[Job build-1 completed] build\nok"));
+        assert!(!has_user_line(&app));
+        assert_eq!(app.transcript.entry_count(), count);
+    }
+
+    #[test]
+    fn notice_before_event_does_not_duplicate() {
+        let mut app = crush_app();
+        app.session_id = Some(SessionId(1));
+        app.apply(notice_for("[Subagent review completed]\nlisto"));
+        let mut done = sub("review", SubagentStatus::Completed, SessionId(1));
+        done.result = Some("listo".into());
+        app.apply(LiveEvent::SubagentChanged(done));
+        assert_eq!(app.transcript.entry_count(), 2);
+        assert!(!has_user_line(&app));
+    }
+
+    #[test]
+    fn restored_notices_become_items_not_user_messages() {
+        let mut app = crush_app();
+        app.restore_messages(vec![
+            Message::user("hola"),
+            Message::user("[Subagent review completed]\nready"),
+            Message::user("[Job j1 failed] build\nboom"),
+        ]);
+        let user_lines: Vec<String> = app
+            .transcript
+            .iter()
+            .filter(|l| l.kind == batten::state::LineKind::User)
+            .map(|l| l.plain().to_string())
+            .collect();
+        assert_eq!(user_lines, vec!["hola".to_string()]);
+        assert_eq!(
+            heads(&app),
+            vec![
+                ("subagent  review".to_string(), ToolStatus::Success),
+                ("job  build".to_string(), ToolStatus::Error),
+            ]
+        );
+        let lines = texts(&app);
+        let pos = |text: &str| lines.iter().position(|t| t == text).unwrap();
+        assert!(pos("hola") < pos("subagent  review"));
+        assert!(pos("subagent  review") < pos("job  build"));
+        assert!(lines.iter().any(|t| t == "ready"));
+        assert!(lines.iter().any(|t| t == "boom"));
+    }
+
+    #[test]
+    fn restored_notices_with_the_same_label_each_create_an_item() {
+        let mut app = crush_app();
+        app.restore_messages(vec![
+            Message::user("[Subagent review completed]\nuno"),
+            Message::user("[Subagent review completed]\ndos"),
+        ]);
+        let lines = texts(&app);
+        assert_eq!(heads(&app).len(), 2);
+        assert!(lines.iter().any(|t| t == "uno"));
+        assert!(lines.iter().any(|t| t == "dos"));
+        assert!(!has_user_line(&app));
+    }
+
+    #[test]
+    fn unparseable_notice_falls_back_to_a_plain_message() {
+        let mut app = crush_app();
+        app.apply(LiveEvent::MessageAdded(Message::user("[Job sin cerrar")));
+        assert!(app
+            .transcript
+            .iter()
+            .any(|l| l.kind == batten::state::LineKind::User && l.plain() == "[Job sin cerrar"));
+        assert!(heads(&app).is_empty());
+    }
+
+    #[test]
+    fn classic_look_keeps_notices_as_user_messages_and_hides_activity() {
+        let mut app = App::new(); // tema Batten = Classic
+        app.session_id = Some(SessionId(1));
+        app.apply(LiveEvent::SubagentChanged(sub(
+            "review",
+            SubagentStatus::Running,
+            SessionId(1),
+        )));
+        app.apply(notice_for("[Subagent review completed]\nready"));
+        let lines = texts(&app);
+        assert!(lines.iter().any(|t| t == "[Subagent review completed]"));
+        assert!(lines.iter().any(|t| t == "ready"));
+        let user_count = app
+            .transcript
+            .iter()
+            .filter(|l| l.kind == batten::state::LineKind::User)
+            .count();
+        assert_eq!(user_count, 2);
+        assert!(heads(&app).is_empty());
+    }
+
+    #[test]
+    fn switching_look_hides_and_restores_activity() {
+        let mut app = crush_app();
+        app.session_id = Some(SessionId(1));
+        app.apply(LiveEvent::SubagentChanged(sub(
+            "review",
+            SubagentStatus::Running,
+            SessionId(1),
+        )));
+        assert_eq!(heads(&app).len(), 1);
+        app.theme = batten::widgets::Theme::preset(batten::widgets::ThemePreset::Batten);
+        app.sync_all_tools();
+        assert!(heads(&app).is_empty());
+        app.theme = batten::widgets::Theme::preset(batten::widgets::ThemePreset::Crush);
+        app.sync_all_tools();
+        assert_eq!(
+            heads(&app),
+            vec![("subagent  review".to_string(), ToolStatus::Running)]
+        );
+    }
+
+    /// Tarea de prueba con el contenido y el estado indicados.
+    fn todo(
+        content: &str,
+        status: codeloom_core::todo::TodoStatus,
+    ) -> codeloom_core::todo::TodoItem {
+        codeloom_core::todo::TodoItem {
+            content: content.into(),
+            status,
+        }
+    }
+
+    #[test]
+    fn todos_event_creates_and_updates_one_element() {
+        use codeloom_core::todo::TodoStatus::{Completed, Pending};
+        let mut app = crush_app();
+        app.session_id = Some(SessionId(1));
+        app.apply(LiveEvent::TodosChanged {
+            session: SessionId(1),
+            items: vec![todo("uno", Pending), todo("dos", Pending)],
+        });
+        assert_eq!(app.transcript.entry_count(), 1);
+        assert!(texts(&app).iter().any(|t| t == "todos  0/2"));
+        app.apply(LiveEvent::TodosChanged {
+            session: SessionId(1),
+            items: vec![todo("uno", Completed), todo("dos", Pending)],
+        });
+        assert_eq!(app.transcript.entry_count(), 1);
+        let lines = texts(&app);
+        assert!(lines.iter().any(|t| t == "todos  1/2"));
+        assert!(!lines.iter().any(|t| t == "todos  0/2"));
+    }
+
+    #[test]
+    fn foreign_session_todos_are_ignored() {
+        use codeloom_core::todo::TodoStatus::Pending;
+        let mut app = crush_app();
+        app.session_id = Some(SessionId(1));
+        app.apply(LiveEvent::TodosChanged {
+            session: SessionId(2),
+            items: vec![todo("ajena", Pending)],
+        });
+        assert!(app.todos.is_empty());
+        assert_eq!(app.transcript.entry_count(), 0);
+    }
+
+    #[test]
+    fn classic_look_keeps_todos_out_of_the_transcript_but_stores_them() {
+        use codeloom_core::todo::TodoStatus::InProgress;
+        let mut app = App::new(); // tema Batten = Classic
+        app.session_id = Some(SessionId(1));
+        app.apply(LiveEvent::TodosChanged {
+            session: SessionId(1),
+            items: vec![todo("uno", InProgress)],
+        });
+        assert_eq!(app.todos.len(), 1);
+        assert!(!texts(&app).iter().any(|t| t.starts_with("todos")));
+    }
+
+    #[test]
+    fn switching_look_hides_and_restores_todos() {
+        use codeloom_core::todo::TodoStatus::Pending;
+        let mut app = crush_app();
+        app.session_id = Some(SessionId(1));
+        app.apply(LiveEvent::TodosChanged {
+            session: SessionId(1),
+            items: vec![todo("uno", Pending)],
+        });
+        assert!(texts(&app).iter().any(|t| t == "todos  0/1"));
+        app.theme = batten::widgets::Theme::preset(batten::widgets::ThemePreset::Batten);
+        app.sync_all_tools();
+        assert!(!texts(&app).iter().any(|t| t.starts_with("todos")));
+        app.theme = batten::widgets::Theme::preset(batten::widgets::ThemePreset::Crush);
+        app.sync_all_tools();
+        assert!(texts(&app).iter().any(|t| t == "todos  0/1"));
+    }
+
+    #[test]
+    fn todo_write_tool_has_no_transcript_card() {
+        let mut app = crush_app();
+        app.apply(LiveEvent::ToolStarted {
+            call_id: "t1".into(),
+            name: "todo_write".into(),
+        });
+        assert_eq!(app.tools.len(), 1);
+        assert!(!texts(&app).iter().any(|t| t.starts_with("todo_write")));
+        // Un cambio de look no debe devolver la tarjeta de la herramienta.
+        app.sync_all_tools();
+        assert!(!texts(&app).iter().any(|t| t.starts_with("todo_write")));
+    }
+
+    #[test]
+    fn empty_list_clears_the_element() {
+        use codeloom_core::todo::TodoStatus::Pending;
+        let mut app = crush_app();
+        app.session_id = Some(SessionId(1));
+        app.apply(LiveEvent::TodosChanged {
+            session: SessionId(1),
+            items: vec![todo("uno", Pending), todo("dos", Pending)],
+        });
+        app.apply(LiveEvent::TodosChanged {
+            session: SessionId(1),
+            items: Vec::new(),
+        });
+        assert!(app.todos.is_empty());
+        assert!(!texts(&app).iter().any(|t| t.starts_with("todos")));
+        assert_eq!(app.transcript.entry_count(), 1);
+    }
+
+    #[test]
+    fn restore_rebuilds_todos_from_history() {
+        let mut app = crush_app();
+        app.restore_messages(vec![Message::assistant(vec![ContentPart::ToolCall {
+            id: "t1".into(),
+            name: "todo_write".into(),
+            input: json!({"todos": [
+                {"content": "a", "status": "completed"},
+                {"content": "b", "status": "pending"}
+            ]}),
+        }])]);
+        assert_eq!(app.todos.len(), 2);
+        assert!(texts(&app).iter().any(|t| t == "todos  1/2"));
+    }
+
+    #[test]
+    fn restore_keeps_only_the_last_todo_list() {
+        let mut app = crush_app();
+        app.restore_messages(vec![
+            Message::assistant(vec![ContentPart::ToolCall {
+                id: "t1".into(),
+                name: "todo_write".into(),
+                input: json!({"todos": [{"content": "a", "status": "pending"}]}),
+            }]),
+            Message::assistant(vec![ContentPart::ToolCall {
+                id: "t2".into(),
+                name: "todo_write".into(),
+                input: json!({"todos": [
+                    {"content": "a", "status": "completed"},
+                    {"content": "b", "status": "in_progress"}
+                ]}),
+            }]),
+        ]);
+        assert_eq!(app.todos.len(), 2);
+        let lines = texts(&app);
+        assert_eq!(lines.iter().filter(|t| t.starts_with("todos")).count(), 1);
+        assert!(lines.iter().any(|t| t == "todos  1/2"));
+    }
+
+    #[test]
+    fn restore_ignores_invalid_todo_input_and_clears_previous_todos() {
+        use codeloom_core::todo::TodoStatus::Pending;
+        let mut app = crush_app();
+        app.session_id = Some(SessionId(1));
+        app.apply(LiveEvent::TodosChanged {
+            session: SessionId(1),
+            items: vec![todo("viejo", Pending)],
+        });
+        app.restore_messages(vec![Message::assistant(vec![ContentPart::ToolCall {
+            id: "t1".into(),
+            name: "todo_write".into(),
+            input: json!({"todos": "nope"}),
+        }])]);
+        assert!(app.todos.is_empty());
+        assert!(!texts(&app).iter().any(|t| t.starts_with("todos")));
+    }
+
+    /// Pregunta de `ask_user` con opciones `labels`.
+    fn ask_question(text: &str, labels: &[&str], multi_select: bool) -> Question {
+        Question {
+            header: "Stack".into(),
+            question: text.into(),
+            options: labels
+                .iter()
+                .map(|label| QuestionOption {
+                    label: (*label).into(),
+                    description: String::new(),
+                })
+                .collect(),
+            multi_select,
+        }
+    }
+
+    #[test]
+    fn enqueue_questions_opens_the_first_and_queues_the_rest() {
+        use tokio::sync::oneshot::error::TryRecvError;
+        let mut app = App::new();
+        let (tx1, mut rx1) = tokio::sync::oneshot::channel();
+        let (tx2, mut rx2) = tokio::sync::oneshot::channel();
+        app.enqueue_questions(vec![ask_question("Uno?", &["a", "b"], false)], tx1);
+        app.enqueue_questions(vec![ask_question("Dos?", &["a", "b"], false)], tx2);
+        let open = app.question.as_ref().expect("abre la primera pregunta");
+        assert_eq!(open.questions[0].question, "Uno?");
+        assert_eq!(open.dialog.len(), 1);
+        assert_eq!(app.question_queue.len(), 1);
+        assert!(matches!(rx1.try_recv(), Err(TryRecvError::Empty)));
+        assert!(matches!(rx2.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn answering_sends_answers_and_opens_the_next() {
+        use codeloom_core::question::Answer;
+        let mut app = App::new();
+        let (tx1, mut rx1) = tokio::sync::oneshot::channel();
+        let (tx2, _rx2) = tokio::sync::oneshot::channel();
+        app.enqueue_questions(vec![ask_question("Uno?", &["a", "b"], false)], tx1);
+        app.enqueue_questions(vec![ask_question("Dos?", &["a", "b"], false)], tx2);
+        app.question_key(batten::state::QuestionKey::Enter);
+        assert_eq!(
+            rx1.try_recv().unwrap(),
+            Some(vec![Answer {
+                question: "Uno?".into(),
+                selected: vec!["a".into()],
+            }])
+        );
+        let next = app.question.as_ref().expect("abre la siguiente");
+        assert_eq!(next.questions[0].question, "Dos?");
+    }
+
+    #[test]
+    fn esc_sends_none() {
+        let mut app = App::new();
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        app.enqueue_questions(vec![ask_question("Uno?", &["a", "b"], false)], tx);
+        app.question_key(batten::state::QuestionKey::Esc);
+        assert_eq!(rx.try_recv().unwrap(), None);
+        assert!(app.question.is_none());
+    }
+
+    #[test]
+    fn cancel_question_drains_everything_with_none() {
+        let mut app = App::new();
+        let (tx1, mut rx1) = tokio::sync::oneshot::channel();
+        let (tx2, mut rx2) = tokio::sync::oneshot::channel();
+        app.enqueue_questions(vec![ask_question("Uno?", &["a", "b"], false)], tx1);
+        app.enqueue_questions(vec![ask_question("Dos?", &["a", "b"], false)], tx2);
+        app.cancel_question();
+        assert_eq!(rx1.try_recv().unwrap(), None);
+        assert_eq!(rx2.try_recv().unwrap(), None);
+        assert!(app.question.is_none());
+        assert!(app.question_queue.is_empty());
+    }
+
+    #[test]
+    fn questions_close_other_overlays() {
+        let mut app = App::new();
+        app.help_open = true;
+        app.tools_open = true;
+        app.queue_open = true;
+        app.settings_open = true;
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        app.enqueue_questions(vec![ask_question("Uno?", &["a", "b"], false)], tx);
+        assert!(!app.help_open);
+        assert!(!app.tools_open);
+        assert!(!app.queue_open);
+        assert!(!app.settings_open);
+        assert!(app.question.is_some());
+    }
+
+    #[test]
+    fn empty_question_list_is_answered_with_none() {
+        let mut app = App::new();
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        app.enqueue_questions(Vec::new(), tx);
+        assert_eq!(rx.try_recv().unwrap(), None);
+        assert!(app.question.is_none());
+        assert!(app.question_queue.is_empty());
     }
 }

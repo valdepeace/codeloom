@@ -123,6 +123,22 @@ fn transcript_key(app: &mut App, code: KeyCode) {
 
 /// Traduce una tecla a una accion sobre la app. Devuelve el prompt a enviar
 /// cuando el usuario pulsa Enter con texto.
+/// Traduce una tecla de crossterm a la del diálogo de preguntas.
+fn question_key_of(code: KeyCode) -> Option<batten::state::QuestionKey> {
+    use batten::state::QuestionKey;
+    Some(match code {
+        KeyCode::Up => QuestionKey::Up,
+        KeyCode::Down => QuestionKey::Down,
+        KeyCode::Left => QuestionKey::Left,
+        KeyCode::Right => QuestionKey::Right,
+        KeyCode::Enter => QuestionKey::Enter,
+        KeyCode::Esc => QuestionKey::Esc,
+        KeyCode::Backspace => QuestionKey::Backspace,
+        KeyCode::Char(c) => QuestionKey::Char(c),
+        _ => return None,
+    })
+}
+
 pub fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Option<String> {
     if app.slash_query().is_none() {
         app.slash_feedback = None;
@@ -296,7 +312,10 @@ pub fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Option<St
         app.session_selected = app.session_selected.min(choices - 1);
         return None;
     }
-    if code == KeyCode::Esc {
+    // Con un diálogo de preguntas abierto (y sin permiso encima), Esc cancela la
+    // pregunta en vez de contar para la salida por doble Esc.
+    let question_has_keys = app.question.is_some() && app.permission.is_none();
+    if code == KeyCode::Esc && !question_has_keys {
         if app.queue_open {
             app.queue_open = false;
             return None;
@@ -321,6 +340,13 @@ pub fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Option<St
     if let Some(p) = app.permission.as_mut() {
         if let Some(d) = crate::permission_flow::permission_key(&mut p.dialog, code) {
             app.resolve_permission(d);
+        }
+        return None;
+    }
+    if app.question.is_some() {
+        // Las teclas no reconocidas se consumen: no llegan al composer ni a los atajos.
+        if let Some(key) = question_key_of(code) {
+            app.question_key(key);
         }
         return None;
     }
@@ -649,7 +675,8 @@ pub fn handle_event(app: &mut App, ev: Event) -> Option<String> {
                 && !app.help_open
                 && !app.tools_open
                 && !app.queue_open
-                && app.permission.is_none() =>
+                && app.permission.is_none()
+                && app.question.is_none() =>
         {
             match mouse.kind {
                 MouseEventKind::ScrollUp => app.viewport.scroll_up(3),
@@ -663,7 +690,8 @@ pub fn handle_event(app: &mut App, ev: Event) -> Option<String> {
                 && !app.session_loading
                 && !app.help_open
                 && !app.tools_open
-                && app.permission.is_none() =>
+                && app.permission.is_none()
+                && app.question.is_none() =>
         {
             if app.settings_open {
                 if app.settings_editing && !app.settings_saving {
@@ -726,6 +754,7 @@ fn cancel_active_turn(app: &mut App, active_turn: &ActiveTurn) {
             while app.permission.is_some() {
                 app.resolve_permission(codeloom_core::permission::Decision::Deny);
             }
+            app.cancel_question();
         }
     }
 }
@@ -743,6 +772,10 @@ pub async fn run(
     mut perm_rx: tokio::sync::mpsc::Receiver<(
         codeloom_core::permission::PermissionRequest,
         crate::permission_flow::PermissionReply,
+    )>,
+    mut ask_rx: tokio::sync::mpsc::Receiver<(
+        Vec<codeloom_core::question::Question>,
+        crate::permission_flow::QuestionReply,
     )>,
     active_turn: ActiveTurn,
     session_command_tx: UnboundedSender<SessionCommand>,
@@ -780,7 +813,7 @@ pub async fn run(
     anim.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut fx: Option<batten::widgets::fx::Effect> = None;
     let mut fx_clock = Instant::now();
-    let (mut bus_open, mut perm_open) = (true, true);
+    let (mut bus_open, mut perm_open, mut ask_open) = (true, true, true);
     let mut session_update_open = true;
     let mut pending_settings: Option<oneshot::Receiver<Result<(), String>>> = None;
     send_session_commands(&mut app, &session_command_tx);
@@ -832,6 +865,13 @@ pub async fn run(
                     frames.request(Urgency::Input);
                 }
                 None => perm_open = false,
+            },
+            ask = ask_rx.recv(), if ask_open => match ask {
+                Some((questions, reply)) => {
+                    app.enqueue_questions(questions, reply);
+                    frames.request(Urgency::Input);
+                }
+                None => ask_open = false,
             },
             update = session_update_rx.recv(), if session_update_open => {
                 match update {
@@ -919,6 +959,7 @@ pub async fn run(
             token.cancel();
         }
     }
+    app.cancel_question();
     Ok(())
 }
 
@@ -1775,6 +1816,53 @@ mod tests {
             Err(oneshot::error::TryRecvError::Empty)
         ));
         assert!(app.permission.is_some());
+    }
+
+    fn ask_question_for_keys() -> codeloom_core::question::Question {
+        use codeloom_core::question::{Question, QuestionOption};
+        let option = |label: &str| QuestionOption {
+            label: label.into(),
+            description: String::new(),
+        };
+        Question {
+            header: "Stack".into(),
+            question: "Which?".into(),
+            options: vec![option("a"), option("b")],
+            multi_select: false,
+        }
+    }
+
+    #[test]
+    fn keys_reach_the_question_dialog_and_not_the_composer() {
+        use codeloom_core::question::Answer;
+        let mut app = App::new();
+        let (tx, mut rx) = oneshot::channel();
+        app.enqueue_questions(vec![ask_question_for_keys()], tx);
+        handle_key(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::F(1), KeyModifiers::NONE);
+        handle_event(&mut app, Event::Paste("oculto".into()));
+        assert!(app.composer.is_empty());
+        assert!(!app.help_open);
+        assert!(app.question.is_some());
+        handle_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.question.is_none());
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Some(vec![Answer {
+                question: "Which?".into(),
+                selected: vec!["b".into()],
+            }])
+        );
+
+        // Esc responde a la pregunta (sin contar para la salida por doble Esc).
+        let (tx, mut rx) = oneshot::channel();
+        app.enqueue_questions(vec![ask_question_for_keys()], tx);
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(rx.try_recv().unwrap(), None);
+        assert!(!app.should_quit);
+        assert!(app.last_escape.is_none());
+        assert!(app.composer.is_empty());
     }
 
     #[test]

@@ -1,4 +1,6 @@
 use crate::app::App;
+use crate::rail;
+use batten::widgets::{ChromeStyle, LayoutStyle};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
@@ -81,28 +83,104 @@ fn draw_workspace_header(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+/// Cabecera de una línea del chrome `Flat`: marca, directorio, modelo y estado.
+fn draw_flat_header(frame: &mut Frame, area: Rect, app: &App) {
+    let status_style = if app.status.starts_with("error:") {
+        app.theme.styles.error
+    } else {
+        app.theme.styles.muted
+    };
+    let mut text = vec![
+        Span::styled(
+            " CODELOOM ",
+            app.theme.styles.heading.add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("╱╱╱╱", app.theme.styles.muted),
+        Span::styled(format!("  {}", app.cwd), app.theme.styles.muted),
+        Span::styled(format!("  • {}", app.model), app.theme.styles.muted),
+        Span::styled(format!("  • {}", app.status), status_style),
+    ];
+    if app.queued > 0 {
+        text.push(Span::styled(
+            format!("  • {} queued", app.queued),
+            app.theme.styles.muted,
+        ));
+    }
+    if app.queue_paused {
+        text.push(Span::styled("  • queue paused", app.theme.styles.warning));
+    }
+    let (running, finished, subagents, subagents_finished) = job_counts(app);
+    if running > 0 || finished > 0 || subagents > 0 || subagents_finished > 0 {
+        text.push(Span::styled(
+            format!("  • {subagents} subagents · {running} jobs"),
+            app.theme.styles.muted,
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(text)), area);
+}
+
+/// Atajos del pie del chrome `Flat`, en el orden en que se muestran.
+const FLAT_HINTS: [(&str, &str); 8] = [
+    ("enter", "send"),
+    ("ctrl+j", "newline"),
+    ("ctrl+k", "queue"),
+    ("ctrl+o", "fold"),
+    ("ctrl+t", "tools"),
+    ("ctrl+b", "sidebar"),
+    ("f2", "settings"),
+    ("esc", "cancel"),
+];
+
+/// Pie del chrome `Flat`: el feedback de slash si lo hay; si no, atajos cortos.
+fn draw_flat_footer(frame: &mut Frame, area: Rect, app: &App) {
+    let line = if let Some(feedback) = app.slash_feedback.as_deref() {
+        Line::from(Span::styled(feedback, app.theme.styles.muted))
+    } else {
+        let mut spans = Vec::with_capacity(FLAT_HINTS.len() * 3);
+        for (index, (key, label)) in FLAT_HINTS.iter().enumerate() {
+            if index > 0 {
+                spans.push(Span::styled("  ", app.theme.styles.muted));
+            }
+            spans.push(Span::styled(*key, app.theme.styles.heading));
+            spans.push(Span::styled(format!(" {label}"), app.theme.styles.muted));
+        }
+        Line::from(spans)
+    };
+    frame.render_widget(Paragraph::new(line), area);
+}
+
 fn draw_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
-    let inner = batten::widgets::panel::render(
-        frame,
-        area,
-        &batten::widgets::Panel {
-            title: "Conversation",
-            info: &app.status,
-            tone: if app.status == "working" {
-                batten::state::Tone::Info
-            } else {
-                batten::state::Tone::Neutral
+    // El chrome `Flat` no usa caja: el chat ocupa el área con un margen de una columna.
+    let flat = app.theme.look.chrome == ChromeStyle::Flat;
+    let inner = if flat {
+        Rect::new(
+            area.x.saturating_add(1),
+            area.y,
+            area.width.saturating_sub(2),
+            area.height,
+        )
+    } else {
+        batten::widgets::panel::render(
+            frame,
+            area,
+            &batten::widgets::Panel {
+                title: "Conversation",
+                info: &app.status,
+                tone: if app.status == "working" {
+                    batten::state::Tone::Info
+                } else {
+                    batten::state::Tone::Neutral
+                },
             },
-        },
-        &app.theme,
-    );
+            &app.theme,
+        )
+    };
     if inner.is_empty() {
         return;
     }
     // Con el look `Pinned` la última herramienta ocupa una tarjeta fija; con
     // `Inline` aparece dentro del transcript y no reserva filas aquí.
     let pinned = app.theme.look.tool == batten::widgets::ToolStyle::Pinned;
-    let crush = app.theme.look.composer == batten::widgets::ComposerStyle::Crush;
     let thinking_rows = u16::from(app.thinking);
     let max_tool_rows = inner.height.saturating_sub(4 + thinking_rows);
     let tool_rows = app.tools.back().filter(|_| pinned).map_or(0, |tool| {
@@ -127,8 +205,8 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
         inner.width,
         max_composer_height,
     );
-    // El look Crush no muestra la cabecera de la conversación.
-    let header_rows = if crush { 0 } else { 1 };
+    // El chrome `Flat` no muestra la cabecera de la conversación.
+    let header_rows = if flat { 0 } else { 1 };
     let rows = Layout::vertical([
         Constraint::Length(header_rows),
         Constraint::Min(1),
@@ -137,7 +215,7 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
         Constraint::Length(composer_height),
     ])
     .split(inner);
-    if !crush {
+    if !flat {
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled("CodeLoom", app.theme.styles.heading),
@@ -172,6 +250,7 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
         &app.composer,
         app.focus == crate::app::Focus::Composer
             && app.permission.is_none()
+            && app.question.is_none()
             && !app.session_picker_open
             && !app.session_loading
             && !app.queue_open
@@ -797,14 +876,29 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     app.matrix_rain.render(frame, area);
+    let flat = app.theme.look.chrome == ChromeStyle::Flat;
     let rows = Layout::vertical([
-        Constraint::Length(2),
+        Constraint::Length(if flat { 1 } else { 2 }),
         Constraint::Min(1),
         Constraint::Length(1),
     ])
     .split(area);
-    draw_workspace_header(frame, rows[0], app);
-    if rows[1].width >= 105 {
+    if flat {
+        draw_flat_header(frame, rows[0], app);
+    } else {
+        draw_workspace_header(frame, rows[0], app);
+    }
+    if app.theme.look.layout == LayoutStyle::ContextRail {
+        // Sin sidebar izquierdo ni métricas: el chat y, si hay ancho, el rail derecho.
+        if rows[1].width >= 80 && !app.rail_hidden {
+            let [chat, context] =
+                Layout::horizontal([Constraint::Min(1), Constraint::Length(32)]).areas(rows[1]);
+            draw_transcript(frame, chat, app);
+            rail::draw_context_rail(frame, context, app);
+        } else {
+            draw_transcript(frame, rows[1], app);
+        }
+    } else if rows[1].width >= 105 {
         let [left, center, right] = Layout::horizontal([
             Constraint::Length(23),
             Constraint::Min(42),
@@ -829,23 +923,31 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     } else {
         draw_transcript(frame, rows[1], app);
     }
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(format!(" {} ", app.status), app.theme.styles.heading),
-            Span::styled(
-                app.slash_feedback.as_deref().unwrap_or(
-                    "  Enter send · Ctrl+J newline · Ctrl+K queue · Ctrl+O tool · Ctrl+T inspect · F2 settings · Esc cancel",
+    if flat {
+        draw_flat_footer(frame, rows[2], app);
+    } else {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(format!(" {} ", app.status), app.theme.styles.heading),
+                Span::styled(
+                    app.slash_feedback.as_deref().unwrap_or(
+                        "  Enter send · Ctrl+J newline · Ctrl+K queue · Ctrl+O tool · Ctrl+T inspect · F2 settings · Esc cancel",
+                    ),
+                    app.theme.styles.muted,
                 ),
-                app.theme.styles.muted,
-            ),
-            Span::styled(
-                format!("  ↑ {} · ↓ {} tokens", app.input_tokens, app.output_tokens),
-                app.theme.styles.muted,
-            ),
-        ])),
-        rows[2],
-    );
+                Span::styled(
+                    format!("  ↑ {} · ↓ {} tokens", app.input_tokens, app.output_tokens),
+                    app.theme.styles.muted,
+                ),
+            ])),
+            rows[2],
+        );
+    }
 
+    // Las preguntas se pintan antes que los permisos: un permiso queda por encima.
+    if let Some(q) = &app.question {
+        batten::widgets::question::render(frame, area, &q.dialog, &app.theme);
+    }
     if let Some(p) = &app.permission {
         batten::widgets::permission::render(frame, area, &p.dialog, &app.theme);
     }
@@ -1144,7 +1246,8 @@ mod tests {
             call_id: "c1".into(),
             name: "View".into(),
         });
-        let content = buffer_of(&mut app, 90, 20);
+        // Por debajo de 80 columnas no hay rail, que también lista la tool.
+        let content = buffer_of(&mut app, 70, 20);
         assert_eq!(content.matches("● View").count(), 1);
         assert!(!content.contains("RUNNING"));
     }
@@ -1376,6 +1479,78 @@ mod tests {
         assert!(content.contains("Denegar"));
     }
 
+    fn ask_question_for_render() -> codeloom_core::question::Question {
+        use codeloom_core::question::{Question, QuestionOption};
+        let option = |label: &str| QuestionOption {
+            label: label.into(),
+            description: String::new(),
+        };
+        Question {
+            header: "Stack".into(),
+            question: "Which framework?".into(),
+            options: vec![option("Alpha"), option("Beta")],
+            multi_select: false,
+        }
+    }
+
+    #[test]
+    fn question_dialog_renders_and_hides_the_composer_cursor() {
+        let mut app = App::new();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        app.enqueue_questions(vec![ask_question_for_render()], tx);
+        let content = buffer_of(&mut app, 120, 40);
+        assert!(content.contains("Question 1/1"));
+        assert!(content.contains("Which framework?"));
+        assert!(content.contains("Alpha"));
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(!terminal.backend().cursor_visible());
+    }
+
+    #[test]
+    fn permission_is_drawn_above_a_question() {
+        use codeloom_core::permission::PermissionRequest;
+        let request = PermissionRequest {
+            tool: "bash".into(),
+            action: "run".into(),
+            detail: r#"{"command":"cargo test"}"#.into(),
+        };
+        let render_with_question = |open_question: bool| {
+            let mut app = App::new();
+            if open_question {
+                let (tx, _rx) = tokio::sync::oneshot::channel();
+                app.enqueue_questions(vec![ask_question_for_render()], tx);
+            }
+            let (ptx, _prx) = tokio::sync::oneshot::channel();
+            app.enqueue_permission(request.clone(), ptx);
+            let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            terminal.backend().buffer().clone()
+        };
+        let alone = render_with_question(false);
+        let stacked = render_with_question(true);
+        let text: String = stacked.content.iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("Permiso"));
+        assert!(text.contains("cargo test"));
+        assert!(
+            text.contains("Question 1/1"),
+            "la pregunta debe seguir visible fuera del permiso"
+        );
+        // Las celdas del permiso no pueden mostrar nada de la pregunta: se pintó encima.
+        let dialog = crate::permission_flow::dialog_for(&request);
+        let rect = batten::widgets::permission::area(Rect::new(0, 0, 120, 40), &dialog);
+        for y in rect.top()..rect.bottom() {
+            for x in rect.left()..rect.right() {
+                let i = usize::from(y) * 120 + usize::from(x);
+                assert_eq!(
+                    stacked.content[i].symbol(),
+                    alone.content[i].symbol(),
+                    "celda ({x},{y}) pintada por debajo del permiso"
+                );
+            }
+        }
+    }
+
     fn chatty_app() -> App {
         let mut app = App::new();
         for i in 0..60 {
@@ -1404,5 +1579,216 @@ mod tests {
         let content = buffer_of(&mut app, 60, 20);
         assert!(!app.viewport.is_following());
         assert!(!content.contains("msg-59"));
+    }
+
+    /// Aplicación con el look Crush (layout `ContextRail`, chrome `Flat`).
+    fn crush_ctx() -> App {
+        let mut app = App::with_context("/proj", "mistral-nemo");
+        app.theme_preset = batten::widgets::ThemePreset::Crush;
+        app.theme = batten::widgets::Theme::preset(batten::widgets::ThemePreset::Crush);
+        app
+    }
+
+    /// Job de prueba con el dueño y el tipo indicados.
+    fn job_snapshot(
+        id: &str,
+        label: &str,
+        kind: &str,
+        status: codeloom_core::job::JobStatus,
+        owner: codeloom_core::session::SessionId,
+    ) -> codeloom_core::job::JobSnapshot {
+        codeloom_core::job::JobSnapshot {
+            id: codeloom_core::job::JobId(id.into()),
+            kind: kind.into(),
+            label: label.into(),
+            owner,
+            status,
+            progress: None,
+            output: String::new(),
+            output_start: 0,
+            output_end: 0,
+            detail: None,
+            result: None,
+        }
+    }
+
+    /// Aplicación Crush con ficheros, herramienta, job y subagente de la sesión 1.
+    fn loaded_crush_app() -> App {
+        use codeloom_core::event::LiveEvent;
+        use codeloom_core::job::JobStatus;
+        use codeloom_core::session::{SessionId, SubagentDescriptor, SubagentStatus};
+        let mut app = crush_ctx();
+        app.session_id = Some(SessionId(1));
+        app.apply(LiveEvent::FileDiff {
+            path: "src/main.rs".into(),
+            added: 3,
+            removed: 1,
+        });
+        app.apply(LiveEvent::ToolStarted {
+            call_id: "c1".into(),
+            name: "View".into(),
+        });
+        app.apply(LiveEvent::JobChanged(job_snapshot(
+            "build-1",
+            "build",
+            "shell",
+            JobStatus::Running,
+            SessionId(1),
+        )));
+        app.apply(LiveEvent::SubagentChanged(SubagentDescriptor {
+            parent: SessionId(1),
+            child: SessionId(9),
+            job_id: "subagent-1".into(),
+            label: "review".into(),
+            status: SubagentStatus::Running,
+            result: None,
+            notice_delivered: false,
+        }));
+        app
+    }
+
+    #[test]
+    fn crush_layout_has_only_a_right_rail_when_wide() {
+        let mut app = crush_ctx();
+        let content = buffer_of(&mut app, 120, 40);
+        assert!(content.contains("MODEL"));
+        assert!(content.contains("mistral-nemo"));
+        assert!(!content.contains("PROJECT")); // secciones del sidebar izquierdo
+        assert!(!content.contains("FLOCK"));
+        assert!(!content.contains("Token usage")); // panel de métricas
+        assert!(!content.contains("Conversation")); // panel del chat
+    }
+
+    #[test]
+    fn crush_without_width_for_the_rail_uses_the_whole_screen() {
+        let mut app = crush_ctx();
+        let content = buffer_of(&mut app, 70, 24);
+        assert!(!content.contains("MODEL"));
+        assert!(content.contains("CODELOOM"));
+    }
+
+    #[test]
+    fn toggle_sidebar_follows_the_look() {
+        let mut app = crush_ctx();
+        assert!(buffer_of(&mut app, 120, 30).contains("MODEL"));
+        app.toggle_sidebar();
+        assert!(app.rail_hidden && !app.sidebar_expanded);
+        assert!(!buffer_of(&mut app, 120, 30).contains("MODEL"));
+        app.toggle_sidebar();
+        assert!(buffer_of(&mut app, 120, 30).contains("MODEL"));
+        let mut classic = App::with_context("/proj", "m");
+        classic.toggle_sidebar();
+        assert!(classic.sidebar_expanded && !classic.rail_hidden);
+    }
+
+    #[test]
+    fn crush_header_is_one_flat_line() {
+        let mut app = crush_ctx();
+        let content = buffer_of(&mut app, 120, 30);
+        // `buffer_of` no inserta saltos de línea: la primera fila son las primeras 120 celdas.
+        let first: String = content.chars().take(120).collect();
+        assert!(first.contains("CODELOOM"));
+        assert!(first.contains("/proj"));
+        assert!(first.contains("ready"));
+        assert!(!content.contains("WORKSPACE"));
+    }
+
+    #[test]
+    fn crush_footer_shows_short_key_hints() {
+        let mut app = crush_ctx();
+        let content = buffer_of(&mut app, 120, 30);
+        assert!(content.contains("enter send"));
+        assert!(content.contains("ctrl+j newline"));
+    }
+
+    #[test]
+    fn rail_lists_files_tools_jobs_and_subagents() {
+        let mut app = loaded_crush_app();
+        let content = buffer_of(&mut app, 120, 40);
+        for expected in [
+            "FILES",
+            "src/main.rs",
+            "TOOLS",
+            "View",
+            "JOBS",
+            "build",
+            "SUBAGENTS",
+            "review",
+        ] {
+            assert!(content.contains(expected), "falta {expected:?} en el rail");
+        }
+    }
+
+    #[test]
+    fn rail_caps_long_lists() {
+        let mut app = crush_ctx();
+        for i in 0..40 {
+            app.apply(codeloom_core::event::LiveEvent::FileDiff {
+                path: format!("src/file{i:02}.rs"),
+                added: 1,
+                removed: 0,
+            });
+        }
+        let content = buffer_of(&mut app, 120, 40);
+        assert!(content.contains("… +32 more"));
+        assert!(!content.contains("file20.rs"));
+    }
+
+    #[test]
+    fn rail_does_not_panic_on_tiny_heights() {
+        let mut app = loaded_crush_app();
+        for (width, height) in [(120, 1), (120, 2), (120, 3), (80, 4), (200, 5)] {
+            let _ = buffer_of(&mut app, width, height);
+        }
+    }
+
+    /// Tarea de prueba para el rail.
+    fn todo_item(
+        content: &str,
+        status: codeloom_core::todo::TodoStatus,
+    ) -> codeloom_core::todo::TodoItem {
+        codeloom_core::todo::TodoItem {
+            content: content.into(),
+            status,
+        }
+    }
+
+    #[test]
+    fn rail_lists_todos_with_progress() {
+        use codeloom_core::event::LiveEvent;
+        use codeloom_core::session::SessionId;
+        use codeloom_core::todo::TodoStatus::{Completed, Pending};
+        let mut app = crush_ctx();
+        app.session_id = Some(SessionId(1));
+        app.apply(LiveEvent::TodosChanged {
+            session: SessionId(1),
+            items: vec![
+                todo_item("Escribir el parser", Completed),
+                todo_item("Pintar el rail", Pending),
+            ],
+        });
+        let content = buffer_of(&mut app, 120, 40);
+        assert!(content.contains("TODOS"));
+        assert!(content.contains("1/2"));
+        assert!(content.contains("Pintar el rail"));
+    }
+
+    #[test]
+    fn rail_caps_long_todo_lists() {
+        use codeloom_core::event::LiveEvent;
+        use codeloom_core::session::SessionId;
+        use codeloom_core::todo::TodoStatus::Pending;
+        let mut app = crush_ctx();
+        app.session_id = Some(SessionId(1));
+        let items = (1..=20)
+            .map(|n| todo_item(&format!("tarea {n:02}"), Pending))
+            .collect();
+        app.apply(LiveEvent::TodosChanged {
+            session: SessionId(1),
+            items,
+        });
+        let content = buffer_of(&mut app, 120, 40);
+        assert!(content.contains("… +12 more"));
+        assert!(!content.contains("tarea 20"));
     }
 }

@@ -1,12 +1,30 @@
-//! Traducción entre peticiones de permiso del core y el diálogo de batten.
+//! Traducción entre peticiones de permiso y preguntas del core y los diálogos de batten.
 
-use batten::state::{Diff, PermissionBody, PermissionChoice, PermissionDialog};
+use batten::state::{Diff, PermissionBody, PermissionChoice, PermissionDialog, QuestionSpec};
 use codeloom_core::permission::{Decision, PermissionRequest};
+use codeloom_core::question::{Answer, Question};
 use crossterm::event::KeyCode;
 use tokio::sync::oneshot;
 
 /// Canal por el que se devuelve la decisión al core.
 pub type PermissionReply = oneshot::Sender<Decision>;
+
+/// Canal por el que se devuelven las respuestas de `ask_user`; `None` si el usuario cancela.
+pub type QuestionReply = oneshot::Sender<Option<Vec<Answer>>>;
+
+/// Especificación de diálogo para una pregunta del core.
+pub fn spec_for(question: &Question) -> QuestionSpec {
+    QuestionSpec {
+        header: question.header.clone(),
+        question: question.question.clone(),
+        options: question
+            .options
+            .iter()
+            .map(|option| (option.label.clone(), option.description.clone()))
+            .collect(),
+        multi: question.multi_select,
+    }
+}
 
 /// Diálogo para una petición. `detail` es el JSON del input de la tool.
 // limitación: en `edit` los números de línea son relativos al fragmento
