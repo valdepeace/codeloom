@@ -1,4 +1,5 @@
 use crate::permission_flow::{dialog_for, spec_for, PermissionReply, QuestionReply};
+use crate::tool_facts::tool_facts;
 use batten::widgets::composer::hit_index;
 use codeloom_core::config::{CodeLoomConfig, ProviderKind};
 use codeloom_core::event::LiveEvent;
@@ -776,7 +777,10 @@ impl App {
                                         self.sync_todos();
                                     }
                                 }
-                                self.tool_mut(&id, &name).set_summary(input.to_string());
+                                let facts = tool_facts(&name, &input);
+                                let tool = self.tool_mut(&id, &name);
+                                tool.set_summary(input.to_string());
+                                tool.facts = facts;
                                 self.sync_tool(&id);
                             }
                             _ => {}
@@ -1546,7 +1550,10 @@ impl App {
             for part in message.parts {
                 match part {
                     ContentPart::ToolCall { id, name, input } => {
-                        self.tool_mut(&id, &name).set_summary(input.to_string());
+                        let facts = tool_facts(&name, &input);
+                        let tool = self.tool_mut(&id, &name);
+                        tool.set_summary(input.to_string());
+                        tool.facts = facts;
                         self.sync_tool(&id);
                     }
                     ContentPart::ToolResult {
@@ -1650,7 +1657,7 @@ impl App {
         let Some(item) = self.tools.iter().find(|tool| tool.call_id == call_id) else {
             return;
         };
-        let lines = batten::state::tool_lines(item);
+        let lines = batten::state::tool_lines_with(item, &item.facts);
         let todo = item.name == TODO_TOOL;
         let inline = self.tool_inline() && !todo;
         match self.tool_entries.get_mut(call_id) {

@@ -1,3 +1,5 @@
+use super::tool_atom::ToolFacts;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolStatus {
     Pending,
@@ -14,6 +16,9 @@ pub struct ToolItem {
     pub name: String,
     pub expanded: bool,
     pub summary: Option<String>,
+    /// Hechos extraídos de la entrada de la llamada, calculados una sola vez al
+    /// fijarla (ver `codeloom-tui`). Los usa la pieza de render de la herramienta.
+    pub facts: ToolFacts,
     pub output: Option<String>,
     started: bool,
     result: Option<bool>,
@@ -28,6 +33,7 @@ impl ToolItem {
             name: name.into(),
             expanded: false,
             summary: None,
+            facts: ToolFacts::default(),
             output: None,
             started: false,
             result: None,

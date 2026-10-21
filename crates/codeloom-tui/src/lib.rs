@@ -7,4 +7,5 @@ pub mod prefs;
 pub mod rail;
 pub mod render;
 pub mod run;
+pub mod tool_facts;
 pub mod widgets;
