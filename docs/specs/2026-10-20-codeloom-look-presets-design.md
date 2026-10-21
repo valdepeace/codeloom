@@ -234,4 +234,9 @@ Decisiones de implementación:
   texto al cambiar de look.
 - Las entradas de tool que salen de la ventana de 8 del inspector conservan en
   Inline su último contenido; es deliberado, para no perder historial visible.
+- Actividad de jobs y subagentes (plan `2026-10-20-codeloom-transcript-activity.md`):
+  en Crush son elementos `◆` del transcript, actualizados en su sitio, y los
+  avisos `[Job …]`/`[Subagent …]` dejan de pintarse como mensajes "You". El
+  filtro de avisos es por texto: un mensaje tecleado a mano que empiece por
+  `[Job ` o `[Subagent ` también se convertiría en elemento.
 - Validación visual en terminal real: **pendiente**.
