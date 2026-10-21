@@ -945,6 +945,8 @@ impl App {
                     self.sync_todos();
                 }
             }
+            // La marca de espera de los subagentes se pinta en la tarea 4.
+            LiveEvent::SubagentInputRequested { .. } | LiveEvent::SubagentInputResolved { .. } => {}
         }
     }
 

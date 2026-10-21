@@ -39,6 +39,17 @@ pub enum LiveEvent {
     },
     JobChanged(crate::job::JobSnapshot),
     SubagentChanged(crate::session::SubagentDescriptor),
+    /// Un hijo queda a la espera de una respuesta de su padre (`input-required`).
+    SubagentInputRequested {
+        parent: crate::session::SessionId,
+        child: crate::session::SessionId,
+        label: String,
+    },
+    /// La espera del hijo termina: respondida, descartada o cancelada.
+    SubagentInputResolved {
+        parent: crate::session::SessionId,
+        child: crate::session::SessionId,
+    },
     TodosChanged {
         session: crate::session::SessionId,
         items: Vec<crate::todo::TodoItem>,

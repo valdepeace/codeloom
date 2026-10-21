@@ -57,6 +57,7 @@ impl AgentLoop {
                 config.clone(),
                 cwd.clone(),
                 jobs.clone(),
+                bus.clone(),
             )) as Arc<dyn crate::subagent::SubagentLauncher>
         });
         Self {

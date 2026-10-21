@@ -5,10 +5,13 @@
 //! componente puro: no conoce la red ni la interfaz.
 
 use crate::error::{CoreError, Result};
+use crate::event::{EventBus, LiveEvent};
+use crate::permission::{Decision, PermissionRequest, PermissionResponder, PermissionService};
 use crate::question::{Answer, Question};
 use crate::session::SessionId;
+use async_trait::async_trait;
 use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::oneshot;
 
 /// Petición de un hijo que espera respuesta de su padre.
@@ -208,11 +211,88 @@ impl Drop for Cleanup<'_> {
     }
 }
 
+/// Responder de un hijo. Los permisos se delegan en el servicio del padre, de modo
+/// que comparten decisiones y caché; las preguntas (`ask_user`) se encaminan al
+/// buzón y se anuncian en el bus como `SubagentInputRequested` / `SubagentInputResolved`.
+pub struct ChildResponder {
+    parent_service: Arc<PermissionService>,
+    broker: Arc<InputBroker>,
+    parent: SessionId,
+    child: SessionId,
+    label: String,
+    bus: EventBus,
+}
+
+impl ChildResponder {
+    pub fn new(
+        parent_service: Arc<PermissionService>,
+        broker: Arc<InputBroker>,
+        parent: SessionId,
+        child: SessionId,
+        label: String,
+        bus: EventBus,
+    ) -> Self {
+        Self {
+            parent_service,
+            broker,
+            parent,
+            child,
+            label,
+            bus,
+        }
+    }
+}
+
+/// Publica `SubagentInputResolved` al soltarse, de forma que la marca de espera
+/// desaparezca también cuando la pregunta se cancela a mitad.
+struct ResolvedOnDrop {
+    bus: EventBus,
+    parent: SessionId,
+    child: SessionId,
+}
+
+impl Drop for ResolvedOnDrop {
+    fn drop(&mut self) {
+        self.bus.publish(LiveEvent::SubagentInputResolved {
+            parent: self.parent,
+            child: self.child,
+        });
+    }
+}
+
+#[async_trait]
+impl PermissionResponder for ChildResponder {
+    async fn decide(&self, req: &PermissionRequest) -> Decision {
+        self.parent_service.check(req.clone()).await
+    }
+
+    async fn ask(&self, questions: &[Question]) -> Option<Vec<Answer>> {
+        self.bus.publish(LiveEvent::SubagentInputRequested {
+            parent: self.parent,
+            child: self.child,
+            label: self.label.clone(),
+        });
+        let _resolved = ResolvedOnDrop {
+            bus: self.bus.clone(),
+            parent: self.parent,
+            child: self.child,
+        };
+        self.broker
+            .request(
+                self.parent,
+                self.child,
+                self.label.clone(),
+                questions.to_vec(),
+            )
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::question::QuestionOption;
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     const PARENT: SessionId = SessionId(1);
@@ -442,5 +522,98 @@ mod tests {
                 selected: vec!["ok".into()],
             }])
         );
+    }
+
+    /// Espera, con cota de tiempo, al siguiente evento del bus.
+    async fn next_event(rx: &mut tokio::sync::broadcast::Receiver<LiveEvent>) -> LiveEvent {
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("debería llegar un evento")
+            .expect("el bus debería seguir abierto")
+    }
+
+    /// Responder del padre que cuenta las decisiones y siempre deniega.
+    struct CountingDeny(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl PermissionResponder for CountingDeny {
+        async fn decide(&self, _req: &PermissionRequest) -> Decision {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Decision::Deny
+        }
+    }
+
+    #[tokio::test]
+    async fn child_responder_delegates_permissions_to_the_parent() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let parent_service = Arc::new(PermissionService::with_responder(Box::new(CountingDeny(
+            calls.clone(),
+        ))));
+        let child_service = PermissionService::with_responder(Box::new(ChildResponder::new(
+            parent_service,
+            Arc::new(InputBroker::default()),
+            PARENT,
+            CHILD,
+            "obrero".into(),
+            EventBus::new(8),
+        )));
+        let req = PermissionRequest {
+            tool: "bash".into(),
+            action: "run".into(),
+            detail: String::new(),
+        };
+        assert_eq!(child_service.check(req).await, Decision::Deny);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn child_responder_ask_goes_through_the_broker_and_emits_events() {
+        let broker = Arc::new(InputBroker::default());
+        let bus = EventBus::new(8);
+        let mut rx = bus.subscribe();
+        let service = Arc::new(PermissionService::with_responder(Box::new(
+            ChildResponder::new(
+                Arc::new(PermissionService::allow_all()),
+                broker.clone(),
+                PARENT,
+                CHILD,
+                "obrero".into(),
+                bus.clone(),
+            ),
+        )));
+        let questions = vec![question("¿Cuál?")];
+        let s = service.clone();
+        let q = questions.clone();
+        let handle = tokio::spawn(async move { s.ask_user(&q).await });
+
+        match next_event(&mut rx).await {
+            LiveEvent::SubagentInputRequested {
+                parent,
+                child,
+                label,
+            } => {
+                assert_eq!(parent, PARENT);
+                assert_eq!(child, CHILD);
+                assert_eq!(label, "obrero");
+            }
+            other => panic!("evento inesperado: {other:?}"),
+        }
+        wait_for_pending(&broker, PARENT).await;
+
+        broker.answer(PARENT, CHILD, vec!["a".into()]).unwrap();
+        assert_eq!(
+            handle.await.unwrap(),
+            Some(vec![Answer {
+                question: "¿Cuál?".into(),
+                selected: vec!["a".into()],
+            }])
+        );
+        match next_event(&mut rx).await {
+            LiveEvent::SubagentInputResolved { parent, child } => {
+                assert_eq!(parent, PARENT);
+                assert_eq!(child, CHILD);
+            }
+            other => panic!("evento inesperado: {other:?}"),
+        }
     }
 }

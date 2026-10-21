@@ -6,6 +6,7 @@ use crate::job::{JobId, JobRegistry, JobResult, JobSpec};
 use crate::permission::PermissionService;
 use crate::provider::Provider;
 use crate::session::{SessionId, SessionStore, SubagentDescriptor, SubagentStatus};
+use crate::subagent_input::{ChildResponder, InputBroker, PendingInput};
 use crate::tools::ToolRegistry;
 use async_trait::async_trait;
 use std::path::PathBuf;
@@ -45,6 +46,21 @@ pub struct InProcessSubagentLauncher {
     cwd: PathBuf,
     jobs: Arc<dyn JobRegistry>,
     active: Arc<Semaphore>,
+    bus: EventBus,
+    broker: Arc<InputBroker>,
+}
+
+/// Descarta la pregunta pendiente del hijo al terminar su trabajo, sea cual sea la
+/// causa (final normal, cancelación o aborto), para no dejar entradas huérfanas.
+struct DiscardOnExit {
+    broker: Arc<InputBroker>,
+    child: SessionId,
+}
+
+impl Drop for DiscardOnExit {
+    fn drop(&mut self) {
+        self.broker.discard(self.child);
+    }
 }
 
 impl InProcessSubagentLauncher {
@@ -57,6 +73,7 @@ impl InProcessSubagentLauncher {
         config: Arc<RwLock<CodeLoomConfig>>,
         cwd: PathBuf,
         jobs: Arc<dyn JobRegistry>,
+        bus: EventBus,
     ) -> Self {
         Self {
             provider,
@@ -65,15 +82,31 @@ impl InProcessSubagentLauncher {
                 tools
                     .without("subagent")
                     .without("subagent_control")
-                    .without("subagent_list")
-                    .without("ask_user"),
+                    .without("subagent_list"),
             ),
             permission,
             config,
             cwd,
             jobs,
             active: Arc::new(Semaphore::new(8)),
+            bus,
+            broker: Arc::new(InputBroker::default()),
         }
+    }
+
+    /// Preguntas pendientes de los hijos de un padre (`input-required`).
+    pub fn pending_inputs(&self, parent: SessionId) -> Vec<PendingInput> {
+        self.broker.pending(parent)
+    }
+
+    /// Responde la pregunta pendiente de un hijo; una respuesta por pregunta, en orden.
+    pub async fn answer(
+        &self,
+        parent: SessionId,
+        child: SessionId,
+        answers: Vec<String>,
+    ) -> Result<()> {
+        self.broker.answer(parent, child, answers)
     }
 }
 
@@ -99,7 +132,19 @@ impl SubagentLauncher for InProcessSubagentLauncher {
         let child_store = self.store.clone();
         let child_tools = self.tools.clone();
         let child_provider = self.provider.read().unwrap().clone();
-        let child_permission = self.permission.clone();
+        // Cada hijo tiene su propio servicio de permisos: delega en el del padre y
+        // encamina sus preguntas (`ask_user`) al buzón de este lanzador.
+        let child_permission = Arc::new(PermissionService::with_responder(Box::new(
+            ChildResponder::new(
+                self.permission.clone(),
+                self.broker.clone(),
+                parent,
+                child,
+                label.clone(),
+                self.bus.clone(),
+            ),
+        )));
+        let child_broker = self.broker.clone();
         let child_config = self.config.read().unwrap().clone();
         let child_cwd = self.cwd.clone();
         let child_jobs = self.jobs.clone();
@@ -112,6 +157,10 @@ impl SubagentLauncher for InProcessSubagentLauncher {
             run: Box::new(move |handle, job_cancel| {
                 Box::pin(async move {
                     let _permit = permit;
+                    let _discard = DiscardOnExit {
+                        broker: child_broker,
+                        child,
+                    };
                     let child_agent = AgentLoop::new(
                         child_provider,
                         child_store.clone(),
@@ -264,6 +313,7 @@ mod tests {
     use crate::provider::StreamChunk;
     use crate::session::sqlite::SqliteStore;
     use crate::tools::subagent::SubagentTool;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn runs_a_child_and_queues_its_parent_notice_without_recursive_tool() {
@@ -299,6 +349,7 @@ mod tests {
             })),
             dir.path().to_path_buf(),
             jobs.clone(),
+            EventBus::new(64),
         );
 
         assert!(runtime.tools.get("subagent").is_none());
@@ -338,7 +389,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn child_registry_hides_ask_user() {
+    async fn child_keeps_ask_user_tool() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(
             SqliteStore::open(dir.path().join("subagents.db").to_str().unwrap())
@@ -365,7 +416,205 @@ mod tests {
             })),
             dir.path().to_path_buf(),
             Arc::new(LocalJobRegistry::default()),
+            EventBus::new(64),
         );
-        assert!(runtime.tools.get("ask_user").is_none());
+        assert!(runtime.tools.get("ask_user").is_some());
+    }
+
+    /// Proveedor de prueba con un guion por cada paso de la conversación.
+    struct QueueProvider {
+        scripts: std::sync::Mutex<std::collections::VecDeque<Vec<StreamChunk>>>,
+    }
+
+    #[async_trait]
+    impl Provider for QueueProvider {
+        fn capabilities(&self) -> crate::provider::Capabilities {
+            crate::provider::Capabilities {
+                tool_use: true,
+                reasoning: false,
+                streaming: true,
+            }
+        }
+        async fn stream(
+            &self,
+            _req: crate::provider::ProviderRequest,
+            _cancel: CancellationToken,
+        ) -> Result<crate::provider::ProviderStream> {
+            let script = self.scripts.lock().unwrap().pop_front().unwrap_or_default();
+            Ok(Box::pin(futures::stream::iter(script)))
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupt_discards_the_pending_question() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SqliteStore::open(dir.path().join("interrupt.db").to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+        let parent = store.create_session("/project").await.unwrap();
+        let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+            scripts: std::sync::Mutex::new(
+                vec![vec![
+                    StreamChunk::ToolCallComplete {
+                        id: "c1".into(),
+                        name: "ask_user".into(),
+                        input: serde_json::json!({"questions": [{
+                            "question": "¿Cuál?",
+                            "options": [{"label": "Sí"}, {"label": "No"}]
+                        }]}),
+                    },
+                    StreamChunk::Done(FinishReason::ToolCalls),
+                ]]
+                .into(),
+            ),
+        });
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(crate::tools::ask_user::AskUserTool));
+        let jobs = Arc::new(LocalJobRegistry::default());
+        let runtime = InProcessSubagentLauncher::new(
+            Arc::new(RwLock::new(provider)),
+            store.clone(),
+            Arc::new(tools),
+            Arc::new(PermissionService::allow_all()),
+            Arc::new(RwLock::new(CodeLoomConfig {
+                provider: ProviderConfig {
+                    kind: ProviderKind::OpenAiCompat,
+                    base_url: "http://localhost".into(),
+                    api_key_env: "KEY".into(),
+                },
+                model: "test".into(),
+                max_steps: 4,
+            })),
+            dir.path().to_path_buf(),
+            jobs.clone(),
+            EventBus::new(64),
+        );
+
+        let (child, job) = runtime
+            .start(
+                parent,
+                "obrero".into(),
+                "decide algo".into(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.pending_inputs(parent).is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("el hijo debería quedar esperando una respuesta");
+
+        runtime
+            .control(parent, child, "interrupt", None)
+            .await
+            .unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), jobs.wait(parent, &job))
+            .await
+            .expect("el hijo interrumpido debería terminar")
+            .unwrap();
+
+        assert_eq!(outcome.status, JobStatus::Killed);
+        assert!(runtime.pending_inputs(parent).is_empty());
+        assert!(runtime
+            .answer(parent, child, vec!["Sí".into()])
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn child_that_asks_blocks_until_the_parent_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SqliteStore::open(dir.path().join("ask.db").to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+        let parent = store.create_session("/project").await.unwrap();
+        let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+            scripts: std::sync::Mutex::new(
+                vec![
+                    vec![
+                        StreamChunk::ToolCallComplete {
+                            id: "c1".into(),
+                            name: "ask_user".into(),
+                            input: serde_json::json!({"questions": [{
+                                "question": "¿Cuál?",
+                                "options": [{"label": "Sí"}, {"label": "No"}]
+                            }]}),
+                        },
+                        StreamChunk::Done(FinishReason::ToolCalls),
+                    ],
+                    vec![
+                        StreamChunk::TextDelta("hecho".into()),
+                        StreamChunk::Done(FinishReason::Stop),
+                    ],
+                ]
+                .into(),
+            ),
+        });
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(crate::tools::ask_user::AskUserTool));
+        let jobs = Arc::new(LocalJobRegistry::default());
+        let runtime = InProcessSubagentLauncher::new(
+            Arc::new(RwLock::new(provider)),
+            store.clone(),
+            Arc::new(tools),
+            Arc::new(PermissionService::allow_all()),
+            Arc::new(RwLock::new(CodeLoomConfig {
+                provider: ProviderConfig {
+                    kind: ProviderKind::OpenAiCompat,
+                    base_url: "http://localhost".into(),
+                    api_key_env: "KEY".into(),
+                },
+                model: "test".into(),
+                max_steps: 4,
+            })),
+            dir.path().to_path_buf(),
+            jobs.clone(),
+            EventBus::new(64),
+        );
+
+        let (child, job) = runtime
+            .start(
+                parent,
+                "obrero".into(),
+                "decide algo".into(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.pending_inputs(parent).is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("el hijo debería quedar esperando una respuesta");
+        assert_eq!(runtime.pending_inputs(parent)[0].child, child);
+
+        runtime
+            .answer(parent, child, vec!["Sí".into()])
+            .await
+            .unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), jobs.wait(parent, &job))
+            .await
+            .expect("el hijo debería terminar tras la respuesta")
+            .unwrap();
+
+        assert_eq!(outcome.status, JobStatus::Completed);
+        assert!(runtime.pending_inputs(parent).is_empty());
+        let messages = store.messages(child).await.unwrap();
+        assert!(messages
+            .iter()
+            .flat_map(|message| message.parts.iter())
+            .any(|part| matches!(
+                part,
+                crate::message::ContentPart::ToolResult { content, .. } if content.contains("Sí")
+            )));
     }
 }
