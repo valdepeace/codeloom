@@ -180,15 +180,21 @@ async fn main() -> Result<()> {
             UiPermissionResponder::new(perm_tx, cli.yolo).with_questions(ask_tx),
         ))
     });
-    let agent = Arc::new(AgentLoop::new(
-        provider,
-        store.clone(),
-        Arc::new(build_tools()),
-        bus,
-        permission,
-        cfg.clone(),
-        cwd,
-    ));
+    // Catálogo compartido con el agente (y sus hijos): vacío hasta que llega la carga en
+    // segundo plano, así que los apuntes de antes llevan precio `NULL`.
+    let catalog = Arc::new(std::sync::RwLock::new(Catalog::default()));
+    let agent = Arc::new(
+        AgentLoop::new(
+            provider,
+            store.clone(),
+            Arc::new(build_tools()),
+            bus,
+            permission,
+            cfg.clone(),
+            cwd,
+        )
+        .with_catalog(catalog.clone()),
+    );
 
     if let Some(prompt) = cli.print {
         let session = store.create_session(&project).await?;
@@ -207,7 +213,7 @@ async fn main() -> Result<()> {
     let (session_update_tx, session_update_rx) = tokio::sync::mpsc::unbounded_channel();
     // Solo en modo TUI (`--print` ya ha salido arriba): la carga corre en segundo plano.
     let (catalog_tx, catalog_rx) = tokio::sync::mpsc::unbounded_channel();
-    tokio::spawn(load_catalog(catalog_tx));
+    tokio::spawn(load_catalog(catalog_tx, catalog.clone()));
     let active_turn: codeloom_tui::run::ActiveTurn = Arc::new(std::sync::Mutex::new(None));
     let worker_active_turn = active_turn.clone();
     let agent_task = agent.clone();
@@ -235,13 +241,16 @@ async fn main() -> Result<()> {
                                 SessionChoice::New => worker_store.create_session(&worker_project).await?,
                             };
                             let messages = worker_store.messages(id).await?;
+                            // Una sesión nueva no tiene apuntes: la consulta devuelve vacío.
+                            let usage = worker_store.session_usage(id).await?;
                             let subagents = worker_store.list_subagents(id).await?;
-                            Ok::<_, codeloom_core::error::CoreError>((id, messages, subagents))
+                            Ok::<_, codeloom_core::error::CoreError>((id, messages, usage, subagents))
                         }.await;
                         match loaded {
-                            Ok((id, messages, subagents)) => {
+                            Ok((id, messages, usage, subagents)) => {
                                 session = Some(id);
                                 let _ = session_update_tx.send(SessionUpdate::Loaded(id, messages));
+                                let _ = session_update_tx.send(SessionUpdate::Usage(id, usage));
                                 let _ = session_update_tx.send(SessionUpdate::Subagents(id, subagents));
                             }
                             Err(error) => {
@@ -330,9 +339,20 @@ async fn main() -> Result<()> {
 }
 
 /// Entrega a la interfaz el catálogo de models.dev: primero la caché (si existe) y, si falta
-/// o ha caducado, uno descargado. Los fallos se ignoran en silencio: sin catálogo, `/settings`
-/// funciona como antes. Corre en su propia tarea, así que nunca retrasa el arranque.
-async fn load_catalog(tx: tokio::sync::mpsc::UnboundedSender<Arc<Catalog>>) {
+/// o ha caducado, uno descargado. Cada catálogo que llega se copia también en `shared`, el que
+/// usa el agente para fijar los precios de los apuntes. Los fallos se ignoran en silencio: sin
+/// catálogo, `/settings` funciona como antes. Corre en su propia tarea, así que nunca retrasa
+/// el arranque.
+async fn load_catalog(
+    tx: tokio::sync::mpsc::UnboundedSender<Arc<Catalog>>,
+    shared: Arc<std::sync::RwLock<Catalog>>,
+) {
+    let publish = |catalog: Catalog| {
+        if let Ok(mut guard) = shared.write() {
+            *guard = catalog.clone();
+        }
+        let _ = tx.send(Arc::new(catalog));
+    };
     let Some(path) = cache_path() else {
         return;
     };
@@ -350,11 +370,11 @@ async fn load_catalog(tx: tokio::sync::mpsc::UnboundedSender<Arc<Catalog>>) {
         None => true,
     };
     if let Some((catalog, _)) = cached {
-        let _ = tx.send(Arc::new(catalog));
+        publish(catalog);
     }
     if needs_refresh {
         if let Ok(catalog) = refresh(&path, || fetch_raw(CATALOG_URL)).await {
-            let _ = tx.send(Arc::new(catalog));
+            publish(catalog);
         }
     }
 }

@@ -8,7 +8,7 @@ use codeloom_core::event::LiveEvent;
 use codeloom_core::message::{ContentPart, Message, Role};
 use codeloom_core::permission::{Decision, PermissionRequest};
 use codeloom_core::question::{Answer, Question};
-use codeloom_core::session::{SessionId, SessionInfo};
+use codeloom_core::session::{SessionId, SessionInfo, UsageRecord};
 use ratatui::layout::Rect;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -462,6 +462,8 @@ pub struct App {
     pub provider_settings: Option<ProviderSettings>,
     /// Catálogo de proveedores y modelos de models.dev. Vacío hasta que llega la carga en segundo plano.
     pub catalog: Arc<Catalog>,
+    /// Apuntes de consumo de la sesión abierta: los persistidos al abrirla más los vivos.
+    pub usage_records: Vec<UsageRecord>,
     /// Copia de los ajustes al abrir el diálogo y tras guardar con éxito.
     /// Sirve para saber si hay cambios sin guardar.
     pub settings_baseline: Option<ProviderSettings>,
@@ -643,6 +645,7 @@ impl App {
             session_loading: false,
             provider_settings: None,
             catalog: Arc::new(Catalog::default()),
+            usage_records: Vec::new(),
             settings_baseline: None,
             settings_warned: false,
             settings_open: false,
@@ -1271,6 +1274,8 @@ impl App {
         self.subagents.clear();
         self.awaiting_input.clear();
         self.agent_stats.clear();
+        // Los apuntes son de la sesión anterior; la carga posterior repone los de esta.
+        self.usage_records.clear();
         self.session_selected = 0;
         self.session_query.clear();
         self.session_searching = false;
@@ -1284,6 +1289,32 @@ impl App {
         // El bloque activo pertenece también a la sesión anterior.
         self.block = None;
         self.restore_messages(messages);
+    }
+
+    /// Sustituye los apuntes de la sesión abierta por los que devuelve la base de datos. Una
+    /// carga de otra sesión se ignora, para no mezclar totales.
+    pub fn load_usage(&mut self, session: SessionId, records: Vec<UsageRecord>) {
+        if self.session_id == Some(session) {
+            self.usage_records = records;
+        }
+    }
+
+    /// Añade un apunte vivo con el modelo y los precios vigentes en este instante. La recarga
+    /// de la sesión sustituye esta lista por la de la base de datos, así que no duplica.
+    fn record_live_usage(&mut self, input_tokens: u32, output_tokens: u32) {
+        let (input_price, output_price) = self.model_prices().unzip();
+        let created_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+            .unwrap_or(0);
+        self.usage_records.push(UsageRecord {
+            model: self.model.clone(),
+            input_tokens: u64::from(input_tokens),
+            output_tokens: u64::from(output_tokens),
+            input_price,
+            output_price,
+            created_at_ms,
+        });
     }
 
     pub fn load_subagents(
@@ -1932,6 +1963,7 @@ impl App {
                 self.turn_output_tokens = self
                     .turn_output_tokens
                     .saturating_add(u64::from(output_tokens));
+                self.record_live_usage(input_tokens, output_tokens);
             }
             LiveEvent::ToolStarted { call_id, name } => {
                 self.set_phase("running tools");
@@ -2044,6 +2076,14 @@ impl App {
                 event,
             } => {
                 if Some(parent) == self.session_id {
+                    // El consumo de un hijo se atribuye al modelo actual de la interfaz.
+                    if let LiveEvent::Usage {
+                        input_tokens,
+                        output_tokens,
+                    } = event.as_ref()
+                    {
+                        self.record_live_usage(*input_tokens, *output_tokens);
+                    }
                     self.apply_child_event(child, *event);
                 }
             }
@@ -4283,6 +4323,132 @@ mod tests {
         assert_eq!(priced_app("half", url).model_prices(), None);
         assert_eq!(priced_app("plain", url).model_prices(), None);
         assert_eq!(priced_app("ausente", url).model_prices(), None);
+    }
+
+    /// Apunte de prueba con precios conocidos (3 y 15 por millón), como los que guarda el libro.
+    fn usage_record(model: &str, input: u64, output: u64) -> UsageRecord {
+        UsageRecord {
+            model: model.into(),
+            input_tokens: input,
+            output_tokens: output,
+            input_price: Some(3.0),
+            output_price: Some(15.0),
+            created_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn load_usage_replaces_records_for_the_open_session() {
+        let mut app = App::new();
+        app.session_id = Some(SessionId(1));
+        app.usage_records = vec![usage_record("viejo", 1, 1)];
+        let stored = vec![usage_record("priced", 10, 2), usage_record("priced", 20, 4)];
+        app.load_usage(SessionId(1), stored.clone());
+        assert_eq!(
+            app.usage_records, stored,
+            "la lista de la base de datos sustituye a la anterior"
+        );
+    }
+
+    #[test]
+    fn load_usage_ignores_other_sessions() {
+        let mut app = App::new();
+        app.session_id = Some(SessionId(1));
+        let mine = vec![usage_record("priced", 10, 2)];
+        app.load_usage(SessionId(1), mine.clone());
+        app.load_usage(SessionId(2), vec![usage_record("ajena", 99, 99)]);
+        assert_eq!(
+            app.usage_records, mine,
+            "una carga de otra sesión no se mezcla"
+        );
+    }
+
+    #[test]
+    fn live_usage_appends_a_priced_record() {
+        let mut app = priced_app("priced", "https://acme.example/v1");
+        app.session_id = Some(SessionId(1));
+        app.apply(LiveEvent::Usage {
+            input_tokens: 100,
+            output_tokens: 10,
+        });
+        assert_eq!(app.usage_records.len(), 1);
+        let record = &app.usage_records[0];
+        assert_eq!(record.model, "priced");
+        assert_eq!((record.input_tokens, record.output_tokens), (100, 10));
+        assert_eq!(
+            (record.input_price, record.output_price),
+            (Some(3.0), Some(15.0))
+        );
+        assert!(record.created_at_ms > 0, "el apunte lleva marca de tiempo");
+    }
+
+    #[test]
+    fn live_child_usage_appends_a_record() {
+        let mut app = priced_app("priced", "https://acme.example/v1");
+        app.session_id = Some(SessionId(1));
+        app.apply(child_event(
+            SessionId(1),
+            7,
+            LiveEvent::Usage {
+                input_tokens: 50,
+                output_tokens: 5,
+            },
+        ));
+        assert_eq!(app.usage_records.len(), 1);
+        assert_eq!(app.usage_records[0].model, "priced");
+        assert_eq!(app.usage_records[0].input_tokens, 50);
+        // Un hijo de otra sesión no entra en la sesión abierta.
+        app.apply(child_event(
+            SessionId(9),
+            8,
+            LiveEvent::Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+        ));
+        assert_eq!(
+            app.usage_records.len(),
+            1,
+            "solo los hijos de la sesión abierta"
+        );
+    }
+
+    #[test]
+    fn session_load_clears_usage_records() {
+        let mut app = priced_app("priced", "https://acme.example/v1");
+        app.session_id = Some(SessionId(1));
+        app.apply(LiveEvent::Usage {
+            input_tokens: 1,
+            output_tokens: 1,
+        });
+        app.load_session(SessionId(2), Vec::new());
+        assert!(
+            app.usage_records.is_empty(),
+            "la sesión anterior no deja apuntes"
+        );
+    }
+
+    #[test]
+    fn reload_does_not_duplicate_live_records() {
+        let mut app = priced_app("priced", "https://acme.example/v1");
+        app.session_id = Some(SessionId(1));
+        app.apply(LiveEvent::Usage {
+            input_tokens: 100,
+            output_tokens: 10,
+        });
+        // La base de datos ya contiene ese apunte: la recarga lo sustituye, no lo suma.
+        let persisted = app.usage_records.clone();
+        app.load_usage(SessionId(1), persisted.clone());
+        assert_eq!(app.usage_records, persisted);
+        assert_eq!(app.usage_records.len(), 1);
+        // Un apunte vivo nuevo y una recarga posterior que ya lo incluye: sigue habiendo dos.
+        app.apply(LiveEvent::Usage {
+            input_tokens: 20,
+            output_tokens: 2,
+        });
+        let persisted = app.usage_records.clone();
+        app.load_usage(SessionId(1), persisted);
+        assert_eq!(app.usage_records.len(), 2);
     }
 
     #[test]

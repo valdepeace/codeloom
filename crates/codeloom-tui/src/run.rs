@@ -35,6 +35,11 @@ pub enum SessionUpdate {
         codeloom_core::session::SessionId,
         Vec<codeloom_core::message::Message>,
     ),
+    /// Apuntes de consumo persistidos de la sesión (con sus hijos); llega tras `Loaded`.
+    Usage(
+        codeloom_core::session::SessionId,
+        Vec<codeloom_core::session::UsageRecord>,
+    ),
     Subagents(
         codeloom_core::session::SessionId,
         Vec<codeloom_core::session::SubagentDescriptor>,
@@ -1150,6 +1155,9 @@ pub async fn run(
                     Some(SessionUpdate::List(sessions)) => app.update_sessions(sessions),
                     Some(SessionUpdate::Loaded(session, messages)) => {
                         app.load_session(session, messages);
+                    }
+                    Some(SessionUpdate::Usage(session, records)) => {
+                        app.load_usage(session, records);
                     }
                     Some(SessionUpdate::Subagents(session, subagents)) => {
                         app.load_subagents(session, subagents);
