@@ -14,6 +14,10 @@ pub enum LineKind {
     Error,
     /// Cabecera de una herramienta, con su estado.
     ToolHead(ToolStatus),
+    /// Cabecera de un elemento de actividad (job o subagente), con su estado.
+    ActivityHead(ToolStatus),
+    /// Elemento de la lista de tareas, con su estado (pendiente, en curso o hecha).
+    TodoItem(ToolStatus),
     /// Línea de salida de una herramienta.
     ToolBody,
     /// Indicación de salida oculta bajo una herramienta.

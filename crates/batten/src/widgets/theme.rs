@@ -141,11 +141,31 @@ pub enum ToolStyle {
     Inline,
 }
 
+/// Disposición de la pantalla: áreas laterales y cabecera.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutStyle {
+    /// Sidebar izquierdo y transcript a la derecha (disposición histórica).
+    Workspace,
+    /// Transcript a la izquierda y un rail de contexto a la derecha.
+    ContextRail,
+}
+
+/// Marco visual de los paneles y de la barra de estado.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChromeStyle {
+    /// Paneles con borde y cabecera de dos filas (comportamiento histórico).
+    Panels,
+    /// Sin cajas: cabecera de una línea y separadores ligeros.
+    Flat,
+}
+
 /// Presentación de cada elemento; un preset es paleta más `Look`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Look {
     pub composer: ComposerStyle,
     pub tool: ToolStyle,
+    pub layout: LayoutStyle,
+    pub chrome: ChromeStyle,
 }
 
 impl Look {
@@ -153,6 +173,8 @@ impl Look {
         Self {
             composer: ComposerStyle::Classic,
             tool: ToolStyle::Pinned,
+            layout: LayoutStyle::Workspace,
+            chrome: ChromeStyle::Panels,
         }
     }
 
@@ -160,6 +182,8 @@ impl Look {
         Self {
             composer: ComposerStyle::Crush,
             tool: ToolStyle::Inline,
+            layout: LayoutStyle::ContextRail,
+            chrome: ChromeStyle::Flat,
         }
     }
 }
@@ -741,5 +765,9 @@ mod tests {
         assert_eq!(Look::crush().tool, ToolStyle::Inline);
         assert_eq!(Look::classic().composer, ComposerStyle::Classic);
         assert_eq!(Look::classic().tool, ToolStyle::Pinned);
+        assert_eq!(Look::classic().layout, LayoutStyle::Workspace);
+        assert_eq!(Look::classic().chrome, ChromeStyle::Panels);
+        assert_eq!(Look::crush().layout, LayoutStyle::ContextRail);
+        assert_eq!(Look::crush().chrome, ChromeStyle::Flat);
     }
 }

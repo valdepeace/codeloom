@@ -28,6 +28,7 @@ pub mod permission;
 pub mod profile;
 pub mod profile_view;
 pub mod progress;
+pub mod question;
 pub mod queue;
 pub mod raster;
 pub mod rule;
@@ -59,7 +60,8 @@ pub use rule::rule;
 pub use spinner::{Anim, Animatable, FRAME_INTERVAL};
 pub use status::status;
 pub use theme::{
-    ColorDepth, ComposerStyle, Glyphs, Look, Styles, Theme, ThemeError, ThemePreset, ToolStyle,
+    ChromeStyle, ColorDepth, ComposerStyle, Glyphs, LayoutStyle, Look, Styles, Theme, ThemeError,
+    ThemePreset, ToolStyle,
 };
 pub use thinking::render as render_thinking;
 pub use toast::render as render_toast;

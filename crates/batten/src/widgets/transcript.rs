@@ -22,6 +22,10 @@ fn prefix(kind: LineKind) -> &'static str {
         LineKind::Banner => "",
         LineKind::Error => "! ",
         LineKind::ToolHead(_) => "● ",
+        LineKind::ActivityHead(_) => "◆ ",
+        LineKind::TodoItem(ToolStatus::Running) => "◐ ",
+        LineKind::TodoItem(ToolStatus::Success) => "☑ ",
+        LineKind::TodoItem(_) => "☐ ",
         LineKind::ToolBody => "│ ",
         LineKind::ToolMore => "  ",
     }
@@ -38,16 +42,24 @@ fn kind_token(kind: LineKind) -> StyleToken {
         LineKind::Plan => StyleToken::Heading,
         LineKind::Banner => StyleToken::Accent,
         LineKind::Error => StyleToken::Error,
-        LineKind::ToolHead(status) => match status {
-            ToolStatus::Pending => StyleToken::ToolPending,
-            ToolStatus::Running => StyleToken::ToolRunning,
-            ToolStatus::Success => StyleToken::ToolSuccess,
-            ToolStatus::Error => StyleToken::ToolError,
-            ToolStatus::Canceled => StyleToken::ToolCanceled,
-            ToolStatus::AwaitingPermission => StyleToken::Warning,
-        },
+        LineKind::ToolHead(status) | LineKind::ActivityHead(status) => status_token(status),
+        LineKind::TodoItem(ToolStatus::Running) => StyleToken::TodoInProgress,
+        LineKind::TodoItem(ToolStatus::Success) => StyleToken::TodoCompleted,
+        LineKind::TodoItem(_) => StyleToken::TodoPending,
         LineKind::ToolBody => StyleToken::Muted,
         LineKind::ToolMore => StyleToken::Dim,
+    }
+}
+
+/// Token de la cabecera de una tool o de un elemento de actividad según su estado.
+fn status_token(status: ToolStatus) -> StyleToken {
+    match status {
+        ToolStatus::Pending => StyleToken::ToolPending,
+        ToolStatus::Running => StyleToken::ToolRunning,
+        ToolStatus::Success => StyleToken::ToolSuccess,
+        ToolStatus::Error => StyleToken::ToolError,
+        ToolStatus::Canceled => StyleToken::ToolCanceled,
+        ToolStatus::AwaitingPermission => StyleToken::Warning,
     }
 }
 
@@ -606,6 +618,36 @@ mod tests {
         assert!(out.contains("│ uno"), "falta el cuerpo de la tool");
         assert!(!t.line(0).unwrap().plain().contains('●'));
         assert!(!t.line(1).unwrap().plain().contains('│'));
+    }
+
+    #[test]
+    fn activity_entries_paint_a_prefix_that_is_not_part_of_the_text() {
+        use crate::state::{activity_lines, ActivityView, ToolStatus};
+        let lines = activity_lines(&ActivityView {
+            kind: "job",
+            label: "build",
+            status: ToolStatus::Running,
+            progress: None,
+            body: None,
+        });
+        let mut t = Transcript::new();
+        t.push_lines(lines);
+        let out = buffer(&t, 40, 3);
+        assert!(out.contains("◆ job"), "falta la cabecera de la actividad");
+        assert!(!t.line(0).unwrap().plain().contains('◆'));
+    }
+
+    #[test]
+    fn todo_entries_paint_a_prefix_that_is_not_part_of_the_text() {
+        use crate::state::{todo_lines, ToolStatus};
+        let lines = todo_lines(&[("uno", ToolStatus::Success), ("dos", ToolStatus::Running)]);
+        let mut t = Transcript::new();
+        t.push_lines(lines);
+        let out = buffer(&t, 40, 4);
+        assert!(out.contains("☑ uno"), "falta la tarea hecha");
+        assert!(out.contains("◐ dos"), "falta la tarea en curso");
+        assert!(!t.line(1).unwrap().plain().contains('☑'));
+        assert!(!t.line(2).unwrap().plain().contains('◐'));
     }
 
     #[test]

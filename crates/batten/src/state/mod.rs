@@ -1,5 +1,6 @@
 //! Estado puro: sin ratatui, sin crossterm.
 
+pub mod activity_lines;
 pub mod composer;
 pub mod composer_layout;
 pub mod diff;
@@ -7,26 +8,31 @@ pub mod file_changes;
 pub mod history;
 pub mod markdown;
 pub mod permission;
+pub mod question;
 pub mod selection;
 pub mod sidebar;
 pub mod stream;
 pub mod toast;
+pub mod todo_lines;
 pub mod tone;
 pub mod tool;
 pub mod tool_lines;
 pub mod transcript;
 pub mod viewport;
 
+pub use activity_lines::{activity_lines, ActivityView};
 pub use composer::Composer;
 pub use composer_layout::{layout as composer_layout, ComposerLayout, VisualRow};
 pub use diff::{Diff, DiffKind, DiffLine};
 pub use file_changes::{FileChange, FileChanges};
 pub use history::History;
 pub use permission::{PermissionBody, PermissionChoice, PermissionDialog};
+pub use question::{QuestionDialog, QuestionKey, QuestionOutcome, QuestionSpec};
 pub use selection::Selection;
 pub use sidebar::{Logo, Section, Sidebar};
 pub use stream::Stream;
 pub use toast::{Toast, Toasts};
+pub use todo_lines::todo_lines;
 pub use tone::Tone;
 pub use tool::{ToolItem, ToolStatus};
 pub use tool_lines::tool_lines;
