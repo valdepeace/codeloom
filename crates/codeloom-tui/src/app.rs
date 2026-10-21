@@ -1,7 +1,8 @@
 use crate::permission_flow::{dialog_for, spec_for, PermissionReply, QuestionReply};
+use crate::rail::format_tokens;
 use crate::tool_facts::tool_facts;
 use batten::widgets::composer::hit_index;
-use codeloom_core::catalog::Catalog;
+use codeloom_core::catalog::{Catalog, CatalogModel, CatalogProvider};
 use codeloom_core::config::{CodeLoomConfig, ProviderKind};
 use codeloom_core::event::LiveEvent;
 use codeloom_core::message::{ContentPart, Message, Role};
@@ -59,12 +60,68 @@ pub enum SessionChoice {
 /// Aviso que se muestra al cerrar `/settings` con cambios sin guardar.
 const SETTINGS_DISCARD_WARNING: &str = "Unsaved changes · Esc again to discard";
 
+/// Catálogo de muestra (formato de models.dev, recortado) para las pruebas del selector.
+#[cfg(test)]
+pub(crate) const PICKER_SAMPLE_JSON: &str = r#"{
+    "openrouter": {"id": "openrouter", "name": "OpenRouter", "npm": "@openrouter/ai-sdk-provider",
+        "api": "https://openrouter.ai/api/v1", "env": ["OPENROUTER_API_KEY"],
+        "models": {"qwen": {"id": "qwen", "name": "Qwen Coder", "tool_call": true,
+            "release_date": "2025-06-01", "limit": {"context": 262000, "output": 8000},
+            "cost": {"input": 0.3, "output": 1.2}}}},
+    "anthropic": {"id": "anthropic", "name": "Anthropic", "npm": "@ai-sdk/anthropic",
+        "env": ["ANTHROPIC_API_KEY"],
+        "models": {
+            "claude-opus": {"id": "claude-opus", "name": "Claude Opus", "tool_call": true,
+                "release_date": "2025-05-01", "limit": {"context": 200000, "output": 32000}},
+            "claude-sonnet": {"id": "claude-sonnet", "name": "Claude Sonnet", "tool_call": true,
+                "release_date": "2025-09-01", "limit": {"context": 200000, "output": 64000},
+                "cost": {"input": 3, "output": 15}}}}
+}"#;
+
+/// Catálogo de muestra ya construido, listo para `App::set_catalog`.
+#[cfg(test)]
+pub(crate) fn picker_sample_catalog() -> Arc<Catalog> {
+    Arc::new(Catalog::from_json(PICKER_SAMPLE_JSON).expect("el JSON de muestra es válido"))
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProviderSettings {
     pub kind: ProviderKind,
     pub model: String,
     pub base_url: String,
     pub api_key_env: String,
+}
+
+/// Selector abierto sobre un campo de `/settings`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsPicker {
+    /// Proveedores del catálogo.
+    Provider,
+    /// Modelos del proveedor del catálogo cuya URL base coincide con la actual.
+    Model,
+}
+
+/// Fila de un selector: identificador que se guarda, etiqueta visible y detalle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PickerItem {
+    pub id: String,
+    pub label: String,
+    pub detail: String,
+}
+
+/// Forma comparable de una URL base: sin espacios, sin barras finales y en minúsculas.
+fn normalize_base_url(url: &str) -> String {
+    url.trim().trim_end_matches('/').to_ascii_lowercase()
+}
+
+/// Resumen de un modelo para el selector: `ctx 200k · $3/$15` (coste por millón de tokens).
+fn model_detail(model: &CatalogModel) -> String {
+    let context = model.context.map_or_else(|| "-".to_string(), format_tokens);
+    let cost = match (model.input_cost, model.output_cost) {
+        (Some(input), Some(output)) => format!("${input}/${output}"),
+        _ => "-".to_string(),
+    };
+    format!("ctx {context} · {cost}")
 }
 
 impl From<&CodeLoomConfig> for ProviderSettings {
@@ -368,6 +425,12 @@ pub struct App {
     pub settings_save_requested: bool,
     pub settings_saving: bool,
     pub settings_feedback: Option<String>,
+    /// Selector abierto sobre el campo de proveedor o de modelo, si lo hay.
+    pub settings_picker: Option<SettingsPicker>,
+    /// Texto con el que se filtra el selector abierto.
+    pub picker_query: String,
+    /// Índice de la fila resaltada dentro de `picker_items()`.
+    pub picker_selected: usize,
     pub help_open: bool,
 }
 
@@ -540,6 +603,9 @@ impl App {
             settings_save_requested: false,
             settings_saving: false,
             settings_feedback: None,
+            settings_picker: None,
+            picker_query: String::new(),
+            picker_selected: 0,
             help_open: false,
             sidebar_expanded: false,
             rail_hidden: false,
@@ -641,6 +707,7 @@ impl App {
             self.settings_open = true;
             self.settings_feedback = None;
             self.settings_warned = false;
+            self.close_picker();
             self.settings_baseline = self.provider_settings.clone();
         }
     }
@@ -675,6 +742,124 @@ impl App {
             .count()
     }
 
+    /// Proveedor del catálogo cuya URL base coincide con la de los ajustes actuales.
+    fn model_catalog_provider(&self) -> Option<&CatalogProvider> {
+        let current = self.provider_settings.as_ref()?;
+        let wanted = normalize_base_url(&current.base_url);
+        self.catalog
+            .providers
+            .iter()
+            .find(|provider| normalize_base_url(&provider.base_url) == wanted)
+    }
+
+    /// Abre el selector del campo indicado. Sin catálogo, o sin proveedor del catálogo
+    /// que coincida con la URL actual, no lo abre y deja el aviso en `settings_feedback`.
+    pub fn open_picker(&mut self, picker: SettingsPicker) {
+        if self.catalog.is_empty() {
+            self.settings_feedback = Some("Catalog not loaded yet; type it by hand".into());
+            return;
+        }
+        if picker == SettingsPicker::Model && self.model_catalog_provider().is_none() {
+            self.settings_feedback = Some("No catalog provider matches the current URL".into());
+            return;
+        }
+        self.settings_picker = Some(picker);
+        self.picker_query.clear();
+        self.picker_selected = 0;
+        self.settings_feedback = None;
+    }
+
+    /// Cierra el selector sin tocar los valores ni el diálogo.
+    pub fn close_picker(&mut self) {
+        self.settings_picker = None;
+        self.picker_query.clear();
+        self.picker_selected = 0;
+    }
+
+    /// Filas del selector abierto, filtradas por `picker_query` (sin distinguir mayúsculas,
+    /// sobre el identificador y el nombre). Sin selector abierto, lista vacía.
+    pub fn picker_items(&self) -> Vec<PickerItem> {
+        let query = self.picker_query.trim().to_lowercase();
+        let all: Vec<PickerItem> = match self.settings_picker {
+            None => return Vec::new(),
+            Some(SettingsPicker::Provider) => self
+                .catalog
+                .providers
+                .iter()
+                .map(|provider| PickerItem {
+                    id: provider.id.clone(),
+                    label: provider.name.clone(),
+                    detail: provider.base_url.clone(),
+                })
+                .collect(),
+            Some(SettingsPicker::Model) => self
+                .model_catalog_provider()
+                .map(|provider| {
+                    provider
+                        .models
+                        .iter()
+                        .map(|model| PickerItem {
+                            id: model.id.clone(),
+                            label: if model.name.is_empty() {
+                                model.id.clone()
+                            } else {
+                                model.name.clone()
+                            },
+                            detail: model_detail(model),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
+        all.into_iter()
+            .filter(|item| {
+                query.is_empty()
+                    || item.id.to_lowercase().contains(&query)
+                    || item.label.to_lowercase().contains(&query)
+            })
+            .collect()
+    }
+
+    /// Mueve la fila resaltada del selector, sin salirse de la lista filtrada.
+    pub fn picker_move(&mut self, down: bool) {
+        let last = self.picker_items().len().saturating_sub(1);
+        self.picker_selected = if down {
+            (self.picker_selected + 1).min(last)
+        } else {
+            self.picker_selected.saturating_sub(1)
+        };
+    }
+
+    /// Aplica la fila resaltada y cierra el selector. Elegir un proveedor rellena tipo,
+    /// URL base y variable de clave (si el catálogo la trae; si no, se conserva la
+    /// actual). Elegir un modelo rellena el identificador. Lo rellenado cuenta como
+    /// cambio sin guardar.
+    pub fn picker_choose(&mut self) {
+        let Some(picker) = self.settings_picker else {
+            return;
+        };
+        let items = self.picker_items();
+        if let (Some(item), Some(settings)) = (
+            items.get(self.picker_selected),
+            self.provider_settings.as_mut(),
+        ) {
+            match picker {
+                SettingsPicker::Provider => {
+                    if let Some(provider) = self.catalog.provider(&item.id) {
+                        settings.kind = provider.kind;
+                        settings.base_url = provider.base_url.clone();
+                        if !provider.api_key_env.is_empty() {
+                            settings.api_key_env = provider.api_key_env.clone();
+                        }
+                    }
+                }
+                SettingsPicker::Model => settings.model = item.id.clone(),
+            }
+        }
+        self.close_picker();
+        self.settings_feedback = None;
+    }
+
     /// Cierra `/settings`. Con cambios sin guardar avisa primero: devuelve `false`
     /// y deja el aviso en `settings_feedback`. Con el aviso ya dado descarta los
     /// cambios, restaura la copia guardada y devuelve `true`.
@@ -687,6 +872,7 @@ impl App {
         if self.settings_dirty() {
             self.provider_settings = self.settings_baseline.clone();
         }
+        self.close_picker();
         self.settings_open = false;
         self.settings_warned = false;
         self.settings_feedback = None;
@@ -4185,6 +4371,142 @@ mod tests {
         assert!(
             app.catalog.is_empty(),
             "el catálogo nuevo sustituye al anterior"
+        );
+    }
+
+    fn anthropic_settings_open() -> App {
+        let mut app = App::new();
+        app.set_provider_settings(ProviderSettings {
+            kind: codeloom_core::config::ProviderKind::Anthropic,
+            model: "model-a".into(),
+            base_url: "https://api.anthropic.com".into(),
+            api_key_env: "ANTHROPIC_API_KEY".into(),
+        });
+        app.set_catalog(picker_sample_catalog());
+        app.open_settings();
+        app
+    }
+
+    #[test]
+    fn picker_filters_by_query() {
+        let mut app = app_with_settings_open();
+        app.set_catalog(picker_sample_catalog());
+        app.open_picker(SettingsPicker::Provider);
+        assert_eq!(app.picker_items().len(), 2);
+        app.picker_query = "ANTH".into();
+        let items = app.picker_items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "anthropic");
+        app.picker_query = "nada".into();
+        assert!(app.picker_items().is_empty());
+    }
+
+    #[test]
+    fn choosing_a_provider_fills_kind_url_and_env() {
+        let mut app = app_with_settings_open();
+        app.set_catalog(picker_sample_catalog());
+        app.open_picker(SettingsPicker::Provider);
+        app.picker_query = "anthropic".into();
+        app.picker_choose();
+        let settings = app.provider_settings.as_ref().unwrap();
+        assert_eq!(
+            settings.kind,
+            codeloom_core::config::ProviderKind::Anthropic
+        );
+        assert_eq!(settings.base_url, "https://api.anthropic.com");
+        assert_eq!(settings.api_key_env, "ANTHROPIC_API_KEY");
+        assert_eq!(
+            settings.model, "model-a",
+            "elegir proveedor no toca el modelo"
+        );
+        assert!(app.settings_picker.is_none());
+    }
+
+    #[test]
+    fn provider_without_key_variable_keeps_the_current_one() {
+        use codeloom_core::catalog::{Catalog, CatalogProvider};
+
+        let mut app = app_with_settings_open();
+        app.set_catalog(Arc::new(Catalog {
+            providers: vec![CatalogProvider {
+                id: "local".into(),
+                name: "Local".into(),
+                kind: codeloom_core::config::ProviderKind::OpenAiCompat,
+                base_url: "http://localhost:11434/v1".into(),
+                api_key_env: String::new(),
+                models: Vec::new(),
+            }],
+        }));
+        app.open_picker(SettingsPicker::Provider);
+        app.picker_choose();
+        let settings = app.provider_settings.as_ref().unwrap();
+        assert_eq!(settings.base_url, "http://localhost:11434/v1");
+        assert_eq!(settings.api_key_env, "API_KEY");
+    }
+
+    #[test]
+    fn choosing_a_model_fills_the_model() {
+        let mut app = anthropic_settings_open();
+        app.open_picker(SettingsPicker::Model);
+        let ids: Vec<String> = app.picker_items().into_iter().map(|i| i.id).collect();
+        assert_eq!(ids, ["claude-sonnet", "claude-opus"]);
+        app.picker_selected = 1;
+        app.picker_choose();
+        assert_eq!(app.provider_settings.as_ref().unwrap().model, "claude-opus");
+    }
+
+    #[test]
+    fn picker_with_empty_catalog_sets_feedback() {
+        let mut app = app_with_settings_open();
+        app.open_picker(SettingsPicker::Provider);
+        assert!(app.settings_picker.is_none());
+        assert_eq!(
+            app.settings_feedback.as_deref(),
+            Some("Catalog not loaded yet; type it by hand")
+        );
+    }
+
+    #[test]
+    fn model_picker_without_matching_provider_sets_feedback() {
+        // La URL de `settings_fixture` (example.test) no está en el catálogo de muestra.
+        let mut app = app_with_settings_open();
+        app.set_catalog(picker_sample_catalog());
+        app.open_picker(SettingsPicker::Model);
+        assert!(app.settings_picker.is_none());
+        assert_eq!(
+            app.settings_feedback.as_deref(),
+            Some("No catalog provider matches the current URL")
+        );
+        assert!(!app.settings_dirty());
+    }
+
+    #[test]
+    fn picker_changes_count_as_unsaved() {
+        let mut app = anthropic_settings_open();
+        app.open_picker(SettingsPicker::Model);
+        app.picker_selected = 1;
+        app.picker_choose();
+        assert!(app.settings_dirty());
+        assert_eq!(app.settings_change_count(), 1);
+        assert!(
+            !app.close_settings(),
+            "elegir del selector cuenta como cambio sin guardar"
+        );
+        assert!(app.settings_open);
+    }
+
+    #[test]
+    fn manual_edit_still_works_after_picking() {
+        let mut app = anthropic_settings_open();
+        app.open_picker(SettingsPicker::Model);
+        app.picker_choose();
+        app.settings_field = 1;
+        app.edit_settings_value();
+        app.settings_editor.set_text("model-manual");
+        app.commit_settings_value();
+        assert_eq!(
+            app.provider_settings.as_ref().unwrap().model,
+            "model-manual"
         );
     }
 }

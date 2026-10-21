@@ -1,5 +1,5 @@
 use crate::app::Focus;
-use crate::app::{App, ProviderSettings, SessionChoice};
+use crate::app::{App, ProviderSettings, SessionChoice, SettingsPicker};
 use crate::frame::{FrameScheduler, Urgency, MIN_FRAME};
 use crate::render::render;
 use codeloom_core::catalog::Catalog;
@@ -791,6 +791,10 @@ fn handle_settings_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         }
         return;
     }
+    if app.settings_picker.is_some() {
+        handle_picker_key(app, code, mods);
+        return;
+    }
     if code != KeyCode::Esc {
         app.settings_disarm();
     }
@@ -801,12 +805,39 @@ fn handle_settings_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         KeyCode::Up => app.settings_field = app.settings_field.saturating_sub(1),
         KeyCode::Down => app.settings_field = (app.settings_field + 1).min(4),
         KeyCode::Left | KeyCode::Right if app.settings_field == 0 => toggle_provider(app),
-        KeyCode::Enter if app.settings_field == 0 => {
-            toggle_provider(app);
-        }
+        KeyCode::Enter if app.settings_field == 0 => app.open_picker(SettingsPicker::Provider),
         KeyCode::Enter if (1..=3).contains(&app.settings_field) => app.edit_settings_value(),
         KeyCode::Enter if app.settings_field == 4 => app.request_settings_save(),
+        KeyCode::Char('l') if mods.contains(KeyModifiers::CONTROL) => match app.settings_field {
+            0 => app.open_picker(SettingsPicker::Provider),
+            1 => app.open_picker(SettingsPicker::Model),
+            _ => {}
+        },
         KeyCode::Char('s') if mods.contains(KeyModifiers::CONTROL) => app.request_settings_save(),
+        _ => {}
+    }
+}
+
+/// Teclas con el selector de `/settings` abierto: escribir filtra, ↑/↓ mueven, Enter
+/// elige y Esc cierra solo el selector, nunca el diálogo.
+fn handle_picker_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
+    if code == KeyCode::Esc {
+        app.close_picker();
+        return;
+    }
+    app.settings_disarm();
+    match code {
+        KeyCode::Up => app.picker_move(false),
+        KeyCode::Down => app.picker_move(true),
+        KeyCode::Enter => app.picker_choose(),
+        KeyCode::Backspace => {
+            app.picker_query.pop();
+            app.picker_selected = 0;
+        }
+        KeyCode::Char(c) if !mods.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+            app.picker_query.push(c);
+            app.picker_selected = 0;
+        }
         _ => {}
     }
 }
@@ -3218,5 +3249,65 @@ mod tests {
 
         assert_eq!(app.catalog.providers.len(), 1);
         assert_eq!(app.catalog.providers[0].id, "openrouter");
+    }
+
+    fn anthropic_app_with_catalog() -> App {
+        let mut app = App::new();
+        app.set_provider_settings(ProviderSettings {
+            kind: codeloom_core::config::ProviderKind::Anthropic,
+            model: "model-a".into(),
+            base_url: "https://api.anthropic.com".into(),
+            api_key_env: "ANTHROPIC_API_KEY".into(),
+        });
+        app.set_catalog(crate::app::picker_sample_catalog());
+        app.open_settings();
+        app
+    }
+
+    #[test]
+    fn ctrl_l_opens_the_picker_for_the_focused_field() {
+        let mut app = anthropic_app_with_catalog();
+        app.settings_field = 1;
+        handle_key(&mut app, KeyCode::Char('l'), KeyModifiers::CONTROL);
+        assert_eq!(app.settings_picker, Some(SettingsPicker::Model));
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.settings_picker.is_none());
+        assert!(app.settings_open, "Esc cierra solo el selector");
+
+        app.settings_field = 0;
+        handle_key(&mut app, KeyCode::Char('l'), KeyModifiers::CONTROL);
+        assert_eq!(app.settings_picker, Some(SettingsPicker::Provider));
+    }
+
+    #[test]
+    fn enter_on_provider_opens_picker_and_arrows_still_toggle_kind() {
+        let mut app = anthropic_app_with_catalog();
+        app.settings_field = 0;
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.settings_picker, Some(SettingsPicker::Provider));
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(
+            app.provider_settings.as_ref().unwrap().kind,
+            codeloom_core::config::ProviderKind::OpenAiCompat
+        );
+    }
+
+    #[test]
+    fn picker_keys_filter_move_and_choose() {
+        let mut app = anthropic_app_with_catalog();
+        app.settings_field = 0;
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        for c in "open".chars() {
+            handle_key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        handle_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        let settings = app.provider_settings.as_ref().unwrap();
+        assert_eq!(settings.base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(settings.api_key_env, "OPENROUTER_API_KEY");
+        assert!(app.settings_picker.is_none());
+        assert!(app.settings_open);
     }
 }

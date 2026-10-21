@@ -1,4 +1,4 @@
-use crate::app::{App, Focus};
+use crate::app::{App, Focus, SettingsPicker};
 use crate::rail;
 use batten::widgets::{ChromeStyle, LayoutStyle};
 use ratatui::buffer::Buffer;
@@ -651,12 +651,17 @@ fn draw_provider_settings(frame: &mut Frame, area: Rect, app: &App) {
             "Ctrl+A clear · Enter accept · Esc cancel"
         } else if app.settings_saving {
             "Applying settings… · Esc close"
+        } else if app.settings_picker.is_some() {
+            "type to filter · ↑/↓ select · Enter choose · Esc close list"
         } else {
-            "↑/↓ select · ←/→ provider · Enter edit/apply · Ctrl+S save (idle) · Esc close"
+            "↑/↓ select · ←/→ provider · Enter edit/apply · Ctrl+L catalog · Ctrl+S save (idle) · Esc close"
         },
         app.theme.styles.muted,
     ));
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+    if app.settings_picker.is_some() {
+        draw_settings_picker(frame, popup, app);
+    }
     if app.settings_editing {
         let label_width = [
             "Provider: ".len(),
@@ -672,6 +677,76 @@ fn draw_provider_settings(frame: &mut Frame, area: Rect, app: &App) {
             frame.set_cursor_position((x, y));
         }
     }
+}
+
+/// Filas visibles del selector de `/settings` antes de desplazarse.
+const PICKER_VISIBLE_ROWS: usize = 8;
+
+/// Pinta el selector de `/settings` como una lista encima del diálogo, con el filtro arriba.
+fn draw_settings_picker(frame: &mut Frame, dialog: Rect, app: &App) {
+    let Some(picker) = app.settings_picker else {
+        return;
+    };
+    let items = app.picker_items();
+    let rows = items.len().clamp(1, PICKER_VISIBLE_ROWS) as u16;
+    // Bordes (2) y línea de filtro (1); nunca cubre la primera fila del diálogo.
+    let height = (rows + 3).min(dialog.height.saturating_sub(1));
+    if height < 3 {
+        return;
+    }
+    let area = Rect::new(
+        dialog.x + 1,
+        dialog.y + 1,
+        dialog.width.saturating_sub(2),
+        height,
+    );
+    frame.render_widget(Clear, area);
+    let title = match picker {
+        SettingsPicker::Provider => " Provider ",
+        SettingsPicker::Model => " Model ",
+    };
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(app.theme.styles.border);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines = vec![Line::from(vec![
+        Span::styled("Filter: ", app.theme.styles.muted),
+        Span::styled(app.picker_query.clone(), app.theme.styles.default),
+    ])];
+    if items.is_empty() {
+        lines.push(Line::styled("No matches", app.theme.styles.muted));
+    }
+    // El desplazamiento mantiene visible la fila resaltada.
+    let selected = app.picker_selected.min(items.len().saturating_sub(1));
+    let offset = (selected + 1).saturating_sub(PICKER_VISIBLE_ROWS);
+    for (index, item) in items
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(PICKER_VISIBLE_ROWS)
+    {
+        let is_selected = index == selected;
+        lines.push(Line::from(vec![
+            Span::styled(
+                if is_selected { "› " } else { "  " },
+                app.theme.styles.accent_from,
+            ),
+            Span::styled(
+                item.label.clone(),
+                if is_selected {
+                    app.theme.styles.heading.add_modifier(Modifier::BOLD)
+                } else {
+                    app.theme.styles.default
+                },
+            ),
+            Span::styled(format!("  {}", item.detail), app.theme.styles.muted),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_prompt_queue(frame: &mut Frame, area: Rect, app: &App) {
@@ -2464,5 +2539,25 @@ mod tests {
         assert_eq!(content.matches("● unsaved").count(), 1);
         assert!(content.contains("other-model"));
         assert!(content.contains("Save and apply (1 change)"));
+    }
+
+    #[test]
+    fn picker_renders_items_with_detail() {
+        use crate::app::SettingsPicker;
+
+        let mut app = App::new();
+        app.set_provider_settings(crate::app::ProviderSettings {
+            kind: codeloom_core::config::ProviderKind::Anthropic,
+            model: "model-a".into(),
+            base_url: "https://api.anthropic.com".into(),
+            api_key_env: "ANTHROPIC_API_KEY".into(),
+        });
+        app.set_catalog(crate::app::picker_sample_catalog());
+        app.open_settings();
+        app.open_picker(SettingsPicker::Model);
+        let content = buffer_of(&mut app, 120, 40);
+        assert!(content.contains("Claude Sonnet"));
+        assert!(content.contains("ctx 200k · $3/$15"));
+        assert!(content.contains("ctx 200k · -"));
     }
 }
