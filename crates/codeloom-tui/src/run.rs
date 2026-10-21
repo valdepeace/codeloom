@@ -698,7 +698,11 @@ fn execute_slash_command(app: &mut App, command: crate::commands::Command) -> Op
         Command::Quit => handle_key(app, KeyCode::Char('q'), KeyModifiers::CONTROL),
         Command::Parent => {
             if !app.go_parent() {
-                app.status = "no parent session".into();
+                app.status = if app.turn_in_flight {
+                    "wait for the turn to finish".into()
+                } else {
+                    "no parent session".into()
+                };
             }
             None
         }
@@ -3139,5 +3143,14 @@ mod tests {
         let mut app = App::new();
         execute_slash_command(&mut app, crate::commands::Command::Parent);
         assert_eq!(app.status, "no parent session");
+    }
+
+    #[test]
+    fn parent_command_during_a_turn_asks_to_wait() {
+        let mut app = App::new();
+        app.parent_stack.push(codeloom_core::session::SessionId(1));
+        app.turn_in_flight = true;
+        execute_slash_command(&mut app, crate::commands::Command::Parent);
+        assert_eq!(app.status, "wait for the turn to finish");
     }
 }
