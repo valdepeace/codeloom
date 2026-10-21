@@ -169,7 +169,13 @@ fn rail_lines(app: &App) -> Vec<Line<'_>> {
                     app.theme.styles.tool_canceled
                 }
             };
-            out.push(glyph_line(subagent.label.as_str(), style));
+            let mut line = glyph_line(subagent.label.as_str(), style);
+            // Marca de espera: un «?» de acento tras la etiqueta. Solo una consulta al conjunto.
+            if app.awaiting_input.contains(&subagent.child.0) {
+                line.spans
+                    .push(Span::styled(" ?", app.theme.styles.warning));
+            }
+            out.push(line);
         }
         more(&mut out, subagent_total, SUBAGENT_LIMIT, app);
     }
@@ -215,5 +221,62 @@ fn tool_style(status: ToolStatus, app: &App) -> Style {
         ToolStatus::Error => app.theme.styles.tool_error,
         ToolStatus::Canceled => app.theme.styles.tool_canceled,
         ToolStatus::AwaitingPermission => app.theme.styles.warning,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codeloom_core::session::{SessionId, SubagentDescriptor};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    /// Subagente en marcha de la sesión 1 con el id interno `child`.
+    fn running(child: i64, label: &str) -> SubagentDescriptor {
+        SubagentDescriptor {
+            parent: SessionId(1),
+            child: SessionId(child),
+            job_id: format!("subagent-{child}"),
+            label: label.into(),
+            status: SubagentStatus::Running,
+            result: None,
+            notice_delivered: false,
+        }
+    }
+
+    /// Filas del búfer de `width` columnas, una cadena por fila.
+    fn rows_of(app: &App, width: u16, height: u16) -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+        term.draw(|f| draw_context_rail(f, f.area(), app)).unwrap();
+        let buffer = term.backend().buffer().clone();
+        buffer
+            .content
+            .chunks(usize::from(width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn rail_marks_subagents_waiting_for_input() {
+        let mut app = App::new();
+        app.session_id = Some(SessionId(1));
+        app.subagents.insert(9, running(9, "review"));
+        app.subagents.insert(10, running(10, "tests"));
+        app.awaiting_input.insert(9);
+
+        let rows = rows_of(&app, 40, 20);
+        let review = rows
+            .iter()
+            .find(|row| row.contains("review"))
+            .expect("el rail lista el subagente review");
+        let tests = rows
+            .iter()
+            .find(|row| row.contains("tests"))
+            .expect("el rail lista el subagente tests");
+        assert!(
+            review.contains(" ?"),
+            "falta la marca de espera: {review:?}"
+        );
+        assert!(!tests.contains(" ?"), "marca de espera de más: {tests:?}");
     }
 }

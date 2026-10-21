@@ -62,6 +62,18 @@ impl From<SubagentStatus> for TaskState {
     }
 }
 
+/// Proyección de un subagente a su estado A2A, con la espera de su padre.
+///
+/// Dícese de la marca `awaiting_input` que solo cobra sentido mientras el hijo
+/// sigue en marcha: un hijo terminado ya no espera nada.
+pub fn subagent_task_state(status: SubagentStatus, awaiting_input: bool) -> TaskState {
+    if status == SubagentStatus::Running && awaiting_input {
+        TaskState::InputRequired
+    } else {
+        TaskState::from(status)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,6 +105,26 @@ mod tests {
         assert_eq!(TaskState::from(JobStatus::Completed), TaskState::Completed);
         assert_eq!(TaskState::from(JobStatus::Failed), TaskState::Failed);
         assert_eq!(TaskState::from(JobStatus::Killed), TaskState::Canceled);
+    }
+
+    #[test]
+    fn awaiting_input_only_matters_while_running() {
+        assert_eq!(
+            subagent_task_state(SubagentStatus::Running, true),
+            TaskState::InputRequired
+        );
+        assert_eq!(
+            subagent_task_state(SubagentStatus::Running, false),
+            TaskState::Working
+        );
+        assert_eq!(
+            subagent_task_state(SubagentStatus::Completed, true),
+            TaskState::Completed
+        );
+        assert_eq!(
+            subagent_task_state(SubagentStatus::Failed, true),
+            TaskState::Failed
+        );
     }
 
     #[test]

@@ -186,6 +186,9 @@ pub struct App {
     todo_tool_calls: HashSet<String>,
     pub jobs: BTreeMap<codeloom_core::job::JobId, codeloom_core::job::JobSnapshot>,
     pub subagents: BTreeMap<i64, codeloom_core::session::SubagentDescriptor>,
+    /// Hijos de la sesión abierta que esperan una respuesta de su padre (`input-required`).
+    /// La clave es el id interno del hijo, como en `subagents`.
+    pub awaiting_input: HashSet<i64>,
     pub tools_open: bool,
     pub tool_selected: usize,
     pub tool_scroll: (u16, u16),
@@ -314,6 +317,7 @@ impl App {
             todo_tool_calls: HashSet::new(),
             jobs: BTreeMap::new(),
             subagents: BTreeMap::new(),
+            awaiting_input: HashSet::new(),
             tools_open: false,
             tool_selected: 0,
             tool_scroll: (0, 0),
@@ -632,6 +636,7 @@ impl App {
     pub fn load_session(&mut self, session: SessionId, messages: Vec<Message>) {
         self.session_id = Some(session);
         self.subagents.clear();
+        self.awaiting_input.clear();
         self.session_selected = 0;
         self.session_query.clear();
         self.session_searching = false;
@@ -928,6 +933,10 @@ impl App {
                                 codeloom_core::session::SubagentStatus::Failed
                             }
                         };
+                        // Un subagente que deja de estar en marcha ya no espera respuesta.
+                        if subagent.status != codeloom_core::session::SubagentStatus::Running {
+                            self.awaiting_input.remove(&subagent.child.0);
+                        }
                     }
                 }
                 self.sync_job_activity(&snapshot);
@@ -935,6 +944,10 @@ impl App {
             }
             LiveEvent::SubagentChanged(subagent) => {
                 if Some(subagent.parent) == self.session_id {
+                    // Un hijo terminado ya no espera a su padre.
+                    if subagent.status != codeloom_core::session::SubagentStatus::Running {
+                        self.awaiting_input.remove(&subagent.child.0);
+                    }
                     self.sync_subagent_activity(&subagent);
                     self.subagents.insert(subagent.child.0, subagent);
                 }
@@ -945,8 +958,14 @@ impl App {
                     self.sync_todos();
                 }
             }
-            // La marca de espera de los subagentes se pinta en la tarea 4.
-            LiveEvent::SubagentInputRequested { .. } | LiveEvent::SubagentInputResolved { .. } => {}
+            LiveEvent::SubagentInputRequested { parent, child, .. } => {
+                if Some(parent) == self.session_id {
+                    self.awaiting_input.insert(child.0);
+                }
+            }
+            LiveEvent::SubagentInputResolved { child, .. } => {
+                self.awaiting_input.remove(&child.0);
+            }
         }
     }
 
@@ -2525,5 +2544,59 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap(), None);
         assert!(app.question.is_none());
         assert!(app.question_queue.is_empty());
+    }
+
+    #[test]
+    fn subagent_input_events_toggle_the_waiting_mark() {
+        let mut app = crush_app();
+        app.session_id = Some(SessionId(1));
+        app.apply(LiveEvent::SubagentChanged(sub(
+            "review",
+            SubagentStatus::Running,
+            SessionId(1),
+        )));
+
+        // Preguntar marca al hijo, pero solo si su padre es la sesión abierta.
+        app.apply(LiveEvent::SubagentInputRequested {
+            parent: SessionId(2),
+            child: SessionId(9),
+            label: "review".into(),
+        });
+        assert!(app.awaiting_input.is_empty());
+        app.apply(LiveEvent::SubagentInputRequested {
+            parent: SessionId(1),
+            child: SessionId(9),
+            label: "review".into(),
+        });
+        assert!(app.awaiting_input.contains(&9));
+
+        // Un hijo que sigue en marcha conserva la marca al cambiar de estado no terminal.
+        app.apply(LiveEvent::SubagentChanged(sub(
+            "review",
+            SubagentStatus::Running,
+            SessionId(1),
+        )));
+        assert!(app.awaiting_input.contains(&9));
+
+        // Responder retira la marca.
+        app.apply(LiveEvent::SubagentInputResolved {
+            parent: SessionId(1),
+            child: SessionId(9),
+        });
+        assert!(!app.awaiting_input.contains(&9));
+
+        // Un estado terminal retira la marca aunque no llegara la resolución.
+        app.apply(LiveEvent::SubagentInputRequested {
+            parent: SessionId(1),
+            child: SessionId(9),
+            label: "review".into(),
+        });
+        assert!(app.awaiting_input.contains(&9));
+        app.apply(LiveEvent::SubagentChanged(sub(
+            "review",
+            SubagentStatus::Completed,
+            SessionId(1),
+        )));
+        assert!(!app.awaiting_input.contains(&9));
     }
 }
