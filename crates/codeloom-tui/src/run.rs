@@ -806,6 +806,10 @@ fn handle_settings_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         KeyCode::Down => app.settings_field = (app.settings_field + 1).min(4),
         KeyCode::Left | KeyCode::Right if app.settings_field == 0 => toggle_provider(app),
         KeyCode::Enter if app.settings_field == 0 => app.open_picker(SettingsPicker::Provider),
+        // Con catálogo, «Model» abre la lista de su proveedor; sin él, se edita a mano.
+        KeyCode::Enter if app.settings_field == 1 && !app.catalog.is_empty() => {
+            app.open_picker(SettingsPicker::Model)
+        }
         KeyCode::Enter if (1..=3).contains(&app.settings_field) => app.edit_settings_value(),
         KeyCode::Enter if app.settings_field == 4 => app.request_settings_save(),
         KeyCode::Char('l') if mods.contains(KeyModifiers::CONTROL) => match app.settings_field {
@@ -3280,6 +3284,26 @@ mod tests {
     }
 
     #[test]
+    fn enter_on_model_opens_the_model_picker_when_the_catalog_is_loaded() {
+        let mut app = anthropic_app_with_catalog();
+        app.settings_field = 1;
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.settings_picker, Some(SettingsPicker::Model));
+    }
+
+    #[test]
+    fn enter_on_model_edits_by_hand_without_a_catalog() {
+        let mut app = anthropic_app_with_catalog();
+        app.set_catalog(std::sync::Arc::new(
+            codeloom_core::catalog::Catalog::default(),
+        ));
+        app.settings_field = 1;
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.settings_picker.is_none());
+        assert!(app.settings_editing);
+    }
+
+    #[test]
     fn enter_on_provider_opens_picker_and_arrows_still_toggle_kind() {
         let mut app = anthropic_app_with_catalog();
         app.settings_field = 0;
@@ -3307,7 +3331,8 @@ mod tests {
         let settings = app.provider_settings.as_ref().unwrap();
         assert_eq!(settings.base_url, "https://openrouter.ai/api/v1");
         assert_eq!(settings.api_key_env, "OPENROUTER_API_KEY");
-        assert!(app.settings_picker.is_none());
+        // Elegido el proveedor, se abre la lista de sus modelos.
+        assert_eq!(app.settings_picker, Some(SettingsPicker::Model));
         assert!(app.settings_open);
     }
 }

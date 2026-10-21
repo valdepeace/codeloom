@@ -839,6 +839,17 @@ impl App {
             return;
         };
         let items = self.picker_items();
+        // Un filtro sin coincidencias en la lista de modelos se acepta tal cual:
+        // permite fijar a mano un modelo que el catálogo aún no conoce.
+        if picker == SettingsPicker::Model && items.is_empty() && !self.picker_query.is_empty() {
+            let typed = self.picker_query.trim().to_string();
+            if let Some(settings) = self.provider_settings.as_mut() {
+                settings.model = typed;
+            }
+            self.close_picker();
+            self.settings_feedback = None;
+            return;
+        }
         if let (Some(item), Some(settings)) = (
             items.get(self.picker_selected),
             self.provider_settings.as_mut(),
@@ -858,6 +869,11 @@ impl App {
         }
         self.close_picker();
         self.settings_feedback = None;
+        // Tras elegir proveedor se pasa directamente a sus modelos.
+        if picker == SettingsPicker::Provider {
+            self.settings_field = 1;
+            self.open_picker(SettingsPicker::Model);
+        }
     }
 
     /// Cierra `/settings`. Con cambios sin guardar avisa primero: devuelve `false`
@@ -4418,6 +4434,25 @@ mod tests {
         assert_eq!(
             settings.model, "model-a",
             "elegir proveedor no toca el modelo"
+        );
+        // Tras elegir proveedor se pasa a la lista de sus modelos.
+        assert_eq!(app.settings_picker, Some(SettingsPicker::Model));
+        assert_eq!(app.settings_field, 1);
+    }
+
+    #[test]
+    fn unknown_model_typed_in_the_picker_is_accepted() {
+        let mut app = app_with_settings_open();
+        app.set_catalog(picker_sample_catalog());
+        app.settings_field = 1;
+        app.open_picker(SettingsPicker::Provider);
+        app.picker_query = "anthropic".into();
+        app.picker_choose();
+        app.picker_query = "mi-modelo-nuevo".into();
+        app.picker_choose();
+        assert_eq!(
+            app.provider_settings.as_ref().unwrap().model,
+            "mi-modelo-nuevo"
         );
         assert!(app.settings_picker.is_none());
     }
