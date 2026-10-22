@@ -61,14 +61,20 @@ después el transporte (A7, A8).
   - `rejected` («the agent has decided to not perform the task», al crear la tarea o
     después): decidir qué rechazos son del agente (límites, perfil desconocido,
     permiso denegado) frente a un fallo de ejecución.
-  - `auth-required`: sin productor hasta que haya algo que autenticar.
+  - `auth-required`: la spec (§7.6) cita como ejemplo «requiring human approval
+    before a destructive action is taken». Hoy el permiso de un hijo se delega al
+    padre sin cambiar su estado (`ChildResponder::decide`); candidato a productor.
+    Cuidado: «Agents MUST NOT treat the `TASK_STATE_AUTH_REQUIRED` state transition,
+    by itself, as authorization».
   Requiere variantes nuevas de `SubagentStatus` y su cadena en SQLite (la columna es
   `TEXT NOT NULL`, sin cambio de esquema), y actualizar la columna «productor» del
   showcase.
-- [ ] **A3. Leer lo que falta de la especificación.** No se leyó la sección 4.1.3 de la
-  página principal, ni las 3.x y 6.x íntegras, ni el `a2a.proto` completo, ni los
-  bindings (§9–§13), ni el esquema JSON. Resumir con citas literales y anotar en la
-  spec A2A qué consta y qué no. Esta tarea desbloquea A2 y A10.
+- [x] **A3. Leer lo que falta de la especificación** (hecho el 2026-10-22, parcial).
+  Leído en literal: el `a2a.proto` completo y, de la especificación, las secciones 3.1,
+  3.3, 3.4 y 7.6. Anotado en la spec A2A qué consta y qué no. **Quedan por leer en
+  literal** §4.4, §8.4, §9 a §11, §12 y §13 (se hará al abordar A4 y A8; basta
+  descargar el fichero en crudo, porque la herramienta web solo da literal los primeros
+  ~39 000 caracteres).
 - [ ] **A4. Adaptador de nombres del cable.** v0.3 en `kebab-case`, v1.0 en
   `TASK_STATE_*`. Vive en el borde (crate del adaptador), nunca en el núcleo.
 - [ ] **A5. Tipos del protocolo en el núcleo.** `Task`, `Message`, `Part`, `Artifact`,
@@ -82,11 +88,14 @@ después el transporte (A7, A8).
   `codeloom-a2a`. Aquí cobra sentido `auth-required`.
 - [ ] **A9. Flujo de eventos** `TaskStatusUpdateEvent` y de artefactos sobre el bus de
   eventos existente, sin canal de interfaz paralelo.
-- [ ] **A10. Cancelar y reanudar.** `CancelTask` solicitado por el cliente; reanudar
-  tras `input-required` con un nuevo mensaje del mismo `taskId` (esto último consta
-  solo en un resumen de la spec: comprobarlo en A3).
-- [ ] **A11. Tareas enlazadas** (`follow_up_of`, Fase C de la autonomía) sobre
-  `taskId`/`contextId`.
+- [ ] **A10. Cancelar y reanudar.** `CancelTask` lo solicita el cliente y devuelve la
+  `Task` actualizada; no consta a qué estado pasa (la inferencia `canceled` ha de
+  rotularse) ni si `input-required` es cancelable. Reanudar tras `input-required` con
+  un mensaje con el mismo `taskId` y `contextId` (consta literal).
+- [ ] **A11. Tareas enlazadas** (`follow_up_of`, Fase C de la autonomía). Según la
+  spec, una tarea terminal no se reinicia: el seguimiento es una **tarea nueva** en el
+  mismo `contextId`, con `reference_task_ids`. El nombre `follow_up_of` es nuestro;
+  valorar si debe alinearse con `reference_task_ids`. Los ids los genera el servidor.
 
 ## Cruces con otras líneas
 

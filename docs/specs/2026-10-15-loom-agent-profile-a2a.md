@@ -280,6 +280,90 @@ interrumpidos. Sí dice que los cambios de estado los notifica el agente
 - Los glifos y colores, la línea de causa del despertar del padre y los ficheros
   por hijo son interfaz y extensiones de CodeLoom, no parte del protocolo.
 
+### Lectura de la especificación: ciclo de vida, cancelación y multiturno (2026-10-22)
+
+Fuentes: `docs/specification.md` y `specification/a2a.proto` de la rama `main` del
+repositorio `a2aproject/A2A`, descargados en crudo el 2026-10-22 (no consta commit ni
+versión en el texto; el sitio dice «Latest Released Version 1.0.0»), y las páginas
+`topics/life-of-a-task`, `key-concepts` y `streaming-and-async`. Las citas van en
+inglés y entre comillas porque son literales; lo demás es resumen o inferencia y se
+rotula.
+
+**Lo que consta (literal):**
+
+- Estados terminales e interrumpidos: véase la sección anterior (proto).
+- Tarea terminal: «Once a task reaches a terminal state (completed, canceled,
+  rejected, or failed), it cannot restart.» y «Any subsequent interaction related to
+  that task, such as a refinement, must initiate a new task within the same
+  `contextId`.» Un mensaje a una tarea terminal da `UnsupportedOperationError`.
+- Identificadores: «Task IDs are **server-generated**»; «Client-provided `taskId`
+  values for creating new tasks is **NOT** supported»; un `taskId` del cliente «MUST
+  reference an existing task» o se devuelve `TaskNotFoundError`. El `contextId`
+  «logically groups multiple related Task and Message objects».
+- Reanudar `input-required`: «The client continues the interaction by sending a new
+  message with the same `taskId` and `contextId`»; el agente «MUST infer `contextId`
+  from the task if only `taskId` is provided» y «MUST reject messages containing
+  mismatching `contextId` and `taskId`».
+- Seguimientos: «Clients SHOULD use the `referenceTaskIds` field in Message to
+  explicitly reference related tasks» (en el proto, `reference_task_ids`).
+- `input-required`: «Agents can request additional input mid-processing by
+  transitioning a task to the `input-required` state». Es el agente quien transiciona.
+- `auth-required` (§7.6): el agente «MUST use a Task», «MUST transition the TaskState
+  to `TASK_STATE_AUTH_REQUIRED`» y «MUST include a TaskStatus message explaining the
+  required authorization». Las credenciales llegan «via an out-of-band means» salvo
+  negociación previa. **Entre los ejemplos de la propia especificación figura «An
+  agent requiring human approval before a destructive action is taken».** Además:
+  «Agents MUST NOT treat the `TASK_STATE_AUTH_REQUIRED` state transition, by itself,
+  as authorization for any particular operation.»
+- Cancelación: «Requests the cancellation of an ongoing task. The server will attempt
+  to cancel the task, but success is not guaranteed». Salida: «Updated Task with
+  cancellation status». Errores: `TaskNotCancelableError` («The task is not in a
+  cancelable state (e.g., already completed, failed, or canceled).») y
+  `TaskNotFoundError`. Es idempotente.
+- `SendMessage` devuelve `Task` o `Message`: «The agent MAY create a new `Task` ...
+  or MAY return a direct `Message` response for simple interactions». Los resultados
+  van en artefactos: «Results SHOULD BE returned using Artifacts associated with a
+  Task.»
+- Streaming: con `Message` el flujo contiene uno solo y se cierra; con `Task`
+  empieza por la `Task` y «MUST close when the task reaches a terminal state».
+  `SubscribeToTask` devuelve primero la `Task` actual y da `UnsupportedOperationError`
+  sobre una tarea terminal.
+- Los errores se llaman `TaskNotFoundError`, `TaskNotCancelableError`,
+  `UnsupportedOperationError`, `PushNotificationNotSupportedError`,
+  `ContentTypeNotSupportedError`, `InvalidAgentResponseError`,
+  `ExtendedAgentCardNotConfiguredError`, `ExtensionSupportRequiredError` y
+  `VersionNotSupportedError`.
+- Proto: `SendMessageConfiguration` **no** tiene campo `blocking`; el equivalente es
+  `return_immediately`. El campo es `reference_task_ids`.
+
+**Lo que NO consta en lo leído:**
+
+- Una tabla de transiciones permitidas, ni una regla general de quién provoca cada
+  transición.
+- A qué estado pasa una tarea al cancelarse: el texto dice «cancellation status»; que
+  sea `TASK_STATE_CANCELED` es inferencia (coherente con la definición del estado).
+- Si una tarea en `input-required` o `auth-required` es cancelable.
+- Cuándo emite el agente `submitted`, o si es obligatorio. Solo consta su definición
+  («successfully submitted and acknowledged»).
+- Una distinción entre `failed` y `rejected` más allá de sus definiciones.
+- Una regla normativa que ligue `completed` con la existencia de artefactos.
+
+**Discrepancia sin resolver:** la página `streaming-and-async` dice que el servidor
+cierra el flujo también en `INPUT_REQUIRED`, mientras que §3.1.2 de la
+especificación lista solo los cuatro terminales.
+
+**Aún sin leer en literal:** §4.4 (campos de la tarjeta), §8.4 (firma y
+canonicalización), §9 a §11 salvo lo anterior, §12 y §13. El `a2a.proto` sí se leyó
+completo. La herramienta de lectura web solo entrega literal los primeros ~39 000
+caracteres de cada página; para el resto conviene descargar el fichero en crudo.
+
+**Candidatos de productor para nuestros estados (decisión pendiente, no es A2A):**
+hoy los permisos de un hijo se delegan al servicio del padre de forma síncrona
+(`ChildResponder::decide`) y el hijo no cambia de estado visible; solo sus preguntas
+(`ask`) lo marcan `input-required`. Dado que §7.6 cita expresamente la aprobación
+humana antes de una acción destructiva, un hijo a la espera de un permiso es el
+candidato natural a `auth-required`; no se afirma que lo sea hasta decidirlo.
+
 ### Hallazgos de la lectura de la especificación oficial (2026-10-21)
 
 Fuente: `a2a-protocol.org/latest/specification/` (v1.0.0) y las páginas de
