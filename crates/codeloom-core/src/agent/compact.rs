@@ -109,6 +109,12 @@ pub fn parse_summary(message: &Message) -> Option<(usize, String)> {
     let [ContentPart::Text { text }] = message.parts.as_slice() else {
         return None;
     };
+    parse_summary_text(text)
+}
+
+/// Como `parse_summary`, pero sobre el texto ya extraído del mensaje: evita construir un
+/// `Message` a quien solo tiene la cadena (por ejemplo, la interfaz al pintar el transcript).
+pub fn parse_summary_text(text: &str) -> Option<(usize, String)> {
     let resto = text.strip_prefix(SUMMARY_PREFIX)?;
     let fin = resto.find(']')?;
     let covers = resto[..fin]

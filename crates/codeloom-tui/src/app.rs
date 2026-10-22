@@ -2,6 +2,7 @@ use crate::permission_flow::{dialog_for, spec_for, PermissionReply, QuestionRepl
 use crate::rail::{agent_state, format_tokens};
 use crate::tool_facts::tool_facts;
 use batten::widgets::composer::hit_index;
+use codeloom_core::agent::compact::parse_summary_text;
 use codeloom_core::catalog::{Catalog, CatalogModel, CatalogProvider};
 use codeloom_core::config::{CodeLoomConfig, ProviderKind};
 use codeloom_core::event::LiveEvent;
@@ -225,12 +226,31 @@ enum Notice<'a> {
         label: &'a str,
         body: &'a str,
     },
+    /// Resumen del historial que escribe el bucle al compactar. Lo emite CodeLoom.
+    Compaction {
+        covers: usize,
+        body: String,
+    },
 }
 
-/// Interpreta `[Job {id} {estado}] {etiqueta}\n{cuerpo}` y
-/// `[Subagent {etiqueta} completed]\n{cuerpo}`. Devuelve `None` si el texto no
-/// encaja con ninguno de los dos formatos.
+/// Rótulo del aviso de compactación. Es una función de CodeLoom: no es un estado de A2A ni un
+/// mensaje de la persona usuaria.
+fn compaction_label(covers: usize) -> String {
+    if covers == 1 {
+        "contexto compactado (1 mensaje resumido)".to_string()
+    } else {
+        format!("contexto compactado ({covers} mensajes resumidos)")
+    }
+}
+
+/// Interpreta `[Job {id} {estado}] {etiqueta}\n{cuerpo}`,
+/// `[Subagent {etiqueta} completed]\n{cuerpo}` y el resumen de compactación
+/// `[Context summary: first {N} messages]\n{cuerpo}`. Devuelve `None` si el texto no
+/// encaja con ninguno de los formatos.
 fn parse_notice(text: &str) -> Option<Notice<'_>> {
+    if let Some((covers, body)) = parse_summary_text(text) {
+        return Some(Notice::Compaction { covers, body });
+    }
     let (header, body) = text.split_once('\n').unwrap_or((text, ""));
     if let Some(rest) = header.strip_prefix("[Job ") {
         let (inside, label) = rest.split_once(']')?;
@@ -1443,7 +1463,11 @@ impl App {
             match message.role {
                 Role::User => {
                     let text = message.text();
-                    self.history.push(text.clone());
+                    // Los avisos (resúmenes incluidos, de hasta 16 000 bytes) no los escribió la
+                    // persona usuaria: no entran en el historial del composer.
+                    if parse_notice(&text).is_none() {
+                        self.history.push(text.clone());
+                    }
                     self.user_message(&text);
                 }
                 Role::Assistant => {
@@ -2460,7 +2484,8 @@ impl App {
                 let session = self.session_id.unwrap_or(SessionId(0));
                 self.record_live_usage(session, input_tokens, output_tokens);
             }
-            // El resumen llega como mensaje propio (`MessageAdded`); su pintado es la Tarea 5.
+            // El resumen ya llega como mensaje (`MessageAdded`), que `parse_notice` reconoce y
+            // pinta como aviso propio. Aquí no se añade una segunda línea.
             LiveEvent::ContextCompacted { .. } => {}
             LiveEvent::ToolStarted { call_id, name } => {
                 self.set_phase("running tools");
@@ -2882,11 +2907,18 @@ impl App {
         }
         // Con el look clásico el aviso se conserva entero, pero es del sistema: atribuirlo a la
         // persona usuaria (`You`) confundiría a los actores.
-        if parse_notice(text).is_some() {
+        if let Some(notice) = parse_notice(text) {
+            // El resumen se pinta con su cabecera de CodeLoom; los demás avisos, tal cual.
+            let shown = match notice {
+                Notice::Compaction { covers, body } => {
+                    format!("{}\n{body}", compaction_label(covers))
+                }
+                Notice::Job { .. } | Notice::Subagent { .. } => text.to_string(),
+            };
             self.transcript.push_entry(
                 batten::state::LineKind::System,
                 batten::state::Format::Plain,
-                text,
+                &shown,
             );
             self.assistant = None;
             return;
@@ -3143,6 +3175,14 @@ impl App {
                     ),
                 }
             }
+            // Mismo mecanismo que un aviso de subagente, pero con el tipo `codeloom`: la
+            // cabecera no lleva ningún estado de A2A.
+            Notice::Compaction { covers, body } => self.push_notice_entry(
+                "codeloom",
+                batten::state::ToolStatus::Success,
+                &compaction_label(covers),
+                &body,
+            ),
         }
         true
     }
@@ -4618,6 +4658,96 @@ linea 2",
             .iter()
             .any(|l| l.kind == batten::state::LineKind::User && l.plain() == "[Job sin cerrar"));
         assert!(heads(&app).is_empty());
+    }
+
+    #[test]
+    fn compaction_summary_renders_as_a_notice_not_as_user_text() {
+        use codeloom_core::agent::compact::summary_message;
+        let mut app = crush_app();
+        app.apply(LiveEvent::MessageAdded(summary_message(
+            2,
+            "resumen del tramo",
+        )));
+        assert!(!has_user_line(&app));
+        assert!(!texts(&app)
+            .iter()
+            .any(|t| t.starts_with("[Context summary")));
+        // Cabecera de CodeLoom, sin estado de A2A, y el resumen como cuerpo plegable.
+        assert_eq!(
+            heads(&app),
+            vec![(
+                "codeloom  contexto compactado (2 mensajes resumidos)".to_string(),
+                ToolStatus::Success
+            )]
+        );
+        assert!(texts(&app).iter().any(|t| t == "resumen del tramo"));
+    }
+
+    #[test]
+    fn compaction_summary_in_classic_look_keeps_the_header() {
+        use codeloom_core::agent::compact::summary_message;
+        let mut app = App::new(); // tema Batten = Classic
+        app.apply(LiveEvent::MessageAdded(summary_message(
+            2,
+            "resumen del tramo",
+        )));
+        let lines = texts(&app);
+        assert!(lines
+            .iter()
+            .any(|t| t == "contexto compactado (2 mensajes resumidos)"));
+        assert!(lines.iter().any(|t| t == "resumen del tramo"));
+        assert!(!has_user_line(&app));
+    }
+
+    #[test]
+    fn ordinary_user_message_starting_with_a_bracket_is_untouched() {
+        let mut app = crush_app();
+        app.apply(LiveEvent::MessageAdded(Message::user("[nota] hola")));
+        assert!(app
+            .transcript
+            .iter()
+            .any(|l| l.kind == batten::state::LineKind::User && l.plain() == "[nota] hola"));
+        assert!(heads(&app).is_empty());
+    }
+
+    #[test]
+    fn reloading_a_session_with_a_summary_in_the_middle_shows_a_notice() {
+        use codeloom_core::agent::compact::summary_message;
+        let mut app = crush_app();
+        app.restore_messages(vec![
+            Message::user("primera"),
+            summary_message(1, "resumen viejo"),
+            Message::user("segunda"),
+        ]);
+        let users: Vec<String> = app
+            .transcript
+            .iter()
+            .filter(|l| l.kind == batten::state::LineKind::User)
+            .map(|l| l.plain().to_string())
+            .collect();
+        assert_eq!(users, vec!["primera", "segunda"]);
+        assert_eq!(
+            heads(&app),
+            vec![(
+                "codeloom  contexto compactado (1 mensaje resumido)".to_string(),
+                ToolStatus::Success
+            )]
+        );
+        assert!(texts(&app).iter().any(|t| t == "resumen viejo"));
+    }
+
+    #[test]
+    fn restored_summary_does_not_enter_the_composer_history() {
+        use codeloom_core::agent::compact::summary_message;
+        let mut app = crush_app();
+        app.restore_messages(vec![
+            Message::user("primera"),
+            summary_message(1, "resumen viejo"),
+            Message::user("segunda"),
+        ]);
+        assert_eq!(app.history.len(), 2, "solo los dos mensajes de la persona");
+        assert_eq!(app.history.prev(""), Some("segunda"));
+        assert_eq!(app.history.prev(""), Some("primera"));
     }
 
     #[test]
