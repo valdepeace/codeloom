@@ -2,7 +2,7 @@ use crate::error::{CoreError, Result};
 use serde::Deserialize;
 use std::io::Write;
 use std::net::IpAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub mod context;
 
@@ -34,6 +34,41 @@ pub struct CodeLoomConfig {
 
 fn default_max_steps() -> usize {
     30
+}
+
+/// Sección opcional `[agents]` de `codeloom.toml`. Sin ella, todo son valores por defecto.
+/// Vive aparte de `CodeLoomConfig` para que su ausencia no afecte a la configuración principal.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct AgentsConfig {
+    /// Directorio de agentes globales. Un `~/` inicial se expande al directorio personal.
+    pub global_dir: Option<PathBuf>,
+    /// Directorio de agentes del proyecto. Una ruta relativa cuelga de la raíz del proyecto.
+    pub project_dir: Option<PathBuf>,
+    /// Aprueba todos los agentes de proyecto sin preguntar. Por defecto, desactivado.
+    pub trust_project_agents: bool,
+}
+
+/// Forma del fichero a efectos de la sección `[agents]`; el resto de claves se ignora.
+#[derive(Deserialize)]
+struct FicheroConAgentes {
+    #[serde(default)]
+    agents: AgentsConfig,
+}
+
+impl AgentsConfig {
+    /// Lee la sección `[agents]` de un texto TOML. Su ausencia da los valores por defecto.
+    pub fn from_toml(text: &str) -> Result<AgentsConfig> {
+        toml::from_str::<FicheroConAgentes>(text)
+            .map(|fichero| fichero.agents)
+            .map_err(|e| CoreError::Config(e.to_string()))
+    }
+
+    pub fn load(path: &Path) -> Result<AgentsConfig> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| CoreError::Config(format!("read {}: {e}", path.display())))?;
+        Self::from_toml(&text)
+    }
 }
 
 pub fn validate_base_url(input: &str) -> std::result::Result<(), String> {
@@ -227,5 +262,37 @@ mod tests {
         assert!(validate_base_url("http://127.0.0.1:8000/v1").is_ok());
         assert!(validate_base_url("http://api.example.test/v1").is_err());
         assert!(validate_base_url("https://user:secret@example.test/v1").is_err());
+    }
+
+    #[test]
+    fn agents_section_is_optional_in_config() {
+        let text = "model = \"gpt-4o\"\nprovider = { kind = \"openai_compat\", base_url = \"https://api.openai.com\", api_key_env = \"OPENAI_API_KEY\" }\n";
+        let agents = AgentsConfig::from_toml(text).unwrap();
+        assert_eq!(agents, AgentsConfig::default());
+        assert_eq!(agents.global_dir, None);
+        assert_eq!(agents.project_dir, None);
+        assert!(
+            !agents.trust_project_agents,
+            "por defecto no se confía en proyectos"
+        );
+    }
+
+    #[test]
+    fn agents_config_parses_dirs_and_trust_flag() {
+        let text = r#"
+            model = "gpt-4o"
+            provider = { kind = "openai_compat", base_url = "https://api.openai.com", api_key_env = "OPENAI_API_KEY" }
+            [agents]
+            global_dir = "~/mis-agentes"
+            project_dir = "config/agentes"
+            trust_project_agents = true
+        "#;
+        let agents = AgentsConfig::from_toml(text).unwrap();
+        assert_eq!(agents.global_dir, Some(PathBuf::from("~/mis-agentes")));
+        assert_eq!(agents.project_dir, Some(PathBuf::from("config/agentes")));
+        assert!(agents.trust_project_agents);
+        // La sección convive con el resto: la configuración principal sigue leyéndose igual.
+        let cfg: CodeLoomConfig = toml::from_str(text).unwrap();
+        assert_eq!(cfg.model, "gpt-4o");
     }
 }

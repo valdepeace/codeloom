@@ -38,6 +38,8 @@ pub struct AgentLoop {
     /// Prompt de sistema propio del agente (perfil). Se añade tras el contexto del proyecto;
     /// `None` o vacío no añade nada.
     system_extra: Option<String>,
+    /// Registro de agentes compartido con los subagentes; `None` deja solo el agente `default`.
+    registry: Option<Arc<crate::registry::AgentRegistry>>,
 }
 
 impl AgentLoop {
@@ -67,6 +69,7 @@ impl AgentLoop {
             subagents: None,
             catalog: Arc::new(RwLock::new(Catalog::default())),
             system_extra: None,
+            registry: None,
             cwd,
         };
         if has_subagents {
@@ -98,21 +101,34 @@ impl AgentLoop {
         self
     }
 
-    /// Lanzador de subagentes con el estado actual de este agente, catálogo incluido.
+    /// Comparte el registro de agentes con los subagentes que este agente lance. Como
+    /// `with_catalog`, reconstruye el lanzador si ya existía.
+    pub fn with_agent_registry(mut self, registry: Arc<crate::registry::AgentRegistry>) -> Self {
+        self.registry = Some(registry);
+        if self.subagents.is_some() {
+            self.subagents = Some(self.subagent_launcher());
+        }
+        self
+    }
+
+    /// Lanzador de subagentes con el estado actual de este agente, catálogo y registro incluidos.
     fn subagent_launcher(&self) -> Arc<dyn crate::subagent::SubagentLauncher> {
-        Arc::new(
-            crate::subagent::InProcessSubagentLauncher::new(
-                self.provider.clone(),
-                self.store.clone(),
-                self.tools.clone(),
-                self.permission.clone(),
-                self.config.clone(),
-                self.cwd.clone(),
-                self.jobs.clone(),
-                self.bus.clone(),
-            )
-            .with_catalog(self.catalog.clone()),
+        let lanzador = crate::subagent::InProcessSubagentLauncher::new(
+            self.provider.clone(),
+            self.store.clone(),
+            self.tools.clone(),
+            self.permission.clone(),
+            self.config.clone(),
+            self.cwd.clone(),
+            self.jobs.clone(),
+            self.bus.clone(),
         )
+        .with_catalog(self.catalog.clone());
+        let lanzador = match &self.registry {
+            Some(registro) => lanzador.with_registry(registro.clone()),
+            None => lanzador,
+        };
+        Arc::new(lanzador)
     }
 
     /// Guarda el apunte de consumo de una respuesta, con el modelo y la URL de la configuración

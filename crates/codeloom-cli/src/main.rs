@@ -4,12 +4,15 @@ use codeloom_core::agent::AgentLoop;
 use codeloom_core::catalog::{
     cache_path, fetch_raw, is_stale, read_cache, refresh, Catalog, CATALOG_URL,
 };
-use codeloom_core::config::{CodeLoomConfig, ProviderKind};
+use codeloom_core::config::{AgentsConfig, CodeLoomConfig, ProviderKind};
 use codeloom_core::event::EventBus;
 use codeloom_core::permission::{DenyAll, PermissionService};
 use codeloom_core::provider::anthropic::AnthropicProvider;
 use codeloom_core::provider::openai::OpenAiCompatProvider;
 use codeloom_core::provider::Provider;
+use codeloom_core::registry::{
+    AgentRegistry, AgentSource, BuiltInSource, FileSource, ProfileLevel, TrustStore,
+};
 use codeloom_core::session::sqlite::SqliteStore;
 use codeloom_core::session::SessionStore;
 use codeloom_core::tools::ask_user::AskUserTool;
@@ -31,6 +34,7 @@ use codeloom_herdr::{AgentState, HerdrContext};
 use codeloom_tui::app::{ProviderSettings, SessionChoice};
 use codeloom_tui::run::{SessionCommand, SessionUpdate};
 use codeloom_tui::widgets::permission::UiPermissionResponder;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokio_util::sync::CancellationToken;
@@ -148,6 +152,7 @@ async fn main() -> Result<()> {
     load_dotenv(&cwd);
     let config_path = cwd.join("codeloom.toml");
     let cfg = CodeLoomConfig::load(&config_path)?;
+    let agents_cfg = AgentsConfig::load(&config_path)?;
     let cwd_label = cwd.display().to_string();
     let model_label = cfg.model.clone();
     let provider = build_provider(&cfg)?;
@@ -166,6 +171,10 @@ async fn main() -> Result<()> {
 
     let bus = EventBus::new(1024);
     let bus_rx = bus.subscribe();
+    let arranque = arrancar_agentes(dirs::home_dir().as_deref(), &cwd, &agents_cfg);
+    let registro_agentes = Arc::new(arranque.registro);
+    // La vigilancia dura lo que `main`: al soltar el `WatcherHandle` se detiene.
+    let _vigilancia_agentes = registro_agentes.spawn_watcher(arranque.directorios, bus.clone());
     let (perm_tx, perm_rx) = tokio::sync::mpsc::channel(8);
     let (ask_tx, ask_rx) = tokio::sync::mpsc::channel(4);
     let permission = Arc::new(if cli.print.is_some() {
@@ -193,7 +202,8 @@ async fn main() -> Result<()> {
             cfg.clone(),
             cwd,
         )
-        .with_catalog(catalog.clone()),
+        .with_catalog(catalog.clone())
+        .with_agent_registry(registro_agentes.clone()),
     );
 
     if let Some(prompt) = cli.print {
@@ -386,6 +396,69 @@ fn load_dotenv(dir: &std::path::Path) {
     let _ = dotenvy::from_path(dir.join(".env"));
 }
 
+/// Registro de agentes y directorios que vigila, tal como quedan al arrancar.
+struct ArranqueAgentes {
+    registro: AgentRegistry,
+    directorios: Vec<PathBuf>,
+}
+
+/// Construye el registro con `default` integrado, la fuente global y la de proyecto, de menor
+/// a mayor precedencia. Sin `home` no hay fuente global ni almacén de aprobaciones: los agentes
+/// de proyecto quedan pendientes y nunca se guarda una aprobación dentro del repositorio.
+fn arrancar_agentes(home: Option<&Path>, raiz: &Path, agents: &AgentsConfig) -> ArranqueAgentes {
+    let global = match &agents.global_dir {
+        Some(ruta) => resolver_ruta(ruta, home, raiz),
+        None => home.map(|h| h.join(".agents").join("agents")),
+    };
+    let proyecto = match &agents.project_dir {
+        Some(ruta) => resolver_ruta(ruta, home, raiz),
+        None => Some(raiz.join(".agents").join("agents")),
+    };
+    let mut fuentes: Vec<Box<dyn AgentSource>> = vec![Box::new(BuiltInSource)];
+    let mut directorios = Vec::new();
+    if let Some(dir) = global {
+        directorios.push(dir.clone());
+        fuentes.push(Box::new(FileSource::new(dir, ProfileLevel::Global)));
+    }
+    if let Some(dir) = proyecto {
+        directorios.push(dir.clone());
+        fuentes.push(Box::new(FileSource::new(dir, ProfileLevel::Project)));
+    }
+    let mut registro = AgentRegistry::new(fuentes);
+    if let Some(home) = home {
+        match TrustStore::open(home.join(".codeloom")) {
+            Ok(almacen) => {
+                registro =
+                    registro.with_trust(almacen, raiz.to_path_buf(), agents.trust_project_agents);
+            }
+            Err(error) => {
+                eprintln!("codeloom: almacén de aprobaciones de agentes no disponible: {error}");
+            }
+        }
+    }
+    ArranqueAgentes {
+        registro,
+        directorios,
+    }
+}
+
+/// Resuelve una ruta de `[agents]`: un `~/` inicial va al directorio personal y una ruta
+/// relativa cuelga de la raíz del proyecto. `None` si depende de un home que no existe.
+fn resolver_ruta(ruta: &Path, home: Option<&Path>, raiz: &Path) -> Option<PathBuf> {
+    let texto = ruta.to_string_lossy();
+    if let Some(resto) = texto
+        .strip_prefix("~/")
+        .or_else(|| texto.strip_prefix("~\\"))
+    {
+        return home.map(|h| h.join(resto));
+    }
+    if ruta.is_absolute() {
+        Some(ruta.to_path_buf())
+    } else {
+        Some(raiz.join(ruta))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,5 +515,72 @@ mod tests {
         };
         let updated = config_from_provider_settings(settings, &current).unwrap();
         assert_eq!(updated.effort.as_deref(), Some("high"));
+    }
+
+    use codeloom_core::registry::Approval;
+
+    fn perfil_de_prueba(nombre: &str) -> String {
+        format!("---\nname: {nombre}\ndescription: Agente de prueba\n---\n\nCuerpo.\n")
+    }
+
+    #[test]
+    fn startup_without_home_directory_does_not_panic() {
+        let proyecto = tempfile::tempdir().unwrap();
+        let agentes_dir = proyecto.path().join(".agents").join("agents");
+        std::fs::create_dir_all(&agentes_dir).unwrap();
+        std::fs::write(agentes_dir.join("revisor.md"), perfil_de_prueba("revisor")).unwrap();
+
+        let arranque = arrancar_agentes(None, proyecto.path(), &AgentsConfig::default());
+
+        // Sin home: ni fuente global ni vigilancia global, y el proyecto se sigue leyendo.
+        assert_eq!(arranque.directorios, vec![agentes_dir]);
+        let instantanea = arranque.registro.snapshot();
+        assert!(instantanea.get("default").is_some());
+        assert!(instantanea.get("revisor").is_some());
+        // Sin home no hay almacén de aprobaciones: el agente de proyecto queda pendiente.
+        assert_eq!(instantanea.approval("revisor"), Some(Approval::Pending));
+    }
+
+    #[test]
+    fn startup_with_home_reads_global_and_project_agents() {
+        let home = tempfile::tempdir().unwrap();
+        let proyecto = tempfile::tempdir().unwrap();
+        let global_dir = home.path().join(".agents").join("agents");
+        std::fs::create_dir_all(&global_dir).unwrap();
+        std::fs::write(global_dir.join("global.md"), perfil_de_prueba("global")).unwrap();
+        let proyecto_dir = proyecto.path().join(".agents").join("agents");
+        std::fs::create_dir_all(&proyecto_dir).unwrap();
+        std::fs::write(proyecto_dir.join("local.md"), perfil_de_prueba("local")).unwrap();
+
+        let arranque =
+            arrancar_agentes(Some(home.path()), proyecto.path(), &AgentsConfig::default());
+
+        assert_eq!(arranque.directorios, vec![global_dir, proyecto_dir]);
+        let instantanea = arranque.registro.snapshot();
+        assert_eq!(instantanea.approval("global"), Some(Approval::NotRequired));
+        assert_eq!(instantanea.approval("local"), Some(Approval::Pending));
+        // El almacén de aprobaciones vive en el directorio de datos del usuario, nunca en el proyecto.
+        assert!(home.path().join(".codeloom").is_dir());
+    }
+
+    #[test]
+    fn agents_config_overrides_the_default_directories() {
+        let home = tempfile::tempdir().unwrap();
+        let proyecto = tempfile::tempdir().unwrap();
+        let agents = AgentsConfig {
+            global_dir: Some(PathBuf::from("~/mis-agentes")),
+            project_dir: Some(PathBuf::from("config/agentes")),
+            trust_project_agents: true,
+        };
+
+        let arranque = arrancar_agentes(Some(home.path()), proyecto.path(), &agents);
+
+        assert_eq!(
+            arranque.directorios,
+            vec![
+                home.path().join("mis-agentes"),
+                proyecto.path().join("config").join("agentes"),
+            ]
+        );
     }
 }
