@@ -21,6 +21,7 @@ bytes = "1"
 glob = "0.3"
 regex = "1"
 ignore = "0.4"
+serde_yaml_bw = "2.5.8"
 
 [dev-dependencies]
 tempfile = "3"
