@@ -77,5 +77,3 @@ fichero saneado (sin `..` ni separadores).
 
 Estado en la spec; decálogo: reglas 3, 4, 5 (parcial) y 8; comparativa enlazada.
 
-
-Estado en la spec; decálogo: reglas 5 (parcial: limpieza hecha, resumen pendiente), 3 y 8 (hechas).
