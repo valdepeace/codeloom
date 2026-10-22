@@ -203,7 +203,7 @@ Implementado en los ocho commits de A13, en orden cronológico:
 ### Limitaciones reales
 
 - `scope`, `delegation`, `transport` y `a2a` se leen y se declaran, pero no se aplican. Un perfil que los declara recibe el aviso «declarado y no aplicado». `max_depth` tampoco se aplica, y se lee sin aviso.
-- **Sin diálogo de aprobación en la interfaz.** Hoy un agente de proyecto solo se usa con `trust_project_agents = true` o aprobándolo por API.
+- **Aprobación desde la interfaz (añadida después del cierre inicial).** El comando `/agents` abre un popup con la lista del registro; bajo ella se muestran el origen y el prompt del agente seleccionado, y las teclas `a` y `r` aprueban o revocan (`AgentRegistry::approve` y `revoke`, que toman la huella de la instantánea vigente). Commits `94a81dd` y `05a4632`. Limitaciones: el popup copia la instantánea al abrirse y las filas solo se refrescan al aprobar o revocar, no con una recarga en caliente; los problemas de carga se cuentan pero no se detallan; no hay confirmación de segunda pulsación al aprobar.
 - `AgentRegistryChanged` se emite, pero la TUI lo recibe y no lo muestra.
 - **Sin fuente remota** (A8). `Execution::Remote` existe y `start` lo rechaza con «agente remoto no disponible».
 - **Sin edición desde la TUI.** Los ficheros se editan a mano o con cualquier editor.
@@ -239,4 +239,4 @@ La herramienta `subagent` acepta `prompt` (obligatorio) y `agent` (opcional: nom
 {"prompt": "Revisa el manejo de errores de crates/codeloom-core/src/registry/trust.rs", "agent": "rust"}
 ```
 
-Los perfiles de proyecto viven en `.agents/agents/` de la raíz del repositorio. Un perfil de proyecto solo se usa si `trust_project_agents = true` o si se ha aprobado por API; en otro caso, `start` lo rechaza con «pendiente de aprobación».
+Los perfiles de proyecto viven en `.agents/agents/` de la raíz del repositorio. Un perfil de proyecto solo se usa si `trust_project_agents = true` o si se ha aprobado (con `a` en el popup de `/agents`, o por API); en otro caso, `start` lo rechaza con «pendiente de aprobación».

@@ -177,8 +177,8 @@ después el transporte (A7, A8).
   - **Abierto:**
     - **A12 sigue pendiente.** `subagent` acepta el argumento `agent`, pero nada elige el
       agente por la tarea: quien llama lo nombra.
-    - Sin diálogo de aprobación en la interfaz. Un agente de proyecto solo se usa con
-      `trust_project_agents = true` o aprobándolo por API.
+    - La aprobación ya se hace desde el popup de `/agents` (`a`/`r`); quedan sin detallar
+      los problemas de carga y el popup no se refresca con la recarga en caliente.
     - `AgentRegistryChanged` se emite, pero la TUI no lo muestra.
     - Sin fuente remota (A8) ni edición desde la TUI.
     - `scope`, `delegation`, `transport` y `a2a` se leen y no se aplican; `max_depth` tampoco.
