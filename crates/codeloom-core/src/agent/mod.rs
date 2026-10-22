@@ -586,6 +586,7 @@ impl AgentLoop {
         // Un flujo que acaba en error o sin `Done` ha podido quedarse a medias: un resumen
         // truncado por un fallo se descarta en lugar de presentarse como bueno.
         let mut cierre: Option<FinishReason> = None;
+        let mut uso: Option<Usage> = None;
         loop {
             let chunk = tokio::select! {
                 _ = cancel.cancelled() => return Ok(false),
@@ -593,6 +594,18 @@ impl AgentLoop {
             };
             match chunk {
                 Some(StreamChunk::TextDelta(t)) => recogido.push_str(&t),
+                Some(StreamChunk::Usage(parcial)) => {
+                    let total = uso.get_or_insert(Usage {
+                        input_tokens: 0,
+                        output_tokens: 0,
+                    });
+                    total.input_tokens = total.input_tokens.saturating_add(parcial.input_tokens);
+                    total.output_tokens = total.output_tokens.saturating_add(parcial.output_tokens);
+                    self.bus.publish(LiveEvent::Usage {
+                        input_tokens: parcial.input_tokens,
+                        output_tokens: parcial.output_tokens,
+                    });
+                }
                 Some(StreamChunk::Done(razon)) => {
                     cierre = Some(razon);
                     break;
@@ -600,6 +613,11 @@ impl AgentLoop {
                 None => break,
                 Some(_) => {}
             }
+        }
+        // La llamada de resumen cuesta lo mismo que cualquier otra, se acepte el resumen o no:
+        // el consumo se apunta siempre para que el coste de compactar sea visible.
+        if let Some(total) = &uso {
+            self.record_usage(session, total).await;
         }
         if cancel.is_cancelled() {
             return Ok(false);
@@ -1989,6 +2007,8 @@ Cuerpo.
         texto: String,
         /// Cierre del flujo: `None` simula un flujo que se corta sin `Done`.
         cierre: Mutex<Option<FinishReason>>,
+        /// Consumo que el proveedor declara en la respuesta, si lo declara.
+        uso: Option<Usage>,
         seen: Mutex<Vec<ProviderRequest>>,
     }
 
@@ -2008,6 +2028,9 @@ Cuerpo.
         ) -> Result<ProviderStream> {
             self.seen.lock().unwrap().push(req);
             let mut chunks = vec![StreamChunk::TextDelta(self.texto.clone())];
+            if let Some(uso) = &self.uso {
+                chunks.push(StreamChunk::Usage(uso.clone()));
+            }
             if let Some(razon) = *self.cierre.lock().unwrap() {
                 chunks.push(StreamChunk::Done(razon));
             }
@@ -2040,6 +2063,10 @@ Cuerpo.
         let proveedor = Arc::new(SummaryProvider {
             texto: texto.to_string(),
             cierre: Mutex::new(Some(FinishReason::Stop)),
+            uso: Some(Usage {
+                input_tokens: 700,
+                output_tokens: 90,
+            }),
             seen: Mutex::new(Vec::new()),
         });
         let bus = EventBus::new(64);
@@ -2158,6 +2185,34 @@ Cuerpo.
                 antes.len(),
                 "no se persiste un resumen truncado ({cierre:?})"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_records_the_usage_of_the_summary_call_even_if_it_is_discarded() {
+        for cierre in [Some(FinishReason::Stop), Some(FinishReason::Error)] {
+            let e = entorno_de_resumen("resumen", &historial_grande(100)).await;
+            *e.proveedor.cierre.lock().unwrap() = cierre;
+            let antes = e.store.messages(e.sid).await.unwrap();
+            let mut rx = e.bus.subscribe();
+            let cancel = CancellationToken::new();
+            e.agente.compact(e.sid, &antes, 0, &cancel).await.unwrap();
+
+            let apuntes = e.store.session_usage(e.sid).await.unwrap();
+            assert_eq!(apuntes.len(), 1, "un apunte por la llamada ({cierre:?})");
+            assert_eq!(apuntes[0].input_tokens, 700);
+            assert_eq!(apuntes[0].output_tokens, 90);
+            let mut visto = false;
+            while let Ok(evento) = rx.try_recv() {
+                visto |= matches!(
+                    evento,
+                    LiveEvent::Usage {
+                        input_tokens: 700,
+                        output_tokens: 90
+                    }
+                );
+            }
+            assert!(visto, "el consumo también llega a los contadores en vivo");
         }
     }
 
