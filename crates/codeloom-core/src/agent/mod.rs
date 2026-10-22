@@ -1,4 +1,5 @@
 pub mod changes;
+mod clear;
 pub mod dispatch;
 pub mod stop;
 
@@ -295,7 +296,7 @@ impl AgentLoop {
             let req = ProviderRequest {
                 model: config.model.clone(),
                 system: system.clone(),
-                messages: history.clone(),
+                messages: clear::clear_old_tool_results(&history, clear::KEEP_TOOL_RESULTS),
                 tools: self.tools.specs(),
                 temperature: 0.0,
                 max_tokens: 4096,
@@ -1570,5 +1571,126 @@ Cuerpo.
             "el modelo debe recibir la regla configurada: {}",
             vistos[0]
         );
+    }
+
+    /// Proveedor que guarda el historial de cada petición recibida.
+    struct HistorySpy {
+        seen: Mutex<Vec<Vec<crate::message::Message>>>,
+    }
+
+    #[async_trait]
+    impl Provider for HistorySpy {
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                tool_use: false,
+                reasoning: false,
+                streaming: true,
+            }
+        }
+        async fn stream(
+            &self,
+            req: ProviderRequest,
+            _cancel: CancellationToken,
+        ) -> Result<ProviderStream> {
+            self.seen.lock().unwrap().push(req.messages);
+            Ok(Box::pin(futures::stream::iter(vec![StreamChunk::Done(
+                FinishReason::Stop,
+            )])))
+        }
+    }
+
+    #[tokio::test]
+    async fn request_clears_old_tool_results_but_store_keeps_them() {
+        let provider = Arc::new(HistorySpy {
+            seen: Mutex::new(Vec::new()),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SqliteStore::open(dir.path().join("c.db").to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+        let sid = store.create_session("/p").await.unwrap();
+        for i in 0..10 {
+            let call_id = format!("c{i}");
+            store
+                .append_message(
+                    sid,
+                    // El input varía en cada llamada: con firmas iguales, `should_stop` cortaría el turno.
+                    &Message::assistant(vec![ContentPart::ToolCall {
+                        id: call_id.clone(),
+                        name: "noop".into(),
+                        input: serde_json::json!({ "i": i }),
+                    }]),
+                )
+                .await
+                .unwrap();
+            store
+                .append_message(
+                    sid,
+                    &Message::new(
+                        Role::Tool,
+                        vec![ContentPart::ToolResult {
+                            call_id,
+                            content: "x".repeat(1000),
+                            is_error: false,
+                        }],
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+
+        let cfg = CodeLoomConfig {
+            provider: crate::config::ProviderConfig {
+                kind: crate::config::ProviderKind::OpenAiCompat,
+                base_url: "http://x".into(),
+                api_key_env: "K".into(),
+            },
+            model: "m".into(),
+            max_steps: 5,
+            effort: None,
+        };
+        let agent = AgentLoop::new(
+            provider.clone(),
+            store.clone(),
+            Arc::new(ToolRegistry::new()),
+            EventBus::new(64),
+            Arc::new(PermissionService::allow_all()),
+            cfg,
+            dir.path().to_path_buf(),
+        );
+        agent
+            .run(sid, "hi".into(), CancellationToken::new())
+            .await
+            .unwrap();
+
+        let contents_of = |messages: &[Message]| -> Vec<String> {
+            messages
+                .iter()
+                .flat_map(|m| m.parts.iter())
+                .filter_map(|p| match p {
+                    ContentPart::ToolResult { content, .. } => Some(content.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        let seen = provider.seen.lock().unwrap();
+        let sent = contents_of(&seen[0]);
+        assert_eq!(sent.len(), 10);
+        for content in &sent[..4] {
+            assert_eq!(
+                content,
+                "[tool result cleared: 1000 bytes; run the tool again if you need it]"
+            );
+        }
+        for content in &sent[4..] {
+            assert_eq!(content.len(), 1000);
+        }
+
+        let stored = contents_of(&store.messages(sid).await.unwrap());
+        assert_eq!(stored.len(), 10);
+        assert!(stored.iter().all(|c| c.len() == 1000));
     }
 }
