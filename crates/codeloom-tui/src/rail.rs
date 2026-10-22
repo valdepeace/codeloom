@@ -2,9 +2,9 @@
 //! jobs y subagentes de la sesión abierta.
 
 use crate::app::{AgentStats, App, Focus};
-use batten::state::ToolStatus;
+use batten::state::{AgentState, ToolStatus};
 use codeloom_core::job::JobStatus;
-use codeloom_core::session::SubagentStatus;
+use codeloom_core::task::{subagent_task_state, TaskState};
 use codeloom_core::todo::TodoStatus;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -202,31 +202,35 @@ fn rail_lines(app: &App, width: usize) -> Vec<Line<'_>> {
         // Un único `Instant::now()` por dibujado: el tiempo transcurrido de todos los hijos.
         let ahora = Instant::now();
         for subagent in subagents().take(SUBAGENT_LIMIT) {
-            let style = match subagent.status {
-                SubagentStatus::Running => app.theme.styles.tool_running,
-                SubagentStatus::Completed => app.theme.styles.tool_success,
-                SubagentStatus::Failed => app.theme.styles.tool_error,
-                SubagentStatus::Killed | SubagentStatus::Interrupted => {
-                    app.theme.styles.tool_canceled
-                }
-            };
-            // Con el foco en el rail, el hijo elegido con ↑/↓ lleva `›` de acento en vez de `●`.
-            // Ambos glifos ocupan dos columnas, así que la línea no cambia de anchura.
+            // El estado visual sale de la proyección del núcleo, que ya tiene en cuenta
+            // si el hijo espera a su padre.
+            let espera = app.awaiting_input.contains(&subagent.child.0);
+            let estado = agent_state(subagent_task_state(subagent.status, espera));
+            // Con el foco en el rail, el hijo elegido con ↑/↓ lleva `›` de acento en vez del glifo.
+            // El glifo y el `›` ocupan una columna más el espacio, así que la línea no cambia de anchura.
             let seleccionado =
                 app.focus == Focus::Rail && app.rail_selected == Some(subagent.child.0);
-            let mut line = if seleccionado {
+            let line = if seleccionado {
+                // El `›` sustituye al glifo, de modo que una espera del hijo se conserva
+                // tiñéndolo con el color de aviso en lugar del acento.
+                let marca = if estado == AgentState::InputRequired {
+                    app.theme.styles.warning
+                } else {
+                    app.theme.styles.accent
+                };
                 Line::from(vec![
-                    Span::styled("› ", app.theme.styles.accent),
+                    Span::styled("› ", marca),
                     Span::raw(subagent.label.as_str()),
                 ])
             } else {
-                glyph_line(subagent.label.as_str(), style)
+                Line::from(vec![
+                    Span::styled(
+                        format!("{} ", estado.glyph()),
+                        estado.style(&app.theme.styles),
+                    ),
+                    Span::raw(subagent.label.as_str()),
+                ])
             };
-            // Marca de espera: un «?» de acento tras la etiqueta. Solo una consulta al conjunto.
-            if app.awaiting_input.contains(&subagent.child.0) {
-                line.spans
-                    .push(Span::styled(" ?", app.theme.styles.warning));
-            }
             out.push(line);
             // Segunda línea tenue con las métricas, solo si el hijo tiene estadísticas.
             if let Some(stats) = app.agent_stats.get(&subagent.child.0) {
@@ -245,6 +249,21 @@ fn rail_lines(app: &App, width: usize) -> Vec<Line<'_>> {
     }
 
     out
+}
+
+/// Proyección de un estado de tarea de A2A al estado visual del rail. El `match`
+/// es exhaustivo y sin comodín: un estado nuevo del núcleo obliga a decidir su glifo.
+fn agent_state(state: TaskState) -> AgentState {
+    match state {
+        TaskState::Submitted => AgentState::Submitted,
+        TaskState::Working => AgentState::Working,
+        TaskState::InputRequired => AgentState::InputRequired,
+        TaskState::AuthRequired => AgentState::AuthRequired,
+        TaskState::Completed => AgentState::Completed,
+        TaskState::Failed => AgentState::Failed,
+        TaskState::Canceled => AgentState::Canceled,
+        TaskState::Rejected => AgentState::Rejected,
+    }
 }
 
 /// Título de sección: acento en negrita.
@@ -472,7 +491,7 @@ fn tool_style(status: ToolStatus, app: &App) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codeloom_core::session::{SessionId, SubagentDescriptor, UsageRecord};
+    use codeloom_core::session::{SessionId, SubagentDescriptor, SubagentStatus, UsageRecord};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -519,10 +538,10 @@ mod tests {
             .find(|row| row.contains("tests"))
             .expect("el rail lista el subagente tests");
         assert!(
-            review.contains(" ?"),
-            "falta la marca de espera: {review:?}"
+            review.contains("? review"),
+            "falta el glifo de espera: {review:?}"
         );
-        assert!(!tests.contains(" ?"), "marca de espera de más: {tests:?}");
+        assert!(!tests.contains('?'), "glifo de espera de más: {tests:?}");
     }
 
     /// Estadísticas de un hijo con paso, herramienta y tokens; `started` fija el arranque.
@@ -1129,5 +1148,138 @@ mod tests {
             .expect("la línea de coste aparece también en un rail estrecho");
         assert_eq!(fila.chars().count(), 12, "la fila ocupa el ancho del rail");
         assert!(fila.contains('…'), "la línea no se recorta: {fila:?}");
+    }
+
+    #[test]
+    fn rail_shows_input_required_glyph_for_waiting_running_child() {
+        let mut app = App::new();
+        app.session_id = Some(SessionId(1));
+        app.subagents.insert(9, running(9, "review"));
+        app.subagents.insert(10, running(10, "tests"));
+        app.awaiting_input.insert(9);
+
+        let rows = rows_of(&app, 40, 24);
+        assert!(
+            rows.iter().any(|row| row.contains("? review")),
+            "falta el glifo input-required del hijo en espera: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("● tests")),
+            "el hijo sin espera debe pintarse como working: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn rail_shows_failed_glyph_for_interrupted_child() {
+        let mut app = App::new();
+        app.session_id = Some(SessionId(1));
+        app.subagents.insert(
+            9,
+            SubagentDescriptor {
+                status: SubagentStatus::Interrupted,
+                ..running(9, "review")
+            },
+        );
+
+        let rows = rows_of(&app, 40, 24);
+        assert!(
+            rows.iter().any(|row| row.contains("✗ review")),
+            "un hijo interrumpido debe verse como failed: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn rail_ignores_awaiting_input_for_finished_child() {
+        let mut app = App::new();
+        app.session_id = Some(SessionId(1));
+        app.subagents.insert(
+            9,
+            SubagentDescriptor {
+                status: SubagentStatus::Completed,
+                ..running(9, "review")
+            },
+        );
+        app.awaiting_input.insert(9);
+
+        let rows = rows_of(&app, 40, 24);
+        let fila = rows
+            .iter()
+            .find(|row| row.contains("review"))
+            .expect("el rail lista review");
+        assert!(
+            fila.contains("✓ review"),
+            "un hijo terminado debe verse como completed: {fila:?}"
+        );
+        assert!(
+            !fila.contains('?'),
+            "espera residual en un hijo terminado: {fila:?}"
+        );
+    }
+
+    #[test]
+    fn task_state_projection_covers_every_state() {
+        use codeloom_core::task::TaskState;
+        // Submitted, AuthRequired y Rejected no tienen productor hoy: se construyen a mano.
+        let pares = [
+            (TaskState::Submitted, AgentState::Submitted),
+            (TaskState::Working, AgentState::Working),
+            (TaskState::InputRequired, AgentState::InputRequired),
+            (TaskState::AuthRequired, AgentState::AuthRequired),
+            (TaskState::Completed, AgentState::Completed),
+            (TaskState::Failed, AgentState::Failed),
+            (TaskState::Canceled, AgentState::Canceled),
+            (TaskState::Rejected, AgentState::Rejected),
+        ];
+        for (tarea, esperado) in pares {
+            assert_eq!(agent_state(tarea), esperado, "proyección de {tarea:?}");
+        }
+    }
+
+    #[test]
+    fn rail_selected_child_keeps_arrow_marker() {
+        let mut app = App::new();
+        app.session_id = Some(SessionId(1));
+        app.subagents.insert(9, running(9, "review"));
+        app.subagents.insert(10, running(10, "tests"));
+        app.rail_selected = Some(9);
+        app.awaiting_input.insert(9);
+        app.focus = crate::app::Focus::Rail;
+
+        let rows = rows_of(&app, 40, 24);
+        assert!(
+            rows.iter().any(|row| row.contains("› review")),
+            "el hijo elegido con foco en el rail debe llevar ›: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains("? review")),
+            "el › sustituye al glifo del hijo elegido: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("● tests")),
+            "el hijo no elegido conserva su glifo: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn selected_child_marker_is_tinted_when_waiting_for_input() {
+        let mut app = App::new();
+        app.session_id = Some(SessionId(1));
+        app.subagents.insert(9, running(9, "review"));
+        app.subagents.insert(10, running(10, "tests"));
+        app.focus = crate::app::Focus::Rail;
+        app.rail_selected = Some(9);
+        app.awaiting_input.insert(9);
+        let marca = |app: &App, etiqueta: &str| {
+            rail_lines(app, 40)
+                .into_iter()
+                .find(|line| line.spans.iter().any(|s| s.content == etiqueta))
+                .and_then(|line| line.spans.first().map(|s| s.style))
+                .expect("la línea del hijo existe")
+        };
+        assert_eq!(marca(&app, "review"), app.theme.styles.warning);
+
+        // Sin espera, el marcador vuelve al acento.
+        app.awaiting_input.clear();
+        assert_eq!(marca(&app, "review"), app.theme.styles.accent);
     }
 }

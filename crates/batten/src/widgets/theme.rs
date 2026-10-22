@@ -1,6 +1,6 @@
 //! Tema: tokens semánticos, glifos y carga desde `theme.toml` parcial.
 
-use crate::state::StyleToken;
+use crate::state::{AgentState, StyleToken};
 use ratatui::style::{Color, Modifier, Style};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -115,6 +115,21 @@ impl Default for Styles {
             code: Style::default().fg(Color::Indexed(180)),
             strong: Style::default().add_modifier(Modifier::BOLD),
             emphasis: Style::default().add_modifier(Modifier::ITALIC),
+        }
+    }
+}
+
+impl AgentState {
+    /// Estilo del estado a partir de los tokens del tema. `InputRequired` y
+    /// `AuthRequired` comparten el aviso porque ambos esperan a un actor externo.
+    pub fn style(self, styles: &Styles) -> Style {
+        match self {
+            Self::Submitted => styles.muted,
+            Self::Working => styles.tool_running,
+            Self::InputRequired | Self::AuthRequired => styles.warning,
+            Self::Completed => styles.tool_success,
+            Self::Failed | Self::Rejected => styles.tool_error,
+            Self::Canceled => styles.tool_canceled,
         }
     }
 }
@@ -861,5 +876,18 @@ mod tests {
         assert_eq!(th.style(StyleToken::ToolPath).fg, Some(Color::Magenta));
         assert_eq!(th.style(StyleToken::ToolCount).fg, Some(Color::Green));
         assert!(th.extensions.is_empty());
+    }
+
+    #[test]
+    fn agent_state_style_maps_each_state() {
+        let st = Theme::test().styles;
+        assert_eq!(AgentState::Submitted.style(&st), st.muted);
+        assert_eq!(AgentState::Working.style(&st), st.tool_running);
+        assert_eq!(AgentState::InputRequired.style(&st), st.warning);
+        assert_eq!(AgentState::AuthRequired.style(&st), st.warning);
+        assert_eq!(AgentState::Completed.style(&st), st.tool_success);
+        assert_eq!(AgentState::Failed.style(&st), st.tool_error);
+        assert_eq!(AgentState::Canceled.style(&st), st.tool_canceled);
+        assert_eq!(AgentState::Rejected.style(&st), st.tool_error);
     }
 }

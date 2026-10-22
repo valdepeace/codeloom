@@ -1,6 +1,7 @@
 //! Estado puro: sin ratatui, sin crossterm.
 
 pub mod activity_lines;
+pub mod agent_state;
 pub mod composer;
 pub mod composer_layout;
 pub mod diff;
@@ -25,6 +26,7 @@ pub mod transcript;
 pub mod viewport;
 
 pub use activity_lines::{activity_lines, ActivityView};
+pub use agent_state::AgentState;
 pub use composer::Composer;
 pub use composer_layout::{layout as composer_layout, ComposerLayout, VisualRow};
 pub use diff::{Diff, DiffKind, DiffLine};
