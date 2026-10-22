@@ -335,6 +335,44 @@ pub struct AgentStats {
     pub finished_at: Option<Instant>,
 }
 
+/// Número máximo de elementos que se conservan en el registro de un hijo. Al superarlo
+/// se descarta el más antiguo, de modo que la memoria no crece con un hijo muy verboso.
+pub const MAX_CHILD_ITEMS: usize = 200;
+
+/// Longitud máxima, en caracteres, del texto de un mensaje del hijo en su registro.
+const MAX_CHILD_TEXT: usize = 240;
+
+/// Longitud máxima, en caracteres, del resumen de una llamada a herramienta del hijo.
+const MAX_CHILD_SUMMARY: usize = 80;
+
+/// Elemento del registro de un hijo: un texto del asistente o una llamada a herramienta.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChildItem {
+    /// Texto del asistente del hijo, recortado a `MAX_CHILD_TEXT` caracteres.
+    Text(String),
+    /// Llamada a herramienta del hijo. `status` pasa de `Running` a `Success` o `Error`
+    /// cuando llega su resultado.
+    Tool {
+        call_id: String,
+        name: String,
+        summary: Option<String>,
+        status: batten::state::ToolStatus,
+    },
+}
+
+/// Registro acotado de lo que dice y hace un hijo. Se alimenta de los `ChildEvent` y,
+/// como `AgentStats`, no se persiste: al cambiar de sesión desaparece.
+#[derive(Debug, Clone, Default)]
+pub struct ChildLog {
+    pub items: VecDeque<ChildItem>,
+}
+
+/// Recorta `texto` a `maximo` caracteres. Cuenta caracteres, no bytes, de modo que no
+/// parte ningún carácter multibyte.
+fn recortar(texto: &str, maximo: usize) -> String {
+    texto.chars().take(maximo).collect()
+}
+
 /// Una fila del popup de agentes: lo que se muestra de un agente del registro.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentRow {
@@ -427,6 +465,9 @@ pub struct App {
     /// Métricas de los hijos de la sesión abierta, por id interno del hijo. Solo
     /// contiene hijos de esa sesión: se filtra al recibir y se limpia al cargarla.
     pub agent_stats: HashMap<i64, AgentStats>,
+    /// Registro acotado de cada hijo de la sesión abierta, por id interno del hijo. Se
+    /// alimenta de los mismos `ChildEvent` que `agent_stats` y se limpia al cargar otra sesión.
+    pub child_logs: HashMap<i64, ChildLog>,
     /// Subagente resaltado en el rail (clave de `subagents`), si hay. Solo se mueve
     /// con el foco en el rail y se descarta si el hijo deja de existir.
     pub rail_selected: Option<i64>,
@@ -673,6 +714,7 @@ impl App {
             jobs: BTreeMap::new(),
             subagents: BTreeMap::new(),
             agent_stats: HashMap::new(),
+            child_logs: HashMap::new(),
             rail_selected: None,
             parent_stack: Vec::new(),
             nav_keep_stack: false,
@@ -1452,6 +1494,7 @@ impl App {
         self.rail_selected = None;
         self.subagents.clear();
         self.agent_stats.clear();
+        self.child_logs.clear();
         // Los apuntes son de la sesión anterior; la carga posterior repone los de esta.
         self.usage_records.clear();
         self.session_selected = 0;
@@ -2136,15 +2179,18 @@ impl App {
             .insert(path.to_string(), (added, removed));
     }
 
-    /// Actualiza las métricas de un hijo de la sesión abierta. Solo toca `agent_stats`:
-    /// el turno, el transcript y los contadores del padre quedan intactos.
+    /// Actualiza las métricas y el registro de un hijo de la sesión abierta. Solo toca
+    /// `agent_stats` y `child_logs`: el turno, el transcript y los contadores del padre
+    /// quedan intactos.
     fn apply_child_event(&mut self, child: SessionId, event: LiveEvent) {
         // Los eventos que no se reenvían no crean métricas.
         if !event.is_child_relevant() {
             return;
         }
-        // Los mensajes del hijo aún no alimentan ningún registro: se ignoran sin crear métricas.
-        if matches!(event, LiveEvent::MessageAdded(_)) {
+        // Los mensajes del hijo alimentan su registro, pero no crean métricas: el registro
+        // es independiente de `agent_stats`.
+        if let LiveEvent::MessageAdded(message) = event {
+            self.record_child_message(child.0, message);
             return;
         }
         // Un fichero editado por el hijo se anota en su sesión, sin tocar el panel del padre
@@ -2157,6 +2203,11 @@ impl App {
         {
             self.record_file(child.0, &path, added, removed);
             return;
+        }
+        // El fin de una herramienta del hijo cierra su elemento en el registro; las métricas
+        // siguen su curso habitual más abajo.
+        if let LiveEvent::ToolFinished { call_id, is_error } = &event {
+            self.finish_child_tool(child.0, call_id, *is_error);
         }
         let now = Instant::now();
         let stats = self
@@ -2193,6 +2244,77 @@ impl App {
                 stats.tool = None;
             }
             _ => {}
+        }
+    }
+
+    /// Anota en el registro de `child` un mensaje completo. Del asistente se registran sus
+    /// textos y sus llamadas a herramienta; los resultados de herramienta, de cualquier rol,
+    /// cierran la llamada correspondiente. Los textos del usuario no se registran.
+    fn record_child_message(&mut self, child: i64, message: Message) {
+        let asistente = message.role == Role::Assistant;
+        for part in message.parts {
+            match part {
+                ContentPart::Text { text } if asistente => {
+                    let texto = text.trim();
+                    if !texto.is_empty() {
+                        let recortado = recortar(texto, MAX_CHILD_TEXT);
+                        self.push_child_item(child, ChildItem::Text(recortado));
+                    }
+                }
+                ContentPart::ToolCall { id, name, input } if asistente => {
+                    let summary = tool_facts(&name, &input)
+                        .primary
+                        .map(|primary| recortar(&primary, MAX_CHILD_SUMMARY));
+                    self.push_child_item(
+                        child,
+                        ChildItem::Tool {
+                            call_id: id,
+                            name,
+                            summary,
+                            status: batten::state::ToolStatus::Running,
+                        },
+                    );
+                }
+                ContentPart::ToolResult {
+                    call_id, is_error, ..
+                } => self.finish_child_tool(child, &call_id, is_error),
+                _ => {}
+            }
+        }
+    }
+
+    /// Añade `item` al final del registro de `child` y descarta los más antiguos hasta
+    /// respetar `MAX_CHILD_ITEMS`.
+    fn push_child_item(&mut self, child: i64, item: ChildItem) {
+        let log = self.child_logs.entry(child).or_default();
+        log.items.push_back(item);
+        while log.items.len() > MAX_CHILD_ITEMS {
+            log.items.pop_front();
+        }
+    }
+
+    /// Fija el estado de la llamada `call_id` del registro de `child` según `is_error`. Si
+    /// el registro no tiene esa llamada, no hace nada.
+    fn finish_child_tool(&mut self, child: i64, call_id: &str, is_error: bool) {
+        let Some(log) = self.child_logs.get_mut(&child) else {
+            return;
+        };
+        for item in &mut log.items {
+            if let ChildItem::Tool {
+                call_id: id,
+                status,
+                ..
+            } = item
+            {
+                if id.as_str() == call_id {
+                    *status = if is_error {
+                        batten::state::ToolStatus::Error
+                    } else {
+                        batten::state::ToolStatus::Success
+                    };
+                    return;
+                }
+            }
         }
     }
 
@@ -5698,6 +5820,156 @@ linea 2",
         app.subagents
             .insert(12, child_descriptor(12, TaskState::Working, SessionId(2)));
         assert_eq!(app.active_agents(), 2);
+    }
+
+    #[test]
+    fn child_log_records_text_and_tool_calls_and_results() {
+        let mut app = crush_app();
+        app.session_id = Some(SessionId(1));
+        app.apply(child_event(
+            SessionId(1),
+            9,
+            LiveEvent::MessageAdded(Message::assistant(vec![
+                ContentPart::Text {
+                    text: "voy a mirar".into(),
+                },
+                ContentPart::ToolCall {
+                    id: "c1".into(),
+                    name: "bash".into(),
+                    input: json!({ "command": "cargo test" }),
+                },
+            ])),
+        ));
+        // Un texto muy largo se recorta a 240 caracteres (no bytes): las vocales acentuadas
+        // ocupan dos bytes en UTF-8 y no deben contar doble.
+        app.apply(child_event(
+            SessionId(1),
+            9,
+            LiveEvent::MessageAdded(Message::assistant(vec![ContentPart::Text {
+                text: "á".repeat(300),
+            }])),
+        ));
+        app.apply(child_event(
+            SessionId(1),
+            9,
+            LiveEvent::MessageAdded(Message::new(
+                Role::Tool,
+                vec![ContentPart::ToolResult {
+                    call_id: "c1".into(),
+                    content: "ok".into(),
+                    is_error: false,
+                }],
+            )),
+        ));
+        app.apply(child_event(
+            SessionId(1),
+            9,
+            LiveEvent::MessageAdded(Message::assistant(vec![ContentPart::ToolCall {
+                id: "c2".into(),
+                name: "bash".into(),
+                input: json!({ "command": "cargo build" }),
+            }])),
+        ));
+        app.apply(child_event(
+            SessionId(1),
+            9,
+            LiveEvent::ToolFinished {
+                call_id: "c2".into(),
+                is_error: true,
+            },
+        ));
+
+        let items = app
+            .child_logs
+            .get(&9)
+            .map(|log| log.items.clone())
+            .unwrap_or_default();
+        assert_eq!(items.len(), 4);
+        assert_eq!(items[0], ChildItem::Text("voy a mirar".into()));
+        assert_eq!(
+            items[1],
+            ChildItem::Tool {
+                call_id: "c1".into(),
+                name: "bash".into(),
+                summary: Some("cargo test".into()),
+                status: ToolStatus::Success,
+            }
+        );
+        assert_eq!(items[2], ChildItem::Text("á".repeat(MAX_CHILD_TEXT)));
+        assert_eq!(
+            items[3],
+            ChildItem::Tool {
+                call_id: "c2".into(),
+                name: "bash".into(),
+                summary: Some("cargo build".into()),
+                status: ToolStatus::Error,
+            }
+        );
+        // El registro no crea métricas: estas siguen siendo las del ToolFinished.
+        assert_eq!(app.agent_stats[&9].tool, None);
+    }
+
+    #[test]
+    fn child_log_is_bounded() {
+        let mut app = crush_app();
+        app.session_id = Some(SessionId(1));
+        for i in 0..MAX_CHILD_ITEMS + 5 {
+            app.apply(child_event(
+                SessionId(1),
+                9,
+                LiveEvent::MessageAdded(Message::assistant(vec![ContentPart::Text {
+                    text: format!("mensaje {i}"),
+                }])),
+            ));
+        }
+        let items = app
+            .child_logs
+            .get(&9)
+            .map(|log| log.items.clone())
+            .unwrap_or_default();
+        assert_eq!(items.len(), MAX_CHILD_ITEMS);
+        // Se descartan los más antiguos: se conservan los últimos MAX_CHILD_ITEMS.
+        assert_eq!(items.front(), Some(&ChildItem::Text("mensaje 5".into())));
+        assert_eq!(
+            items.back(),
+            Some(&ChildItem::Text(format!("mensaje {}", MAX_CHILD_ITEMS + 4)))
+        );
+    }
+
+    #[test]
+    fn child_log_ignores_user_messages_and_unknown_results() {
+        let mut app = crush_app();
+        app.session_id = Some(SessionId(1));
+        app.apply(child_event(
+            SessionId(1),
+            9,
+            LiveEvent::MessageAdded(Message::user("hola")),
+        ));
+        app.apply(child_event(
+            SessionId(1),
+            9,
+            LiveEvent::MessageAdded(Message::new(
+                Role::Tool,
+                vec![ContentPart::ToolResult {
+                    call_id: "desconocida".into(),
+                    content: "nada".into(),
+                    is_error: false,
+                }],
+            )),
+        ));
+        app.apply(child_event(
+            SessionId(1),
+            9,
+            LiveEvent::ToolFinished {
+                call_id: "desconocida".into(),
+                is_error: false,
+            },
+        ));
+        // Ni el texto del usuario ni los resultados sin llamada previa dejan rastro.
+        assert!(app
+            .child_logs
+            .get(&9)
+            .map_or(true, |log| log.items.is_empty()));
     }
 
     #[test]
