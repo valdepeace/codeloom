@@ -9,10 +9,11 @@
 
 pub mod profile;
 pub mod source;
+pub mod trust;
 pub mod watch;
 
 use std::collections::{BTreeMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::event::{EventBus, LiveEvent};
@@ -22,13 +23,19 @@ pub use source::{
     AgentEntry, AgentOrigin, AgentSource, BuiltInSource, Execution, FileSource, LoadProblem,
     LocalSpec, ProfileLevel, SourceLoad, AGENTE_POR_DEFECTO,
 };
+pub use trust::{content_hash, Approval, TrustError, TrustStore};
 pub use watch::WatcherHandle;
+
+use trust::Confianza;
 
 /// Vista inmutable del registro en un momento dado.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RegistrySnapshot {
     entries: BTreeMap<String, AgentEntry>,
     problems: Vec<LoadProblem>,
+    /// Confianza configurada en el registro. `None`: no hay almacén, así que ningún agente de
+    /// proyecto se aprueba.
+    confianza: Option<Confianza>,
 }
 
 impl RegistrySnapshot {
@@ -46,6 +53,32 @@ impl RegistrySnapshot {
     pub fn problems(&self) -> &[LoadProblem] {
         &self.problems
     }
+
+    /// Estado de aprobación del agente `name`. `None` si no existe en la instantánea.
+    ///
+    /// La consulta lee el almacén en el momento de llamarla (no al cargar la instantánea):
+    /// aprobar o revocar se refleja sin recargar los ficheros.
+    pub fn approval(&self, name: &str) -> Option<Approval> {
+        let entrada = self.entries.get(name)?;
+        Some(match &entrada.origin {
+            AgentOrigin::BuiltIn => Approval::NotRequired,
+            AgentOrigin::File {
+                level: ProfileLevel::Global,
+                ..
+            } => Approval::NotRequired,
+            AgentOrigin::File {
+                level: ProfileLevel::Project,
+                ..
+            } => match (&self.confianza, &entrada.content_hash) {
+                (Some(confianza), Some(huella)) if confianza.aprueba(name, huella) => {
+                    Approval::Approved
+                }
+                _ => Approval::Pending,
+            },
+            // Sin transporte todavía (A8): no hay forma de confiar en él. Denegar por defecto.
+            AgentOrigin::Remote { .. } => Approval::Pending,
+        })
+    }
 }
 
 /// Registro de agentes. Las fuentes se pasan de menor a mayor precedencia: la última gana.
@@ -54,17 +87,36 @@ pub struct AgentRegistry {
     actual: RwLock<Arc<RegistrySnapshot>>,
     /// Serializa las recargas: cada una parte de la instantánea que dejó la anterior.
     recarga: Mutex<()>,
+    confianza: Option<Confianza>,
 }
 
 impl AgentRegistry {
     /// Crea el registro y carga las fuentes una vez.
     pub fn new(sources: Vec<Box<dyn AgentSource>>) -> Self {
-        let inicial = Arc::new(cargar(&sources, None));
+        let inicial = Arc::new(cargar(&sources, None, None));
         AgentRegistry {
             sources,
             actual: RwLock::new(inicial),
             recarga: Mutex::new(()),
+            confianza: None,
         }
+    }
+
+    /// Configura la aprobación de los agentes de proyecto y recalcula la instantánea vigente.
+    ///
+    /// `project_root` se canoniza. Con `trust_all_projects`, todo agente de proyecto se
+    /// considera aprobado (opción `trust_project_agents` de `codeloom.toml`).
+    pub fn with_trust(
+        mut self,
+        almacen: TrustStore,
+        project_root: PathBuf,
+        trust_all_projects: bool,
+    ) -> Self {
+        self.confianza = Some(Confianza::new(almacen, &project_root, trust_all_projects));
+        // La instantánea inicial se recalcula: la aprobación depende de la confianza.
+        let inicial = Arc::new(cargar(&self.sources, None, self.confianza.as_ref()));
+        *self.actual.get_mut().unwrap_or_else(|e| e.into_inner()) = inicial;
+        self
     }
 
     /// Vuelve a cargar todas las fuentes, publica la nueva instantánea y la devuelve.
@@ -91,7 +143,7 @@ impl AgentRegistry {
     fn recargar(&self) -> (Arc<RegistrySnapshot>, Arc<RegistrySnapshot>) {
         let _turno = self.recarga.lock().unwrap_or_else(|e| e.into_inner());
         let antes = self.snapshot();
-        let despues = Arc::new(cargar(&self.sources, Some(&antes)));
+        let despues = Arc::new(cargar(&self.sources, Some(&antes), self.confianza.as_ref()));
         let mut actual = self.actual.write().unwrap_or_else(|e| e.into_inner());
         *actual = Arc::clone(&despues);
         (antes, despues)
@@ -102,7 +154,11 @@ impl AgentRegistry {
 /// y la entrada vencida queda anotada como `Shadowed`.
 ///
 /// Con `previa`, aplica la regla de «última versión válida» (ver `conservar_ultimas_validas`).
-fn cargar(sources: &[Box<dyn AgentSource>], previa: Option<&RegistrySnapshot>) -> RegistrySnapshot {
+fn cargar(
+    sources: &[Box<dyn AgentSource>],
+    previa: Option<&RegistrySnapshot>,
+    confianza: Option<&Confianza>,
+) -> RegistrySnapshot {
     let mut entries: BTreeMap<String, AgentEntry> = BTreeMap::new();
     let mut problems = Vec::new();
     for source in sources {
@@ -122,7 +178,11 @@ fn cargar(sources: &[Box<dyn AgentSource>], previa: Option<&RegistrySnapshot>) -
             entries.insert(entry.name.clone(), entry);
         }
     }
-    RegistrySnapshot { entries, problems }
+    RegistrySnapshot {
+        entries,
+        problems,
+        confianza: confianza.cloned(),
+    }
 }
 
 /// Regla de «última versión válida». Si un fichero que cargaba antes falla ahora (o su
@@ -552,5 +612,210 @@ mod tests {
         registro.reload_and_publish(&bus);
 
         assert!(ultimo_evento(&mut rx).is_none());
+    }
+
+    /// Registro con confianza configurada sobre `almacen` para la raíz `proyecto`.
+    fn registro_con_confianza(
+        global: &Path,
+        proyecto: &Path,
+        almacen: &TrustStore,
+        confiar_todo: bool,
+    ) -> AgentRegistry {
+        registro_con_global_y_proyecto(global, proyecto).with_trust(
+            almacen.clone(),
+            proyecto.to_path_buf(),
+            confiar_todo,
+        )
+    }
+
+    #[test]
+    fn global_and_builtin_do_not_need_approval() {
+        let global = tempfile::tempdir().unwrap();
+        let proyecto = tempfile::tempdir().unwrap();
+        let datos = tempfile::tempdir().unwrap();
+        escribir(global.path(), "frontend.md", &perfil("frontend", "UI"));
+        let almacen = TrustStore::open(datos.path().to_path_buf()).unwrap();
+
+        let instantanea =
+            registro_con_confianza(global.path(), proyecto.path(), &almacen, false).snapshot();
+
+        assert_eq!(
+            instantanea.approval(AGENTE_POR_DEFECTO),
+            Some(Approval::NotRequired)
+        );
+        assert_eq!(
+            instantanea.approval("frontend"),
+            Some(Approval::NotRequired)
+        );
+    }
+
+    #[test]
+    fn project_agent_is_pending_until_approved() {
+        let global = tempfile::tempdir().unwrap();
+        let proyecto = tempfile::tempdir().unwrap();
+        let datos = tempfile::tempdir().unwrap();
+        escribir(proyecto.path(), "revisor.md", &perfil("revisor", "Revisa"));
+        let almacen = TrustStore::open(datos.path().to_path_buf()).unwrap();
+        let registro = registro_con_confianza(global.path(), proyecto.path(), &almacen, false);
+
+        let hash = registro
+            .snapshot()
+            .get("revisor")
+            .unwrap()
+            .content_hash
+            .clone()
+            .expect("un agente de fichero lleva huella");
+        assert_eq!(
+            registro.snapshot().approval("revisor"),
+            Some(Approval::Pending)
+        );
+
+        almacen.approve(proyecto.path(), "revisor", &hash).unwrap();
+
+        // Sin recargar: la consulta refleja el estado actual del almacén.
+        assert_eq!(
+            registro.snapshot().approval("revisor"),
+            Some(Approval::Approved)
+        );
+    }
+
+    #[test]
+    fn project_agent_without_trust_config_is_pending() {
+        let global = tempfile::tempdir().unwrap();
+        let proyecto = tempfile::tempdir().unwrap();
+        escribir(proyecto.path(), "revisor.md", &perfil("revisor", "Revisa"));
+
+        let instantanea = registro_con_global_y_proyecto(global.path(), proyecto.path()).snapshot();
+
+        assert_eq!(
+            instantanea.approval("revisor"),
+            Some(Approval::Pending),
+            "sin almacén configurado nada de proyecto se aprueba"
+        );
+    }
+
+    #[test]
+    fn approval_is_invalidated_by_a_content_change() {
+        let global = tempfile::tempdir().unwrap();
+        let proyecto = tempfile::tempdir().unwrap();
+        let datos = tempfile::tempdir().unwrap();
+        escribir(proyecto.path(), "revisor.md", &perfil("revisor", "v1"));
+        let almacen = TrustStore::open(datos.path().to_path_buf()).unwrap();
+        let registro = registro_con_confianza(global.path(), proyecto.path(), &almacen, false);
+        let hash_v1 = registro
+            .snapshot()
+            .get("revisor")
+            .unwrap()
+            .content_hash
+            .clone()
+            .unwrap();
+        almacen
+            .approve(proyecto.path(), "revisor", &hash_v1)
+            .unwrap();
+
+        // Un `git pull` que cambia el fichero: la aprobación anterior ya no vale.
+        escribir(proyecto.path(), "revisor.md", &perfil("revisor", "v2"));
+        registro.reload();
+
+        assert_eq!(
+            registro.snapshot().approval("revisor"),
+            Some(Approval::Pending)
+        );
+    }
+
+    #[test]
+    fn approval_is_per_project_root() {
+        let global = tempfile::tempdir().unwrap();
+        let proyecto_a = tempfile::tempdir().unwrap();
+        let proyecto_b = tempfile::tempdir().unwrap();
+        let datos = tempfile::tempdir().unwrap();
+        // Mismo contenido en ambos: la huella coincide, pero la raíz no.
+        escribir(
+            proyecto_a.path(),
+            "revisor.md",
+            &perfil("revisor", "Revisa"),
+        );
+        escribir(
+            proyecto_b.path(),
+            "revisor.md",
+            &perfil("revisor", "Revisa"),
+        );
+        let almacen = TrustStore::open(datos.path().to_path_buf()).unwrap();
+        let registro_a = registro_con_confianza(global.path(), proyecto_a.path(), &almacen, false);
+        let hash = registro_a
+            .snapshot()
+            .get("revisor")
+            .unwrap()
+            .content_hash
+            .clone()
+            .unwrap();
+        almacen
+            .approve(proyecto_a.path(), "revisor", &hash)
+            .unwrap();
+
+        let registro_b = registro_con_confianza(global.path(), proyecto_b.path(), &almacen, false);
+
+        assert_eq!(
+            registro_a.snapshot().approval("revisor"),
+            Some(Approval::Approved)
+        );
+        assert_eq!(
+            registro_b.snapshot().approval("revisor"),
+            Some(Approval::Pending)
+        );
+    }
+
+    #[test]
+    fn revoke_returns_it_to_pending() {
+        let global = tempfile::tempdir().unwrap();
+        let proyecto = tempfile::tempdir().unwrap();
+        let datos = tempfile::tempdir().unwrap();
+        escribir(proyecto.path(), "revisor.md", &perfil("revisor", "Revisa"));
+        let almacen = TrustStore::open(datos.path().to_path_buf()).unwrap();
+        let registro = registro_con_confianza(global.path(), proyecto.path(), &almacen, false);
+        let hash = registro
+            .snapshot()
+            .get("revisor")
+            .unwrap()
+            .content_hash
+            .clone()
+            .unwrap();
+        almacen.approve(proyecto.path(), "revisor", &hash).unwrap();
+
+        almacen.revoke(proyecto.path(), "revisor").unwrap();
+
+        assert_eq!(
+            registro.snapshot().approval("revisor"),
+            Some(Approval::Pending)
+        );
+    }
+
+    #[test]
+    fn trust_all_projects_skips_the_approval() {
+        let global = tempfile::tempdir().unwrap();
+        let proyecto = tempfile::tempdir().unwrap();
+        let datos = tempfile::tempdir().unwrap();
+        escribir(proyecto.path(), "revisor.md", &perfil("revisor", "Revisa"));
+        let almacen = TrustStore::open(datos.path().to_path_buf()).unwrap();
+
+        let registro = registro_con_confianza(global.path(), proyecto.path(), &almacen, true);
+
+        assert_eq!(
+            registro.snapshot().approval("revisor"),
+            Some(Approval::Approved)
+        );
+    }
+
+    #[test]
+    fn approval_of_an_unknown_agent_is_none() {
+        let global = tempfile::tempdir().unwrap();
+        let proyecto = tempfile::tempdir().unwrap();
+        let datos = tempfile::tempdir().unwrap();
+        let almacen = TrustStore::open(datos.path().to_path_buf()).unwrap();
+
+        let instantanea =
+            registro_con_confianza(global.path(), proyecto.path(), &almacen, false).snapshot();
+
+        assert_eq!(instantanea.approval("no-existe"), None);
     }
 }

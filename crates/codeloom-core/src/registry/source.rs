@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 use crate::card::AgentCard;
 use crate::registry::profile::{parse_profile, AgentProfile, ProfileProblem};
+use crate::registry::trust::content_hash;
 
 /// Nombre del agente por defecto, integrado. Un `default.md` de proyecto o global lo redefine.
 pub const AGENTE_POR_DEFECTO: &str = "default";
@@ -103,6 +104,10 @@ pub struct AgentEntry {
     pub card: AgentCard,
     /// Lo local, que no viaja en la tarjeta.
     pub execution: Execution,
+    /// Huella del contenido del fichero (`trust::content_hash`). Solo los agentes de fichero
+    /// la llevan; el integrado y los remotos, `None`. La aprobación de un agente de proyecto
+    /// depende de ella: cualquier byte cambiado la invalida.
+    pub content_hash: Option<String>,
 }
 
 /// Problema detectado al cargar. Nunca se silencia: viaja en la instantánea.
@@ -225,7 +230,11 @@ impl AgentSource for FileSource {
                         path: ruta,
                         level: self.level,
                     };
-                    entries.push(entrada_desde_perfil(perfil, origin));
+                    entries.push(entrada_desde_perfil(
+                        perfil,
+                        origin,
+                        Some(content_hash(&texto)),
+                    ));
                 }
             }
         }
@@ -236,7 +245,11 @@ impl AgentSource for FileSource {
 
 /// Entrada del registro a partir de un perfil validado. La tarjeta se sintetiza solo con
 /// `name`, `description` y `version`; persona, modelo y esfuerzo no viajan en ella.
-fn entrada_desde_perfil(perfil: AgentProfile, origin: AgentOrigin) -> AgentEntry {
+fn entrada_desde_perfil(
+    perfil: AgentProfile,
+    origin: AgentOrigin,
+    content_hash: Option<String>,
+) -> AgentEntry {
     let version = perfil
         .version
         .unwrap_or_else(|| VERSION_POR_DEFECTO.to_string());
@@ -254,6 +267,7 @@ fn entrada_desde_perfil(perfil: AgentProfile, origin: AgentOrigin) -> AgentEntry
             max_turns: perfil.max_turns,
             max_depth: perfil.max_depth,
         }),
+        content_hash,
     }
 }
 
@@ -292,6 +306,7 @@ impl AgentSource for BuiltInSource {
                 max_turns: None,
                 max_depth: None,
             }),
+            content_hash: None,
         };
         SourceLoad {
             entries: vec![entrada],
