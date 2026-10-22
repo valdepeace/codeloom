@@ -41,9 +41,10 @@ documentos. No se inventa ningún campo del protocolo.
   `"doubt"` (por defecto: pregunta si duda), `"always"` (propone siempre la asignación y
   espera), `"never"` (delega sin preguntar y lo cuenta). Cambia únicamente el texto de la
   regla del prompt; es determinista y comprobable por test.
-- **Qué agente lleva cada hijo se muestra en la interfaz.** Hoy el descriptor guarda
-  `agent` y `agent_origin` y nadie los pinta. El rail y el detalle del subagente nombran el
-  agente (`front`, `default`…). Es observabilidad pura, sin lógica nueva.
+- **Qué agente lleva cada hijo se muestra en la interfaz, siempre.** Hoy el descriptor guarda
+  `agent` y `agent_origin` y nadie los pinta. El rail y la cabecera del subagente nombran el
+  agente (`front`, `default`…), con el origen cuando es de proyecto o remoto. Es
+  observabilidad pura, sin lógica nueva; la persona usuaria la declaró vital.
 - **Hueco para el clasificador.** La regla se construye en un único lugar (el generador de
   la sección del prompt). Un enrutador futuro podría preseleccionar un agente y el padre
   preguntaría solo con confianza baja; esta spec **no** lo implementa. Se conserva la
@@ -94,8 +95,9 @@ tests.
 - `prompt_section` contiene la regla propia de cada modo y no las de los otros.
 - Extremo a extremo con el proveedor espía: el prompt de sistema que recibe el modelo lleva
   la regla del modo configurado.
-- TUI: un hijo con agente `front` lo muestra en el rail; uno con `default` y origen
-  `built-in` no añade ruido.
+- TUI: un hijo con agente `front` lo muestra en el rail y en su cabecera; uno con `default`
+  también (decisión de la persona usuaria, 2026-10-22: la observabilidad es vital, así que el
+  agente se muestra siempre que se conozca); uno sin agente conocido no muestra nada.
 - Declarado: el cumplimiento de la regla por el modelo **no se puede probar** sin un modelo
   real; solo se comprueba que llega al prompt.
 
