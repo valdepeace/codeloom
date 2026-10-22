@@ -71,10 +71,9 @@ después el transporte (A7, A8).
   en `docs/specs/2026-10-22-codeloom-a2a-states-producers-design.md`, sección «Estado».
   Cuidado de siempre: «Agents MUST NOT treat the `TASK_STATE_AUTH_REQUIRED` state transition,
   by itself, as authorization».
-  - **Abierto (divergencias temporales declaradas):** `result` sigue siendo texto y el
-    mensaje de estado (`TaskStatus.message`) es texto, no `Message`/`Part`; no hay
-    `contextId` ni `reference_task_ids`. Quedan para A5 (tipos del protocolo) y A11
-    (tareas enlazadas).
+  - **Resuelto en A5 (2026-10-22):** `result` y el mensaje de estado ya son `Artifact` y
+    `Message`, según la spec de tipos. Historial: hasta A5 eran texto (divergencia temporal
+    declarada). Sigue abierto: no hay `contextId` compartido ni `reference_task_ids` (A11).
   - **Abierto (no consta en A2A):** qué pasa con `input-required` o `auth-required` si el
     usuario cancela al hijo (hoy pasa a `canceled`; ver A10).
 - [x] **A3. Leer lo que falta de la especificación** (completa el 2026-10-22: ya se ha
@@ -85,9 +84,18 @@ después el transporte (A7, A8).
   Las dudas que siguen abiertas están en esa misma sección.
 - [ ] **A4. Adaptador de nombres del cable.** v0.3 en `kebab-case`, v1.0 en
   `TASK_STATE_*`. Vive en el borde (crate del adaptador), nunca en el núcleo.
-- [ ] **A5. Tipos del protocolo en el núcleo.** `Task`, `Message`, `Part`, `Artifact`,
+- [x] **A5. Tipos del protocolo en el núcleo.** `Task`, `Message`, `Part`, `Artifact`,
   `TaskStatus`, con `taskId` y `contextId`. Alinear con la Fase B de la autonomía
   (artefactos) en lugar de inventar un tipo propio.
+  - **Hecho el 2026-10-22** en los commits `ad2952a` (tipos `a2a`: `Role`, `Part`, `Message`,
+    `Artifact`) y `3ea5ee2` (`TaskStatus.message` y `SubagentDescriptor.artifacts`, con la
+    migración de lectura en SQLite). Spec: `docs/specs/2026-10-22-codeloom-a2a-protocol-types-design.md`,
+    sección «Estado». Plan: `docs/plans/2026-10-22-codeloom-a2a-protocol-types.md`.
+  - **Abierto:** no existe un tipo `Task` en el núcleo, así que `history` y `metadata` no se
+    modelan. `contextId` solo se deriva en lectura (id de la sesión del padre), sin
+    `contextId` compartido entre tareas. `reference_task_ids` existe, pero nada lo escribe
+    hasta A11. La serialización JSON es interna y la del cable queda para A4. La validación
+    visual en terminal real está pendiente.
 - [ ] **A6. Tarjeta del agente (`AgentCard`)** y capacidades declaradas.
 - [ ] **A7. Transporte `InProcess`** detrás de `AgentTransport`: mensajes en memoria,
   sin socket, para los tests.

@@ -233,6 +233,13 @@ Nota (historial): hasta el 2026-10-22 el subagente tenía un enum propio
 `Canceled` y `Unfinished` como `Failed`. Ese enfoque se sustituye por la spec
 `2026-10-22-codeloom-a2a-task-model-design.md`.
 
+Nota (2026-10-22, tras A5): esta sección no tenía una nota de divergencias temporales
+explícita; la equivalente es la de la spec de la tarea A5. El mensaje de estado y el
+resultado de un subagente ya no son texto: `TaskStatus.message` es un `Message` y el
+resultado son `Artifact`s (`docs/specs/2026-10-22-codeloom-a2a-protocol-types-design.md`,
+sección «Estado»). Quedan abiertos el `contextId` compartido entre tareas y
+`reference_task_ids` (A11). El resto de esta sección no cambia.
+
 ### Fuente normativa de los estados (2026-10-22)
 
 Fuente: `https://a2a-protocol.org/latest/definitions/`, proto `lf.a2a.v1`, que la

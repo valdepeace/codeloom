@@ -56,9 +56,15 @@ tiene un test que comprueba que el texto lista los estados originales.
 ## No objetivos
 
 - `Artifact`, `Message`/`Part` del protocolo, `contextId` y `reference_task_ids`: son las
-  tareas A5 y A11. Hasta entonces `result` sigue siendo texto y el aviso al padre sigue
-  siendo el que hay (es presentación del cliente hacia su propio modelo, no la entrega
-  de la salida de una tarea entre agentes). **Se declara como divergencia temporal.**
+  tareas A5 y A11. **Resuelto en A5 (2026-10-22):** `Artifact` y `Message`/`Part` existen y
+  el resultado y el mensaje de estado los usan (ver
+  `2026-10-22-codeloom-a2a-protocol-types-design.md`, sección «Estado»). **Sigue abierto:**
+  `contextId` compartido entre tareas y `reference_task_ids` (A11). El aviso al padre sigue
+  siendo texto derivado de las `Part`s: es presentación del cliente hacia su propio modelo,
+  no la entrega de la salida de una tarea entre agentes.
+
+  Nota (historial): hasta A5, `result` era texto y el mensaje de estado también; ambos se
+  declaraban como divergencia temporal.
 - Transporte, tarjeta del agente, nombres JSON del cable (A4, A6, A7, A8).
 - `JobStatus` de los trabajos de `bash` y similares: no son tareas A2A y quedan como están.
 
@@ -85,8 +91,11 @@ tiene un test que comprueba que el texto lista los estados originales.
 
 ### Lecturas o simplificaciones nuestras (rotuladas)
 
-- **`TaskStatus.message` como texto.** En el proto es un `Message` con `Part`s; se guarda
-  como texto hasta A5 (que introduce `Message`/`Part`).
+- **`TaskStatus.message` como texto. RESUELTA en A5 (2026-10-22):** `TaskStatus.message` es
+  un `Option<Message>` con `Part`s de texto, como en el proto.
+
+  Nota (historial): hasta A5 se guardaba como texto, porque el proto lo define como `Message`
+  con `Part`s.
 - **Lo no terminado al reabrir pasa a `failed`.** A2A no dice qué estado corresponde a
   una tarea cuyo proceso desapareció; `failed` es la lectura más cercana a su
   definición.
@@ -119,8 +128,9 @@ en terminal real: pendiente.
 
 ## Limitaciones previstas
 
-- Divergencias temporales declaradas arriba (`result` como texto, mensaje de estado como
-  texto, ids propios sin `contextId`) hasta A5 y A11.
+- Divergencias declaradas arriba: `result` como texto y mensaje de estado como texto,
+  **resueltas en A5 (2026-10-22)**. **Abiertas hasta A11:** `contextId` compartido entre
+  tareas (hoy solo se deriva en lectura) y `reference_task_ids`.
 - La spec no define la cancelación en `input-required` ni `auth-required`; hoy el
   usuario puede matar al hijo y la tarea pasa a `canceled`.
 - `submitted` puede durar milisegundos.
