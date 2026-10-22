@@ -482,6 +482,13 @@ pub struct App {
     /// Nodos de subagente desplegados, por id interno del hijo. Vacío significa que todos
     /// están plegados. Vive solo en memoria de la interfaz: no se persiste.
     pub expanded_nodes: HashSet<i64>,
+    /// Llamadas del padre que apuntan a un hijo (`job_output`, `job_kill` o `subagent_control`),
+    /// por id interno del hijo: el nombre de cada una, una entrada por llamada. Se muestran
+    /// como `↳ parent: {herramienta}` bajo el nodo, en lugar de como líneas sueltas.
+    pub node_actions: HashMap<i64, Vec<String>>,
+    /// Llamada del padre (`call_id`) que ya se anotó en `node_actions`, con el hijo al que apunta.
+    /// Sirve para que re-sincronizar la misma llamada no la cuente dos veces.
+    node_calls: HashMap<String, i64>,
     /// Subagente resaltado en el rail (clave de `subagents`), si hay. Solo se mueve
     /// con el foco en el rail y se descarta si el hijo deja de existir.
     pub rail_selected: Option<i64>,
@@ -730,6 +737,8 @@ impl App {
             agent_stats: HashMap::new(),
             child_logs: HashMap::new(),
             expanded_nodes: HashSet::new(),
+            node_actions: HashMap::new(),
+            node_calls: HashMap::new(),
             rail_selected: None,
             parent_stack: Vec::new(),
             nav_keep_stack: false,
@@ -1406,6 +1415,10 @@ impl App {
         self.history = batten::state::History::new();
         self.tools.clear();
         self.tool_entries.clear();
+        // Las anotaciones de nodo van con sus entradas: si sobrevivieran, una llamada
+        // restaurada se contaría dos veces o no se anotaría.
+        self.node_calls.clear();
+        self.node_actions.clear();
         self.activity_entries.clear();
         self.todos.clear();
         self.todo_entry = None;
@@ -1511,6 +1524,8 @@ impl App {
         self.agent_stats.clear();
         self.child_logs.clear();
         self.expanded_nodes.clear();
+        self.node_actions.clear();
+        self.node_calls.clear();
         // Los apuntes son de la sesión anterior; la carga posterior repone los de esta.
         self.usage_records.clear();
         self.session_selected = 0;
@@ -1577,6 +1592,8 @@ impl App {
                 .into_iter()
                 .map(|subagent| (subagent.child.0, subagent))
                 .collect();
+            // Las llamadas restauradas antes que los hijos se reclasifican ahora que constan.
+            self.resync_tools();
             // Un hijo que ya no existe no puede seguir marcado en el rail.
             if self
                 .rail_selected
@@ -2518,6 +2535,8 @@ impl App {
                 if Some(subagent.parent) == self.session_id {
                     self.sync_subagent_activity(&subagent);
                     self.subagents.insert(subagent.child.0, subagent);
+                    // Una llamada del padre que llegó antes que su hijo puede colgar ahora de él.
+                    self.resync_tools();
                 }
             }
             LiveEvent::TodosChanged { session, items } => {
@@ -2702,24 +2721,76 @@ impl App {
         }
     }
 
+    /// Hijo al que apunta una llamada del padre: `job_output` o `job_kill` sobre el job de un
+    /// hijo de la sesión abierta, o `subagent_control` sobre el id de un hijo. Cualquier otra
+    /// llamada, o un id ajeno al árbol, no tiene hijo.
+    fn node_target(&self, tool: &batten::state::ToolItem) -> Option<i64> {
+        match tool.name.as_str() {
+            "job_output" | "job_kill" => {
+                let job = tool.facts.primary.as_deref()?;
+                self.subagents
+                    .values()
+                    .find(|subagent| subagent.job_id == job)
+                    .map(|subagent| subagent.child.0)
+            }
+            "subagent_control" => {
+                let child = tool.facts.secondary.as_deref()?.parse::<i64>().ok()?;
+                self.subagents.contains_key(&child).then_some(child)
+            }
+            _ => None,
+        }
+    }
+
+    /// Líneas visibles de una herramienta en el transcript. Ninguna si es la lista de tareas o
+    /// si su llamada cuelga de un nodo de subagente; si no, las que muestre el look actual.
+    fn tool_shown(&self, call_id: &str, lines: &[batten::state::Line]) -> Vec<batten::state::Line> {
+        if self.todo_tool_calls.contains(call_id) || self.node_calls.contains_key(call_id) {
+            Vec::new()
+        } else {
+            self.shown_lines(lines)
+        }
+    }
+
+    /// Vuelve a sincronizar las herramientas del padre. Sirve para reclasificar las llamadas que
+    /// llegaron antes que su hijo; las demás no cambian, porque `sync_tool` las reconoce por caché.
+    fn resync_tools(&mut self) {
+        let ids: Vec<String> = self.tools.iter().map(|tool| tool.call_id.clone()).collect();
+        for id in ids {
+            self.sync_tool(&id);
+        }
+    }
+
     /// Sincroniza las líneas de una herramienta con su entrada del transcript.
     /// Solo reemplaza la entrada si sus líneas cambiaron: no se llama desde el
-    /// camino de los deltas, que se ejecuta por cada token.
+    /// camino de los deltas, que se ejecuta por cada token. Una llamada que apunta a un
+    /// hijo se anota una sola vez en su nodo y no deja línea propia.
     pub fn sync_tool(&mut self, call_id: &str) {
         let Some(item) = self.tools.iter().find(|tool| tool.call_id == call_id) else {
             return;
         };
         let lines = batten::state::tool_lines_with(item, &item.facts);
         let todo = item.name == TODO_TOOL;
+        let enlace = self.node_target(item);
+        let nombre = item.name.clone();
+        let recien_anotada = match enlace {
+            Some(hijo) if !self.node_calls.contains_key(call_id) => {
+                self.node_calls.insert(call_id.to_string(), hijo);
+                self.node_actions.entry(hijo).or_default().push(nombre);
+                self.refresh_child_node(hijo);
+                true
+            }
+            _ => false,
+        };
         // La lista de tareas tiene su propia entrada: la llamada que la escribe no se repite.
         let shown = if todo {
             Vec::new()
         } else {
-            self.shown_lines(&lines)
+            self.tool_shown(call_id, &lines)
         };
         match self.tool_entries.get_mut(call_id) {
             Some((id, cache)) => {
-                if *cache == lines {
+                // Una llamada recién anotada debe quitar su línea aunque sus líneas no cambien.
+                if *cache == lines && !recien_anotada {
                     return;
                 }
                 *cache = lines;
@@ -2746,11 +2817,7 @@ impl App {
     pub fn sync_all_tools(&mut self) {
         let inline = self.tool_inline();
         for (call_id, (id, lines)) in &self.tool_entries {
-            let shown = if self.todo_tool_calls.contains(call_id) {
-                Vec::new()
-            } else {
-                self.shown_lines(lines)
-            };
+            let shown = self.tool_shown(call_id, lines);
             self.transcript.replace(*id, shown);
         }
         for entry in &self.activity_entries {
@@ -2761,10 +2828,7 @@ impl App {
             let shown = if inline { lines.clone() } else { Vec::new() };
             self.transcript.replace(*id, shown);
         }
-        let ids: Vec<String> = self.tools.iter().map(|tool| tool.call_id.clone()).collect();
-        for id in ids {
-            self.sync_tool(&id);
-        }
+        self.resync_tools();
     }
 
     /// Sincroniza la lista de tareas con su entrada del transcript. Como en
@@ -2940,19 +3004,29 @@ impl App {
         batten::state::node_lines(&view)
     }
 
-    /// Resumen de progreso de un nodo, p. ej. `step 2/30 · read_file`. Omite lo que falte: el
-    /// paso solo si el hijo conoce su máximo, y la herramienta solo si está ejecutando algo.
+    /// Resumen de progreso de un nodo, p. ej. `step 2/30 · read_file · 3 queries`. Omite lo que
+    /// falte: el paso solo si el hijo conoce su máximo, la herramienta solo si está ejecutando
+    /// algo, y las consultas del padre solo si hay alguna.
     fn node_summary(&self, child: i64) -> Option<String> {
-        let stats = self.agent_stats.get(&child)?;
-        let paso =
-            (stats.max_steps > 0).then(|| format!("step {}/{}", stats.step, stats.max_steps));
-        let herramienta = stats.tool.as_deref().filter(|tool| !tool.is_empty());
-        match (paso, herramienta) {
-            (Some(paso), Some(tool)) => Some(format!("{paso} · {tool}")),
-            (Some(paso), None) => Some(paso),
-            (None, Some(tool)) => Some(tool.to_string()),
-            (None, None) => None,
-        }
+        let stats = self.agent_stats.get(&child);
+        let paso = stats
+            .filter(|stats| stats.max_steps > 0)
+            .map(|stats| format!("step {}/{}", stats.step, stats.max_steps));
+        let herramienta = stats
+            .and_then(|stats| stats.tool.as_deref())
+            .filter(|tool| !tool.is_empty())
+            .map(str::to_string);
+        let consultas = self
+            .node_actions
+            .get(&child)
+            .map(Vec::len)
+            .filter(|&n| n > 0)
+            .map(|n| format!("{n} {}", if n == 1 { "query" } else { "queries" }));
+        let partes: Vec<String> = [paso, herramienta, consultas]
+            .into_iter()
+            .flatten()
+            .collect();
+        (!partes.is_empty()).then(|| partes.join(" · "))
     }
 
     /// Filas de los hijos de un nodo, como pares (icono, texto), en el orden del registro. El
@@ -2993,6 +3067,15 @@ impl App {
                     .collect()
             })
             .unwrap_or_default();
+        // Las llamadas del padre sobre este hijo cuelgan tras su registro, en orden de llegada.
+        // El glifo `↳` lo pinta el widget como `├─ ↳ parent: …` (o `└─` en la última fila).
+        if let Some(acciones) = self.node_actions.get(&subagent.child.0) {
+            filas.extend(
+                acciones
+                    .iter()
+                    .map(|nombre| ("↳".to_string(), format!("parent: {nombre}"))),
+            );
+        }
         if subagent.status.state.is_terminal() {
             let resultado = subagent.result_text().unwrap_or_default();
             let primera = resultado
@@ -4862,6 +4945,103 @@ linea 2",
 
         assert!(app.set_node_expanded(false));
         assert_eq!(texts(&app).len(), 1);
+    }
+
+    /// Mensaje del asistente con una única llamada `name` de entrada `input`, para que la
+    /// herramienta fije sus hechos como lo hace una sesión restaurada o en vivo.
+    fn tool_call_message(id: &str, name: &str, input: serde_json::Value) -> LiveEvent {
+        LiveEvent::MessageAdded(Message::assistant(vec![ContentPart::ToolCall {
+            id: id.into(),
+            name: name.into(),
+            input,
+        }]))
+    }
+
+    #[test]
+    fn job_output_on_a_child_job_hangs_from_its_node_and_leaves_no_line() {
+        let mut app = crush_app();
+        app.session_id = Some(SessionId(1));
+        app.apply(LiveEvent::SubagentChanged(sub(
+            "review",
+            TaskState::Working,
+            SessionId(1),
+        )));
+        app.apply(tool_call_message(
+            "j1",
+            "job_output",
+            json!({"id": "subagent-1"}),
+        ));
+        assert!(
+            !texts(&app).iter().any(|t| t.starts_with("job_output")),
+            "la llamada al job del hijo no debe dejar línea suelta: {:?}",
+            texts(&app)
+        );
+        app.focus = Focus::Transcript;
+        app.block = Some(0);
+        assert!(app.set_node_expanded(true));
+        assert_eq!(
+            texts(&app).last().map(String::as_str),
+            Some("└─ ↳ parent: job_output"),
+            "la llamada debe colgar del nodo: {:?}",
+            texts(&app)
+        );
+    }
+
+    #[test]
+    fn job_output_on_an_unknown_id_stays_a_normal_line() {
+        let mut app = crush_app();
+        app.session_id = Some(SessionId(1));
+        app.apply(LiveEvent::SubagentChanged(sub(
+            "review",
+            TaskState::Working,
+            SessionId(1),
+        )));
+        app.apply(tool_call_message(
+            "j2",
+            "job_output",
+            json!({"id": "job-ajeno"}),
+        ));
+        assert!(
+            texts(&app).iter().any(|t| t.starts_with("job_output")),
+            "un job ajeno al árbol sigue siendo una línea del padre: {:?}",
+            texts(&app)
+        );
+    }
+
+    #[test]
+    fn folded_node_counts_the_parent_queries() {
+        let mut app = crush_app();
+        app.session_id = Some(SessionId(1));
+        app.apply(LiveEvent::SubagentChanged(sub(
+            "review",
+            TaskState::Working,
+            SessionId(1),
+        )));
+        app.apply(tool_call_message(
+            "j1",
+            "job_output",
+            json!({"id": "subagent-1"}),
+        ));
+        app.apply(tool_call_message(
+            "j2",
+            "job_kill",
+            json!({"id": "subagent-1"}),
+        ));
+        app.apply(tool_call_message(
+            "s1",
+            "subagent_control",
+            json!({"action": "interrupt", "child_id": 9}),
+        ));
+        assert_eq!(
+            texts(&app),
+            vec!["▸ ● subagent  review (working) · 3 queries".to_string()]
+        );
+        // Volver a sincronizar las mismas llamadas no las cuenta de nuevo.
+        app.sync_all_tools();
+        assert_eq!(
+            texts(&app),
+            vec!["▸ ● subagent  review (working) · 3 queries".to_string()]
+        );
     }
 
     /// Tarea de prueba con el contenido y el estado indicados.
