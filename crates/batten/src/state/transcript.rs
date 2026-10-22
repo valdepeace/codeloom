@@ -26,6 +26,10 @@ pub enum LineKind {
     ToolDiff(DiffKind),
     /// Indicación de salida oculta bajo una herramienta.
     ToolMore,
+    /// Cabecera de un nodo de subagente, con su estado. El icono va en el texto.
+    NodeHead(ToolStatus),
+    /// Hijo de un nodo de subagente desplegado. El guion de árbol va en el texto.
+    NodeBody,
 }
 
 /// Token semantico de estilo. La capa `state` no conoce colores: los widgets

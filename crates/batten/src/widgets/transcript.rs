@@ -31,6 +31,7 @@ fn prefix(kind: LineKind) -> &'static str {
         LineKind::TodoItem(_) => "☐ ",
         LineKind::ToolBody | LineKind::ToolDiff(_) => "│ ",
         LineKind::ToolMore => "  ",
+        LineKind::NodeHead(_) | LineKind::NodeBody => "",
     }
 }
 
@@ -55,6 +56,8 @@ fn kind_token(kind: LineKind) -> StyleToken {
         LineKind::ToolDiff(DiffKind::Hunk) => StyleToken::DiffHunk,
         LineKind::ToolDiff(DiffKind::Context) => StyleToken::Muted,
         LineKind::ToolMore => StyleToken::Dim,
+        LineKind::NodeHead(status) => status_token(status),
+        LineKind::NodeBody => StyleToken::Muted,
     }
 }
 
@@ -828,6 +831,12 @@ mod tests {
         let out = buffer(&t, 40, 3);
         assert!(out.contains("◆ job"), "falta la cabecera de la actividad");
         assert!(!t.line(0).unwrap().plain().contains('◆'));
+    }
+
+    #[test]
+    fn node_lines_have_no_glyph_prefix() {
+        assert_eq!(prefix(LineKind::NodeHead(ToolStatus::Running)), "");
+        assert_eq!(prefix(LineKind::NodeBody), "");
     }
 
     #[test]
