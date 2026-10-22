@@ -192,6 +192,13 @@ La card es la **vista externa**; el `AgentProfile` es la **vista interna**.
 - **Servir la card** es un **rol**, no un requisito: solo se expone por HTTP si esta
   instancia debe **aceptar** A2A entrante. Por defecto **apagado**.
 
+**Nota (2026-10-22):** los tipos de la tarjeta (`AgentCard`, `AgentProvider`,
+`AgentCapabilities`, `AgentExtension`, `AgentInterface` y `AgentSkill`) ya existen en
+`crates/codeloom-core/src/card.rs` (commit `77b8de1`). El cargador de `AgentProfile`
+desde fichero **no** existe aún: queda pendiente y es prerrequisito de A12. El formato
+del perfil es el de la sección 2 de este documento. Estado y limitaciones de la tarjeta:
+`docs/specs/2026-10-22-codeloom-a2a-agent-card-design.md`, sección «Estado».
+
 ## 5. A2A como transporte
 
 - **Dónde vive**: crate **opcional** `codeloom-a2a` (como `codeloom-herdr`,

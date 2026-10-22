@@ -96,12 +96,20 @@ después el transporte (A7, A8).
     `contextId` compartido entre tareas. `reference_task_ids` existe, pero nada lo escribe
     hasta A11. La serialización JSON es interna y la del cable queda para A4. La validación
     visual en terminal real está pendiente.
-- [ ] **A6. Tarjeta del agente (`AgentCard`)** y capacidades declaradas.
+- [x] **A6. Tarjeta del agente (`AgentCard`)** y capacidades declaradas.
+  - **Hecho el 2026-10-22** en el commit `77b8de1` (`feat(core): los tipos de la tarjeta de agente de A2A`),
+    módulo `crates/codeloom-core/src/card.rs`. Spec y plan en `cf82838`. Spec:
+    `docs/specs/2026-10-22-codeloom-a2a-agent-card-design.md`, sección «Estado». Plan:
+    `docs/plans/2026-10-22-codeloom-a2a-agent-card.md`.
+  - **Fuera de A6:** seguridad, firmas e icono de la tarjeta, que quedan para A8.
 - [ ] **A7. Transporte `InProcess`** detrás de `AgentTransport`: mensajes en memoria,
   sin socket, para los tests.
 - [ ] **A8. Transporte `A2aRemote`** (HTTP JSON-RPC y SSE; gRPC opcional) con roles
   `serve | consume | both`, por defecto desactivados, en el crate opcional
   `codeloom-a2a`. Aquí cobra sentido `auth-required`.
+  - Seguridad, firmas e icono de la tarjeta (`security_schemes`, `security_requirements`,
+    `signatures`, `icon_url`) quedan para esta tarea. A6 no los modela; ver la spec de la
+    tarjeta, sección «Estado».
 - [ ] **A9. Flujo de eventos** `TaskStatusUpdateEvent` y de artefactos sobre el bus de
   eventos existente, sin canal de interfaz paralelo.
 - [ ] **A10. Cancelar y reanudar.** `CancelTask` lo solicita el cliente y devuelve la
@@ -126,6 +134,10 @@ después el transporte (A7, A8).
   no del protocolo; para uno remoto, el agente es opaco y solo cabría una extensión
   declarada en su tarjeta o `metadata` libre, ambas cosas propias y sin garantía de que
   el otro lado las atienda. Requiere su propia spec antes de implementar.
+- [ ] **A13. Cargador de `AgentProfile` desde fichero (prerrequisito de A12).** Lee el
+  perfil del agente y de él se sintetiza la tarjeta local. El formato es el de la sección 2
+  de `docs/specs/2026-10-15-loom-agent-profile-a2a.md`. No consta aún ningún código de
+  perfiles; el cargador es una pieza nueva.
 
 ## Cruces con otras líneas
 

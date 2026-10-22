@@ -64,3 +64,49 @@ Pruebas puras: ida y vuelta serde de una tarjeta completa; constructor local con
 valores por defecto declarados; `with_skill` añade una skill con sus `tags`; capacidades
 sin declarar frente a `Some(false)`; una tarjeta local tiene `supported_interfaces`
 vacío y lo reporta un método (`is_servable()` = false).
+
+## Estado (2026-10-22)
+
+**Implementado.** Commit `77b8de1` (`feat(core): los tipos de la tarjeta de agente de A2A`):
+módulo `crates/codeloom-core/src/card.rs`, declarado en `lib.rs`. Contiene los seis tipos
+de «Qué dice el proto», `AgentSkill::new`, `AgentCard::local`, `AgentCard::with_skill` y
+`AgentCard::is_servable`, con siete tests: `card_roundtrips_through_serde`,
+`local_card_has_declared_defaults`, `local_card_is_not_servable`,
+`card_with_an_interface_is_servable`, `with_skill_appends_a_skill_with_its_tags`,
+`capabilities_distinguish_undeclared_from_false` y `skill_without_optional_fields_roundtrips`.
+El plan es `docs/plans/2026-10-22-codeloom-a2a-agent-card.md`; esta spec y el plan se
+commitearon en `cf82838`.
+
+**Decisiones tomadas al implementar** (además de las de arriba):
+
+- Los campos `Option` llevan `#[serde(default)]`: un JSON sin ellos se deserializa como `None`.
+- Los `Vec` obligatorios del proto (`supported_interfaces`, `tags`, los modos por defecto y
+  `skills`) no tienen valor por defecto de serde. Un JSON que no los trae falla al
+  deserializar, como marca el proto. Los opcionales de la skill (`examples`, `input_modes`,
+  `output_modes`) sí lo tienen.
+- `AgentCapabilities` no deriva `Default`; `AgentCard::local` construye sus campos a mano.
+- `is_servable()` solo comprueba que haya al menos una interfaz. No valida `url`,
+  `protocol_binding` ni `protocol_version`.
+
+**Limitaciones reales:**
+
+- Un `Option<serde_json::Value>` con `Some(null)` no sobrevive la ida y vuelta: serde lo lee
+  como `None`. Pasa en `AgentExtension::params` igual que en los `metadata` de `a2a.rs`.
+  No consta ningún caso que dependa de esa distinción; si apareciera, habría que cambiar el tipo.
+- El test `capabilities_distinguish_undeclared_from_false` **pasó ya en la fase roja**,
+  porque se apoya solo en serde derivado y no toca ningún cuerpo dejado en `todo!()`. Por
+  tanto no demuestra por sí mismo que la prueba falle sin el código; cabe señalar que
+  comprueba una propiedad que garantiza el derivado.
+- No existe código de `AgentProfile`. El formato solo está en la spec del perfil del 15 de
+  octubre, así que la tarjeta no se puede sintetizar aún desde un fichero.
+- No se sirve ni se descarga ninguna tarjeta (A7 y A8), y no hay validación de tarjetas recibidas.
+- Quedan fuera `security_schemes`, `security_requirements` (en la tarjeta y en la skill),
+  `signatures` e `icon_url`. Entran con A8.
+
+**Pendiente:**
+
+- A8: seguridad, firmas e icono de la tarjeta. Si la firma se implementa con JCS, habrá que
+  distinguir «no puesto» de «puesto con valor por defecto» (lectura nuestra de la spec del
+  protocolo, sección 8.4).
+- Cargador de `AgentProfile` desde fichero, prerrequisito de A12. Queda como entrada A13 de
+  la hoja de ruta (`docs/plans/2026-10-22-codeloom-a2a-roadmap.md`).
