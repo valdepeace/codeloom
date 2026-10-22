@@ -377,6 +377,10 @@ pub struct App {
     pub current_step: usize,
     pub max_steps: usize,
     pub changes: batten::state::FileChanges,
+    /// Ficheros editados por sesión (padre e hijos): sesión → ruta → (añadidas, quitadas).
+    /// La última edición de cada ruta gana. Alimenta el rail y el panel de cambios al
+    /// cargar una sesión; se vacía cuando la carga no es una navegación padre↔hijo.
+    pub files_by_session: HashMap<i64, BTreeMap<String, (usize, usize)>>,
     /// Scroll del transcript (sigue el final salvo que el usuario suba).
     pub viewport: batten::state::Viewport,
     pub layout: batten::widgets::transcript::Layout,
@@ -604,6 +608,7 @@ impl App {
             current_step: 0,
             max_steps: 0,
             changes: batten::state::FileChanges::new(),
+            files_by_session: HashMap::new(),
             viewport: batten::state::Viewport::new(),
             layout: batten::widgets::transcript::Layout::new(),
             focus: Focus::Composer,
@@ -1267,8 +1272,10 @@ impl App {
         self.session_id = Some(session);
         // Una navegación con `open_child` o `go_parent` conserva la pila de padres;
         // cualquier otra carga (p. ej. el selector de sesiones) la vacía.
-        if !std::mem::take(&mut self.nav_keep_stack) {
+        let navegacion = std::mem::take(&mut self.nav_keep_stack);
+        if !navegacion {
             self.parent_stack.clear();
+            self.files_by_session.clear();
         }
         self.rail_selected = None;
         self.subagents.clear();
@@ -1289,6 +1296,16 @@ impl App {
         // El bloque activo pertenece también a la sesión anterior.
         self.block = None;
         self.restore_messages(messages);
+        // `restore_messages` vacía el panel de cambios; se repone con los ficheros de esta sesión.
+        if let Some(files) = self.files_by_session.get(&session.0) {
+            for (path, &(added, removed)) in files {
+                self.changes.upsert(batten::state::FileChange {
+                    path: path.clone(),
+                    added,
+                    removed,
+                });
+            }
+        }
     }
 
     /// Sustituye los apuntes de la sesión abierta por los que devuelve la base de datos. Una
@@ -1885,11 +1902,36 @@ impl App {
             .count()
     }
 
+    /// Número de ficheros distintos que ha editado `child` en la sesión abierta.
+    pub fn child_file_count(&self, child: SessionId) -> usize {
+        self.files_by_session.get(&child.0).map_or(0, BTreeMap::len)
+    }
+
+    /// Anota una edición en `files_by_session` para `session`. La última edición de una
+    /// ruta sustituye a la anterior, igual que `changes.upsert`.
+    fn record_file(&mut self, session: i64, path: &str, added: usize, removed: usize) {
+        self.files_by_session
+            .entry(session)
+            .or_default()
+            .insert(path.to_string(), (added, removed));
+    }
+
     /// Actualiza las métricas de un hijo de la sesión abierta. Solo toca `agent_stats`:
     /// el turno, el transcript y los contadores del padre quedan intactos.
     fn apply_child_event(&mut self, child: SessionId, event: LiveEvent) {
         // Los eventos que no se reenvían no crean métricas.
         if !event.is_child_relevant() {
+            return;
+        }
+        // Un fichero editado por el hijo se anota en su sesión, sin tocar el panel del padre
+        // ni crear métricas nuevas para el hijo.
+        if let LiveEvent::FileDiff {
+            path,
+            added,
+            removed,
+        } = event
+        {
+            self.record_file(child.0, &path, added, removed);
             return;
         }
         let now = Instant::now();
@@ -2035,11 +2077,16 @@ impl App {
                 path,
                 added,
                 removed,
-            } => self.changes.upsert(batten::state::FileChange {
-                path,
-                added,
-                removed,
-            }),
+            } => {
+                if let Some(session) = self.session_id {
+                    self.record_file(session.0, &path, added, removed);
+                }
+                self.changes.upsert(batten::state::FileChange {
+                    path,
+                    added,
+                    removed,
+                });
+            }
             LiveEvent::JobChanged(snapshot) => {
                 if snapshot.kind == "subagent" {
                     if let Some(subagent) = self
@@ -4304,6 +4351,186 @@ mod tests {
         assert_eq!(app.turn_in_flight, in_flight);
         assert_eq!(app.transcript.entry_count(), entries);
         assert_eq!(app.phase, phase);
+    }
+
+    /// Ficheros de un hijo tal como los ve la interfaz: ruta → (añadidas, quitadas).
+    fn child_files(app: &App, child: i64) -> Vec<(String, (usize, usize))> {
+        app.files_by_session
+            .get(&child)
+            .map(|files| files.iter().map(|(p, c)| (p.clone(), *c)).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn child_file_diff_accumulates_by_child_and_keeps_last_per_path() {
+        let mut app = crush_app();
+        app.session_id = Some(SessionId(1));
+
+        app.apply(child_event(
+            SessionId(1),
+            9,
+            LiveEvent::FileDiff {
+                path: "a.rs".into(),
+                added: 1,
+                removed: 0,
+            },
+        ));
+        app.apply(child_event(
+            SessionId(1),
+            9,
+            LiveEvent::FileDiff {
+                path: "b.rs".into(),
+                added: 1,
+                removed: 1,
+            },
+        ));
+        app.apply(child_event(
+            SessionId(1),
+            9,
+            LiveEvent::FileDiff {
+                path: "a.rs".into(),
+                added: 4,
+                removed: 2,
+            },
+        ));
+        app.apply(child_event(
+            SessionId(1),
+            10,
+            LiveEvent::FileDiff {
+                path: "a.rs".into(),
+                added: 7,
+                removed: 7,
+            },
+        ));
+
+        assert_eq!(
+            child_files(&app, 9),
+            vec![("a.rs".to_string(), (4, 2)), ("b.rs".to_string(), (1, 1))],
+            "la última edición de cada ruta gana y las rutas se ordenan"
+        );
+        assert_eq!(child_files(&app, 10), vec![("a.rs".to_string(), (7, 7))]);
+        assert_eq!(app.child_file_count(SessionId(9)), 2);
+        assert_eq!(app.child_file_count(SessionId(42)), 0);
+    }
+
+    #[test]
+    fn child_file_diff_does_not_touch_parent_changes() {
+        let mut app = crush_app();
+        app.session_id = Some(SessionId(1));
+        app.apply(LiveEvent::FileDiff {
+            path: "propio.rs".into(),
+            added: 3,
+            removed: 1,
+        });
+        let antes = app.changes.totals();
+
+        app.apply(child_event(
+            SessionId(1),
+            9,
+            LiveEvent::FileDiff {
+                path: "del_hijo.rs".into(),
+                added: 5,
+                removed: 5,
+            },
+        ));
+
+        assert_eq!(app.changes.len(), 1, "el panel del padre no cambia");
+        assert_eq!(app.changes.totals(), antes);
+        assert_eq!(app.changes.iter().next().unwrap().path, "propio.rs");
+    }
+
+    #[test]
+    fn own_file_diff_is_recorded_for_the_open_session() {
+        let mut app = crush_app();
+        app.session_id = Some(SessionId(1));
+        app.apply(LiveEvent::FileDiff {
+            path: "a.rs".into(),
+            added: 1,
+            removed: 0,
+        });
+        app.apply(LiveEvent::FileDiff {
+            path: "a.rs".into(),
+            added: 2,
+            removed: 3,
+        });
+
+        assert_eq!(
+            app.files_by_session
+                .get(&1)
+                .and_then(|files| files.get("a.rs")),
+            Some(&(2, 3)),
+            "el fichero propio queda anotado en la sesión abierta"
+        );
+        assert_eq!(app.changes.len(), 1);
+    }
+
+    #[test]
+    fn parent_files_return_to_changes_panel_after_child_roundtrip() {
+        let mut app = crush_app();
+        app.session_id = Some(SessionId(1));
+        app.subagents.insert(
+            9,
+            child_descriptor(9, SubagentStatus::Running, SessionId(1)),
+        );
+        app.apply(LiveEvent::FileDiff {
+            path: "a.rs".into(),
+            added: 1,
+            removed: 0,
+        });
+
+        // Entrar en el hijo: su panel empieza vacío, sin los ficheros del padre.
+        assert!(app.open_child(9));
+        app.load_session(SessionId(9), Vec::new());
+        assert!(
+            app.changes.is_empty(),
+            "el hijo no hereda los ficheros del padre"
+        );
+
+        // Mientras el hijo está abierto, sus propias ediciones llegan directas.
+        app.apply(LiveEvent::FileDiff {
+            path: "b.rs".into(),
+            added: 2,
+            removed: 0,
+        });
+        assert_eq!(app.changes.len(), 1);
+
+        // Volver al padre: sus ficheros reaparecen y los del hijo no.
+        assert!(app.go_parent());
+        app.load_session(SessionId(1), Vec::new());
+        let rutas: Vec<&str> = app.changes.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(rutas, ["a.rs"], "el panel del padre recupera sus ficheros");
+        assert!(
+            app.files_by_session.contains_key(&9),
+            "la navegación conserva al hijo"
+        );
+    }
+
+    #[test]
+    fn loading_an_unrelated_session_clears_files_by_session() {
+        let mut app = crush_app();
+        app.session_id = Some(SessionId(1));
+        app.apply(LiveEvent::FileDiff {
+            path: "a.rs".into(),
+            added: 1,
+            removed: 0,
+        });
+        app.apply(child_event(
+            SessionId(1),
+            9,
+            LiveEvent::FileDiff {
+                path: "b.rs".into(),
+                added: 1,
+                removed: 0,
+            },
+        ));
+
+        app.load_session(SessionId(7), Vec::new());
+
+        assert!(
+            app.files_by_session.is_empty(),
+            "la carga ajena vacía el mapa"
+        );
+        assert!(app.changes.is_empty());
     }
 
     /// App con el catálogo de precios y unos ajustes que apuntan a `acme` con el modelo dado.

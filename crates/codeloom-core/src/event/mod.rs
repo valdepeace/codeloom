@@ -87,13 +87,13 @@ impl LiveEvent {
             | LiveEvent::ToolStarted { .. }
             | LiveEvent::ToolFinished { .. }
             | LiveEvent::Usage { .. }
+            | LiveEvent::FileDiff { .. }
             | LiveEvent::TurnEnded
             | LiveEvent::Error { .. } => true,
             LiveEvent::Delta { .. }
             | LiveEvent::ReasoningDelta { .. }
             | LiveEvent::MessageAdded(_)
             | LiveEvent::SessionMessageAdded { .. }
-            | LiveEvent::FileDiff { .. }
             | LiveEvent::JobChanged(_)
             | LiveEvent::SubagentChanged(_)
             | LiveEvent::SubagentInputRequested { .. }
@@ -143,6 +143,16 @@ mod tests {
     async fn publish_without_subscriber_is_ok() {
         let bus = EventBus::new(8);
         bus.publish(LiveEvent::Delta { text: "x".into() });
+    }
+
+    #[test]
+    fn file_diff_is_forwarded_from_children() {
+        let event = LiveEvent::FileDiff {
+            path: "src/lib.rs".into(),
+            added: 2,
+            removed: 1,
+        };
+        assert!(event.is_child_relevant(), "debería reenviarse: {event:?}");
     }
 
     #[test]
