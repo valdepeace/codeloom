@@ -331,6 +331,7 @@ async fn main() -> Result<()> {
     app.set_provider_settings((&cfg).into());
     app.set_sessions(sessions);
     app.set_prefs_path(data_dir.join("ui.toml"));
+    app.set_agent_registry(registro_agentes.clone());
     codeloom_tui::run::run(
         app,
         prompt_tx,

@@ -479,6 +479,8 @@ pub struct App {
     pub provider_settings: Option<ProviderSettings>,
     /// Catálogo de proveedores y modelos de models.dev. Vacío hasta que llega la carga en segundo plano.
     pub catalog: Arc<Catalog>,
+    /// Registro de agentes, para `/agents`. `None` si el binario no lo cablea.
+    pub agent_registry: Option<Arc<codeloom_core::registry::AgentRegistry>>,
     /// Apuntes de consumo de la sesión abierta: los persistidos al abrirla más los vivos.
     pub usage_records: Vec<UsageRecord>,
     /// Copia de los ajustes al abrir el diálogo y tras guardar con éxito.
@@ -663,6 +665,7 @@ impl App {
             session_loading: false,
             provider_settings: None,
             catalog: Arc::new(Catalog::default()),
+            agent_registry: None,
             usage_records: Vec::new(),
             settings_baseline: None,
             settings_warned: false,
@@ -794,6 +797,25 @@ impl App {
     /// Sustituye el catálogo por otro recién llegado de la carga en segundo plano.
     pub fn set_catalog(&mut self, catalog: Arc<Catalog>) {
         self.catalog = catalog;
+    }
+
+    /// Entrega a la interfaz el registro de agentes que consulta `/agents`.
+    pub fn set_agent_registry(&mut self, registry: Arc<codeloom_core::registry::AgentRegistry>) {
+        self.agent_registry = Some(registry);
+    }
+
+    /// Informe de los agentes cargados, como línea de interfaz del transcript (no pasa al
+    /// historial del modelo ni se persiste). Lee la instantánea vigente en el momento.
+    pub fn show_agents(&mut self) {
+        let texto = match &self.agent_registry {
+            Some(registro) => registro.snapshot().report(),
+            None => "No agent registry available".to_string(),
+        };
+        self.transcript.push_entry(
+            batten::state::LineKind::System,
+            batten::state::Format::Plain,
+            texto,
+        );
     }
 
     pub fn open_settings(&mut self) {
@@ -3214,6 +3236,32 @@ mod tests {
         assert_eq!(titles, ["AGENT", "PROJECT", "FLOCK", "SESSION"]);
         assert_eq!(sb.sections[1].lines[0], "/proj");
         assert_eq!(sb.sections[3].lines[0], "session #42");
+    }
+
+    #[test]
+    fn show_agents_writes_the_registry_report_to_the_transcript() {
+        let mut app = App::new();
+        app.show_agents();
+        let ultima = app.transcript.entry_count() - 1;
+        assert_eq!(
+            app.transcript.entry_lines(ultima)[0].plain(),
+            "No agent registry available"
+        );
+
+        let registro = codeloom_core::registry::AgentRegistry::new(vec![Box::new(
+            codeloom_core::registry::BuiltInSource,
+        )]);
+        app.set_agent_registry(Arc::new(registro));
+        app.show_agents();
+        let ultima = app.transcript.entry_count() - 1;
+        let texto: Vec<&str> = app
+            .transcript
+            .entry_lines(ultima)
+            .iter()
+            .map(|l| l.plain())
+            .collect();
+        assert_eq!(texto[0], "Loaded agents:");
+        assert!(texto[1].contains("default [usable] built-in"), "{texto:?}");
     }
 
     #[test]

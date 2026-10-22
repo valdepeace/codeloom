@@ -80,6 +80,41 @@ impl RegistrySnapshot {
         })
     }
 
+    /// Informe legible para la persona usuaria (`/agents`): un agente por línea con su origen,
+    /// su estado de aprobación, el modelo y el esfuerzo propios (o «inherits») y su descripción.
+    /// Cierra con el número de problemas de carga vigentes.
+    pub fn report(&self) -> String {
+        let mut lineas = vec!["Loaded agents:".to_string()];
+        for entrada in self.entries() {
+            let origen = entrada.origin.as_text();
+            let aprobacion = match self.approval(&entrada.name) {
+                Some(Approval::Pending) => "awaiting approval",
+                Some(Approval::Approved) => "approved",
+                _ => "usable",
+            };
+            let ejecucion = match &entrada.execution {
+                Execution::Local(local) => format!(
+                    "model {} / effort {}",
+                    local.model.as_deref().unwrap_or("inherits"),
+                    local.effort.as_deref().unwrap_or("inherits")
+                ),
+                Execution::Remote => "remote".to_string(),
+            };
+            lineas.push(format!(
+                "  {} [{aprobacion}] {origen} — {ejecucion}",
+                entrada.name
+            ));
+            let descripcion = entrada.card.description.trim();
+            if !descripcion.is_empty() {
+                lineas.push(format!("      {descripcion}"));
+            }
+        }
+        if !self.problems.is_empty() {
+            lineas.push(format!("{} load problem(s)", self.problems.len()));
+        }
+        lineas.join("\n")
+    }
+
     /// Sección del prompt de sistema que enumera los agentes a los que la herramienta
     /// `subagent` puede delegar. Sin ella el modelo no tiene forma de saber cuáles existen.
     ///
@@ -385,6 +420,34 @@ mod tests {
             seccion.contains("awaiting approval: front"),
             "se debe avisar del agente pendiente: {seccion}"
         );
+    }
+
+    #[test]
+    fn report_shows_origin_approval_and_execution_of_each_agent() {
+        let global = tempfile::tempdir().unwrap();
+        let proyecto = tempfile::tempdir().unwrap();
+        escribir(
+            global.path(),
+            "rust.md",
+            "---\nname: rust\ndescription: Experto en Rust\nmodel: m1\n---\n\nCuerpo.\n",
+        );
+        escribir(proyecto.path(), "front.md", &perfil("front", "Interfaz"));
+
+        let informe = registro_con_global_y_proyecto(global.path(), proyecto.path())
+            .snapshot()
+            .report();
+
+        assert!(informe.contains("default [usable] built-in"), "{informe}");
+        assert!(
+            informe.contains("rust [usable] global:")
+                && informe.contains("model m1 / effort inherits"),
+            "{informe}"
+        );
+        assert!(
+            informe.contains("front [awaiting approval] project:"),
+            "{informe}"
+        );
+        assert!(informe.contains("Experto en Rust"), "{informe}");
     }
 
     #[test]

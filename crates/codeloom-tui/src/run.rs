@@ -682,6 +682,10 @@ fn execute_slash_command(app: &mut App, command: crate::commands::Command) -> Op
             None
         }
         Command::Sidebar => handle_key(app, KeyCode::Char('b'), KeyModifiers::CONTROL),
+        Command::Agents => {
+            app.show_agents();
+            None
+        }
         Command::Mouse => {
             app.toggle_mouse_capture();
             confirm_mouse(app);
