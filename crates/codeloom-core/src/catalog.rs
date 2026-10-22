@@ -188,6 +188,22 @@ impl Catalog {
             .find(|candidate| candidate.id == model)?;
         Some((model.input_cost?, model.output_cost?))
     }
+
+    /// Ventana de contexto en tokens del modelo `model` del proveedor cuya URL base coincide
+    /// con `base_url`. `None` si falta el proveedor, el modelo o el límite publicado. La URL se
+    /// compara igual que en `prices`.
+    pub fn context_window(&self, base_url: &str, model: &str) -> Option<u64> {
+        let wanted = normalize_base_url(base_url);
+        let provider = self
+            .providers
+            .iter()
+            .find(|provider| normalize_base_url(&provider.base_url) == wanted)?;
+        let model = provider
+            .models
+            .iter()
+            .find(|candidate| candidate.id == model)?;
+        model.context
+    }
 }
 
 /// Forma comparable de una URL base: sin espacios, sin barras finales y en minúsculas.
@@ -799,6 +815,62 @@ mod tests {
         );
         assert_eq!(
             Catalog::default().prices(url, "mistralai/mistral-nemo"),
+            None,
+            "sin catálogo"
+        );
+    }
+
+    /// Catálogo con `openrouter` (URL con barra final) y dos modelos: uno con límite de
+    /// contexto publicado y otro sin ningún `limit`.
+    fn context_catalog() -> Catalog {
+        Catalog::from_json(
+            r#"{"openrouter": {"id": "openrouter", "npm": "@openrouter/ai-sdk-provider",
+                "api": "https://openrouter.ai/api/v1/", "env": ["OPENROUTER_API_KEY"],
+                "models": {
+                    "con-limite": {"id": "con-limite", "tool_call": true,
+                        "limit": {"context": 200000, "output": 8192}},
+                    "sin-limite": {"id": "sin-limite", "tool_call": true}
+                }}}"#,
+        )
+        .expect("el JSON de contexto es válido")
+    }
+
+    #[test]
+    fn context_window_returns_the_published_limit() {
+        let catalog = context_catalog();
+        assert_eq!(
+            catalog.context_window("https://openrouter.ai/api/v1", "con-limite"),
+            Some(200000),
+            "sin barra final"
+        );
+        assert_eq!(
+            catalog.context_window("HTTPS://OpenRouter.ai/API/v1/", "con-limite"),
+            Some(200000),
+            "con barra final y en mayúsculas"
+        );
+    }
+
+    #[test]
+    fn context_window_is_none_for_unknown_model_or_provider_or_missing_limit() {
+        let catalog = context_catalog();
+        let url = "https://openrouter.ai/api/v1";
+        assert_eq!(
+            catalog.context_window(url, "desconocido"),
+            None,
+            "modelo ausente"
+        );
+        assert_eq!(
+            catalog.context_window(url, "sin-limite"),
+            None,
+            "sin límite publicado"
+        );
+        assert_eq!(
+            catalog.context_window("https://otro.example/v1", "con-limite"),
+            None,
+            "URL de otro proveedor"
+        );
+        assert_eq!(
+            Catalog::default().context_window(url, "con-limite"),
             None,
             "sin catálogo"
         );
