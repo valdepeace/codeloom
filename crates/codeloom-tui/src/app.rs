@@ -2143,6 +2143,10 @@ impl App {
         if !event.is_child_relevant() {
             return;
         }
+        // Los mensajes del hijo aún no alimentan ningún registro: se ignoran sin crear métricas.
+        if matches!(event, LiveEvent::MessageAdded(_)) {
+            return;
+        }
         // Un fichero editado por el hijo se anota en su sesión, sin tocar el panel del padre
         // ni crear métricas nuevas para el hijo.
         if let LiveEvent::FileDiff {

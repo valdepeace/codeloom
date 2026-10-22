@@ -87,7 +87,8 @@ pub enum LiveEvent {
 
 impl LiveEvent {
     /// Indica si un evento del bus de un hijo merece reenviarse al padre. Quedan
-    /// fuera los deltas de texto (volumen) y el resto de eventos de la sesión.
+    /// fuera los deltas de texto (volumen) y el resto de eventos de la sesión. Los
+    /// mensajes completos sí se reenvían: son el registro que la interfaz muestra del hijo.
     pub fn is_child_relevant(&self) -> bool {
         match self {
             LiveEvent::TurnStarted
@@ -96,11 +97,11 @@ impl LiveEvent {
             | LiveEvent::ToolFinished { .. }
             | LiveEvent::Usage { .. }
             | LiveEvent::FileDiff { .. }
+            | LiveEvent::MessageAdded(_)
             | LiveEvent::TurnEnded
             | LiveEvent::Error { .. } => true,
             LiveEvent::Delta { .. }
             | LiveEvent::ReasoningDelta { .. }
-            | LiveEvent::MessageAdded(_)
             | LiveEvent::SessionMessageAdded { .. }
             | LiveEvent::JobChanged(_)
             | LiveEvent::SubagentChanged(_)
@@ -183,7 +184,6 @@ mod tests {
         let excluded = [
             LiveEvent::Delta { text: "x".into() },
             LiveEvent::ReasoningDelta { text: "x".into() },
-            LiveEvent::MessageAdded(Message::user("hola")),
             LiveEvent::JobChanged(job),
         ];
         for event in &excluded {
@@ -191,6 +191,7 @@ mod tests {
         }
 
         let included = [
+            LiveEvent::MessageAdded(Message::user("hola")),
             LiveEvent::TurnStarted,
             LiveEvent::StepStarted {
                 step: 1,
@@ -215,6 +216,23 @@ mod tests {
         ];
         for event in &included {
             assert!(event.is_child_relevant(), "debería reenviarse: {event:?}");
+        }
+    }
+
+    #[test]
+    fn message_added_is_child_relevant_but_deltas_are_not() {
+        let message = LiveEvent::MessageAdded(Message::user("hola"));
+        assert!(
+            message.is_child_relevant(),
+            "debería reenviarse: {message:?}"
+        );
+
+        let deltas = [
+            LiveEvent::Delta { text: "x".into() },
+            LiveEvent::ReasoningDelta { text: "x".into() },
+        ];
+        for delta in &deltas {
+            assert!(!delta.is_child_relevant(), "debería filtrarse: {delta:?}");
         }
     }
 }

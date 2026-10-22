@@ -1443,6 +1443,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn child_messages_are_forwarded_tagged_with_the_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SqliteStore::open(dir.path().join("messages.db").to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+        let parent = store.create_session("/project").await.unwrap();
+        let bus = EventBus::new(256);
+        let mut rx = bus.subscribe();
+        let jobs = Arc::new(LocalJobRegistry::default());
+        let runtime = echo_launcher(
+            dir.path(),
+            store.clone(),
+            jobs.clone(),
+            bus.clone(),
+            vec![vec![
+                StreamChunk::TextDelta("listo".into()),
+                StreamChunk::Done(FinishReason::Stop),
+            ]],
+        );
+
+        let (child, _job) = runtime
+            .start(
+                parent,
+                "obrero".into(),
+                "responde".into(),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        // Se recogen los reenvíos hasta el TurnEnded del hijo (acotado en tiempo).
+        let forwarded = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut seen = Vec::new();
+            loop {
+                match rx.recv().await {
+                    Ok(LiveEvent::ChildEvent {
+                        parent: p,
+                        child: c,
+                        event,
+                    }) => {
+                        let finished = c == child && matches!(*event, LiveEvent::TurnEnded);
+                        seen.push((p, c, *event));
+                        if finished {
+                            return seen;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => panic!("el bus del padre debería seguir abierto: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("el hijo debería reenviar su TurnEnded");
+
+        let message = forwarded.iter().find_map(|(p, c, e)| match e {
+            LiveEvent::MessageAdded(_) => Some((*p, *c)),
+            _ => None,
+        });
+        assert_eq!(
+            message,
+            Some((parent, child)),
+            "el mensaje del hijo debería llegar al padre etiquetado con su identidad: {forwarded:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn forwarder_ends_when_the_child_finishes() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(
