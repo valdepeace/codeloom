@@ -61,6 +61,9 @@ the workspace does not exist.
   tools are `Parallel`.
 - **No real network in tests**: the provider is always a mock (`wiremock` or a
   test `Provider`).
+- **Nothing unbounded reaches the model**: every tool output, prompt section and loop has a
+  cap (spec `docs/specs/2026-10-22-codeloom-decalogo-de-contexto-y-coste.md`). Read the
+  decalogue before adding or changing a tool.
 - One binary pair, two modes: `codeloom-cli` builds both `loom` and `codeloom`,
   which autodetect standalone vs `herdr` plugin.
 
