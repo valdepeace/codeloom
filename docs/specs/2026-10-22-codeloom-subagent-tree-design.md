@@ -1,6 +1,6 @@
 # El subagente como nodo de un árbol en la conversación
 
-Estado: propuesta del 2026-10-22. Continúa `2026-10-22-codeloom-a2a-delegation-choice-design.md`
+Estado: implementada el 2026-10-22 (véase «Estado» al final). Continúa `2026-10-22-codeloom-a2a-delegation-choice-design.md`
 (adenda «el transcript es el diario de toda llamada») y se apoya en la regla de trazabilidad A2A
 (`a2a-visual-traceability`).
 
@@ -107,3 +107,16 @@ persona usuaria (punto ya abierto), el icono de `auth-required` puede cambiarse 
 - ¿Debe el nodo desplegarse solo cuando el hijo pasa a `input-required` (porque necesita a la
   persona usuaria)? Aquí no: sigue plegado y solo cambia su icono.
 - Comando o atajo para desplegar/plegar todos a la vez.
+
+## Estado
+
+Implementada el 2026-10-22, **sin verla aún en una terminal real** y con la medición de fluidez
+del composer con un nodo desplegado pendiente. Commits: `a059b49` (el `MessageAdded` del hijo llega
+al padre), `1bf6ec6` (líneas de nodo en batten), `3d4ee31` (registro acotado por hijo), `7cdce9b`
+(nodo plegable con icono A2A), `865539e` (→/Enter despliega, ← pliega) y `193e141` (las consultas
+del padre cuelgan del nodo).
+
+Lecturas propias que conviene recordar: las filas de acción se rotulan `↳ parent: {herramienta}`
+(en inglés, como el resto de etiquetas del nodo) y el resumen plegado dice `n query` o `n queries`;
+una llamada que llega antes que su hijo se reclasifica cuando este aparece; el aviso de fin del
+subagente en el look clásico sigue siendo una línea de sistema sin etiqueta propia.

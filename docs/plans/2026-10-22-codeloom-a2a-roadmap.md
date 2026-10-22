@@ -141,6 +141,10 @@ después el transporte (A7, A8).
       Spec: `docs/specs/2026-10-22-codeloom-a2a-delegation-choice-design.md`, sección «Estado».
     - **A12b, pendiente:** clasificador o enrutador automático (idea del usuario,
       «interesante más adelante»). El hueco es `regla_de_eleccion` en `registry/mod.rs`.
+- [x] **Árbol de subagentes (2026-10-22).** El subagente es un nodo plegable de la conversación,
+  con el icono del estado A2A y su nombre exacto; desplegado, muestra su texto y sus herramientas
+  y las consultas del padre sobre él. Commits `a059b49`, `1bf6ec6`, `3d4ee31`, `7cdce9b`,
+  `865539e`, `193e141`. Spec: `docs/specs/2026-10-22-codeloom-subagent-tree-design.md`.
 - [x] **A13. Registro de agentes con fuentes intercambiables (prerrequisito de A12).**
   Replanteada el 2026-10-22 por el usuario: la fuente de agentes **no debe ser solo un
   fichero**. El denominador común es la **tarjeta** (`AgentCard`, A6): quien delega
