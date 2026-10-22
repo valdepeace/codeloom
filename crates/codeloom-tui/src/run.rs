@@ -119,6 +119,18 @@ fn transcript_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         app.selection = Some(batten::state::Selection::at(len - 1));
         return;
     }
+    // Con el bloque activo sobre un nodo de subagente, → o Enter lo despliegan y ← lo pliega.
+    // Sin nodo bajo el bloque, la tecla sigue su camino de siempre.
+    let despliegue = match code {
+        KeyCode::Right | KeyCode::Enter => Some(true),
+        KeyCode::Left => Some(false),
+        _ => None,
+    };
+    if let Some(expanded) = despliegue {
+        if app.set_node_expanded(expanded) {
+            return;
+        }
+    }
     // Con el chrome `Flat` (Crush), flechas y j/k avanzan por bloques; Ctrl+flecha y
     // Ctrl+j siguen desplazando por líneas. Con Classic, todo igual que siempre.
     let by_block = app.theme.look.chrome == batten::widgets::ChromeStyle::Flat

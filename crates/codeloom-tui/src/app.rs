@@ -2210,6 +2210,30 @@ impl App {
         self.sync_activity(&node_key(child), "subagent", &label, lines, false);
     }
 
+    /// Despliega (`true`) o pliega (`false`) el nodo del subagente que ocupa el bloque activo.
+    /// Devuelve `false`, sin tocar nada, si el bloque activo no es un nodo de subagente.
+    pub fn set_node_expanded(&mut self, expanded: bool) -> bool {
+        let Some(bloque) = self.block_index() else {
+            return false;
+        };
+        // Los avisos no son nodos: solo cuentan las entradas de subagente en vivo.
+        let hijo = self
+            .activity_entries
+            .iter()
+            .filter(|e| !e.from_notice && e.kind == "subagent" && e.id.index() == bloque)
+            .find_map(|e| e.key.strip_prefix("subagent:")?.parse::<i64>().ok());
+        let Some(hijo) = hijo else {
+            return false;
+        };
+        if expanded {
+            self.expanded_nodes.insert(hijo);
+        } else {
+            self.expanded_nodes.remove(&hijo);
+        }
+        self.refresh_child_node(hijo);
+        true
+    }
+
     fn apply_child_event(&mut self, child: SessionId, event: LiveEvent) {
         // Los eventos que no se reenvían no crean métricas.
         if !event.is_child_relevant() {
@@ -4726,6 +4750,118 @@ linea 2",
                 "└─ ✓ result: primera línea".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn right_expands_the_active_subagent_node_and_left_folds_it() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = crush_app();
+        app.session_id = Some(SessionId(1));
+        app.apply(LiveEvent::SubagentChanged(sub(
+            "review",
+            TaskState::Working,
+            SessionId(1),
+        )));
+        app.apply(child_event(
+            SessionId(1),
+            9,
+            LiveEvent::MessageAdded(Message::assistant(vec![ContentPart::Text {
+                text: "voy a mirar".into(),
+            }])),
+        ));
+        app.apply(child_event(
+            SessionId(1),
+            9,
+            LiveEvent::MessageAdded(Message::assistant(vec![ContentPart::ToolCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                input: json!({ "command": "cargo test" }),
+            }])),
+        ));
+        app.focus = Focus::Transcript;
+        app.block = Some(0);
+        assert_eq!(texts(&app).len(), 1, "plegado, el nodo ocupa una línea");
+
+        crate::run::handle_key(&mut app, KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(
+            texts(&app),
+            vec![
+                "▾ ● subagent  review (working)".to_string(),
+                "├─ › voy a mirar".to_string(),
+                "└─ … bash cargo test".to_string(),
+            ]
+        );
+
+        crate::run::handle_key(&mut app, KeyCode::Left, KeyModifiers::NONE);
+        assert_eq!(
+            texts(&app),
+            vec!["▸ ● subagent  review (working)".to_string()]
+        );
+    }
+
+    #[test]
+    fn expanding_without_an_active_node_does_nothing() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = crush_app();
+        app.session_id = Some(SessionId(1));
+        // Transcript vacío: sin bloque efectivo no hay nodo ni pánico.
+        app.focus = Focus::Transcript;
+        app.block = Some(3);
+        assert!(!app.set_node_expanded(true));
+        crate::run::handle_key(&mut app, KeyCode::Right, KeyModifiers::NONE);
+        crate::run::handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.expanded_nodes.is_empty());
+
+        // Un mensaje normal bajo el bloque activo no es un nodo.
+        app.push_user("hola");
+        app.block = Some(0);
+        assert!(!app.set_node_expanded(true));
+        assert!(app.expanded_nodes.is_empty());
+
+        // Con un nodo en el transcript, el bloque sobre el mensaje sigue sin tocarlo.
+        app.apply(LiveEvent::SubagentChanged(sub(
+            "review",
+            TaskState::Working,
+            SessionId(1),
+        )));
+        app.block = Some(0);
+        assert!(!app.set_node_expanded(true));
+        assert!(app.expanded_nodes.is_empty());
+        assert!(!texts(&app).iter().any(|t| t.starts_with('▾')));
+    }
+
+    #[test]
+    fn expanded_node_follows_new_child_events() {
+        let mut app = crush_app();
+        app.session_id = Some(SessionId(1));
+        app.apply(LiveEvent::SubagentChanged(sub(
+            "review",
+            TaskState::Working,
+            SessionId(1),
+        )));
+        app.focus = Focus::Transcript;
+        app.block = Some(0);
+        assert!(app.set_node_expanded(true));
+        // Sin mensajes del hijo, desplegado solo queda la cabecera.
+        assert_eq!(texts(&app).len(), 1);
+
+        app.apply(child_event(
+            SessionId(1),
+            9,
+            LiveEvent::MessageAdded(Message::assistant(vec![ContentPart::Text {
+                text: "hola".into(),
+            }])),
+        ));
+        assert_eq!(
+            texts(&app),
+            vec![
+                "▾ ● subagent  review (working)".to_string(),
+                "└─ › hola".to_string(),
+            ]
+        );
+
+        assert!(app.set_node_expanded(false));
+        assert_eq!(texts(&app).len(), 1);
     }
 
     /// Tarea de prueba con el contenido y el estado indicados.
