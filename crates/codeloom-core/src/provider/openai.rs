@@ -197,7 +197,7 @@ fn wire_messages(messages: &[crate::message::Message]) -> Vec<serde_json::Value>
                         out.push(serde_json::json!({
                             "role": "tool",
                             "tool_call_id": call_id,
-                            "content": content
+                            "content": crate::tools::limit_output(content)
                         }));
                     }
                 }
@@ -508,5 +508,23 @@ mod effort_tests {
         let con = p.build_body(&peticion(Some("high")));
         assert_eq!(con["reasoning"]["effort"], "high");
         assert!(con.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn oversized_tool_results_from_old_history_are_capped_on_the_wire() {
+        use crate::message::{ContentPart, Message, Role};
+        let big = "x".repeat(crate::tools::MAX_TOOL_OUTPUT_BYTES * 4);
+        let msgs = vec![Message::new(
+            Role::Tool,
+            vec![ContentPart::ToolResult {
+                call_id: "c1".into(),
+                content: big.clone(),
+                is_error: false,
+            }],
+        )];
+        let wire = super::wire_messages(&msgs);
+        let sent = wire[0]["content"].as_str().unwrap();
+        assert!(sent.len() < big.len());
+        assert!(sent.contains("[output truncated:"));
     }
 }

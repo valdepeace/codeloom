@@ -441,7 +441,7 @@ impl AgentLoop {
                     Role::Tool,
                     vec![ContentPart::ToolResult {
                         call_id: id,
-                        content: out.content,
+                        content: crate::tools::limit_output(&out.content).into_owned(),
                         is_error: out.is_error,
                     }],
                 );

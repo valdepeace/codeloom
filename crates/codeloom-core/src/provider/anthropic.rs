@@ -219,7 +219,7 @@ fn wire_messages(messages: &[crate::message::Message]) -> Vec<serde_json::Value>
                         blocks.push(serde_json::json!({
                             "type": "tool_result",
                             "tool_use_id": call_id,
-                            "content": content
+                            "content": crate::tools::limit_output(content)
                         }));
                     }
                 }

@@ -47,6 +47,30 @@ impl ToolOutput {
     }
 }
 
+/// Tope de lo que una herramienta puede devolver al modelo. Ciertamente, una salida
+/// desmedida (un `glob **/*` que recorre `target/`) desborda el contexto del modelo y
+/// el proveedor responde con un 400; de ahí que se recorte siempre, con aviso expreso.
+pub const MAX_TOOL_OUTPUT_BYTES: usize = 20_000;
+
+/// Recorta `content` a `MAX_TOOL_OUTPUT_BYTES` por una frontera de carácter y añade un
+/// aviso con el tamaño original. Si cabe, lo devuelve intacto.
+pub fn limit_output(content: &str) -> std::borrow::Cow<'_, str> {
+    if content.len() <= MAX_TOOL_OUTPUT_BYTES {
+        return std::borrow::Cow::Borrowed(content);
+    }
+    let mut end = MAX_TOOL_OUTPUT_BYTES;
+    while !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    std::borrow::Cow::Owned(format!(
+        "{}
+[output truncated: {} of {} bytes shown; narrow the request]",
+        &content[..end],
+        end,
+        content.len()
+    ))
+}
+
 #[derive(Clone)]
 pub struct ToolCtx {
     pub cwd: PathBuf,
@@ -138,5 +162,15 @@ mod tests {
         r.register(std::sync::Arc::new(Dummy));
         assert!(r.get("dummy").is_some());
         assert_eq!(r.specs()[0].name, "dummy");
+    }
+
+    #[test]
+    fn limit_output_keeps_small_and_truncates_large_on_a_char_boundary() {
+        assert_eq!(limit_output("hola"), "hola");
+        let big = "ñ".repeat(MAX_TOOL_OUTPUT_BYTES);
+        let out = limit_output(&big);
+        assert!(out.len() < big.len());
+        assert!(out.contains("[output truncated:"));
+        assert!(out.contains(&format!("of {} bytes", big.len())));
     }
 }
