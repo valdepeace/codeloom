@@ -1,5 +1,6 @@
 //! Engine (provider-agnostic) for CodeLoom.
 
+pub mod a2a;
 pub mod agent;
 pub mod catalog;
 pub mod config;
