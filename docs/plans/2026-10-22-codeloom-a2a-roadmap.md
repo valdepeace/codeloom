@@ -77,12 +77,12 @@ después el transporte (A7, A8).
     (tareas enlazadas).
   - **Abierto (no consta en A2A):** qué pasa con `input-required` o `auth-required` si el
     usuario cancela al hijo (hoy pasa a `canceled`; ver A10).
-- [x] **A3. Leer lo que falta de la especificación** (hecho el 2026-10-22, parcial).
-  Leído en literal: el `a2a.proto` completo y, de la especificación, las secciones 3.1,
-  3.3, 3.4 y 7.6. Anotado en la spec A2A qué consta y qué no. **Quedan por leer en
-  literal** §4.4, §8.4, §9 a §11, §12 y §13 (se hará al abordar A4 y A8; basta
-  descargar el fichero en crudo, porque la herramienta web solo da literal los primeros
-  ~39 000 caracteres).
+- [x] **A3. Leer lo que falta de la especificación** (completa el 2026-10-22: ya se ha
+  leído todo). Leído en literal: el `a2a.proto` completo y, de la especificación, las
+  secciones 3.1, 3.3, 3.4, 7.6, 4.4, 8, 9 a 11, 12 y 13, con los apartados de los que
+  dependen. Qué consta y qué no queda anotado en `docs/specs/2026-10-15-loom-agent-profile-a2a.md`,
+  sección «Lectura de la especificación: descubrimiento, bindings y seguridad (2026-10-22)».
+  Las dudas que siguen abiertas están en esa misma sección.
 - [ ] **A4. Adaptador de nombres del cable.** v0.3 en `kebab-case`, v1.0 en
   `TASK_STATE_*`. Vive en el borde (crate del adaptador), nunca en el núcleo.
 - [ ] **A5. Tipos del protocolo en el núcleo.** `Task`, `Message`, `Part`, `Artifact`,

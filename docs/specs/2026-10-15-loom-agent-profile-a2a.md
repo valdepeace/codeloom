@@ -365,6 +365,112 @@ hoy los permisos de un hijo se delegan al servicio del padre de forma síncrona
 humana antes de una acción destructiva, un hijo a la espera de un permiso es el
 candidato natural a `auth-required`; no se afirma que lo sea hasta decidirlo.
 
+### Lectura de la especificación: descubrimiento, bindings y seguridad (2026-10-22)
+
+Fuentes: `spec.md` y `a2a.proto` de la copia local del 2026-10-22. Leídos en literal: §4.4, §8, §9 a §13. Para cerrar cada tema se han leído también §3.1.2, §3.1.5, §3.2.2, §3.2.6, §3.3.1 a §3.3.4, §3.5.2, §3.6, §3.7, §5.3 a §5.8 y §14.2.1. Cabe señalar que §8.4 trata de firma, no de descubrimiento: su encabezado es "8.4. Agent Card Signing". La tabla de §4.4 es una macro que la copia no expande, así que los campos se toman del proto. Lo que no conste se dice «no consta»; lo nuestro, «lectura nuestra».
+
+**1. AgentCard y descubrimiento**
+
+- Definición (proto): "A self-describing manifest for an agent." Obligatoriedad (§5.7): "Fields marked with `[(google.api.field_behavior) = REQUIRED]` indicate that the field **MUST** be present and set in valid messages".
+- REQUIRED: `AgentCard` (`name`, `description`, `supported_interfaces`, `version`, `capabilities`, `default_input_modes`, `default_output_modes`, `skills`); `AgentInterface` (`url`, `protocol_binding`, `protocol_version`, p. ej. "string protocol_version = 4 [(google.api.field_behavior) = REQUIRED];"); `AgentProvider` (`url`, `organization`); `AgentSkill` (`id`, `name`, `description`, `tags`); `AgentCardSignature` (`protected`, `signature`).
+- Opcionales: "AgentProvider provider = 4;", "optional string documentation_url = 6;", "optional string icon_url = 14;", "repeated AgentCardSignature signatures = 13;". Capacidades con presencia explícita: "optional bool streaming = 1;", "optional bool push_notifications = 2;", "optional bool extended_agent_card = 4;".
+- Descubrimiento (§8.2): "https://{server_domain}/.well-known/agent-card.json"; el servidor debe "make an Agent Card available" (§8.1). Otras vías: "Querying curated catalogs of agents" y "Pre-configured Agent Card URLs or content".
+- Interfaces (§8.3): "The first entry in `supportedInterfaces` represents the preferred interface"; y "Set the `tenant` field in every request message to exactly the value declared in the selected `AgentInterface` entry". Del proto, sobre `tenant`: "does not define its format or semantics."
+- Firma (§8.4, optativa): "be digitally signed using JSON Web Signature (JWS)"; "be canonicalized using the JSON Canonicalization Scheme (JCS)"; "Fields with default values **MUST** be omitted unless the field is marked as `REQUIRED` or has the `optional` keyword."; "verify at least one signature before trusting an Agent Card" (SHOULD); "Expired or revoked keys **MUST NOT** be used for verification".
+- Caché (§8.6, SHOULD): "include a `Cache-Control` response header with a `max-age` directive" e "include an `ETag` response header derived from the Agent Card's `version` field or a hash of the card content".
+- No consta: cómo se revoca una clave ni qué autoridades son de confianza.
+
+**2. Bindings**
+
+- Nombres: "PascalCase method names matching gRPC conventions (e.g., `SendMessage`, `GetTask`)" (§9.1). REST usa rutas (§11.3):
+
+| Operación | REST (§11.3) |
+|---|---|
+| Enviar | "`POST /message:send` - Send message"; "`POST /message:stream` - Send message with streaming (SSE response)" |
+| Tareas | "`GET /tasks/{id}` - Get task status"; "`POST /tasks/{id}:subscribe` - Subscribe to task updates (SSE response, returns error for terminal tasks)" |
+| Tarjeta extendida | "`GET /extendedAgentCard` - Get authenticated extended Agent Card" |
+
+- Estado: "`TASK_STATE_COMPLETED`, `TASK_STATE_FAILED`, `TASK_STATE_CANCELED`, or `TASK_STATE_REJECTED`" (§9.4.6, JSON-RPC); "Represented using their string values (e.g., `status=TASK_STATE_WORKING`)" (§11.5, REST); gRPC usa el enum del proto: "TASK_STATE_COMPLETED = 3;".
+- Errores (§5.4, filas literales sin retocar):
+
+```
+"| `TaskNotFoundError`                   | `-32001`      | `NOT_FOUND`           | `404 Not Found`             |"
+"| `TaskNotCancelableError`              | `-32002`      | `FAILED_PRECONDITION` | `400 Bad Request`           |"
+"| `PushNotificationNotSupportedError`   | `-32003`      | `FAILED_PRECONDITION` | `400 Bad Request`           |"
+"| `UnsupportedOperationError`           | `-32004`      | `FAILED_PRECONDITION` | `400 Bad Request`           |"
+"| `ContentTypeNotSupportedError`        | `-32005`      | `INVALID_ARGUMENT`    | `400 Bad Request`           |"
+"| `InvalidAgentResponseError`           | `-32006`      | `INTERNAL`            | `500 Internal Server Error` |"
+"| `ExtendedAgentCardNotConfiguredError` | `-32007`      | `FAILED_PRECONDITION` | `400 Bad Request`           |"
+"| `ExtensionSupportRequiredError`       | `-32008`      | `FAILED_PRECONDITION` | `400 Bad Request`           |"
+"| `VersionNotSupportedError`            | `-32009`      | `FAILED_PRECONDITION` | `400 Bad Request`           |"
+```
+
+- Detalle: "A2A-specific errors use codes in the range `-32001` to `-32099`." (§9.5). JSON-RPC: "Implementations **SHOULD** use well-known types such as `google.rpc.ErrorInfo`" (§9.5). gRPC: "implementations **MUST** include a `google.rpc.ErrorInfo` message in the `status.details` array" (§10.6). REST: "implementations **MUST** include a `google.rpc.ErrorInfo` object in the `details` array for A2A-specific errors", con "suffix (e.g., `TASK_NOT_FOUND`, `TASK_NOT_CANCELABLE`)" (§11.6). No consta regla de `reason` para JSON-RPC.
+
+**3. Cancelación (`CancelTask`)**
+
+- General (§3.1.5): "The server will attempt to cancel the task, but success is not guaranteed"; "The operation attempts to cancel the specified task and returns its updated state."; error: "The task is not in a cancelable state (e.g., already completed, failed, or canceled)."
+- Idempotencia (§3.3.1): "operations are idempotent - multiple cancellation requests have the same effect".
+- JSON-RPC (§9.4.5): "Cancels an ongoing task.", sin respuesta de ejemplo (no consta). gRPC (§10.4.5): "Cancels a running task.", respuesta "See [`Task`](#411-task) object definition.". REST (§11.3.2): "`POST /tasks/{id}:cancel` - Cancel task", sin respuesta de ejemplo (no consta).
+- Error (§3.3.2): "An attempt was made to cancel a task that is not in a cancelable state", que en REST es "`TASK_NOT_CANCELABLE`" (§11.6) y en §5.4 es -32002 / FAILED_PRECONDITION / 400. Estado resultante: no consta (el texto dice "with cancellation status"); `canceled` es inferencia nuestra.
+
+**4. Streaming, orden y reconexión**
+
+- Orden (§3.5.2): "deliver events in the order they were generated" y "Events MUST NOT be reordered during transmission, regardless of protocol binding."; varios flujos: "Events MUST be broadcast to all active streams for that task".
+- Cierre, discrepancia interna: §3.1.2, "The stream MUST close when the task reaches a terminal state"; §11.7, "until the task reaches a terminal or interrupted state, at which point the stream closes". JSON-RPC (§9.4.2) y gRPC (§10.7) no fijan regla de cierre.
+- Bloqueo (§3.2.2): además de los terminales, devuelve en "an interrupted state (`TASK_STATE_INPUT_REQUIRED`, `TASK_STATE_AUTH_REQUIRED`) before returning".
+- Reconexión (§3.7): "MAY not receive all status update messages if the client is disconnected and then reconnects"; "Messages MUST NOT be considered a reliable delivery mechanism for critical information." La reanudación se delega al binding propio: "Define behavior for connection interruption and resumption" (§12.5). No consta mecanismo de reanudación ni identificadores de evento en JSON-RPC, gRPC ni REST.
+
+**5. Cabecera `A2A-Version`**
+
+- "Clients MUST send the `A2A-Version` header with each request" (§3.6.1). Ejemplos: "A2A-Version: 1.0" (§3.6.1) y "A2A-Version: 0.3" (§9.2).
+- "Agents MUST interpret empty value as 0.3 version." (§3.6.2). No soportada: "If the version is not supported by the interface, agents MUST return a" (§3.6.2).
+- Clientes: "avoid automatic fallback to older versions" (§3.6.3). Prefijo común: "all service parameters defined by this specification will be prefixed with `a2a-`" (§3.2.6).
+
+**6. Seguridad (§13)**
+
+| Tema | Obligación literal | Consecuencia (lectura nuestra) |
+|---|---|---|
+| Autorización por operación (§13.1) | "Servers **MUST** implement authorization checks on every" | Get, List, Cancel y Subscribe comprueban acceso antes de consultar: "Authorization checks **MUST** occur before any database queries" |
+| Ocultar existencia (§3.3.2) | "**MUST NOT** reveal the existence of resources the client is not authorized to access" | Misma respuesta para «no existe» y «no autorizado» |
+| Modelo de acceso (§13.1) | "Authorization boundaries are defined by each agent's authorization model, not prescribed by the protocol" | Lo fijamos nosotros; no consta modelo previo |
+| Push no soportado (§3.3.4) | "operations related to push notification configuration (Create, Get, List, Delete) **MUST** return" | Declarar `pushNotifications` a false y responder `PushNotificationNotSupportedError` |
+| Push si existe (§13.2) | "Agents **MUST** include authentication credentials in webhook requests" | Fuera del MVP |
+| Tarjeta extendida (§13.3) | "operation **MUST** require authentication" | Solo con `extendedAgentCard` declarado; si no, `UnsupportedOperationError` (§3.3.4) |
+| Transporte (§13.4) | "Production deployments **MUST** use encrypted communication" | HTTPS o TLS en producción; no registrar credenciales |
+
+**7. Matices a lo ya anotado**
+
+- Cabecera vacía igual a 0.3: confirmado (§3.6.2).
+- `SendMessageConfiguration` sin `blocking`: confirmado (`return_immediately`, §3.2.2). Matiz nuevo: el envío bloqueante por defecto devuelve también en estados interrumpidos.
+- Cancelación idempotente: confirmada por §3.3.1, pero choca con §3.1.5 y §3.3.2 (véanse las dudas).
+- La discrepancia de cierre del flujo no es solo de la página `streaming-and-async`: §11.7 coincide con ella y §3.1.2 no.
+- Nombres JSON: "All JSON serializations of the A2A protocol data model **MUST** use **camelCase** naming" (§5.5). El cable no usa los nombres del proto.
+
+**Consecuencias para CodeLoom**
+
+- A4 (adaptador de nombres): camelCase en JSON; `TASK_STATE_*`; `reason` `TASK_*` y códigos -32001 a -32009.
+- A5 (tipos): los campos `optional` tienen presencia explícita; `tenant` es opaco.
+- A6 (`AgentCard`): REQUIRED, orden de `supportedInterfaces`, caché y capacidades. Si se firma, JCS exige distinguir «no puesto» de «puesto con valor por defecto» (lectura nuestra).
+- A7 (`InProcess`): el orden de eventos rige "regardless of protocol binding"; lectura nuestra: el transporte en memoria debe cumplirlo también.
+- A8 (`A2aRemote`): `A2A-Version` en cada petición; no degradar en silencio; HTTPS en producción; autorización por operación; push y tarjeta extendida con error si no se declaran.
+- A9 (eventos): orden garantizado, difusión a varios flujos, posible pérdida al reconectar y cierre en estado interrumpido por decidir.
+- A10 (cancelar y reanudar): cancelación repetida (idempotente o error) y estado final, ambos sin resolver.
+- A11 (tareas enlazadas): sin hallazgos nuevos.
+
+**Dudas que siguen abiertas**
+
+1. Cierre del flujo en estados interrumpidos: §3.1.2 frente a §11.7. No consta cuál prevalece.
+2. Cancelar una tarea ya cancelada: §3.3.1 (mismo efecto) frente a §3.1.5 y §3.3.2 (error).
+3. Si `input-required` y `auth-required` son cancelables: no consta.
+4. Estado resultante de `CancelTask`: no consta.
+5. Reanudación de un flujo tras desconexión: no consta.
+6. Campo de seguridad de la tarjeta: `AgentCard.security` (§13.3) frente a `security_requirements` (proto) y `securityRequirements` (ejemplo de §8.5). No consta si son el mismo campo.
+7. El ejemplo de §12.7 omite `protocolVersion`, que el proto marca REQUIRED. No consta si es deliberado.
+8. Referencias rotas: §12.4 remite a "Section 3.2.2 (Error Handling)" y §14.2.1 a "Section 3.2.5 of the A2A Protocol Specification".
+9. Versiones de ejemplo: 0.3 en §9.2 y §14.2.1; 1.0 en §3.6.1. Fijamos 1.0 (decisión nuestra).
+10. Revocación de claves: §8.4.3 menciona "revoked" sin mecanismo. No consta.
+
 ### Hallazgos de la lectura de la especificación oficial (2026-10-21)
 
 Fuente: `a2a-protocol.org/latest/specification/` (v1.0.0) y las páginas de
