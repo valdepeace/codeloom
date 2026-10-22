@@ -1,5 +1,6 @@
 pub mod changes;
 mod clear;
+pub mod compact;
 pub mod dispatch;
 pub mod stop;
 
