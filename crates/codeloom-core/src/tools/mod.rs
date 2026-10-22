@@ -52,13 +52,17 @@ impl ToolOutput {
 /// el proveedor responde con un 400; de ahí que se recorte siempre, con aviso expreso.
 pub const MAX_TOOL_OUTPUT_BYTES: usize = 20_000;
 
-/// Recorta `content` a `MAX_TOOL_OUTPUT_BYTES` por una frontera de carácter y añade un
-/// aviso con el tamaño original. Si cabe, lo devuelve intacto.
-pub fn limit_output(content: &str) -> std::borrow::Cow<'_, str> {
-    if content.len() <= MAX_TOOL_OUTPUT_BYTES {
+/// Tope del texto variable de un aviso (detalle de un job, resultado de un subagente) que
+/// entra al historial como mensaje de usuario, por el que el tope de herramientas no pasa.
+pub const MAX_NOTICE_BYTES: usize = 8_000;
+
+/// Recorta `content` a `max` bytes por una frontera de carácter y añade un aviso con el
+/// tamaño original. Si cabe, lo devuelve intacto.
+pub fn limit_bytes(content: &str, max: usize) -> std::borrow::Cow<'_, str> {
+    if content.len() <= max {
         return std::borrow::Cow::Borrowed(content);
     }
-    let mut end = MAX_TOOL_OUTPUT_BYTES;
+    let mut end = max;
     while !content.is_char_boundary(end) {
         end -= 1;
     }
@@ -69,6 +73,11 @@ pub fn limit_output(content: &str) -> std::borrow::Cow<'_, str> {
         end,
         content.len()
     ))
+}
+
+/// Recorta la salida de una herramienta a `MAX_TOOL_OUTPUT_BYTES`; ver `limit_bytes`.
+pub fn limit_output(content: &str) -> std::borrow::Cow<'_, str> {
+    limit_bytes(content, MAX_TOOL_OUTPUT_BYTES)
 }
 
 #[derive(Clone)]
@@ -172,5 +181,16 @@ mod tests {
         assert!(out.len() < big.len());
         assert!(out.contains("[output truncated:"));
         assert!(out.contains(&format!("of {} bytes", big.len())));
+    }
+
+    #[test]
+    fn limit_bytes_respects_the_given_cap() {
+        assert_eq!(limit_bytes("corto", 10), "corto");
+        // Cada «ñ» ocupa 2 bytes: el corte de 51 bytes cae a mitad de carácter y retrocede a 50.
+        let big = "ñ".repeat(100);
+        let out = limit_bytes(&big, 51);
+        assert!(out.starts_with(&"ñ".repeat(25)));
+        assert!(!out.starts_with(&"ñ".repeat(26)));
+        assert!(out.contains("[output truncated: 50 of 200 bytes"));
     }
 }

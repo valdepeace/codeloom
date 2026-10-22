@@ -577,8 +577,9 @@ impl SubagentLauncher for InProcessSubagentLauncher {
             }
             if let Some(result) = descriptor.result_text() {
                 let message = crate::message::Message::user(format!(
-                    "[Subagent {} completed]\n{result}",
-                    descriptor.label
+                    "[Subagent {} completed]\n{}",
+                    descriptor.label,
+                    crate::tools::limit_bytes(&result, crate::tools::MAX_NOTICE_BYTES)
                 ));
                 if self
                     .store
@@ -646,6 +647,7 @@ mod tests {
     use crate::session::sqlite::SqliteStore;
     use crate::task::TaskState;
     use crate::tools::subagent::SubagentTool;
+    use crate::tools::MAX_NOTICE_BYTES;
     use std::time::Duration;
 
     #[tokio::test]
@@ -779,6 +781,68 @@ mod tests {
             avisos[0].text(),
             "[Subagent research completed]\nchild result"
         );
+    }
+
+    #[tokio::test]
+    async fn subagent_notice_result_is_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SqliteStore::open(dir.path().join("tope.db").to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+        let parent = store.create_session("/project").await.unwrap();
+        let provider: Arc<dyn Provider> = Arc::new(ScriptedProvider {
+            script: vec![
+                StreamChunk::TextDelta("y".repeat(50_000)),
+                StreamChunk::Done(FinishReason::Stop),
+            ],
+        });
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(SubagentTool));
+        let jobs = Arc::new(LocalJobRegistry::default());
+        let runtime = InProcessSubagentLauncher::new(
+            Arc::new(RwLock::new(provider)),
+            store.clone(),
+            Arc::new(tools),
+            Arc::new(PermissionService::allow_all()),
+            Arc::new(RwLock::new(CodeLoomConfig {
+                provider: ProviderConfig {
+                    kind: ProviderKind::OpenAiCompat,
+                    base_url: "http://localhost".into(),
+                    api_key_env: "KEY".into(),
+                },
+                model: "test".into(),
+                max_steps: 2,
+                effort: None,
+            })),
+            dir.path().to_path_buf(),
+            jobs.clone(),
+            EventBus::new(64),
+        );
+        let (_child, job) = runtime
+            .start(
+                parent,
+                "research".into(),
+                "do work".into(),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        jobs.wait(parent, &job).await.unwrap();
+
+        let avisos = runtime.deliver_notices(parent).await.unwrap();
+        assert_eq!(avisos.len(), 1);
+        let texto = avisos[0].text();
+        assert!(texto.starts_with("[Subagent research completed]\n"));
+        // Tope de 8 000 bytes de resultado más el aviso de recorte; lejos de los 50 000 originales.
+        assert!(
+            texto.len() < MAX_NOTICE_BYTES + 200,
+            "medía {}",
+            texto.len()
+        );
+        assert!(texto.contains("[output truncated:"));
     }
 
     #[tokio::test]

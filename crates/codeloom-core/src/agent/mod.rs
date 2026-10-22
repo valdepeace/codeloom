@@ -10,7 +10,7 @@ use crate::message::{ContentPart, FinishReason, Message, Role, Usage};
 use crate::permission::PermissionService;
 use crate::provider::{Provider, ProviderRequest, StreamChunk};
 use crate::session::{SessionId, SessionStore, UsageRecord};
-use crate::tools::{ToolCtx, ToolRegistry};
+use crate::tools::{limit_bytes, ToolCtx, ToolRegistry, MAX_NOTICE_BYTES};
 use futures::StreamExt;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -476,7 +476,9 @@ impl AgentLoop {
                 "[Job {} {status}] {}{}",
                 job.id.0,
                 job.label,
-                detail.map(|text| format!("\n{text}")).unwrap_or_default()
+                detail
+                    .map(|text| format!("\n{}", limit_bytes(&text, MAX_NOTICE_BYTES)))
+                    .unwrap_or_default()
             ));
             self.store.append_message(session, &message).await?;
             self.jobs.mark_notice_delivered(session, &job.id)?;
@@ -1124,6 +1126,70 @@ mod tests {
             published,
             "el aviso debería publicarse como SessionMessageAdded"
         );
+    }
+
+    #[tokio::test]
+    async fn job_notice_detail_is_capped() {
+        use crate::job::{JobRegistry, JobSpec, LocalJobRegistry};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SqliteStore::open(dir.path().join("tope_job.db").to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+        let sid = store.create_session("/p").await.unwrap();
+        let jobs = Arc::new(LocalJobRegistry::default());
+        let agent = AgentLoop::new(
+            Arc::new(QueueProvider {
+                scripts: Mutex::new(VecDeque::new()),
+            }),
+            store.clone(),
+            Arc::new(ToolRegistry::new()),
+            EventBus::new(64),
+            Arc::new(PermissionService::allow_all()),
+            CodeLoomConfig {
+                provider: crate::config::ProviderConfig {
+                    kind: crate::config::ProviderKind::OpenAiCompat,
+                    base_url: "http://x".into(),
+                    api_key_env: "K".into(),
+                },
+                model: "m".into(),
+                max_steps: 5,
+                effort: None,
+            },
+            dir.path().to_path_buf(),
+        )
+        .with_jobs(jobs.clone());
+
+        // El job falla con un mensaje de 50 000 bytes: ese texto es el `detail` del aviso.
+        let job = jobs
+            .start(JobSpec {
+                kind: "test".into(),
+                label: "tarea larga".into(),
+                owner: sid,
+                output_limit: 20,
+                run: Box::new(|_, _| {
+                    Box::pin(async { Err(crate::error::CoreError::Tool("e".repeat(50_000))) })
+                }),
+            })
+            .unwrap();
+        jobs.wait(sid, job.id()).await.unwrap();
+
+        assert_eq!(agent.flush_subagent_notices(sid).await.unwrap(), 1);
+        let stored = store.messages(sid).await.unwrap();
+        let aviso = stored
+            .iter()
+            .map(|m| m.text())
+            .find(|texto| texto.starts_with("[Job "))
+            .expect("el aviso del job debería quedar en el historial");
+        assert!(aviso.starts_with(&format!("[Job {} failed] tarea larga\n", job.id().0)));
+        // Tope de 8 000 bytes de detalle más el aviso de recorte; lejos de los 50 000 originales.
+        assert!(
+            aviso.len() < crate::tools::MAX_NOTICE_BYTES + 300,
+            "medía {}",
+            aviso.len()
+        );
+        assert!(aviso.contains("[output truncated:"));
     }
 
     /// Catálogo con `acme` (`https://acme.example/v1`) y dos modelos con precios distintos.
