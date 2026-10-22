@@ -1,5 +1,6 @@
 use crate::error::Result;
 use crate::message::Message;
+use crate::task::TaskStatus;
 use async_trait::async_trait;
 
 pub mod sqlite;
@@ -14,25 +15,14 @@ pub struct SessionInfo {
     pub message_count: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SubagentStatus {
-    Running,
-    Completed,
-    Killed,
-    Failed,
-    /// Hijo que seguía en marcha cuando la aplicación se cerró y no llegó a terminar.
-    /// Cabe señalar que no equivale al «interrupted state» de A2A (`input-required`
-    /// y `auth-required`); de ahí el nombre.
-    Unfinished,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubagentDescriptor {
     pub parent: SessionId,
     pub child: SessionId,
     pub job_id: String,
     pub label: String,
-    pub status: SubagentStatus,
+    /// Estado de la tarea del subagente, según A2A: el estado es el `TaskState` mismo.
+    pub status: TaskStatus,
     pub result: Option<String>,
     pub notice_delivered: bool,
 }
@@ -69,11 +59,13 @@ pub trait SessionStore: Send + Sync {
     async fn append_message(&self, sid: SessionId, msg: &Message) -> Result<()>;
     async fn messages(&self, sid: SessionId) -> Result<Vec<Message>>;
     async fn save_subagent(&self, descriptor: &SubagentDescriptor) -> Result<()>;
+    /// Fija el estado de la tarea del hijo. Un estado terminal no admite transiciones
+    /// posteriores: el almacén devuelve error si el actual ya lo es.
     async fn update_subagent_status(
         &self,
         parent: SessionId,
         child: SessionId,
-        status: SubagentStatus,
+        status: TaskStatus,
     ) -> Result<()>;
     async fn list_subagents(&self, parent: SessionId) -> Result<Vec<SubagentDescriptor>>;
     async fn complete_subagent(

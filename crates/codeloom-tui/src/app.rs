@@ -1,5 +1,5 @@
 use crate::permission_flow::{dialog_for, spec_for, PermissionReply, QuestionReply};
-use crate::rail::format_tokens;
+use crate::rail::{agent_state, format_tokens};
 use crate::tool_facts::tool_facts;
 use batten::widgets::composer::hit_index;
 use codeloom_core::catalog::{Catalog, CatalogModel, CatalogProvider};
@@ -9,6 +9,7 @@ use codeloom_core::message::{ContentPart, Message, Role};
 use codeloom_core::permission::{Decision, PermissionRequest};
 use codeloom_core::question::{Answer, Question};
 use codeloom_core::session::{SessionId, SessionInfo, UsageRecord};
+use codeloom_core::task::{TaskState, TaskStatus};
 use ratatui::layout::Rect;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -270,17 +271,29 @@ fn job_tool_status(status: codeloom_core::job::JobStatus) -> batten::state::Tool
 }
 
 /// Estado visible de un subagente, según el mapeo de la especificación.
-fn subagent_tool_status(
-    status: codeloom_core::session::SubagentStatus,
-) -> batten::state::ToolStatus {
+fn subagent_tool_status(state: TaskState) -> batten::state::ToolStatus {
     use batten::state::ToolStatus;
-    use codeloom_core::session::SubagentStatus;
-    match status {
-        SubagentStatus::Running => ToolStatus::Running,
-        SubagentStatus::Completed => ToolStatus::Success,
-        SubagentStatus::Failed => ToolStatus::Error,
-        SubagentStatus::Killed | SubagentStatus::Unfinished => ToolStatus::Canceled,
+    // Varios estados de A2A comparten aspecto: la cabecera nombra el estado exacto, para que
+    // esta agrupación no lo oculte (ver `sync_subagent_activity`).
+    match state {
+        TaskState::Submitted
+        | TaskState::Working
+        | TaskState::InputRequired
+        | TaskState::AuthRequired => ToolStatus::Running,
+        TaskState::Completed => ToolStatus::Success,
+        TaskState::Failed | TaskState::Rejected => ToolStatus::Error,
+        TaskState::Canceled => ToolStatus::Canceled,
     }
+}
+
+/// Formato de un recuento por estado A2A exacto: `working 1, input-required 2`.
+/// Recibe el recuento ya filtrado (solo los estados con cuenta mayor que cero).
+pub fn formato_recuento(recuento: &[(TaskState, usize)]) -> String {
+    recuento
+        .iter()
+        .map(|(estado, cuenta)| format!("{} {cuenta}", agent_state(*estado).label()))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Herramienta con la que el modelo reemplaza la lista de tareas. Su llamada
@@ -1920,13 +1933,60 @@ impl App {
         priced.then_some((total, partial))
     }
 
-    /// Número de subagentes de la sesión abierta que siguen en marcha.
+    /// Recuento de subagentes de la sesión abierta por estado A2A exacto, en el orden de
+    /// `TaskState::ALL`. Solo aparecen los estados con cuenta mayor que cero.
+    pub fn subagent_state_counts(&self) -> Vec<(TaskState, usize)> {
+        TaskState::ALL
+            .into_iter()
+            .filter_map(|estado| {
+                let cuenta = self
+                    .subagents
+                    .values()
+                    .filter(|s| Some(s.parent) == self.session_id && s.status.state == estado)
+                    .count();
+                (cuenta > 0).then_some((estado, cuenta))
+            })
+            .collect()
+    }
+
+    /// Resumen de los subagentes en curso. Sin ninguno, `0 subagents running` sin paréntesis
+    /// (no hay nada que ocultar); con alguno, el desglose por estado A2A entre paréntesis.
+    pub fn running_summary(&self) -> String {
+        let activos: Vec<(TaskState, usize)> = self
+            .subagent_state_counts()
+            .into_iter()
+            .filter(|(estado, _)| !estado.is_terminal())
+            .collect();
+        let total = self.active_agents();
+        if total == 0 {
+            "0 subagents running".to_owned()
+        } else {
+            format!("{total} subagents running ({})", formato_recuento(&activos))
+        }
+    }
+
+    /// Sufijo de los subagentes terminados, ` (subagents: completed 2, failed 1)`; vacío si
+    /// no hay ninguno.
+    pub fn finished_summary(&self) -> String {
+        let terminados: Vec<(TaskState, usize)> = self
+            .subagent_state_counts()
+            .into_iter()
+            .filter(|(estado, _)| estado.is_terminal())
+            .collect();
+        if terminados.is_empty() {
+            String::new()
+        } else {
+            format!(" (subagents: {})", formato_recuento(&terminados))
+        }
+    }
+
+    /// Número de subagentes de la sesión abierta que siguen en marcha, es decir, los que
+    /// no están en un estado terminal de A2A.
     pub fn active_agents(&self) -> usize {
         self.subagents
             .values()
             .filter(|subagent| {
-                Some(subagent.parent) == self.session_id
-                    && subagent.status == codeloom_core::session::SubagentStatus::Running
+                Some(subagent.parent) == self.session_id && !subagent.status.state.is_terminal()
             })
             .count()
     }
@@ -2133,23 +2193,14 @@ impl App {
                         .values_mut()
                         .find(|subagent| subagent.job_id == snapshot.id.0)
                     {
-                        subagent.status = match snapshot.status {
-                            codeloom_core::job::JobStatus::Running
-                            | codeloom_core::job::JobStatus::Stopping => {
-                                codeloom_core::session::SubagentStatus::Running
-                            }
-                            codeloom_core::job::JobStatus::Completed => {
-                                codeloom_core::session::SubagentStatus::Completed
-                            }
-                            codeloom_core::job::JobStatus::Killed => {
-                                codeloom_core::session::SubagentStatus::Killed
-                            }
-                            codeloom_core::job::JobStatus::Failed => {
-                                codeloom_core::session::SubagentStatus::Failed
-                            }
-                        };
-                        // Un subagente que deja de estar en marcha ya no espera respuesta.
-                        if subagent.status != codeloom_core::session::SubagentStatus::Running {
+                        // El estado de la tarea sigue al del job. Si no cambia, se conserva el
+                        // `TaskStatus` tal cual, con su mensaje y su marca de tiempo.
+                        let state = TaskState::from(snapshot.status);
+                        if subagent.status.state != state {
+                            subagent.status = TaskStatus::new(state);
+                        }
+                        // Un subagente que termina ya no espera respuesta.
+                        if subagent.status.state.is_terminal() {
                             self.awaiting_input.remove(&subagent.child.0);
                         }
                     }
@@ -2160,7 +2211,7 @@ impl App {
             LiveEvent::SubagentChanged(subagent) => {
                 if Some(subagent.parent) == self.session_id {
                     // Un hijo terminado ya no espera a su padre.
-                    if subagent.status != codeloom_core::session::SubagentStatus::Running {
+                    if subagent.status.state.is_terminal() {
                         self.awaiting_input.remove(&subagent.child.0);
                     }
                     self.sync_subagent_activity(&subagent);
@@ -2211,8 +2262,8 @@ impl App {
                 // Un hijo que termina bien o con fallo despierta al padre; uno matado
                 // por el usuario o sin terminar no.
                 let motivo = match status {
-                    codeloom_core::session::SubagentStatus::Completed => Some("completed"),
-                    codeloom_core::session::SubagentStatus::Failed => Some("failed"),
+                    codeloom_core::task::TaskState::Completed => Some("completed"),
+                    codeloom_core::task::TaskState::Failed => Some("failed"),
                     _ => None,
                 };
                 if let Some(motivo) = motivo.filter(|_| Some(parent) == self.session_id) {
@@ -2523,15 +2574,19 @@ impl App {
 
     /// Elemento de actividad de un subagente de esta sesión.
     fn sync_subagent_activity(&mut self, subagent: &codeloom_core::session::SubagentDescriptor) {
-        let status = subagent_tool_status(subagent.status);
+        let state = subagent.status.state;
+        let status = subagent_tool_status(state);
         let body = if status == batten::state::ToolStatus::Running {
             None
         } else {
             subagent.result.as_deref()
         };
+        // Regla de trazabilidad: el estado A2A exacto va entre paréntesis tras la etiqueta, de modo
+        // que el aspecto agrupado de `ToolStatus` nunca sustituya al estado real.
+        let titulo = format!("{} ({})", subagent.label, agent_state(state).label());
         let view = batten::state::ActivityView {
             kind: "subagent",
-            label: &subagent.label,
+            label: &titulo,
             status,
             progress: None,
             body,
@@ -2567,10 +2622,11 @@ impl App {
                 });
                 match live {
                     Some(entry) => entry.notice_consumed = true,
+                    // El aviso ya dice que el hijo terminó: el estado exacto es `completed`.
                     None => self.push_notice_entry(
                         "subagent",
                         batten::state::ToolStatus::Success,
-                        label,
+                        &format!("{label} (completed)"),
                         body,
                     ),
                 }
@@ -2697,36 +2753,29 @@ impl App {
             .iter()
             .filter(|tool| tool.status() == batten::state::ToolStatus::Running)
             .count();
-        sb.push_section(
-            "FLOCK",
-            vec![
-                format!("{running} tools running"),
-                format!(
-                    "{} jobs running",
-                    self.jobs
-                        .values()
-                        .filter(|job| Some(job.owner) == self.session_id)
-                        .filter(|job| matches!(
-                            job.status,
-                            codeloom_core::job::JobStatus::Running
-                                | codeloom_core::job::JobStatus::Stopping
-                        ))
-                        .count()
-                ),
-                format!("{} prompts queued", self.queued),
-                format!(
-                    "{} subagents running",
-                    self.subagents
-                        .values()
-                        .filter(|subagent| {
-                            Some(subagent.parent) == self.session_id
-                                && subagent.status
-                                    == codeloom_core::session::SubagentStatus::Running
-                        })
-                        .count()
-                ),
-            ],
-        );
+        let mut flock = vec![
+            format!("{running} tools running"),
+            format!(
+                "{} jobs running",
+                self.jobs
+                    .values()
+                    .filter(|job| Some(job.owner) == self.session_id)
+                    .filter(|job| matches!(
+                        job.status,
+                        codeloom_core::job::JobStatus::Running
+                            | codeloom_core::job::JobStatus::Stopping
+                    ))
+                    .count()
+            ),
+            format!("{} prompts queued", self.queued),
+        ];
+        // Regla de trazabilidad: el resumen de subagentes lleva su desglose por estado A2A. La
+        // barra lateral es estrecha, así que el resumen se parte en líneas de como mucho 20 columnas.
+        flock.extend(crate::rail::partir_por_palabras(
+            &self.running_summary(),
+            20,
+        ));
+        sb.push_section("FLOCK", flock);
         let mut session = Vec::new();
         if let Some(id) = self.session_id {
             session.push(format!("session #{}", id.0));
@@ -2746,7 +2795,7 @@ mod tests {
     use batten::state::ToolStatus;
     use codeloom_core::job::{JobId, JobProgress, JobResult, JobSnapshot, JobStatus};
     use codeloom_core::question::QuestionOption;
-    use codeloom_core::session::{SubagentDescriptor, SubagentStatus};
+    use codeloom_core::session::SubagentDescriptor;
     use serde_json::json;
 
     #[test]
@@ -2818,14 +2867,14 @@ mod tests {
                 child,
                 job_id: "subagent-1".into(),
                 label: "review".into(),
-                status: codeloom_core::session::SubagentStatus::Unfinished,
+                status: TaskStatus::new(TaskState::Failed),
                 result: Some("partial output".into()),
                 notice_delivered: false,
             }],
         );
         assert_eq!(
-            app.subagents.get(&child.0).unwrap().status,
-            codeloom_core::session::SubagentStatus::Unfinished
+            app.subagents.get(&child.0).unwrap().status.state,
+            TaskState::Failed
         );
 
         app.load_session(SessionId(3), Vec::new());
@@ -2838,7 +2887,7 @@ mod tests {
             child: SessionId(child),
             job_id: format!("subagent-{child}"),
             label: "review".into(),
-            status: SubagentStatus::Running,
+            status: TaskStatus::new(TaskState::Working),
             result: None,
             notice_delivered: false,
         }
@@ -3449,13 +3498,13 @@ mod tests {
     }
 
     /// Subagente de prueba (hijo `SessionId(9)`).
-    fn sub(label: &str, status: SubagentStatus, parent: SessionId) -> SubagentDescriptor {
+    fn sub(label: &str, state: TaskState, parent: SessionId) -> SubagentDescriptor {
         SubagentDescriptor {
             parent,
             child: SessionId(9),
             job_id: "subagent-1".into(),
             label: label.into(),
-            status,
+            status: TaskStatus::new(state),
             result: None,
             notice_delivered: false,
         }
@@ -3533,23 +3582,129 @@ mod tests {
         app.session_id = Some(SessionId(1));
         app.apply(LiveEvent::SubagentChanged(sub(
             "review",
-            SubagentStatus::Running,
+            TaskState::Working,
             SessionId(1),
         )));
         assert_eq!(
             heads(&app),
-            vec![("subagent  review".to_string(), ToolStatus::Running)]
+            vec![(
+                "subagent  review (working)".to_string(),
+                ToolStatus::Running
+            )]
         );
 
-        let mut done = sub("review", SubagentStatus::Completed, SessionId(1));
+        let mut done = sub("review", TaskState::Completed, SessionId(1));
         done.result = Some("listo".into());
         app.apply(LiveEvent::SubagentChanged(done));
         assert_eq!(app.transcript.entry_count(), 1);
         assert_eq!(
             heads(&app),
-            vec![("subagent  review".to_string(), ToolStatus::Success)]
+            vec![(
+                "subagent  review (completed)".to_string(),
+                ToolStatus::Success
+            )]
         );
         assert!(texts(&app).iter().any(|t| t == "listo"));
+    }
+
+    #[test]
+    fn activity_status_covers_all_eight_states() {
+        let esperados = [
+            (TaskState::Submitted, ToolStatus::Running),
+            (TaskState::Working, ToolStatus::Running),
+            (TaskState::InputRequired, ToolStatus::Running),
+            (TaskState::AuthRequired, ToolStatus::Running),
+            (TaskState::Completed, ToolStatus::Success),
+            (TaskState::Failed, ToolStatus::Error),
+            (TaskState::Rejected, ToolStatus::Error),
+            (TaskState::Canceled, ToolStatus::Canceled),
+        ];
+        assert_eq!(esperados.len(), TaskState::ALL.len());
+        for (state, esperado) in esperados {
+            assert_eq!(subagent_tool_status(state), esperado, "{state:?}");
+        }
+    }
+
+    #[test]
+    fn activity_header_names_the_exact_a2a_state_in_parentheses() {
+        for state in TaskState::ALL {
+            let mut app = crush_app();
+            app.session_id = Some(SessionId(1));
+            app.apply(LiveEvent::SubagentChanged(sub(
+                "review",
+                state,
+                SessionId(1),
+            )));
+            let nombre = agent_state(state).label();
+            assert_eq!(
+                heads(&app),
+                vec![(
+                    format!("subagent  review ({nombre})"),
+                    subagent_tool_status(state)
+                )],
+                "{state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn state_counts_are_exact_and_ordered() {
+        let mut app = App::new();
+        app.session_id = Some(SessionId(1));
+        for (child, state) in [
+            (10, TaskState::Failed),
+            (11, TaskState::InputRequired),
+            (12, TaskState::Working),
+            (13, TaskState::Working),
+        ] {
+            app.subagents
+                .insert(child, child_descriptor(child, state, SessionId(1)));
+        }
+        // Un subagente de otra sesión no entra en el recuento.
+        app.subagents
+            .insert(20, child_descriptor(20, TaskState::Working, SessionId(2)));
+        assert_eq!(
+            app.subagent_state_counts(),
+            vec![
+                (TaskState::Working, 2),
+                (TaskState::InputRequired, 1),
+                (TaskState::Failed, 1),
+            ]
+        );
+        assert_eq!(
+            app.running_summary(),
+            "3 subagents running (working 2, input-required 1)"
+        );
+        assert_eq!(app.finished_summary(), " (subagents: failed 1)");
+        assert_eq!(
+            formato_recuento(&[(TaskState::Completed, 2), (TaskState::Canceled, 1)]),
+            "completed 2, canceled 1"
+        );
+
+        // Sin subagentes en curso no hay paréntesis que ocultar en el resumen en curso.
+        let mut terminados = App::new();
+        terminados.session_id = Some(SessionId(1));
+        terminados
+            .subagents
+            .insert(10, child_descriptor(10, TaskState::Completed, SessionId(1)));
+        assert_eq!(terminados.running_summary(), "0 subagents running");
+        assert_eq!(terminados.finished_summary(), " (subagents: completed 1)");
+        assert_eq!(App::new().finished_summary(), "");
+    }
+
+    #[test]
+    fn active_agents_counts_only_non_terminal() {
+        let mut app = App::new();
+        app.session_id = Some(SessionId(1));
+        for (indice, state) in TaskState::ALL.into_iter().enumerate() {
+            let child = 10 + indice as i64;
+            app.subagents
+                .insert(child, child_descriptor(child, state, SessionId(1)));
+        }
+        // Un subagente en marcha de otra sesión no cuenta.
+        app.subagents
+            .insert(99, child_descriptor(99, TaskState::Working, SessionId(2)));
+        assert_eq!(app.active_agents(), 4);
     }
 
     #[test]
@@ -3572,7 +3727,7 @@ mod tests {
     fn live_notice_is_suppressed_when_the_item_exists() {
         let mut app = crush_app();
         app.session_id = Some(SessionId(1));
-        let mut done = sub("review", SubagentStatus::Completed, SessionId(1));
+        let mut done = sub("review", TaskState::Completed, SessionId(1));
         done.result = Some("listo".into());
         app.apply(LiveEvent::SubagentChanged(done));
         let count = app.transcript.entry_count();
@@ -3596,7 +3751,7 @@ mod tests {
         let mut app = crush_app();
         app.session_id = Some(SessionId(1));
         app.apply(notice_for("[Subagent review completed]\nlisto"));
-        let mut done = sub("review", SubagentStatus::Completed, SessionId(1));
+        let mut done = sub("review", TaskState::Completed, SessionId(1));
         done.result = Some("listo".into());
         app.apply(LiveEvent::SubagentChanged(done));
         assert_eq!(app.transcript.entry_count(), 2);
@@ -3621,14 +3776,17 @@ mod tests {
         assert_eq!(
             heads(&app),
             vec![
-                ("subagent  review".to_string(), ToolStatus::Success),
+                (
+                    "subagent  review (completed)".to_string(),
+                    ToolStatus::Success
+                ),
                 ("job  build".to_string(), ToolStatus::Error),
             ]
         );
         let lines = texts(&app);
         let pos = |text: &str| lines.iter().position(|t| t == text).unwrap();
-        assert!(pos("hola") < pos("subagent  review"));
-        assert!(pos("subagent  review") < pos("job  build"));
+        assert!(pos("hola") < pos("subagent  review (completed)"));
+        assert!(pos("subagent  review (completed)") < pos("job  build"));
         assert!(lines.iter().any(|t| t == "ready"));
         assert!(lines.iter().any(|t| t == "boom"));
     }
@@ -3664,7 +3822,7 @@ mod tests {
         app.session_id = Some(SessionId(1));
         app.apply(LiveEvent::SubagentChanged(sub(
             "review",
-            SubagentStatus::Running,
+            TaskState::Working,
             SessionId(1),
         )));
         app.apply(notice_for("[Subagent review completed]\nready"));
@@ -3686,7 +3844,7 @@ mod tests {
         app.session_id = Some(SessionId(1));
         app.apply(LiveEvent::SubagentChanged(sub(
             "review",
-            SubagentStatus::Running,
+            TaskState::Working,
             SessionId(1),
         )));
         assert_eq!(heads(&app).len(), 1);
@@ -3697,7 +3855,10 @@ mod tests {
         app.sync_all_tools();
         assert_eq!(
             heads(&app),
-            vec![("subagent  review".to_string(), ToolStatus::Running)]
+            vec![(
+                "subagent  review (working)".to_string(),
+                ToolStatus::Running
+            )]
         );
     }
 
@@ -3974,7 +4135,7 @@ mod tests {
         app.session_id = Some(SessionId(1));
         app.apply(LiveEvent::SubagentChanged(sub(
             "review",
-            SubagentStatus::Running,
+            TaskState::Working,
             SessionId(1),
         )));
 
@@ -3995,7 +4156,7 @@ mod tests {
         // Un hijo que sigue en marcha conserva la marca al cambiar de estado no terminal.
         app.apply(LiveEvent::SubagentChanged(sub(
             "review",
-            SubagentStatus::Running,
+            TaskState::Working,
             SessionId(1),
         )));
         assert!(app.awaiting_input.contains(&9));
@@ -4016,7 +4177,7 @@ mod tests {
         assert!(app.awaiting_input.contains(&9));
         app.apply(LiveEvent::SubagentChanged(sub(
             "review",
-            SubagentStatus::Completed,
+            TaskState::Completed,
             SessionId(1),
         )));
         assert!(!app.awaiting_input.contains(&9));
@@ -4030,7 +4191,7 @@ mod tests {
     }
 
     /// Evento de cierre de un hijo (sesión 9) de la sesión 1 con el estado dado.
-    fn settled(status: SubagentStatus) -> LiveEvent {
+    fn settled(status: TaskState) -> LiveEvent {
         LiveEvent::SubagentSettled {
             parent: SessionId(1),
             child: SessionId(9),
@@ -4051,13 +4212,13 @@ mod tests {
     }
 
     #[test]
-    fn wake_requested_on_completed_or_failed_but_not_killed() {
-        for status in [SubagentStatus::Completed, SubagentStatus::Failed] {
+    fn wake_requested_on_completed_or_failed_but_not_canceled_or_rejected() {
+        for status in [TaskState::Completed, TaskState::Failed] {
             let mut app = idle_parent_app();
             app.apply(settled(status));
             assert!(app.wake_pending, "{status:?} debe despertar al padre");
         }
-        for status in [SubagentStatus::Killed, SubagentStatus::Unfinished] {
+        for status in [TaskState::Canceled, TaskState::Rejected] {
             let mut app = idle_parent_app();
             app.apply(settled(status));
             assert!(!app.wake_pending, "{status:?} no debe despertar al padre");
@@ -4147,7 +4308,7 @@ mod tests {
         assert!(!app.turn_in_flight);
         assert_eq!(app.auto_turns_left, MAX_AUTO_TURNS);
         // Tras el error, un nuevo aviso del hijo vuelve a poder despertar al padre.
-        app.apply(settled(SubagentStatus::Completed));
+        app.apply(settled(TaskState::Completed));
         assert!(app.take_wake());
     }
 
@@ -4162,19 +4323,19 @@ mod tests {
         app.apply(LiveEvent::SubagentSettled {
             parent: SessionId(2),
             child: SessionId(9),
-            status: SubagentStatus::Completed,
+            status: TaskState::Completed,
         });
         assert!(!app.wake_pending);
 
         let mut sin_sesion = App::new();
-        sin_sesion.apply(settled(SubagentStatus::Completed));
+        sin_sesion.apply(settled(TaskState::Completed));
         assert!(!sin_sesion.wake_pending);
     }
 
     #[test]
     fn opening_another_session_drops_the_pending_wake() {
         let mut app = idle_parent_app();
-        app.apply(settled(SubagentStatus::Completed));
+        app.apply(settled(TaskState::Completed));
         assert!(app.wake_pending);
         app.load_session(SessionId(2), Vec::new());
         assert!(!app.wake_pending);
@@ -4193,11 +4354,11 @@ mod tests {
     #[test]
     fn settled_child_records_wake_cause() {
         let mut app = idle_parent_app();
-        app.apply(settled(SubagentStatus::Completed));
+        app.apply(settled(TaskState::Completed));
         assert_eq!(app.wake_causes, vec![(9, "completed")]);
 
         let mut app = idle_parent_app();
-        app.apply(settled(SubagentStatus::Failed));
+        app.apply(settled(TaskState::Failed));
         assert_eq!(app.wake_causes, vec![(9, "failed")]);
     }
 
@@ -4215,7 +4376,7 @@ mod tests {
     #[test]
     fn killed_child_records_no_cause() {
         let mut app = idle_parent_app();
-        app.apply(settled(SubagentStatus::Killed));
+        app.apply(settled(TaskState::Canceled));
         assert!(app.wake_causes.is_empty());
     }
 
@@ -4224,10 +4385,10 @@ mod tests {
         let mut app = idle_parent_app();
         app.apply(LiveEvent::SubagentChanged(sub(
             "review",
-            SubagentStatus::Running,
+            TaskState::Working,
             SessionId(1),
         )));
-        app.apply(settled(SubagentStatus::Completed));
+        app.apply(settled(TaskState::Completed));
         assert!(app.take_wake());
         app.apply(LiveEvent::TurnStarted);
         assert_eq!(
@@ -4240,7 +4401,7 @@ mod tests {
     #[test]
     fn user_turn_emits_no_cause_line() {
         let mut app = idle_parent_app();
-        app.apply(settled(SubagentStatus::Completed));
+        app.apply(settled(TaskState::Completed));
         // Turno del usuario: no hay `wake_in_flight`, así que no hay línea ni se toca la causa.
         app.apply(LiveEvent::TurnStarted);
         assert!(system_lines(&app).is_empty());
@@ -4252,7 +4413,7 @@ mod tests {
         let mut app = idle_parent_app();
         app.apply(LiveEvent::SubagentChanged(sub(
             "review",
-            SubagentStatus::Running,
+            TaskState::Working,
             SessionId(1),
         )));
         app.wake_causes = vec![(9, "completed"), (9, "failed"), (9, "asks input")];
@@ -4276,7 +4437,7 @@ mod tests {
     #[test]
     fn exhausted_budget_drops_wake_causes() {
         let mut app = idle_parent_app();
-        app.apply(settled(SubagentStatus::Completed));
+        app.apply(settled(TaskState::Completed));
         app.auto_turns_left = 0;
         assert!(!app.take_wake());
         assert!(app.wake_causes.is_empty());
@@ -4285,7 +4446,7 @@ mod tests {
     #[test]
     fn escape_clears_wake_causes() {
         let mut app = idle_parent_app();
-        app.apply(settled(SubagentStatus::Completed));
+        app.apply(settled(TaskState::Completed));
         assert!(!app.wake_causes.is_empty());
         app.request_cancel();
         assert!(app.wake_causes.is_empty());
@@ -4301,17 +4462,13 @@ mod tests {
     }
 
     /// Descriptor de un hijo con identificador y estado concretos.
-    fn child_descriptor(
-        child: i64,
-        status: SubagentStatus,
-        parent: SessionId,
-    ) -> SubagentDescriptor {
+    fn child_descriptor(child: i64, state: TaskState, parent: SessionId) -> SubagentDescriptor {
         SubagentDescriptor {
             parent,
             child: SessionId(child),
             job_id: format!("subagent-{child}"),
             label: format!("hijo-{child}"),
-            status,
+            status: TaskStatus::new(state),
             result: None,
             notice_delivered: false,
         }
@@ -4623,10 +4780,8 @@ mod tests {
     fn parent_files_return_to_changes_panel_after_child_roundtrip() {
         let mut app = crush_app();
         app.session_id = Some(SessionId(1));
-        app.subagents.insert(
-            9,
-            child_descriptor(9, SubagentStatus::Running, SessionId(1)),
-        );
+        app.subagents
+            .insert(9, child_descriptor(9, TaskState::Working, SessionId(1)));
         app.apply(LiveEvent::FileDiff {
             path: "a.rs".into(),
             added: 1,
@@ -5092,22 +5247,14 @@ mod tests {
     fn active_agents_counts_only_running_children_of_the_open_session() {
         let mut app = crush_app();
         app.session_id = Some(SessionId(1));
-        app.subagents.insert(
-            9,
-            child_descriptor(9, SubagentStatus::Running, SessionId(1)),
-        );
-        app.subagents.insert(
-            10,
-            child_descriptor(10, SubagentStatus::Completed, SessionId(1)),
-        );
-        app.subagents.insert(
-            11,
-            child_descriptor(11, SubagentStatus::Running, SessionId(1)),
-        );
-        app.subagents.insert(
-            12,
-            child_descriptor(12, SubagentStatus::Running, SessionId(2)),
-        );
+        app.subagents
+            .insert(9, child_descriptor(9, TaskState::Working, SessionId(1)));
+        app.subagents
+            .insert(10, child_descriptor(10, TaskState::Completed, SessionId(1)));
+        app.subagents
+            .insert(11, child_descriptor(11, TaskState::Working, SessionId(1)));
+        app.subagents
+            .insert(12, child_descriptor(12, TaskState::Working, SessionId(2)));
         assert_eq!(app.active_agents(), 2);
     }
 

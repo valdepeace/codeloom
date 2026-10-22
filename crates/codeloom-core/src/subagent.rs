@@ -6,8 +6,9 @@ use crate::event::{EventBus, LiveEvent};
 use crate::job::{JobId, JobRegistry, JobResult, JobSpec};
 use crate::permission::PermissionService;
 use crate::provider::Provider;
-use crate::session::{SessionId, SessionStore, SubagentDescriptor, SubagentStatus};
+use crate::session::{SessionId, SessionStore, SubagentDescriptor};
 use crate::subagent_input::{ChildResponder, InputBroker, PendingInput};
+use crate::task::{TaskState, TaskStatus};
 use crate::tools::ToolRegistry;
 use async_trait::async_trait;
 use std::path::PathBuf;
@@ -243,7 +244,7 @@ impl SubagentLauncher for InProcessSubagentLauncher {
             child,
             job_id: job.id().0.clone(),
             label: descriptor_label,
-            status: SubagentStatus::Running,
+            status: TaskStatus::new(TaskState::Working),
             result: None,
             notice_delivered: false,
         };
@@ -257,22 +258,33 @@ impl SubagentLauncher for InProcessSubagentLauncher {
         tokio::spawn(async move {
             loop {
                 let snapshot = updates.borrow_and_update().clone();
-                let status = match snapshot.status {
-                    crate::job::JobStatus::Completed => Some(SubagentStatus::Completed),
-                    crate::job::JobStatus::Killed => Some(SubagentStatus::Killed),
-                    crate::job::JobStatus::Failed => Some(SubagentStatus::Failed),
-                    _ => None,
-                };
-                if let Some(status) = status {
-                    if let Err(error) = store.update_subagent_status(parent, child, status).await {
-                        tracing::warn!("persist subagent status: {error}");
+                let state = TaskState::from(snapshot.status);
+                if state.is_terminal() {
+                    // `complete_subagent` ya fijó `Completed` junto con el resultado: aquí solo se
+                    // escribe lo que el almacén aún no tiene asentado (muerte, fallo o cierre sin resultado).
+                    let asentado = match store.list_subagents(parent).await {
+                        Ok(hijos) => hijos
+                            .iter()
+                            .any(|hijo| hijo.child == child && hijo.status.state.is_terminal()),
+                        Err(error) => {
+                            tracing::warn!("read subagent status: {error}");
+                            false
+                        }
+                    };
+                    if !asentado {
+                        let estado = TaskStatus::new(state);
+                        if let Err(error) =
+                            store.update_subagent_status(parent, child, estado).await
+                        {
+                            tracing::warn!("persist subagent status: {error}");
+                        }
                     }
                     // Se publica tras el intento de persistir, también si falló: así el
                     // padre nunca lee el aviso antes del estado final.
                     settle_bus.publish(LiveEvent::SubagentSettled {
                         parent,
                         child,
-                        status,
+                        status: state,
                     });
                     break;
                 }
@@ -299,7 +311,7 @@ impl SubagentLauncher for InProcessSubagentLauncher {
             .find(|descriptor| descriptor.child == child)
             .ok_or_else(|| CoreError::Tool("unknown subagent".into()))?;
         let job = JobId(descriptor.job_id);
-        if descriptor.status != SubagentStatus::Running {
+        if descriptor.status.state.is_terminal() {
             return Err(CoreError::Tool("subagent has already finished".into()));
         }
         let snapshot = self
@@ -337,7 +349,7 @@ impl SubagentLauncher for InProcessSubagentLauncher {
     async fn deliver_notices(&self, parent: SessionId) -> Result<Vec<crate::message::Message>> {
         let mut messages = Vec::new();
         for descriptor in self.store.list_subagents(parent).await? {
-            if descriptor.status != SubagentStatus::Completed || descriptor.notice_delivered {
+            if descriptor.status.state != TaskState::Completed || descriptor.notice_delivered {
                 continue;
             }
             if let Some(result) = descriptor.result {
@@ -406,6 +418,7 @@ mod tests {
     use crate::provider::testutil::ScriptedProvider;
     use crate::provider::StreamChunk;
     use crate::session::sqlite::SqliteStore;
+    use crate::task::TaskState;
     use crate::tools::subagent::SubagentTool;
     use std::time::Duration;
 
@@ -547,14 +560,14 @@ mod tests {
         .await
         .expect("el hijo debería asentarse");
 
-        assert_eq!(status, SubagentStatus::Completed);
+        assert_eq!(status, TaskState::Completed);
         // Al llegar el evento, el estado final ya debe estar persistido y el aviso listo.
         assert!(store
             .list_subagents(parent)
             .await
             .unwrap()
             .iter()
-            .any(|d| d.child == child && d.status == SubagentStatus::Completed));
+            .any(|d| d.child == child && d.status.state == TaskState::Completed));
         assert!(runtime
             .deliver_notices(parent)
             .await
@@ -701,6 +714,97 @@ mod tests {
             .answer(parent, child, vec!["Sí".into()])
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn killed_job_becomes_canceled() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SqliteStore::open(dir.path().join("killed.db").to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+        let parent = store.create_session("/project").await.unwrap();
+        let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+            scripts: std::sync::Mutex::new(
+                vec![vec![
+                    StreamChunk::ToolCallComplete {
+                        id: "c1".into(),
+                        name: "ask_user".into(),
+                        input: serde_json::json!({"questions": [{
+                            "question": "¿Cuál?",
+                            "options": [{"label": "Sí"}, {"label": "No"}]
+                        }]}),
+                    },
+                    StreamChunk::Done(FinishReason::ToolCalls),
+                ]]
+                .into(),
+            ),
+        });
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(crate::tools::ask_user::AskUserTool));
+        let bus = EventBus::new(64);
+        let mut rx = bus.subscribe();
+        let runtime = InProcessSubagentLauncher::new(
+            Arc::new(RwLock::new(provider)),
+            store.clone(),
+            Arc::new(tools),
+            Arc::new(PermissionService::allow_all()),
+            Arc::new(RwLock::new(CodeLoomConfig {
+                provider: ProviderConfig {
+                    kind: ProviderKind::OpenAiCompat,
+                    base_url: "http://localhost".into(),
+                    api_key_env: "KEY".into(),
+                },
+                model: "test".into(),
+                max_steps: 4,
+                effort: None,
+            })),
+            dir.path().to_path_buf(),
+            Arc::new(LocalJobRegistry::default()),
+            bus,
+        );
+
+        let (child, _job) = runtime
+            .start(
+                parent,
+                "obrero".into(),
+                "decide algo".into(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.pending_inputs(parent).is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("el hijo debería quedar esperando una respuesta");
+
+        runtime
+            .control(parent, child, "interrupt", None)
+            .await
+            .unwrap();
+        let settled = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await {
+                    Ok(crate::event::LiveEvent::SubagentSettled {
+                        child: settled,
+                        status,
+                        ..
+                    }) if settled == child => return status,
+                    Ok(_) => {}
+                    Err(error) => panic!("el bus debería seguir abierto: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("el hijo matado debería asentarse");
+
+        assert_eq!(settled, TaskState::Canceled);
+        let listed = store.list_subagents(parent).await.unwrap();
+        assert_eq!(listed[0].status.state, TaskState::Canceled);
     }
 
     #[tokio::test]

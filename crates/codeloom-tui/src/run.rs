@@ -2965,7 +2965,8 @@ mod tests {
 
     #[test]
     fn budget_exhausted_stops_waking_until_user_writes() {
-        use codeloom_core::session::{SessionId, SubagentStatus};
+        use codeloom_core::session::SessionId;
+        use codeloom_core::task::TaskState;
         let mut app = App::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         app.session_id = Some(SessionId(1));
@@ -2973,7 +2974,7 @@ mod tests {
         app.apply(codeloom_core::event::LiveEvent::SubagentSettled {
             parent: SessionId(1),
             child: SessionId(9),
-            status: SubagentStatus::Completed,
+            status: TaskState::Completed,
         });
 
         assert!(!app.take_wake());
@@ -3018,14 +3019,15 @@ mod tests {
 
     #[test]
     fn cancel_clears_pending_wake() {
-        use codeloom_core::session::{SessionId, SubagentStatus};
+        use codeloom_core::session::SessionId;
+        use codeloom_core::task::TaskState;
         let mut app = App::new();
         app.session_id = Some(SessionId(1));
         app.turn_in_flight = true;
         app.apply(codeloom_core::event::LiveEvent::SubagentSettled {
             parent: SessionId(1),
             child: SessionId(9),
-            status: SubagentStatus::Completed,
+            status: TaskState::Completed,
         });
         assert!(app.wake_pending);
 
@@ -3138,7 +3140,8 @@ mod tests {
 
     /// Sesión 1 con los hijos 3 y 5 en el rail, con el foco en el rail.
     fn rail_app() -> App {
-        use codeloom_core::session::{SessionId, SubagentDescriptor, SubagentStatus};
+        use codeloom_core::session::{SessionId, SubagentDescriptor};
+        use codeloom_core::task::{TaskState, TaskStatus};
         let parent = SessionId(1);
         let mut app = App::new();
         app.session_id = Some(parent);
@@ -3152,7 +3155,7 @@ mod tests {
                         child: SessionId(id),
                         job_id: format!("subagent-{id}"),
                         label: "review".into(),
-                        status: SubagentStatus::Running,
+                        status: TaskStatus::new(TaskState::Working),
                         result: None,
                         notice_delivered: false,
                     },

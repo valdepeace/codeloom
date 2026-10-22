@@ -28,13 +28,22 @@ fn job_counts(app: &App) -> (usize, usize, usize, usize) {
         .values()
         .filter(|subagent| Some(subagent.parent) == app.session_id)
         .fold((0, 0), |(running, finished), subagent| {
-            if subagent.status == codeloom_core::session::SubagentStatus::Running {
-                (running + 1, finished)
-            } else {
+            if subagent.status.state.is_terminal() {
                 (running, finished + 1)
+            } else {
+                (running + 1, finished)
             }
         });
     (running, finished, subagents_running, subagents_finished)
+}
+
+/// Altura de la cabecera de espacio de trabajo: dos líneas, o tres si hay subagentes que nombrar.
+fn workspace_header_height(app: &App) -> u16 {
+    if app.subagent_state_counts().is_empty() {
+        2
+    } else {
+        3
+    }
 }
 
 fn draw_workspace_header(frame: &mut Frame, area: Rect, app: &App) {
@@ -64,22 +73,33 @@ fn draw_workspace_header(frame: &mut Frame, area: Rect, app: &App) {
     }
     let (running, finished, subagents, subagents_finished) = job_counts(app);
     if running > 0 || finished > 0 || subagents > 0 || subagents_finished > 0 {
+        // El desglose de los subagentes va en su propia línea (ver más abajo): aquí solo los jobs
+        // y el total de «finished», que incluye los terminados de los subagentes.
         text.push(Span::styled(
             format!(
-                "  ·  {subagents} subagents · {running} jobs · {} finished",
+                "  ·  {running} jobs · {} finished",
                 finished + subagents_finished
             ),
             app.theme.styles.muted,
         ));
     }
+    let mut lineas = vec![Line::from(text)];
+    // Regla de trazabilidad: el resumen de subagentes nombra sus estados de A2A exactos. Va en
+    // una línea propia, así no se recorta a 100 columnas; sin subagentes no existe esa línea.
+    if !app.subagent_state_counts().is_empty() {
+        lineas.push(Line::from(Span::styled(
+            format!("  {}{}", app.running_summary(), app.finished_summary()),
+            app.theme.styles.muted,
+        )));
+    }
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(text),
-            Line::from(Span::styled(
+        Paragraph::new({
+            lineas.push(Line::from(Span::styled(
                 "   conversation · activity · context · changed files",
                 app.theme.styles.muted,
-            )),
-        ]),
+            )));
+            lineas
+        }),
         area,
     );
 }
@@ -113,7 +133,7 @@ fn draw_flat_header(frame: &mut Frame, area: Rect, app: &App) {
     let (running, finished, subagents, subagents_finished) = job_counts(app);
     if running > 0 || finished > 0 || subagents > 0 || subagents_finished > 0 {
         text.push(Span::styled(
-            format!("  • {subagents} subagents · {running} jobs"),
+            format!("  • {} · {running} jobs", app.running_summary()),
             app.theme.styles.muted,
         ));
     }
@@ -1203,7 +1223,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     app.composer_area = None;
     let flat = app.theme.look.chrome == ChromeStyle::Flat;
     let rows = Layout::vertical([
-        Constraint::Length(if flat { 1 } else { 2 }),
+        Constraint::Length(if flat {
+            1
+        } else {
+            workspace_header_height(app)
+        }),
         Constraint::Min(1),
         Constraint::Length(1),
     ])
@@ -1327,6 +1351,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 mod tests {
     use super::*;
     use crate::app::App;
+    use codeloom_core::task::{TaskState, TaskStatus};
     use ratatui::backend::{Backend, TestBackend};
     use ratatui::Terminal;
 
@@ -1406,8 +1431,8 @@ mod tests {
             );
         }
         for (child, status) in [
-            (99, codeloom_core::session::SubagentStatus::Running),
-            (100, codeloom_core::session::SubagentStatus::Unfinished),
+            (99, codeloom_core::task::TaskState::Working),
+            (100, codeloom_core::task::TaskState::Failed),
         ] {
             app.subagents.insert(
                 child,
@@ -1416,13 +1441,144 @@ mod tests {
                     child: codeloom_core::session::SessionId(child),
                     job_id: format!("subagent-{child}"),
                     label: "test".into(),
-                    status,
+                    status: codeloom_core::task::TaskStatus::new(status),
                     result: None,
                     notice_delivered: false,
                 },
             );
         }
         assert_eq!(job_counts(&app), (1, 1, 1, 1));
+    }
+
+    #[test]
+    fn header_names_the_a2a_states_of_its_subagent_counts() {
+        let mut app = App::new();
+        app.session_id = Some(codeloom_core::session::SessionId(1));
+        for (child, state) in [(9, TaskState::Working), (10, TaskState::Completed)] {
+            app.subagents.insert(
+                child,
+                codeloom_core::session::SubagentDescriptor {
+                    parent: codeloom_core::session::SessionId(1),
+                    child: codeloom_core::session::SessionId(child),
+                    job_id: format!("subagent-{child}"),
+                    label: "review".into(),
+                    status: TaskStatus::new(state),
+                    result: None,
+                    notice_delivered: false,
+                },
+            );
+        }
+        let texto_de = |dibujar: fn(&mut Frame, Rect, &App)| {
+            let mut term = Terminal::new(TestBackend::new(260, 3)).unwrap();
+            term.draw(|f| dibujar(f, f.area(), &app)).unwrap();
+            term.backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|celda| celda.symbol())
+                .collect::<String>()
+        };
+        let cabecera = texto_de(draw_workspace_header);
+        assert!(
+            cabecera.contains("1 subagents running (working 1)"),
+            "falta el recuento en curso: {cabecera}"
+        );
+        // Solo la cabecera de espacio de trabajo cuenta los terminados.
+        assert!(
+            cabecera.contains(" (subagents: completed 1)"),
+            "falta el recuento de terminados: {cabecera}"
+        );
+        let plana = texto_de(draw_flat_header);
+        assert!(
+            plana.contains("1 subagents running (working 1)"),
+            "falta el recuento en curso: {plana}"
+        );
+    }
+
+    #[test]
+    fn header_shows_state_counts_without_truncation_at_100_columns() {
+        let mut app = App::new();
+        app.session_id = Some(codeloom_core::session::SessionId(1));
+        for (child, state) in [(9, TaskState::Working), (10, TaskState::InputRequired)] {
+            app.subagents.insert(
+                child,
+                codeloom_core::session::SubagentDescriptor {
+                    parent: codeloom_core::session::SessionId(1),
+                    child: codeloom_core::session::SessionId(child),
+                    job_id: format!("subagent-{child}"),
+                    label: "review".into(),
+                    status: TaskStatus::new(state),
+                    result: None,
+                    notice_delivered: false,
+                },
+            );
+        }
+        let mut term = Terminal::new(TestBackend::new(100, 3)).unwrap();
+        term.draw(|f| draw_workspace_header(f, f.area(), &app))
+            .unwrap();
+        let buffer = term.backend().buffer().clone();
+        let fila_resumen: String = buffer.content[100..200]
+            .iter()
+            .map(|celda| celda.symbol())
+            .collect();
+        assert!(
+            fila_resumen.contains("2 subagents running (working 1, input-required 1)"),
+            "el resumen se recorta a 100 columnas: {fila_resumen:?}"
+        );
+    }
+
+    #[test]
+    fn header_has_no_parentheses_without_subagents() {
+        let mut app = App::new();
+        let mut term = Terminal::new(TestBackend::new(100, 3)).unwrap();
+        term.draw(|f| draw_workspace_header(f, f.area(), &app))
+            .unwrap();
+        let sin_subagentes: String = term
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|celda| celda.symbol())
+            .collect();
+        assert!(
+            !sin_subagentes.contains('('),
+            "hay paréntesis sin subagentes: {sin_subagentes}"
+        );
+
+        // Solo terminados: el resumen en curso es `0 subagents running`, sin paréntesis.
+        app.session_id = Some(codeloom_core::session::SessionId(1));
+        app.subagents.insert(
+            9,
+            codeloom_core::session::SubagentDescriptor {
+                parent: codeloom_core::session::SessionId(1),
+                child: codeloom_core::session::SessionId(9),
+                job_id: "subagent-9".into(),
+                label: "review".into(),
+                status: TaskStatus::new(TaskState::Failed),
+                result: None,
+                notice_delivered: false,
+            },
+        );
+        let mut term = Terminal::new(TestBackend::new(100, 3)).unwrap();
+        term.draw(|f| draw_workspace_header(f, f.area(), &app))
+            .unwrap();
+        let texto: String = term
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|celda| celda.symbol())
+            .collect();
+        // El paréntesis que sigue es el de los terminados; el cero en curso no lleva ninguno.
+        assert!(
+            texto.contains("0 subagents running (subagents: failed 1)"),
+            "falta el resumen: {texto}"
+        );
+        assert!(
+            !texto.contains("0 subagents running (working")
+                && !texto.contains("0 subagents running (input"),
+            "el cero no debe nombrar estados: {texto}"
+        );
     }
 
     #[test]
@@ -1481,6 +1637,8 @@ mod tests {
         let content = buffer_of(&mut app, 120, 40);
         assert!(content.contains("mistral-nemo"));
         assert!(content.contains("0 subagents running"));
+        // Sin subagentes en curso el resumen es `0 subagents running`, sin paréntesis que ocultar.
+        assert!(!content.contains("subagents running ("), "{content}");
         assert!(content.contains("CodeLoom"));
     }
 
@@ -1963,7 +2121,7 @@ mod tests {
     fn loaded_crush_app() -> App {
         use codeloom_core::event::LiveEvent;
         use codeloom_core::job::JobStatus;
-        use codeloom_core::session::{SessionId, SubagentDescriptor, SubagentStatus};
+        use codeloom_core::session::{SessionId, SubagentDescriptor};
         let mut app = crush_ctx();
         app.session_id = Some(SessionId(1));
         app.apply(LiveEvent::FileDiff {
@@ -1987,7 +2145,7 @@ mod tests {
             child: SessionId(9),
             job_id: "subagent-1".into(),
             label: "review".into(),
-            status: SubagentStatus::Running,
+            status: TaskStatus::new(TaskState::Working),
             result: None,
             notice_delivered: false,
         }));

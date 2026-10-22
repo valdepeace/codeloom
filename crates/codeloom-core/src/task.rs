@@ -1,11 +1,12 @@
-//! Proyección hacia los estados de tarea de A2A; el modelo interno no cambia.
+//! Estado de tarea de A2A: es el modelo de un subagente, no una proyección suya.
 //!
-//! Cabe señalar que este módulo no fija los nombres del cable (en la v1.0 son
-//! `TASK_STATE_*`; en la 0.3, `input-required` y compañía): esa traducción
-//! corresponde al adaptador del borde.
+//! Cabe señalar que el estado persistido usa los nombres del proto v1.0
+//! (`TASK_STATE_*`, vía `proto_name`). La traducción a los nombres del cable
+//! (y a los de la v0.3, `input-required` y compañía) corresponde al adaptador
+//! del borde; la interfaz deriva de aquí su presentación, sin reescribirlo.
 
 use crate::job::JobStatus;
-use crate::session::SubagentStatus;
+use crate::message::now_ms;
 
 /// Estado de una tarea según A2A.
 ///
@@ -24,6 +25,18 @@ pub enum TaskState {
 }
 
 impl TaskState {
+    /// Los ocho estados reales, en el orden de la tabla de A2A.
+    pub const ALL: [TaskState; 8] = [
+        TaskState::Submitted,
+        TaskState::Working,
+        TaskState::InputRequired,
+        TaskState::AuthRequired,
+        TaskState::Completed,
+        TaskState::Failed,
+        TaskState::Canceled,
+        TaskState::Rejected,
+    ];
+
     /// Dícese de los estados que ya no admiten transiciones posteriores.
     ///
     /// `InputRequired` y `AuthRequired` no son terminales: la tarea sigue viva,
@@ -33,6 +46,62 @@ impl TaskState {
             self,
             Self::Completed | Self::Failed | Self::Canceled | Self::Rejected
         )
+    }
+
+    /// Nombre del proto v1.0 con el que se persiste el estado, p. ej. `TASK_STATE_WORKING`.
+    pub fn proto_name(self) -> &'static str {
+        match self {
+            Self::Submitted => "TASK_STATE_SUBMITTED",
+            Self::Working => "TASK_STATE_WORKING",
+            Self::InputRequired => "TASK_STATE_INPUT_REQUIRED",
+            Self::AuthRequired => "TASK_STATE_AUTH_REQUIRED",
+            Self::Completed => "TASK_STATE_COMPLETED",
+            Self::Failed => "TASK_STATE_FAILED",
+            Self::Canceled => "TASK_STATE_CANCELED",
+            Self::Rejected => "TASK_STATE_REJECTED",
+        }
+    }
+
+    /// Estado a partir de su nombre del proto v1.0. Las cadenas antiguas no pasan por aquí:
+    /// el almacén las traduce aparte.
+    pub fn from_proto_name(name: &str) -> Option<TaskState> {
+        Self::ALL
+            .into_iter()
+            .find(|state| state.proto_name() == name)
+    }
+
+    /// A2A no fija una tabla de transiciones: lo único que impone es que un estado
+    /// terminal no se reinicie. Por eso cualquier otro destino se admite.
+    pub fn can_transition_to(self, _next: TaskState) -> bool {
+        !self.is_terminal()
+    }
+}
+
+/// Estado de una tarea con su mensaje y su marca de tiempo, como el `TaskStatus` del proto.
+///
+/// Cabe señalar que `message` es texto plano: en el proto es un `Message` con `Part`s,
+/// y esa forma llega con la tarea A5 del plan de A2A.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskStatus {
+    pub state: TaskState,
+    pub message: Option<String>,
+    pub timestamp_ms: i64,
+}
+
+impl TaskStatus {
+    /// Estado sin mensaje, con la marca de tiempo del momento de crearlo.
+    pub fn new(state: TaskState) -> Self {
+        Self {
+            state,
+            message: None,
+            timestamp_ms: now_ms(),
+        }
+    }
+
+    /// Añade el mensaje que explica el estado.
+    pub fn with_message(mut self, message: impl Into<String>) -> Self {
+        self.message = Some(message.into());
+        self
     }
 }
 
@@ -45,32 +114,6 @@ impl From<JobStatus> for TaskState {
             JobStatus::Failed => Self::Failed,
             JobStatus::Killed => Self::Canceled,
         }
-    }
-}
-
-impl From<SubagentStatus> for TaskState {
-    fn from(status: SubagentStatus) -> Self {
-        match status {
-            SubagentStatus::Running => Self::Working,
-            SubagentStatus::Completed => Self::Completed,
-            SubagentStatus::Failed => Self::Failed,
-            SubagentStatus::Killed => Self::Canceled,
-            // A2A carece de equivalente a «sin terminar». Se proyecta a fallo porque
-            // la tarea quedó sin terminar cuando la aplicación se cerró.
-            SubagentStatus::Unfinished => Self::Failed,
-        }
-    }
-}
-
-/// Proyección de un subagente a su estado A2A, con la espera de su padre.
-///
-/// Dícese de la marca `awaiting_input` que solo cobra sentido mientras el hijo
-/// sigue en marcha: un hijo terminado ya no espera nada.
-pub fn subagent_task_state(status: SubagentStatus, awaiting_input: bool) -> TaskState {
-    if status == SubagentStatus::Running && awaiting_input {
-        TaskState::InputRequired
-    } else {
-        TaskState::from(status)
     }
 }
 
@@ -108,45 +151,56 @@ mod tests {
     }
 
     #[test]
-    fn awaiting_input_only_matters_while_running() {
-        assert_eq!(
-            subagent_task_state(SubagentStatus::Running, true),
-            TaskState::InputRequired
-        );
-        assert_eq!(
-            subagent_task_state(SubagentStatus::Running, false),
-            TaskState::Working
-        );
-        assert_eq!(
-            subagent_task_state(SubagentStatus::Completed, true),
-            TaskState::Completed
-        );
-        assert_eq!(
-            subagent_task_state(SubagentStatus::Failed, true),
-            TaskState::Failed
-        );
+    fn proto_names_roundtrip_for_all_states() {
+        for state in TaskState::ALL {
+            assert_eq!(
+                TaskState::from_proto_name(state.proto_name()),
+                Some(state),
+                "ida y vuelta de {state:?}"
+            );
+            assert!(state.proto_name().starts_with("TASK_STATE_"));
+        }
+        let mut nombres: Vec<&str> = TaskState::ALL.iter().map(|s| s.proto_name()).collect();
+        nombres.sort_unstable();
+        nombres.dedup();
+        assert_eq!(nombres.len(), 8, "nombres repetidos");
     }
 
     #[test]
-    fn subagent_status_projects_to_task_state() {
-        assert_eq!(TaskState::from(SubagentStatus::Running), TaskState::Working);
-        assert_eq!(
-            TaskState::from(SubagentStatus::Completed),
-            TaskState::Completed
-        );
-        assert_eq!(TaskState::from(SubagentStatus::Failed), TaskState::Failed);
-        assert_eq!(TaskState::from(SubagentStatus::Killed), TaskState::Canceled);
+    fn from_proto_name_rejects_unknown() {
+        assert_eq!(TaskState::from_proto_name("running"), None);
+        assert_eq!(TaskState::from_proto_name("TASK_STATE_UNSPECIFIED"), None);
+        assert_eq!(TaskState::from_proto_name(""), None);
     }
 
     #[test]
-    fn unfinished_projects_to_failed() {
-        assert_eq!(
-            TaskState::from(SubagentStatus::Unfinished),
-            TaskState::Failed
-        );
-        assert_eq!(
-            subagent_task_state(SubagentStatus::Unfinished, true),
-            TaskState::Failed
-        );
+    fn terminal_states_cannot_transition() {
+        for from in TaskState::ALL.into_iter().filter(|s| s.is_terminal()) {
+            for to in TaskState::ALL {
+                assert!(!from.can_transition_to(to), "{from:?} -> {to:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn non_terminal_states_can_transition_anywhere() {
+        for from in TaskState::ALL.into_iter().filter(|s| !s.is_terminal()) {
+            for to in TaskState::ALL {
+                assert!(from.can_transition_to(to), "{from:?} -> {to:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn task_status_new_sets_timestamp() {
+        let antes = crate::message::now_ms();
+        let status = TaskStatus::new(TaskState::Working);
+        let despues = crate::message::now_ms();
+        assert_eq!(status.state, TaskState::Working);
+        assert_eq!(status.message, None);
+        assert!(antes <= status.timestamp_ms && status.timestamp_ms <= despues);
+
+        let con_texto = TaskStatus::new(TaskState::Failed).with_message("roto");
+        assert_eq!(con_texto.message.as_deref(), Some("roto"));
     }
 }

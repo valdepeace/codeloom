@@ -62,7 +62,7 @@ pub enum LiveEvent {
     SubagentSettled {
         parent: crate::session::SessionId,
         child: crate::session::SessionId,
-        status: crate::session::SubagentStatus,
+        status: crate::task::TaskState,
     },
     Error {
         message: String,

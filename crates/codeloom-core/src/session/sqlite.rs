@@ -1,11 +1,13 @@
-use super::{
-    SessionId, SessionInfo, SessionStore, SubagentDescriptor, SubagentStatus, UsageRecord,
-};
+use super::{SessionId, SessionInfo, SessionStore, SubagentDescriptor, UsageRecord};
 use crate::error::{CoreError, Result};
 use crate::message::{self, Message};
+use crate::task::{TaskState, TaskStatus};
 use async_trait::async_trait;
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{Row, SqlitePool};
+
+/// Mensaje con el que queda una tarea que seguía en marcha cuando la aplicación se cerró.
+const INTERRUPTED_AT_SHUTDOWN: &str = "interrupted by application shutdown";
 
 pub struct SqliteStore {
     pool: SqlitePool,
@@ -45,6 +47,8 @@ impl SqliteStore {
                 job_id TEXT NOT NULL,
                 label TEXT NOT NULL,
                 status TEXT NOT NULL,
+                status_message TEXT,
+                status_timestamp_ms INTEGER,
                 result TEXT,
                 notice_delivered INTEGER NOT NULL DEFAULT 0,
                 created_at_ms INTEGER NOT NULL)",
@@ -52,6 +56,30 @@ impl SqliteStore {
         .execute(&pool)
         .await
         .map_err(|e| CoreError::Store(e.to_string()))?;
+        // Una base anterior a A2A no tiene las columnas de estado: se añaden solo si faltan,
+        // así que abrirla dos veces seguidas no falla.
+        let columnas: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('subagents')")
+                .fetch_all(&pool)
+                .await
+                .map_err(|e| CoreError::Store(e.to_string()))?;
+        for (columna, ddl) in [
+            (
+                "status_message",
+                "ALTER TABLE subagents ADD COLUMN status_message TEXT",
+            ),
+            (
+                "status_timestamp_ms",
+                "ALTER TABLE subagents ADD COLUMN status_timestamp_ms INTEGER",
+            ),
+        ] {
+            if !columnas.iter().any(|existente| existente == columna) {
+                sqlx::query(ddl)
+                    .execute(&pool)
+                    .await
+                    .map_err(|e| CoreError::Store(e.to_string()))?;
+            }
+        }
         // Libro de consumo. Una base anterior no la tiene: `IF NOT EXISTS` la añade sin tocar el resto.
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS usage (
@@ -68,11 +96,22 @@ impl SqliteStore {
         .await
         .map_err(|e| CoreError::Store(e.to_string()))?;
         // shortcut: one process per DB; use leases if concurrent Loom processes share it.
-        // Los hijos que seguían en marcha al reabrir quedan como no terminados.
-        sqlx::query("UPDATE subagents SET status = 'unfinished' WHERE status = 'running'")
-            .execute(&pool)
-            .await
-            .map_err(|e| CoreError::Store(e.to_string()))?;
+        // Lo no terminado al reabrir (y la cadena antigua «running») pasa a fallido, con un
+        // mensaje que explica por qué: A2A no define qué le corresponde a un proceso que desapareció.
+        sqlx::query(
+            "UPDATE subagents SET status = ?, status_message = ?, status_timestamp_ms = ?
+             WHERE status IN (?, ?, ?, ?, 'running')",
+        )
+        .bind(TaskState::Failed.proto_name())
+        .bind(INTERRUPTED_AT_SHUTDOWN)
+        .bind(message::now_ms())
+        .bind(TaskState::Submitted.proto_name())
+        .bind(TaskState::Working.proto_name())
+        .bind(TaskState::InputRequired.proto_name())
+        .bind(TaskState::AuthRequired.proto_name())
+        .execute(&pool)
+        .await
+        .map_err(|e| CoreError::Store(e.to_string()))?;
         Ok(Self { pool })
     }
 }
@@ -161,14 +200,16 @@ impl SessionStore for SqliteStore {
 
     async fn save_subagent(&self, descriptor: &SubagentDescriptor) -> Result<()> {
         sqlx::query(
-            "INSERT INTO subagents (parent_session_id, child_session_id, job_id, label, status, created_at_ms)
-             VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO subagents (parent_session_id, child_session_id, job_id, label, status, status_message, status_timestamp_ms, created_at_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(descriptor.parent.0)
         .bind(descriptor.child.0)
         .bind(&descriptor.job_id)
         .bind(&descriptor.label)
-        .bind(subagent_status(descriptor.status))
+        .bind(descriptor.status.state.proto_name())
+        .bind(&descriptor.status.message)
+        .bind(descriptor.status.timestamp_ms)
         .bind(crate::message::now_ms())
         .execute(&self.pool)
         .await
@@ -180,23 +221,54 @@ impl SessionStore for SqliteStore {
         &self,
         parent: SessionId,
         child: SessionId,
-        status: SubagentStatus,
+        status: TaskStatus,
     ) -> Result<()> {
-        sqlx::query(
-            "UPDATE subagents SET status = ? WHERE parent_session_id = ? AND child_session_id = ?",
+        // Leer y escribir en una misma transacción: un terminal no se reabre ni aunque
+        // dos escrituras coincidan.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| CoreError::Store(e.to_string()))?;
+        let actual: Option<String> = sqlx::query_scalar(
+            "SELECT status FROM subagents WHERE parent_session_id = ? AND child_session_id = ?",
         )
-        .bind(subagent_status(status))
         .bind(parent.0)
         .bind(child.0)
-        .execute(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| CoreError::Store(e.to_string()))?;
+        if let Some(actual) = actual {
+            let actual = parse_task_state(&actual)?;
+            if actual.is_terminal() {
+                return Err(CoreError::Store(format!(
+                    "subagent already settled as {}",
+                    actual.proto_name()
+                )));
+            }
+        }
+        sqlx::query(
+            "UPDATE subagents SET status = ?, status_message = ?, status_timestamp_ms = ?
+             WHERE parent_session_id = ? AND child_session_id = ?",
+        )
+        .bind(status.state.proto_name())
+        .bind(&status.message)
+        .bind(status.timestamp_ms)
+        .bind(parent.0)
+        .bind(child.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| CoreError::Store(e.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|e| CoreError::Store(e.to_string()))?;
         Ok(())
     }
 
     async fn list_subagents(&self, parent: SessionId) -> Result<Vec<SubagentDescriptor>> {
         let rows = sqlx::query(
-            "SELECT parent_session_id, child_session_id, job_id, label, status, result, notice_delivered
+            "SELECT parent_session_id, child_session_id, job_id, label, status, status_message,
+                    status_timestamp_ms, created_at_ms, result, notice_delivered
              FROM subagents WHERE parent_session_id = ? ORDER BY created_at_ms, child_session_id",
         )
         .bind(parent.0)
@@ -206,12 +278,20 @@ impl SessionStore for SqliteStore {
         rows.into_iter()
             .map(|row| {
                 let status: String = row.get("status");
+                // Una fila antigua no tiene marca de tiempo propia: se usa la de su creación.
+                let timestamp_ms = row
+                    .get::<Option<i64>, _>("status_timestamp_ms")
+                    .unwrap_or_else(|| row.get("created_at_ms"));
                 Ok(SubagentDescriptor {
                     parent: SessionId(row.get("parent_session_id")),
                     child: SessionId(row.get("child_session_id")),
                     job_id: row.get("job_id"),
                     label: row.get("label"),
-                    status: parse_subagent_status(&status)?,
+                    status: TaskStatus {
+                        state: parse_task_state(&status)?,
+                        message: row.get("status_message"),
+                        timestamp_ms,
+                    },
                     result: row.get("result"),
                     notice_delivered: row.get::<i64, _>("notice_delivered") != 0,
                 })
@@ -225,11 +305,42 @@ impl SessionStore for SqliteStore {
         child: SessionId,
         result: &str,
     ) -> Result<()> {
-        sqlx::query("UPDATE subagents SET status = 'completed', result = ? WHERE parent_session_id = ? AND child_session_id = ?")
-            .bind(result)
-            .bind(parent.0)
-            .bind(child.0)
-            .execute(&self.pool)
+        // Igual que `update_subagent_status`: un terminal no admite otra transición, tampoco esta.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| CoreError::Store(e.to_string()))?;
+        let actual: Option<String> = sqlx::query_scalar(
+            "SELECT status FROM subagents WHERE parent_session_id = ? AND child_session_id = ?",
+        )
+        .bind(parent.0)
+        .bind(child.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| CoreError::Store(e.to_string()))?;
+        if let Some(actual) = actual {
+            let actual = parse_task_state(&actual)?;
+            if actual.is_terminal() {
+                return Err(CoreError::Store(format!(
+                    "subagent already settled as {}",
+                    actual.proto_name()
+                )));
+            }
+        }
+        sqlx::query(
+            "UPDATE subagents SET status = ?, status_message = NULL, status_timestamp_ms = ?, result = ?
+             WHERE parent_session_id = ? AND child_session_id = ?",
+        )
+        .bind(TaskState::Completed.proto_name())
+        .bind(message::now_ms())
+        .bind(result)
+        .bind(parent.0)
+        .bind(child.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| CoreError::Store(e.to_string()))?;
+        tx.commit()
             .await
             .map_err(|e| CoreError::Store(e.to_string()))?;
         Ok(())
@@ -248,7 +359,7 @@ impl SessionStore for SqliteStore {
             .map_err(|e| CoreError::Store(e.to_string()))?;
         let pending = sqlx::query_scalar::<_, i64>(
             "SELECT notice_delivered FROM subagents
-             WHERE parent_session_id = ? AND child_session_id = ? AND status = 'completed'",
+             WHERE parent_session_id = ? AND child_session_id = ? AND status IN ('TASK_STATE_COMPLETED', 'completed')",
         )
         .bind(parent.0)
         .bind(child.0)
@@ -342,28 +453,17 @@ fn from_sql_int(value: i64) -> Result<u64> {
     u64::try_from(value).map_err(|_| CoreError::Store(format!("negative token count: {value}")))
 }
 
-fn subagent_status(status: SubagentStatus) -> &'static str {
+/// Estado de una fila del almacén. Acepta los nombres del proto v1.0 y las cadenas de las
+/// versiones anteriores, que se leen como su equivalente de A2A: `running` es `working`;
+/// `killed`, `canceled`; `interrupted` y `unfinished`, `failed`.
+fn parse_task_state(status: &str) -> Result<TaskState> {
     match status {
-        SubagentStatus::Running => "running",
-        SubagentStatus::Completed => "completed",
-        SubagentStatus::Killed => "killed",
-        SubagentStatus::Failed => "failed",
-        SubagentStatus::Unfinished => "unfinished",
-    }
-}
-
-fn parse_subagent_status(status: &str) -> Result<SubagentStatus> {
-    match status {
-        "running" => Ok(SubagentStatus::Running),
-        "completed" => Ok(SubagentStatus::Completed),
-        "killed" => Ok(SubagentStatus::Killed),
-        "failed" => Ok(SubagentStatus::Failed),
-        // La cadena «interrupted» es la de bases escritas antes del renombrado; se sigue leyendo
-        // para no perder sesiones existentes.
-        "unfinished" | "interrupted" => Ok(SubagentStatus::Unfinished),
-        _ => Err(CoreError::Store(format!(
-            "unknown subagent status: {status}"
-        ))),
+        "running" => Ok(TaskState::Working),
+        "completed" => Ok(TaskState::Completed),
+        "failed" | "interrupted" | "unfinished" => Ok(TaskState::Failed),
+        "killed" => Ok(TaskState::Canceled),
+        _ => TaskState::from_proto_name(status)
+            .ok_or_else(|| CoreError::Store(format!("unknown subagent status: {status}"))),
     }
 }
 
@@ -425,34 +525,48 @@ mod tests {
         assert_eq!(sessions[1].id, old);
     }
 
-    #[tokio::test]
-    async fn persists_subagent_catalog_and_marks_running_entries_after_restart() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("subagents.db");
-        let store = SqliteStore::open(path.to_str().unwrap()).await.unwrap();
-        let parent = store.create_session("/proj").await.unwrap();
-        let child = store.create_session("/proj").await.unwrap();
-        let descriptor = SubagentDescriptor {
+    use crate::task::{TaskState, TaskStatus};
+
+    /// Descriptor de prueba del subagente `child` con el estado A2A dado.
+    fn descriptor(parent: SessionId, child: SessionId, state: TaskState) -> SubagentDescriptor {
+        SubagentDescriptor {
             parent,
             child,
-            job_id: "subagent-1".into(),
+            job_id: format!("subagent-{}", child.0),
             label: "review".into(),
-            status: SubagentStatus::Running,
+            status: TaskStatus::new(state),
             result: None,
             notice_delivered: false,
-        };
-        store.save_subagent(&descriptor).await.unwrap();
-        assert_eq!(
-            store.list_subagents(parent).await.unwrap(),
-            vec![descriptor]
-        );
+        }
+    }
+
+    /// Estado guardado tal cual en la columna `status` de la fila del hijo.
+    async fn raw_status(store: &SqliteStore, child: SessionId) -> String {
+        sqlx::query_scalar("SELECT status FROM subagents WHERE child_session_id = ?")
+            .bind(child.0)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn persists_subagent_catalog_and_completes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(dir.path().join("subagents.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let parent = store.create_session("/proj").await.unwrap();
+        let child = store.create_session("/proj").await.unwrap();
+        let inicial = descriptor(parent, child, TaskState::Working);
+        store.save_subagent(&inicial).await.unwrap();
+        assert_eq!(store.list_subagents(parent).await.unwrap(), vec![inicial]);
         store
             .complete_subagent(parent, child, "finished")
             .await
             .unwrap();
         assert_eq!(
-            store.list_subagents(parent).await.unwrap()[0].status,
-            SubagentStatus::Completed
+            store.list_subagents(parent).await.unwrap()[0].status.state,
+            TaskState::Completed
         );
         let notice = Message::user("[Subagent review completed]\nfinished");
         assert!(store
@@ -464,78 +578,244 @@ mod tests {
             .await
             .unwrap());
         assert_eq!(store.messages(parent).await.unwrap().len(), 1);
-
-        store
-            .update_subagent_status(parent, child, SubagentStatus::Running)
-            .await
-            .unwrap();
-        drop(store);
-        let reopened = SqliteStore::open(path.to_str().unwrap()).await.unwrap();
-        assert_eq!(
-            reopened.list_subagents(parent).await.unwrap()[0].status,
-            SubagentStatus::Unfinished
-        );
     }
 
     #[tokio::test]
-    async fn unfinished_status_roundtrips_through_sqlite() {
+    async fn reopened_store_marks_non_terminal_children_failed_with_message() {
         let dir = tempfile::tempdir().unwrap();
-        let store = SqliteStore::open(dir.path().join("roundtrip.db").to_str().unwrap())
-            .await
-            .unwrap();
+        let path = dir.path().join("reopen.db");
+        let store = SqliteStore::open(path.to_str().unwrap()).await.unwrap();
         let parent = store.create_session("/proj").await.unwrap();
-        let child = store.create_session("/proj").await.unwrap();
-        let descriptor = SubagentDescriptor {
-            parent,
-            child,
-            job_id: "subagent-2".into(),
-            label: "review".into(),
-            status: SubagentStatus::Unfinished,
-            result: None,
-            notice_delivered: false,
-        };
-        store.save_subagent(&descriptor).await.unwrap();
-
-        // Lo que se escribe de nuevo es la cadena nueva, no la antigua.
-        let stored: String =
-            sqlx::query_scalar("SELECT status FROM subagents WHERE child_session_id = ?")
-                .bind(child.0)
-                .fetch_one(&store.pool)
+        let mut vivos = Vec::new();
+        for state in [
+            TaskState::Submitted,
+            TaskState::Working,
+            TaskState::InputRequired,
+            TaskState::AuthRequired,
+        ] {
+            let child = store.create_session("/proj").await.unwrap();
+            store
+                .save_subagent(&descriptor(parent, child, state))
                 .await
                 .unwrap();
-        assert_eq!(stored, "unfinished");
-        assert_eq!(
-            store.list_subagents(parent).await.unwrap(),
-            vec![descriptor]
-        );
-    }
-
-    #[tokio::test]
-    async fn legacy_interrupted_string_is_read_as_unfinished() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = SqliteStore::open(dir.path().join("legacy.db").to_str().unwrap())
+            vivos.push(child);
+        }
+        let terminado = store.create_session("/proj").await.unwrap();
+        store
+            .save_subagent(&descriptor(parent, terminado, TaskState::Completed))
             .await
             .unwrap();
-        let parent = store.create_session("/proj").await.unwrap();
-        let child = store.create_session("/proj").await.unwrap();
-        // Fila escrita por una versión anterior, con la cadena antigua tal cual.
+        // Una fila escrita con la cadena antigua «running» también cuenta como no terminal.
+        let antigua = store.create_session("/proj").await.unwrap();
         sqlx::query(
             "INSERT INTO subagents (parent_session_id, child_session_id, job_id, label, status, created_at_ms)
              VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(parent.0)
-        .bind(child.0)
-        .bind("subagent-legacy")
+        .bind(antigua.0)
+        .bind("subagent-antigua")
         .bind("review")
-        .bind("interrupted")
+        .bind("running")
         .bind(crate::message::now_ms())
         .execute(&store.pool)
         .await
         .unwrap();
+        vivos.push(antigua);
+        drop(store);
 
+        let reopened = SqliteStore::open(path.to_str().unwrap()).await.unwrap();
+        let listed = reopened.list_subagents(parent).await.unwrap();
+        for child in vivos {
+            let fila = listed.iter().find(|d| d.child == child).unwrap();
+            assert_eq!(fila.status.state, TaskState::Failed, "hijo {child:?}");
+            assert_eq!(
+                fila.status.message.as_deref(),
+                Some("interrupted by application shutdown")
+            );
+        }
+        let fila = listed.iter().find(|d| d.child == terminado).unwrap();
+        assert_eq!(fila.status.state, TaskState::Completed);
+        assert_eq!(fila.status.message, None);
+    }
+
+    #[tokio::test]
+    async fn state_roundtrips_through_sqlite_with_message_and_timestamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(dir.path().join("roundtrip.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let parent = store.create_session("/proj").await.unwrap();
+        for state in TaskState::ALL {
+            let child = store.create_session("/proj").await.unwrap();
+            let guardado = SubagentDescriptor {
+                status: TaskStatus {
+                    state,
+                    message: Some(format!("mensaje de {state:?}")),
+                    timestamp_ms: 1_700_000_000_123,
+                },
+                ..descriptor(parent, child, state)
+            };
+            store.save_subagent(&guardado).await.unwrap();
+            // Lo que se escribe es el nombre del proto v1.0, no una cadena propia.
+            assert_eq!(raw_status(&store, child).await, state.proto_name());
+            let leido = store
+                .list_subagents(parent)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|d| d.child == child)
+                .unwrap();
+            assert_eq!(leido, guardado);
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_strings_are_read_as_equivalent_states() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(dir.path().join("legacy.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let parent = store.create_session("/proj").await.unwrap();
+        let pares = [
+            ("running", TaskState::Working),
+            ("completed", TaskState::Completed),
+            ("failed", TaskState::Failed),
+            ("killed", TaskState::Canceled),
+            ("interrupted", TaskState::Failed),
+            ("unfinished", TaskState::Failed),
+        ];
+        let mut hijos = Vec::new();
+        for (cadena, esperado) in pares {
+            let child = store.create_session("/proj").await.unwrap();
+            // Fila escrita por una versión anterior, con la cadena antigua tal cual.
+            sqlx::query(
+                "INSERT INTO subagents (parent_session_id, child_session_id, job_id, label, status, created_at_ms)
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(parent.0)
+            .bind(child.0)
+            .bind(format!("subagent-{cadena}"))
+            .bind("review")
+            .bind(cadena)
+            .bind(crate::message::now_ms())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+            hijos.push((child, esperado));
+        }
         let listed = store.list_subagents(parent).await.unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].status, SubagentStatus::Unfinished);
+        assert_eq!(listed.len(), hijos.len());
+        for (child, esperado) in hijos {
+            let fila = listed.iter().find(|d| d.child == child).unwrap();
+            assert_eq!(fila.status.state, esperado, "hijo {child:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn store_migration_adds_status_columns_to_an_old_database_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("viejo-a2a.db");
+        {
+            let pool =
+                sqlx::SqlitePool::connect(&format!("sqlite://{}?mode=rwc", path.to_str().unwrap()))
+                    .await
+                    .unwrap();
+            // Esquema anterior a A2A: sin `status_message` ni `status_timestamp_ms`.
+            sqlx::query(
+                "CREATE TABLE subagents (
+                    parent_session_id INTEGER NOT NULL,
+                    child_session_id INTEGER NOT NULL PRIMARY KEY,
+                    job_id TEXT NOT NULL,
+                    label TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    result TEXT,
+                    notice_delivered INTEGER NOT NULL DEFAULT 0,
+                    created_at_ms INTEGER NOT NULL)",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO subagents (parent_session_id, child_session_id, job_id, label, status, created_at_ms)
+                 VALUES (1, 2, 'subagent-old', 'review', 'completed', 1)",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            pool.close().await;
+        }
+
+        let store = SqliteStore::open(path.to_str().unwrap()).await.unwrap();
+        let primera = store.list_subagents(SessionId(1)).await.unwrap();
+        assert_eq!(primera.len(), 1);
+        assert_eq!(primera[0].status.state, TaskState::Completed);
+        assert_eq!(primera[0].status.message, None);
+        drop(store);
+
+        // Segunda apertura: las columnas ya existen y no vuelve a fallar ni a cambiar nada.
+        let again = SqliteStore::open(path.to_str().unwrap()).await.unwrap();
+        assert_eq!(again.list_subagents(SessionId(1)).await.unwrap(), primera);
+        let columnas: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('subagents')")
+                .fetch_all(&again.pool)
+                .await
+                .unwrap();
+        assert!(columnas.iter().any(|c| c == "status_message"));
+        assert!(columnas.iter().any(|c| c == "status_timestamp_ms"));
+    }
+
+    #[tokio::test]
+    async fn update_from_terminal_state_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(dir.path().join("terminal.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let parent = store.create_session("/proj").await.unwrap();
+        let child = store.create_session("/proj").await.unwrap();
+        store
+            .save_subagent(&descriptor(parent, child, TaskState::Working))
+            .await
+            .unwrap();
+        store
+            .update_subagent_status(parent, child, TaskStatus::new(TaskState::Completed))
+            .await
+            .unwrap();
+        for intento in [TaskState::Working, TaskState::Failed, TaskState::Canceled] {
+            assert!(
+                store
+                    .update_subagent_status(parent, child, TaskStatus::new(intento))
+                    .await
+                    .is_err(),
+                "de Completed a {intento:?} debería fallar"
+            );
+        }
+        assert!(store
+            .complete_subagent(parent, child, "otra vez")
+            .await
+            .is_err());
+        assert_eq!(
+            store.list_subagents(parent).await.unwrap()[0].status.state,
+            TaskState::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_subagent_writes_the_proto_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(dir.path().join("complete.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let parent = store.create_session("/proj").await.unwrap();
+        let child = store.create_session("/proj").await.unwrap();
+        store
+            .save_subagent(&descriptor(parent, child, TaskState::Working))
+            .await
+            .unwrap();
+        store
+            .complete_subagent(parent, child, "finished")
+            .await
+            .unwrap();
+        assert_eq!(raw_status(&store, child).await, "TASK_STATE_COMPLETED");
     }
 
     /// Apunte de prueba con precios opcionales `(entrada, salida)` por millón. La sesión es
@@ -599,7 +879,7 @@ mod tests {
                 child,
                 job_id: "subagent-1".into(),
                 label: "review".into(),
-                status: SubagentStatus::Completed,
+                status: TaskStatus::new(TaskState::Completed),
                 result: None,
                 notice_delivered: false,
             })
@@ -666,7 +946,7 @@ mod tests {
                 child,
                 job_id: "subagent-1".into(),
                 label: "review".into(),
-                status: SubagentStatus::Completed,
+                status: TaskStatus::new(TaskState::Completed),
                 result: None,
                 notice_delivered: false,
             })

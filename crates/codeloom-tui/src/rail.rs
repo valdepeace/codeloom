@@ -1,10 +1,11 @@
 //! Rail derecho de contexto del look Crush: modelo, ficheros, herramientas,
 //! jobs y subagentes de la sesión abierta.
 
-use crate::app::{AgentStats, App, Focus};
+use crate::app::{formato_recuento, AgentStats, App, Focus};
 use batten::state::{AgentState, ToolStatus};
 use codeloom_core::job::JobStatus;
-use codeloom_core::task::{subagent_task_state, TaskState};
+use codeloom_core::session::SubagentDescriptor;
+use codeloom_core::task::TaskState;
 use codeloom_core::todo::TodoStatus;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -199,13 +200,24 @@ fn rail_lines(app: &App, width: usize) -> Vec<Line<'_>> {
     if subagent_total > 0 {
         push_gap(&mut out);
         out.push(subagents_title(app));
+        // Regla de trazabilidad: bajo el recuento de subagentes en curso se nombra su desglose
+        // por estado A2A exacto, partido para caber en el rail. Sin subagentes en curso no hay nada que nombrar.
+        if app.active_agents() > 0 {
+            let activos: Vec<(TaskState, usize)> = app
+                .subagent_state_counts()
+                .into_iter()
+                .filter(|(estado, _)| !estado.is_terminal())
+                .collect();
+            let grupo = format!("({})", formato_recuento(&activos));
+            for linea in partir_por_palabras(&grupo, width) {
+                out.push(Line::from(Span::styled(linea, app.theme.styles.muted)));
+            }
+        }
         // Un único `Instant::now()` por dibujado: el tiempo transcurrido de todos los hijos.
         let ahora = Instant::now();
         for subagent in subagents().take(SUBAGENT_LIMIT) {
-            // El estado visual sale de la proyección del núcleo, que ya tiene en cuenta
-            // si el hijo espera a su padre.
             let espera = app.awaiting_input.contains(&subagent.child.0);
-            let estado = agent_state(subagent_task_state(subagent.status, espera));
+            let estado = agent_state(estado_del_rail(subagent, espera));
             // Con el foco en el rail, el hijo elegido con ↑/↓ lleva `›` de acento en vez del glifo.
             // El glifo y el `›` ocupan una columna más el espacio, así que la línea no cambia de anchura.
             let seleccionado =
@@ -251,9 +263,10 @@ fn rail_lines(app: &App, width: usize) -> Vec<Line<'_>> {
     out
 }
 
-/// Proyección de un estado de tarea de A2A al estado visual del rail. El `match`
-/// es exhaustivo y sin comodín: un estado nuevo del núcleo obliga a decidir su glifo.
-fn agent_state(state: TaskState) -> AgentState {
+/// Presentación de un estado de tarea de A2A como estado visual. El `match` es exhaustivo
+/// y sin comodín: un estado nuevo del núcleo obliga a decidir su aspecto. Un estado de A2A
+/// tiene un único glifo, así que la presentación no agrupa nada aquí.
+pub fn agent_state(state: TaskState) -> AgentState {
     match state {
         TaskState::Submitted => AgentState::Submitted,
         TaskState::Working => AgentState::Working,
@@ -264,6 +277,44 @@ fn agent_state(state: TaskState) -> AgentState {
         TaskState::Canceled => AgentState::Canceled,
         TaskState::Rejected => AgentState::Rejected,
     }
+}
+
+/// Estado que el rail pinta para un hijo. Es su estado de A2A, salvo que siga en marcha y
+/// espere respuesta: entonces se pinta como `input-required`. La marca `awaiting_input`
+/// todavía vive en la TUI; lo fija el runtime en la tarea 2 del plan.
+fn estado_del_rail(subagent: &SubagentDescriptor, espera: bool) -> TaskState {
+    if espera && !subagent.status.state.is_terminal() {
+        TaskState::InputRequired
+    } else {
+        subagent.status.state
+    }
+}
+
+/// Parte `texto` en líneas de como mucho `width` columnas, cortando por espacios. Una palabra
+/// más ancha que la línea se recorta con `…`, como en el resto del rail.
+pub(crate) fn partir_por_palabras(texto: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut lineas = Vec::new();
+    let mut actual = String::new();
+    for palabra in texto.split_whitespace() {
+        let palabra = recortar(palabra, width);
+        let nueva = if actual.is_empty() {
+            palabra.clone()
+        } else {
+            format!("{actual} {palabra}")
+        };
+        if anchura(&nueva) <= width {
+            actual = nueva;
+        } else {
+            lineas.push(std::mem::replace(&mut actual, palabra));
+        }
+    }
+    if !actual.is_empty() {
+        lineas.push(actual);
+    }
+    lineas
 }
 
 /// Título de sección: acento en negrita.
@@ -491,7 +542,8 @@ fn tool_style(status: ToolStatus, app: &App) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codeloom_core::session::{SessionId, SubagentDescriptor, SubagentStatus, UsageRecord};
+    use codeloom_core::session::{SessionId, SubagentDescriptor, UsageRecord};
+    use codeloom_core::task::{TaskState, TaskStatus};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -502,7 +554,7 @@ mod tests {
             child: SessionId(child),
             job_id: format!("subagent-{child}"),
             label: label.into(),
-            status: SubagentStatus::Running,
+            status: TaskStatus::new(TaskState::Working),
             result: None,
             notice_delivered: false,
         }
@@ -845,6 +897,36 @@ mod tests {
     }
 
     #[test]
+    fn rail_names_the_a2a_states_under_the_running_count() {
+        let mut app = App::new();
+        app.session_id = Some(SessionId(1));
+        app.subagents.insert(9, running(9, "review"));
+
+        let rows = rows_of(&app, 40, 24);
+        // Solo los estados que hay, con su cuenta exacta.
+        assert!(
+            rows.iter().any(|row| row.contains("(working 1)")),
+            "falta el desglose por estado bajo el recuento: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains("auth-required")),
+            "se nombra un estado que no hay: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn grouping_text_wraps_inside_the_rail_width() {
+        let texto = "running (submitted, working, input-required, auth-required)";
+        let lineas = partir_por_palabras(texto, 20);
+        assert!(lineas.len() > 1, "no parte el texto: {lineas:?}");
+        assert!(
+            lineas.iter().all(|linea| anchura(linea) <= 20),
+            "una línea supera el rail: {lineas:?}"
+        );
+        assert_eq!(lineas.join(" "), texto, "se pierden palabras: {lineas:?}");
+    }
+
+    #[test]
     fn rail_without_subagents_is_unchanged() {
         let mut app = App::new();
         app.session_id = Some(SessionId(1));
@@ -1170,13 +1252,13 @@ mod tests {
     }
 
     #[test]
-    fn rail_shows_failed_glyph_for_unfinished_child() {
+    fn rail_shows_failed_glyph_for_a_failed_child() {
         let mut app = App::new();
         app.session_id = Some(SessionId(1));
         app.subagents.insert(
             9,
             SubagentDescriptor {
-                status: SubagentStatus::Unfinished,
+                status: TaskStatus::new(TaskState::Failed),
                 ..running(9, "review")
             },
         );
@@ -1195,7 +1277,7 @@ mod tests {
         app.subagents.insert(
             9,
             SubagentDescriptor {
-                status: SubagentStatus::Completed,
+                status: TaskStatus::new(TaskState::Completed),
                 ..running(9, "review")
             },
         );
@@ -1217,8 +1299,7 @@ mod tests {
     }
 
     #[test]
-    fn task_state_projection_covers_every_state() {
-        use codeloom_core::task::TaskState;
+    fn agent_state_covers_all_eight_states() {
         // Submitted, AuthRequired y Rejected no tienen productor hoy: se construyen a mano.
         let pares = [
             (TaskState::Submitted, AgentState::Submitted),
