@@ -247,8 +247,8 @@ fn get_funcionalidades() -> Vec<FuncionalidadEntrada> {
         ),
         FuncionalidadEntrada::new(
             "Flock/subagentes",
-            "No hay runtime de subagentes implementado",
-            "Etiquetas m2 y estado 'Subagents not available'",
+            "Estados A2A: el runtime produce 5 de los 8; submitted, auth-required y rejected sin productor",
+            "Rail y showcase pintan los 8 estados (glifo, etiqueta y color propios)",
             "No hay eventos/modelos que conecten UI y motor",
             FuncionalidadEstado::Visual,
         ),

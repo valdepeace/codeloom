@@ -1,6 +1,7 @@
 //! Catálogo de demos del showcase.
 
 mod activity_reference;
+mod agent_states;
 mod ansi;
 mod button;
 mod chat;
@@ -824,6 +825,11 @@ pub fn catalog() -> Vec<CatalogItem> {
             "CodeLoom · job_list",
             Box::new(codeloom_tools::CodeLoomToolDemo::new("job_list")),
         ),
+        item(
+            "Agent state",
+            "Batten · A2A",
+            Box::new(agent_states::AgentStatesDemo::new()),
+        ),
     ]
 }
 
@@ -843,6 +849,14 @@ mod tests {
         titles.sort_unstable();
         titles.dedup();
         assert_eq!(titles.len(), n, "títulos repetidos");
+    }
+
+    #[test]
+    fn agent_states_demo_is_registered() {
+        let cat = catalog();
+        assert!(cat
+            .iter()
+            .any(|entry| entry.component == "Agent state" && entry.demo.title() == "agent states"));
     }
 
     #[test]

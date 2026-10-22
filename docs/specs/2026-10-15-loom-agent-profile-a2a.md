@@ -231,6 +231,55 @@ equivalente a «interrumpida», de modo que la tarea se proyecta a fallo por hab
 quedado sin terminar. El modelo interno (`JobStatus`, `SubagentStatus` y el
 esquema SQLite) no cambia; la traducción vive solo en el borde.
 
+Cabe señalar que los ocho estados se pintan tanto en el rail de loom como en el
+showcase de `batten`, a partir de `batten::state::AgentState`, al que el rail
+proyecta `TaskState`. El runtime solo produce hoy `working`, `input-required`,
+`completed`, `failed` y `canceled`; `submitted`, `rejected` y `auth-required`
+quedan pendientes de un productor. Para generarlos bastará con añadir variantes
+a `SubagentStatus` con su cadena en SQLite, sin cambio de esquema.
+
+### Fuente normativa de los estados (2026-10-22)
+
+Fuente: `https://a2a-protocol.org/latest/definitions/`, proto `lf.a2a.v1`, que la
+propia página declara «the source of truth for the A2A protocol specification».
+Ciertamente, estas son las definiciones literales; lo que no consta aquí no debe
+glosarse.
+
+| Nombre v1.0 | v0.3 | Definición literal del proto |
+|---|---|---|
+| `TASK_STATE_UNSPECIFIED` | — | «The task is in an unknown or indeterminate state.» |
+| `TASK_STATE_SUBMITTED` | `submitted` | «Indicates that a task has been successfully submitted and acknowledged.» |
+| `TASK_STATE_WORKING` | `working` | «Indicates that a task is actively being processed by the agent.» |
+| `TASK_STATE_COMPLETED` | `completed` | «Indicates that a task has finished successfully. This is a terminal state.» |
+| `TASK_STATE_FAILED` | `failed` | «Indicates that a task has finished with an error. This is a terminal state.» |
+| `TASK_STATE_CANCELED` | `canceled` | «Indicates that a task was canceled before completion. This is a terminal state.» |
+| `TASK_STATE_INPUT_REQUIRED` | `input-required` | «Indicates that the agent requires additional user input to proceed. This is an interrupted state.» |
+| `TASK_STATE_REJECTED` | `rejected` | «Indicates that the agent has decided to not perform the task. This may be done during initial task creation or later once an agent has determined it can't or won't proceed. This is a terminal state.» |
+| `TASK_STATE_AUTH_REQUIRED` | `auth-required` | «Indicates that authentication is required to proceed. This is an interrupted state.» |
+
+Los nombres cambian de `kebab-case` a `SCREAMING_SNAKE_CASE` en la v1.0 (página
+`whats-new-v1`). Terminales: `completed`, `failed`, `canceled`, `rejected`.
+«Interrumpidos» en el sentido de A2A: `input-required` y `auth-required`.
+
+Cabe señalar lo que la especificación **no** dice, según lo leído: no fija quién
+transiciona a cada estado ni da una tabla de transiciones permitidas; no define
+`submitted` como «aún no iniciada» ni «en cola»; no limita `auth-required` a un
+transporte concreto; y no clasifica `submitted` ni `working` como terminales o
+interrumpidos. Sí dice que los cambios de estado los notifica el agente
+(`TaskStatusUpdateEvent`) y que `CancelTask` lo solicita el cliente.
+
+**Decisiones nuestras, que no son de A2A:**
+
+- `SubagentStatus::Interrupted` (hijo que quedó sin terminar al cerrarse la
+  aplicación) se proyecta a `Failed`. Su nombre **coincide** con el «interrupted
+  state» de A2A, que significa otra cosa (`input-required` y `auth-required`);
+  conviene no confundirlos.
+- `JobStatus::Stopping` se proyecta a `Working`.
+- Las etiquetas del rail y del showcase usan los nombres de la v0.3 como texto de
+  pantalla; los nombres del cable los fija el adaptador.
+- Los glifos y colores, la línea de causa del despertar del padre y los ficheros
+  por hijo son interfaz y extensiones de CodeLoom, no parte del protocolo.
+
 ### Hallazgos de la lectura de la especificación oficial (2026-10-21)
 
 Fuente: `a2a-protocol.org/latest/specification/` (v1.0.0) y las páginas de
