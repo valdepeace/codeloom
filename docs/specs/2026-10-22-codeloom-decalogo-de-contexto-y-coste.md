@@ -5,15 +5,41 @@ aprendiendo.
 
 ## Qué es y qué no es
 
-**No es un estándar.** Es una síntesis propia, escrita a partir de un incidente y de lo que se ve
-en el código. Lo único externo que se ha localizado es la entrada *Unbounded Consumption* del
-OWASP Top 10 for LLM Applications (LLM06 en la edición 2026; las fuentes secundarias no coinciden
-en la numeración), cuyas mitigaciones respaldan las reglas 1, 7 y 10: topes de herramientas,
-tokens y gasto por tarea, límites de pasos y cortacircuitos. Solo se han leído resúmenes de
-terceros, no el documento original. **No consta** referencia normativa sobre el tamaño de la
-salida de una herramienta (ni en MCP ni en guías de truncado): una búsqueda sin resultado no
-prueba que no exista. Las cifras (20 000 bytes, 300 coincidencias, 200 elementos) son decisiones
-**propias**, sin respaldo externo.
+**No es un estándar.** Es una síntesis propia, escrita a partir de un incidente y contrastada el
+2026-10-22 con tres fuentes primarias. Lo que respalda cada una, y lo que no:
+
+- **OWASP Top 10 for LLM Applications, LLM10:2025 «Unbounded Consumption»**
+  (`genai.owasp.org/llmrisk/llm102025-unbounded-consumption/`). Respalda: validar que las
+  entradas no superen «reasonable size limits», límites de tasa y cuotas por usuario, timeouts y
+  *throttling*, y limitar las acciones en cola. **No** respalda límites de tokens ni de salida,
+  ni límite de pasos o recursión de un agente, ni topes de gasto como mitigación (menciona
+  «Denial of Wallet» solo como ejemplo de vulnerabilidad), ni el tamaño de la salida de
+  herramientas. Corrección: una versión previa de este documento, basada en resúmenes de
+  terceros, daba la numeración LLM06:2026; la página oficial dice LLM10:2025.
+- **Especificación de MCP (versión 2026-07-28).** **No consta** ningún límite, truncado ni
+  paginación del resultado de `tools/call` (la paginación solo cubre los listados). Fija que el
+  servidor debe limitar la tasa y sanear las salidas, y que el cliente debería validar los
+  resultados y poner timeouts, sin concretar tamaño. Solo una guía **no normativa** de buenas
+  prácticas para clientes pide «validate and truncate» la salida de un sandbox antes de devolverla
+  al modelo. Es decir: acotar el resultado es responsabilidad del cliente, no del protocolo.
+- **Anthropic, «Writing effective tools for AI agents» (2025-09-11) y «Effective context
+  engineering for AI agents» (2025-09-29).** Es lo más cercano a una referencia de ingeniería:
+  - Único tope numérico: «For Claude Code, we restrict tool responses to 25,000 tokens by
+    default» (comportamiento de Claude Code en esa fecha, no recomendación universal).
+  - Para cualquier respuesta voluminosa, «some combination of pagination, range selection,
+    filtering, and/or truncation with sensible default parameter values»; al truncar, orientar al
+    agente (búsquedas pequeñas y dirigidas) y devolver errores accionables.
+  - Preferir herramientas dirigidas (`search_logs`) frente a volcados (`read_logs`).
+  - Compactar el historial resumiéndolo, y la forma más ligera es limpiar resultados antiguos de
+    herramientas; un subagente devuelve un resumen condensado, «often 1,000-2,000 tokens».
+  - **No dan** umbral de compactación, tamaño de página por defecto, ni presupuesto por
+    herramienta distinto de esos 25 000 tokens.
+
+Consecuencia: las reglas 1, 3, 4, 5 y 8 tienen respaldo de Anthropic; la 7 lo tiene solo en parte
+(OWASP cubre timeouts y cuotas, **no** el límite de pasos ni el presupuesto de tokens, que son
+decisión propia); la 2, la 6, la 9 y la 10 son propias. Las cifras de Codeloom (20 000 bytes
+≈ 5 000 tokens, 300 coincidencias, 200 elementos) son **decisiones propias**, deliberadamente
+más prudentes que los 25 000 tokens de Claude Code.
 
 ## Por qué existe
 
@@ -72,7 +98,8 @@ que no tiene cota acabará, tarde o temprano, desbordándose.**
 
 ## Preguntas abiertas
 
-- ¿Qué tope tiene sentido por herramienta? 20 000 bytes es una cota general prudente, no una
-  medida afinada. Conviene medir con sesiones reales.
+- ¿Qué tope tiene sentido por herramienta? 20 000 bytes (≈ 5 000 tokens) es una cota general
+  prudente, muy por debajo de los 25 000 tokens de Claude Code, y no una medida afinada. Conviene
+  medir con sesiones reales.
 - ¿Presupuesto de tokens por turno y por sesión, con aviso a la persona usuaria al acercarse?
 - ¿Compactación automática o a petición (`/compact`)?
