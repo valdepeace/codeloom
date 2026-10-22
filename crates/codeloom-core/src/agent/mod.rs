@@ -117,6 +117,7 @@ impl AgentLoop {
             .ok()
             .and_then(|catalog| catalog.prices(&base_url, &model));
         let record = UsageRecord {
+            session,
             model,
             input_tokens: u64::from(usage.input_tokens),
             output_tokens: u64::from(usage.output_tokens),
@@ -1187,6 +1188,48 @@ mod tests {
         assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (7, 3));
         assert_eq!((rows[0].input_price, rows[0].output_price), (None, None));
         assert_eq!(rows[0].cost(), None);
+    }
+
+    #[tokio::test]
+    async fn agent_usage_record_carries_agent_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SqliteStore::open(dir.path().join("sesion-agente.db").to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+        let sid = store.create_session("/p").await.unwrap();
+        let provider = Arc::new(QueueProvider {
+            scripts: Mutex::new(
+                vec![vec![
+                    StreamChunk::TextDelta("hola".into()),
+                    usage_chunk(4, 2),
+                    StreamChunk::Done(FinishReason::Stop),
+                ]]
+                .into(),
+            ),
+        });
+        let agent = AgentLoop::new(
+            provider,
+            store.clone(),
+            Arc::new(ToolRegistry::new()),
+            EventBus::new(64),
+            Arc::new(PermissionService::allow_all()),
+            acme_config("m-caro"),
+            dir.path().to_path_buf(),
+        )
+        .with_catalog(priced_catalog());
+        agent
+            .run(sid, "hi".into(), CancellationToken::new())
+            .await
+            .unwrap();
+
+        let rows = store.session_usage(sid).await.unwrap();
+        assert_eq!(rows.len(), 1, "una respuesta, un apunte");
+        assert_eq!(
+            rows[0].session, sid,
+            "el apunte lleva la sesión del propio agente"
+        );
     }
 
     #[tokio::test]

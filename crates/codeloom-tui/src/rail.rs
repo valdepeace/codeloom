@@ -230,7 +230,8 @@ fn rail_lines(app: &App, width: usize) -> Vec<Line<'_>> {
             out.push(line);
             // Segunda línea tenue con las métricas, solo si el hijo tiene estadísticas.
             if let Some(stats) = app.agent_stats.get(&subagent.child.0) {
-                let metricas = metrics_line(stats, ahora, width.saturating_sub(2));
+                let coste = child_cost_label(app.child_cost(subagent.child));
+                let metricas = metrics_line(stats, coste, ahora, width.saturating_sub(2));
                 if !metricas.is_empty() {
                     out.push(Line::from(Span::styled(
                         format!("  {metricas}"),
@@ -361,10 +362,18 @@ pub fn format_elapsed(d: Duration) -> String {
     }
 }
 
-/// Línea de métricas de un subagente, p. ej. `2/5 read_file · 1.2k/300 · 7s`.
+/// Grupo de coste de un hijo para su línea de métricas: `format_cost` sin el espacio tras `≈`
+/// (`≈$0.004`, `≈$0.004+`). `None` sin precio o si el coste es nulo, para no mostrar `≈$0`.
+fn child_cost_label(cost: Option<(f64, bool)>) -> Option<String> {
+    cost.filter(|(dollars, _)| *dollars > 0.0)
+        .map(|(dollars, partial)| format_cost(dollars, partial).replacen("≈ ", "≈", 1))
+}
+
+/// Línea de métricas de un subagente, p. ej. `2/5 read_file · 1.2k/300 · ≈$0.004 · 7s`.
 /// Omite lo que no exista: el paso sin `max_steps`, la herramienta sin curso y
-/// los tokens y el tiempo sin `started_at`. Recorta por columnas, terminando en `…`.
-fn metrics_line(stats: &AgentStats, now: Instant, width: usize) -> String {
+/// los tokens, el coste y el tiempo sin `started_at`. `cost` llega ya formateado.
+/// Recorta por columnas, terminando en `…`.
+fn metrics_line(stats: &AgentStats, cost: Option<String>, now: Instant, width: usize) -> String {
     let mut grupos: Vec<String> = Vec::new();
 
     let mut paso = Vec::new();
@@ -385,6 +394,7 @@ fn metrics_line(stats: &AgentStats, now: Instant, width: usize) -> String {
             format_tokens(stats.input_tokens),
             format_tokens(stats.output_tokens)
         ));
+        grupos.extend(cost);
         grupos.push(format_elapsed(fin.saturating_duration_since(inicio)));
     }
 
@@ -561,30 +571,115 @@ mod tests {
 
         let full = stats(2, 5, Some("read_file"), 1_200, 300, Some(start));
         assert_eq!(
-            metrics_line(&full, now, 80),
+            metrics_line(&full, None, now, 80),
             "2/5 read_file · 1.2k/300 · 7s"
         );
 
         let sin_paso = stats(0, 0, Some("read_file"), 1_200, 300, Some(start));
         assert_eq!(
-            metrics_line(&sin_paso, now, 80),
+            metrics_line(&sin_paso, None, now, 80),
             "read_file · 1.2k/300 · 7s"
         );
 
         let sin_herramienta = stats(2, 5, None, 1_200, 300, Some(start));
         assert_eq!(
-            metrics_line(&sin_herramienta, now, 80),
+            metrics_line(&sin_herramienta, None, now, 80),
             "2/5 · 1.2k/300 · 7s"
         );
 
         let sin_arranque = stats(2, 5, None, 1_200, 300, None);
-        assert_eq!(metrics_line(&sin_arranque, now, 80), "2/5");
+        assert_eq!(metrics_line(&sin_arranque, None, now, 80), "2/5");
 
         let terminado = AgentStats {
             finished_at: Some(start + Duration::from_secs(3)),
             ..stats(2, 5, None, 0, 0, Some(start))
         };
-        assert_eq!(metrics_line(&terminado, now, 80), "2/5 · 0/0 · 3s");
+        assert_eq!(metrics_line(&terminado, None, now, 80), "2/5 · 0/0 · 3s");
+    }
+
+    #[test]
+    fn metrics_line_places_cost_between_tokens_and_elapsed() {
+        let start = Instant::now();
+        let now = start + Duration::from_secs(7);
+        let full = stats(2, 5, Some("read_file"), 1_200, 300, Some(start));
+        assert_eq!(
+            metrics_line(&full, Some("≈$0.004".into()), now, 80),
+            "2/5 read_file · 1.2k/300 · ≈$0.004 · 7s"
+        );
+
+        // Sin arranque no salen tokens ni tiempo, así que tampoco el grupo de coste.
+        let sin_arranque = stats(2, 5, None, 1_200, 300, None);
+        assert_eq!(
+            metrics_line(&sin_arranque, Some("≈$0.004".into()), now, 80),
+            "2/5"
+        );
+    }
+
+    #[test]
+    fn rail_child_metrics_show_cost_group_between_tokens_and_time() {
+        let mut app = priced_rail_app("priced");
+        app.session_id = Some(SessionId(1));
+        app.subagents.insert(9, running(9, "review"));
+        app.agent_stats.insert(
+            9,
+            stats(
+                2,
+                5,
+                None,
+                1_200,
+                300,
+                Some(Instant::now() - Duration::from_secs(7)),
+            ),
+        );
+        app.usage_records = vec![UsageRecord {
+            session: SessionId(9),
+            ..record(1_000_000, 0, Some((3.0, 15.0)))
+        }];
+
+        let rows = rows_of(&app, 40, 24);
+        let fila = rows
+            .iter()
+            .find(|row| row.contains("1.2k/300 ·"))
+            .expect("el rail muestra las métricas del hijo");
+        let tokens = fila.find("1.2k/300").expect("tokens");
+        let coste = fila.find("≈$3.00").expect("el grupo de coste del hijo");
+        let tiempo = fila.find("· 7s").expect("tiempo transcurrido");
+        assert!(
+            tokens < coste && coste < tiempo,
+            "el coste va entre tokens y tiempo: {fila:?}"
+        );
+    }
+
+    #[test]
+    fn rail_child_metrics_omit_cost_group_without_price() {
+        let mut app = priced_rail_app("priced");
+        app.session_id = Some(SessionId(1));
+        app.subagents.insert(9, running(9, "review"));
+        app.agent_stats.insert(
+            9,
+            stats(
+                2,
+                5,
+                None,
+                1_200,
+                300,
+                Some(Instant::now() - Duration::from_secs(7)),
+            ),
+        );
+        app.usage_records = vec![UsageRecord {
+            session: SessionId(9),
+            ..record(1_000, 1_000, None)
+        }];
+
+        let rows = rows_of(&app, 40, 24);
+        let fila = rows
+            .iter()
+            .find(|row| row.contains("1.2k/300 ·"))
+            .expect("el rail muestra las métricas del hijo");
+        assert!(
+            !fila.contains('≈'),
+            "sin precio no hay grupo de coste: {fila:?}"
+        );
     }
 
     #[test]
@@ -594,7 +689,7 @@ mod tests {
         let herramienta = "t".repeat(50);
         let largo = stats(2, 5, Some(&herramienta), 1_200, 300, Some(start));
 
-        let linea = metrics_line(&largo, now, 30);
+        let linea = metrics_line(&largo, None, now, 30);
         assert!(linea.chars().count() <= 30, "supera la anchura: {linea:?}");
         assert!(linea.ends_with('…'), "no acaba en elipsis: {linea:?}");
     }
@@ -828,6 +923,7 @@ mod tests {
     /// Apunte con precios `(entrada, salida)` por millón, o sin precio si `prices` es `None`.
     fn record(input: u64, output: u64, prices: Option<(f64, f64)>) -> UsageRecord {
         UsageRecord {
+            session: SessionId(1),
             model: "priced".into(),
             input_tokens: input,
             output_tokens: output,
@@ -876,6 +972,7 @@ mod tests {
         let mut app = App::new();
         app.session_id = Some(SessionId(1));
         app.usage_records.push(UsageRecord {
+            session: SessionId(1),
             model: "m".into(),
             input_tokens: 10,
             output_tokens: 5,

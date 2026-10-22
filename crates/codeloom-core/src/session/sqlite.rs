@@ -306,7 +306,7 @@ impl SessionStore for SqliteStore {
 
     async fn session_usage(&self, session: SessionId) -> Result<Vec<UsageRecord>> {
         let rows = sqlx::query(
-            "SELECT model, input_tokens, output_tokens, input_price, output_price, created_at_ms
+            "SELECT session_id, model, input_tokens, output_tokens, input_price, output_price, created_at_ms
              FROM usage
              WHERE session_id = ? OR session_id IN (SELECT child_session_id FROM subagents WHERE parent_session_id = ?)
              ORDER BY id",
@@ -319,6 +319,7 @@ impl SessionStore for SqliteStore {
         rows.into_iter()
             .map(|row| {
                 Ok(UsageRecord {
+                    session: SessionId(row.get("session_id")),
                     model: row.get("model"),
                     input_tokens: from_sql_int(row.get("input_tokens"))?,
                     output_tokens: from_sql_int(row.get("output_tokens"))?,
@@ -473,9 +474,11 @@ mod tests {
         );
     }
 
-    /// Apunte de prueba con precios opcionales `(entrada, salida)` por millón.
+    /// Apunte de prueba con precios opcionales `(entrada, salida)` por millón. La sesión es
+    /// provisional: el almacén devuelve la sesión de la fila con la que se guardó.
     fn usage(model: &str, input: u64, output: u64, prices: Option<(f64, f64)>) -> UsageRecord {
         UsageRecord {
+            session: SessionId(0),
             model: model.into(),
             input_tokens: input,
             output_tokens: output,
@@ -493,6 +496,7 @@ mod tests {
             .unwrap();
         let sid = store.create_session("/p").await.unwrap();
         let priced = UsageRecord {
+            session: sid,
             model: "mistral-nemo".into(),
             input_tokens: 1200,
             output_tokens: 300,
@@ -501,6 +505,7 @@ mod tests {
             created_at_ms: 1_000,
         };
         let unpriced = UsageRecord {
+            session: sid,
             model: "sin-precio".into(),
             input_tokens: 5,
             output_tokens: 7,
@@ -513,6 +518,47 @@ mod tests {
         assert_eq!(
             store.session_usage(sid).await.unwrap(),
             vec![priced, unpriced]
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_record_carries_its_session_after_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(dir.path().join("sesion.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let parent = store.create_session("/p").await.unwrap();
+        let child = store.create_session("/p").await.unwrap();
+        store
+            .save_subagent(&SubagentDescriptor {
+                parent,
+                child,
+                job_id: "subagent-1".into(),
+                label: "review".into(),
+                status: SubagentStatus::Completed,
+                result: None,
+                notice_delivered: false,
+            })
+            .await
+            .unwrap();
+        store
+            .record_usage(parent, &usage("padre", 1, 1, None))
+            .await
+            .unwrap();
+        store
+            .record_usage(child, &usage("hijo", 2, 2, None))
+            .await
+            .unwrap();
+
+        let rows = store.session_usage(parent).await.unwrap();
+        let apuntes: Vec<(SessionId, &str)> = rows
+            .iter()
+            .map(|record| (record.session, record.model.as_str()))
+            .collect();
+        assert_eq!(
+            apuntes,
+            vec![(parent, "padre"), (child, "hijo")],
+            "cada apunte vuelve con la sesión que lo originó"
         );
     }
 

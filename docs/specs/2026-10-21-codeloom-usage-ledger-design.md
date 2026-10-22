@@ -115,3 +115,13 @@ Limitaciones conocidas:
 - `AgentLoop::with_jobs` llamado después de `new` deja al lanzador de hijos con
   el registro anterior (hoy nadie lo hace).
 - Validación visual en terminal real: pendiente.
+
+Coste por hijo: cada apunte lleva ya la sesión que lo originó (`UsageRecord::session`).
+El del turno propio se atribuye a la sesión abierta; el de un subagente, a su hijo. Así
+el rail muestra en la línea de métricas de cada subagente su coste estimado, entre los
+tokens y el tiempo (`2/5 read_file · 1.2k/300 · ≈$0.004 · 7s`), con `+` si algún apunte
+del hijo carece de precio. Si el hijo no tiene apuntes, o ninguno lleva precio, el grupo
+se omite y no se muestra `≈$0`. Con esto queda superado el no-objetivo «coste por hijo»
+de la spec de estimación (`2026-10-21-codeloom-cost-estimate-design.md`). Sin sesión
+abierta, el apunte vivo usa `SessionId(0)` como marcador, que la recarga sustituye. La
+tabla `usage` ya tenía la columna `session_id`, así que no hace falta migración.

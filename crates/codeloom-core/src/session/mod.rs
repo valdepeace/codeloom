@@ -37,8 +37,11 @@ pub struct SubagentDescriptor {
 /// Apunte de consumo: los tokens de una respuesta del proveedor y el precio vigente
 /// (dólares por millón de tokens) en el momento de apuntarla. Los precios son `None`
 /// cuando no se conocían; el apunte conserva su precio aunque el catálogo cambie después.
+/// `session` es la sesión que originó el consumo: el padre para su propio turno y el hijo
+/// para lo que gasta un subagente.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsageRecord {
+    pub session: SessionId,
     pub model: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -95,6 +98,7 @@ mod tests {
     #[test]
     fn usage_record_cost_none_without_prices() {
         let priced = UsageRecord {
+            session: SessionId(1),
             model: "m".into(),
             input_tokens: 1_000_000,
             output_tokens: 500_000,

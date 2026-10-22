@@ -1299,15 +1299,18 @@ impl App {
         }
     }
 
-    /// Añade un apunte vivo con el modelo y los precios vigentes en este instante. La recarga
-    /// de la sesión sustituye esta lista por la de la base de datos, así que no duplica.
-    fn record_live_usage(&mut self, input_tokens: u32, output_tokens: u32) {
+    /// Añade un apunte vivo con el modelo y los precios vigentes en este instante, atribuido a
+    /// `session` (el padre para su turno, el hijo para lo suyo). Sin sesión abierta se usa
+    /// `SessionId(0)` como marcador: la recarga de la sesión sustituye esta lista por la de la
+    /// base de datos, así que no duplica ni deja marcadores persistidos.
+    fn record_live_usage(&mut self, session: SessionId, input_tokens: u32, output_tokens: u32) {
         let (input_price, output_price) = self.model_prices().unzip();
         let created_at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
             .unwrap_or(0);
         self.usage_records.push(UsageRecord {
+            session,
             model: self.model.clone(),
             input_tokens: u64::from(input_tokens),
             output_tokens: u64::from(output_tokens),
@@ -1852,6 +1855,25 @@ impl App {
         Some((total, partial))
     }
 
+    /// Coste de un hijo: suma los apuntes que llevan su sesión, con el mismo criterio que
+    /// `estimated_cost` (devuelve `(total, parcial)`). `None` si no tiene apuntes o si ninguno
+    /// lleva precio, para no mostrar un `≈$0` que no informa de nada.
+    pub fn child_cost(&self, child: SessionId) -> Option<(f64, bool)> {
+        let mut total = 0.0;
+        let mut priced = false;
+        let mut partial = false;
+        for record in self.usage_records.iter().filter(|r| r.session == child) {
+            match record.cost() {
+                Some(cost) => {
+                    total += cost;
+                    priced = true;
+                }
+                None => partial = true,
+            }
+        }
+        priced.then_some((total, partial))
+    }
+
     /// Número de subagentes de la sesión abierta que siguen en marcha.
     pub fn active_agents(&self) -> usize {
         self.subagents
@@ -1968,7 +1990,8 @@ impl App {
                 self.turn_output_tokens = self
                     .turn_output_tokens
                     .saturating_add(u64::from(output_tokens));
-                self.record_live_usage(input_tokens, output_tokens);
+                let session = self.session_id.unwrap_or(SessionId(0));
+                self.record_live_usage(session, input_tokens, output_tokens);
             }
             LiveEvent::ToolStarted { call_id, name } => {
                 self.set_phase("running tools");
@@ -2081,13 +2104,14 @@ impl App {
                 event,
             } => {
                 if Some(parent) == self.session_id {
-                    // El consumo de un hijo se atribuye al modelo actual de la interfaz.
+                    // El consumo de un hijo se atribuye al modelo actual de la interfaz, pero
+                    // con la sesión del hijo para que su coste se pueda separar.
                     if let LiveEvent::Usage {
                         input_tokens,
                         output_tokens,
                     } = event.as_ref()
                     {
-                        self.record_live_usage(*input_tokens, *output_tokens);
+                        self.record_live_usage(child, *input_tokens, *output_tokens);
                     }
                     self.apply_child_event(child, *event);
                 }
@@ -4333,6 +4357,7 @@ mod tests {
     /// Apunte de prueba con precios conocidos (3 y 15 por millón), como los que guarda el libro.
     fn usage_record(model: &str, input: u64, output: u64) -> UsageRecord {
         UsageRecord {
+            session: SessionId(1),
             model: model.into(),
             input_tokens: input,
             output_tokens: output,
@@ -4459,6 +4484,7 @@ mod tests {
     /// Apunte con precios `(entrada, salida)` por millón, o sin precio si `prices` es `None`.
     fn priced_record(input: u64, output: u64, prices: Option<(f64, f64)>) -> UsageRecord {
         UsageRecord {
+            session: SessionId(1),
             model: "m".into(),
             input_tokens: input,
             output_tokens: output,
@@ -4466,6 +4492,129 @@ mod tests {
             output_price: prices.map(|(_, price_out)| price_out),
             created_at_ms: 1,
         }
+    }
+
+    /// Apunte de un hijo concreto, con precios `(entrada, salida)` o sin ellos.
+    fn child_record(
+        child: i64,
+        input: u64,
+        output: u64,
+        prices: Option<(f64, f64)>,
+    ) -> UsageRecord {
+        UsageRecord {
+            session: SessionId(child),
+            ..priced_record(input, output, prices)
+        }
+    }
+
+    #[test]
+    fn child_cost_sums_only_that_childs_records() {
+        let mut app = App::new();
+        app.usage_records = vec![
+            child_record(9, 1_000_000, 0, Some((3.0, 15.0))),
+            child_record(9, 0, 100_000, Some((3.0, 15.0))),
+            child_record(10, 1_000_000, 0, Some((3.0, 15.0))),
+        ];
+        let (cost, partial) = app
+            .child_cost(SessionId(9))
+            .expect("el hijo 9 tiene apuntes con precio");
+        // 3,00 de entrada más 1,50 de salida. Los apuntes del hijo 10 no entran.
+        assert!((cost - 4.5).abs() < 1e-9, "coste inesperado: {cost}");
+        assert!(!partial, "todos los apuntes del hijo tienen precio");
+        assert_eq!(
+            app.child_cost(SessionId(11)),
+            None,
+            "un hijo sin apuntes no tiene coste"
+        );
+    }
+
+    #[test]
+    fn child_cost_none_without_prices() {
+        let mut app = App::new();
+        app.usage_records = vec![child_record(9, 1_000, 1_000, None)];
+        assert_eq!(
+            app.child_cost(SessionId(9)),
+            None,
+            "ningún apunte del hijo tiene precio"
+        );
+    }
+
+    #[test]
+    fn child_cost_partial_marks_plus() {
+        let mut app = App::new();
+        app.usage_records = vec![
+            child_record(9, 1_000_000, 0, Some((3.0, 15.0))),
+            child_record(9, 1_000_000, 1_000_000, None),
+        ];
+        let (cost, partial) = app
+            .child_cost(SessionId(9))
+            .expect("hay un apunte con precio");
+        assert!(
+            (cost - 3.0).abs() < 1e-9,
+            "solo suma el apunte con precio: {cost}"
+        );
+        assert!(
+            partial,
+            "un apunte sin precio marca el coste del hijo como parcial"
+        );
+    }
+
+    #[test]
+    fn child_costs_plus_parent_equal_total() {
+        let mut app = App::new();
+        app.session_id = Some(SessionId(1));
+        app.usage_records = vec![
+            child_record(1, 1_000_000, 0, Some((3.0, 15.0))),
+            child_record(9, 0, 100_000, Some((3.0, 15.0))),
+            child_record(10, 1_000_000, 1_000_000, None),
+            child_record(9, 1_000_000, 0, Some((2.0, 10.0))),
+        ];
+        let (total, partial) = app.estimated_cost().expect("hay apuntes");
+        let mut suma = 0.0;
+        for child in [9, 10] {
+            if let Some((cost, _)) = app.child_cost(SessionId(child)) {
+                suma += cost;
+            }
+        }
+        suma += app
+            .usage_records
+            .iter()
+            .filter(|record| record.session == SessionId(1))
+            .filter_map(|record| record.cost())
+            .sum::<f64>();
+        assert!(
+            (total - suma).abs() < 1e-9,
+            "hijos más padre deben dar el total: {suma} frente a {total}"
+        );
+        assert!(partial, "el apunte sin precio del hijo 10 marca el total");
+    }
+
+    #[test]
+    fn live_child_usage_is_attributed_to_the_child() {
+        let mut app = App::new();
+        app.session_id = Some(SessionId(1));
+        app.apply(child_event(
+            SessionId(1),
+            9,
+            LiveEvent::Usage {
+                input_tokens: 1_000,
+                output_tokens: 10,
+            },
+        ));
+        app.apply(LiveEvent::Usage {
+            input_tokens: 2_000,
+            output_tokens: 20,
+        });
+        let sesiones: Vec<SessionId> = app
+            .usage_records
+            .iter()
+            .map(|record| record.session)
+            .collect();
+        assert_eq!(
+            sesiones,
+            vec![SessionId(9), SessionId(1)],
+            "cada apunte vivo lleva la sesión que lo originó"
+        );
     }
 
     #[test]
