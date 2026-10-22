@@ -2,8 +2,12 @@
 
 Estado: propuesta del 2026-10-22, revisada el mismo día bajo la regla «no inventar nada
 que no esté contemplado en A2A» (tarea A2 de
-`docs/plans/2026-10-22-codeloom-a2a-roadmap.md`). Plan:
-`docs/plans/2026-10-22-codeloom-a2a-states-producers.md`.
+`docs/plans/2026-10-22-codeloom-a2a-roadmap.md`). **Se implementa sobre el modelo de
+`2026-10-22-codeloom-a2a-task-model-design.md`** (el estado del subagente ES el
+`TaskState` de A2A), cuyo plan es `docs/plans/2026-10-22-codeloom-a2a-task-model.md`
+(tarea 2); aquí se conservan las citas y la justificación de cada productor. Donde este
+documento habla de «variantes nuevas de `SubagentStatus`», léase «estados de
+`TaskState`»: esa enumeración desaparece.
 Relacionado: `2026-10-15-loom-agent-profile-a2a.md` (secciones «Fuente normativa de los
 estados» y «Lectura de la especificación», de donde salen las citas),
 `2026-10-21-codeloom-subagent-input-required-design.md`.

@@ -44,6 +44,15 @@ Lo que la especificación **no** dice, según lo leído: quién transiciona a ca
 la tabla de transiciones, que `submitted` signifique «aún no iniciada», ni que
 `auth-required` exija transporte remoto.
 
+## Cambio de enfoque (2026-10-22)
+
+Por petición del usuario, el estado de un subagente pasa a ser **directamente** el
+`TaskState` de A2A, sin enum propio ni proyección (la capa visual sí puede mostrarlo de
+forma distinta). Spec: `docs/specs/2026-10-22-codeloom-a2a-task-model-design.md`; plan:
+`docs/plans/2026-10-22-codeloom-a2a-task-model.md`. **A1 y A2 quedan absorbidas por ese
+plan**: el renombrado a `Unfinished` ya hecho desaparece con la variante, y los
+productores se implementan sobre el modelo nuevo.
+
 ## Tareas
 
 Orden sugerido: A1, A2 y A3 (cierran lo ya empezado), luego A4 a A6 (tipos) y solo
