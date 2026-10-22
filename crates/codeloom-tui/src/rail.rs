@@ -1170,13 +1170,13 @@ mod tests {
     }
 
     #[test]
-    fn rail_shows_failed_glyph_for_interrupted_child() {
+    fn rail_shows_failed_glyph_for_unfinished_child() {
         let mut app = App::new();
         app.session_id = Some(SessionId(1));
         app.subagents.insert(
             9,
             SubagentDescriptor {
-                status: SubagentStatus::Interrupted,
+                status: SubagentStatus::Unfinished,
                 ..running(9, "review")
             },
         );
@@ -1184,7 +1184,7 @@ mod tests {
         let rows = rows_of(&app, 40, 24);
         assert!(
             rows.iter().any(|row| row.contains("✗ review")),
-            "un hijo interrumpido debe verse como failed: {rows:?}"
+            "un hijo sin terminar debe verse como failed: {rows:?}"
         );
     }
 

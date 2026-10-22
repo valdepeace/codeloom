@@ -20,7 +20,10 @@ pub enum SubagentStatus {
     Completed,
     Killed,
     Failed,
-    Interrupted,
+    /// Hijo que seguía en marcha cuando la aplicación se cerró y no llegó a terminar.
+    /// Cabe señalar que no equivale al «interrupted state» de A2A (`input-required`
+    /// y `auth-required`); de ahí el nombre.
+    Unfinished,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

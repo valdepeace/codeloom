@@ -55,9 +55,9 @@ impl From<SubagentStatus> for TaskState {
             SubagentStatus::Completed => Self::Completed,
             SubagentStatus::Failed => Self::Failed,
             SubagentStatus::Killed => Self::Canceled,
-            // A2A carece de equivalente a «interrumpida». Se proyecta a fallo porque
+            // A2A carece de equivalente a «sin terminar». Se proyecta a fallo porque
             // la tarea quedó sin terminar cuando la aplicación se cerró.
-            SubagentStatus::Interrupted => Self::Failed,
+            SubagentStatus::Unfinished => Self::Failed,
         }
     }
 }
@@ -136,8 +136,16 @@ mod tests {
         );
         assert_eq!(TaskState::from(SubagentStatus::Failed), TaskState::Failed);
         assert_eq!(TaskState::from(SubagentStatus::Killed), TaskState::Canceled);
+    }
+
+    #[test]
+    fn unfinished_projects_to_failed() {
         assert_eq!(
-            TaskState::from(SubagentStatus::Interrupted),
+            TaskState::from(SubagentStatus::Unfinished),
+            TaskState::Failed
+        );
+        assert_eq!(
+            subagent_task_state(SubagentStatus::Unfinished, true),
             TaskState::Failed
         );
     }

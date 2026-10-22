@@ -68,7 +68,8 @@ impl SqliteStore {
         .await
         .map_err(|e| CoreError::Store(e.to_string()))?;
         // shortcut: one process per DB; use leases if concurrent Loom processes share it.
-        sqlx::query("UPDATE subagents SET status = 'interrupted' WHERE status = 'running'")
+        // Los hijos que seguían en marcha al reabrir quedan como no terminados.
+        sqlx::query("UPDATE subagents SET status = 'unfinished' WHERE status = 'running'")
             .execute(&pool)
             .await
             .map_err(|e| CoreError::Store(e.to_string()))?;
@@ -347,7 +348,7 @@ fn subagent_status(status: SubagentStatus) -> &'static str {
         SubagentStatus::Completed => "completed",
         SubagentStatus::Killed => "killed",
         SubagentStatus::Failed => "failed",
-        SubagentStatus::Interrupted => "interrupted",
+        SubagentStatus::Unfinished => "unfinished",
     }
 }
 
@@ -357,7 +358,9 @@ fn parse_subagent_status(status: &str) -> Result<SubagentStatus> {
         "completed" => Ok(SubagentStatus::Completed),
         "killed" => Ok(SubagentStatus::Killed),
         "failed" => Ok(SubagentStatus::Failed),
-        "interrupted" => Ok(SubagentStatus::Interrupted),
+        // La cadena «interrupted» es la de bases escritas antes del renombrado; se sigue leyendo
+        // para no perder sesiones existentes.
+        "unfinished" | "interrupted" => Ok(SubagentStatus::Unfinished),
         _ => Err(CoreError::Store(format!(
             "unknown subagent status: {status}"
         ))),
@@ -470,8 +473,69 @@ mod tests {
         let reopened = SqliteStore::open(path.to_str().unwrap()).await.unwrap();
         assert_eq!(
             reopened.list_subagents(parent).await.unwrap()[0].status,
-            SubagentStatus::Interrupted
+            SubagentStatus::Unfinished
         );
+    }
+
+    #[tokio::test]
+    async fn unfinished_status_roundtrips_through_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(dir.path().join("roundtrip.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let parent = store.create_session("/proj").await.unwrap();
+        let child = store.create_session("/proj").await.unwrap();
+        let descriptor = SubagentDescriptor {
+            parent,
+            child,
+            job_id: "subagent-2".into(),
+            label: "review".into(),
+            status: SubagentStatus::Unfinished,
+            result: None,
+            notice_delivered: false,
+        };
+        store.save_subagent(&descriptor).await.unwrap();
+
+        // Lo que se escribe de nuevo es la cadena nueva, no la antigua.
+        let stored: String =
+            sqlx::query_scalar("SELECT status FROM subagents WHERE child_session_id = ?")
+                .bind(child.0)
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, "unfinished");
+        assert_eq!(
+            store.list_subagents(parent).await.unwrap(),
+            vec![descriptor]
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_interrupted_string_is_read_as_unfinished() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(dir.path().join("legacy.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let parent = store.create_session("/proj").await.unwrap();
+        let child = store.create_session("/proj").await.unwrap();
+        // Fila escrita por una versión anterior, con la cadena antigua tal cual.
+        sqlx::query(
+            "INSERT INTO subagents (parent_session_id, child_session_id, job_id, label, status, created_at_ms)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(parent.0)
+        .bind(child.0)
+        .bind("subagent-legacy")
+        .bind("review")
+        .bind("interrupted")
+        .bind(crate::message::now_ms())
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+        let listed = store.list_subagents(parent).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].status, SubagentStatus::Unfinished);
     }
 
     /// Apunte de prueba con precios opcionales `(entrada, salida)` por millón. La sesión es

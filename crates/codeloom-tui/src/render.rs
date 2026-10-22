@@ -1407,7 +1407,7 @@ mod tests {
         }
         for (child, status) in [
             (99, codeloom_core::session::SubagentStatus::Running),
-            (100, codeloom_core::session::SubagentStatus::Interrupted),
+            (100, codeloom_core::session::SubagentStatus::Unfinished),
         ] {
             app.subagents.insert(
                 child,

@@ -36,7 +36,7 @@ De A2A (según el proto): los ocho estados de tarea más `UNSPECIFIED`; terminal
 `auth-required`); `TaskStatusUpdateEvent` emitido por el agente; `CancelTask` pedido
 por el cliente.
 
-Nuestro, no del protocolo: `Interrupted → Failed`, `Stopping → Working`, los glifos y
+Nuestro, no del protocolo: `Unfinished → Failed`, `Stopping → Working`, los glifos y
 colores, las etiquetas en `kebab-case` de la v0.3 como texto de pantalla, la línea de
 causa del despertar del padre y los ficheros por hijo.
 
@@ -49,11 +49,11 @@ la tabla de transiciones, que `submitted` signifique «aún no iniciada», ni qu
 Orden sugerido: A1, A2 y A3 (cierran lo ya empezado), luego A4 a A6 (tipos) y solo
 después el transporte (A7, A8).
 
-- [ ] **A1. Renombrar `SubagentStatus::Interrupted`.** Su nombre coincide con el
+- [x] **A1. Renombrar `SubagentStatus::Interrupted`.** Su nombre coincidía con el
   «interrupted state» de A2A (`input-required` y `auth-required`), que significa otra
-  cosa. Decidir el nombre, tocar el enum, la cadena en SQLite (con lectura de la
-  cadena antigua `interrupted` para no perder sesiones) y la proyección. Seguirá
-  proyectándose a `Failed`, decisión nuestra ya rotulada.
+  cosa. Hecho el 2026-10-22: nuevo nombre `SubagentStatus::Unfinished`, cadena en SQLite
+  `unfinished` con lectura de la cadena antigua `interrupted` para no perder sesiones.
+  Sigue proyectándose a `Failed`, decisión nuestra ya rotulada.
 - [ ] **A2. Productores de los estados que faltan.** Hoy el runtime produce `working`,
   `input-required`, `completed`, `failed` y `canceled`. Faltan:
   - `submitted` («successfully submitted and acknowledged»): decidir el instante del

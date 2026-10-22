@@ -279,7 +279,7 @@ fn subagent_tool_status(
         SubagentStatus::Running => ToolStatus::Running,
         SubagentStatus::Completed => ToolStatus::Success,
         SubagentStatus::Failed => ToolStatus::Error,
-        SubagentStatus::Killed | SubagentStatus::Interrupted => ToolStatus::Canceled,
+        SubagentStatus::Killed | SubagentStatus::Unfinished => ToolStatus::Canceled,
     }
 }
 
@@ -2209,7 +2209,7 @@ impl App {
                 status,
             } => {
                 // Un hijo que termina bien o con fallo despierta al padre; uno matado
-                // por el usuario o interrumpido no.
+                // por el usuario o sin terminar no.
                 let motivo = match status {
                     codeloom_core::session::SubagentStatus::Completed => Some("completed"),
                     codeloom_core::session::SubagentStatus::Failed => Some("failed"),
@@ -2818,14 +2818,14 @@ mod tests {
                 child,
                 job_id: "subagent-1".into(),
                 label: "review".into(),
-                status: codeloom_core::session::SubagentStatus::Interrupted,
+                status: codeloom_core::session::SubagentStatus::Unfinished,
                 result: Some("partial output".into()),
                 notice_delivered: false,
             }],
         );
         assert_eq!(
             app.subagents.get(&child.0).unwrap().status,
-            codeloom_core::session::SubagentStatus::Interrupted
+            codeloom_core::session::SubagentStatus::Unfinished
         );
 
         app.load_session(SessionId(3), Vec::new());
@@ -4057,7 +4057,7 @@ mod tests {
             app.apply(settled(status));
             assert!(app.wake_pending, "{status:?} debe despertar al padre");
         }
-        for status in [SubagentStatus::Killed, SubagentStatus::Interrupted] {
+        for status in [SubagentStatus::Killed, SubagentStatus::Unfinished] {
             let mut app = idle_parent_app();
             app.apply(settled(status));
             assert!(!app.wake_pending, "{status:?} no debe despertar al padre");

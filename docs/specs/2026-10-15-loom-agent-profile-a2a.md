@@ -223,10 +223,10 @@ dependen de la versión (v1.0: `TASK_STATE_INPUT_REQUIRED`; v0.3:
 |------------------------------------------------------|--------------|
 | `JobStatus::Running`, `JobStatus::Stopping`          | `Working`    |
 | `JobStatus::Completed`, `SubagentStatus::Completed`  | `Completed`  |
-| `JobStatus::Failed`, `SubagentStatus::Failed`, `SubagentStatus::Interrupted` | `Failed` |
+| `JobStatus::Failed`, `SubagentStatus::Failed`, `SubagentStatus::Unfinished` | `Failed` |
 | `JobStatus::Killed`, `SubagentStatus::Killed`        | `Canceled`   |
 
-Cabe señalar que `Interrupted -> Failed` es decisión nuestra: A2A carece de un
+Cabe señalar que `Unfinished -> Failed` es decisión nuestra: A2A carece de un
 equivalente a «interrumpida», de modo que la tarea se proyecta a fallo por haber
 quedado sin terminar. El modelo interno (`JobStatus`, `SubagentStatus` y el
 esquema SQLite) no cambia; la traducción vive solo en el borde.
@@ -270,10 +270,16 @@ interrumpidos. Sí dice que los cambios de estado los notifica el agente
 
 **Decisiones nuestras, que no son de A2A:**
 
-- `SubagentStatus::Interrupted` (hijo que quedó sin terminar al cerrarse la
-  aplicación) se proyecta a `Failed`. Su nombre **coincide** con el «interrupted
-  state» de A2A, que significa otra cosa (`input-required` y `auth-required`);
-  conviene no confundirlos.
+- `SubagentStatus::Unfinished` (hijo que quedó sin terminar al cerrarse la
+  aplicación) se proyecta a `Failed`. Antes se llamaba `Interrupted`, nombre que
+  **coincidía** con el «interrupted state» de A2A, que significa otra cosa
+  (`input-required` y `auth-required`); conviene no confundirlos. Renombrado el
+  2026-10-22 para no coincidir con el «interrupted state» de A2A; la cadena antigua
+  `interrupted` se sigue leyendo.
+- Diferencia previa, no corregida en esta tarea: la interfaz (`app.rs`) muestra
+  `Unfinished` igual que `Killed`, como cancelado, mientras que la proyección A2A lo
+  lleva a `Failed`. Se conserva el comportamiento de la interfaz; queda anotada
+  aquí para decidir más adelante cuál de los dos criterios prevalece.
 - `JobStatus::Stopping` se proyecta a `Working`.
 - Las etiquetas del rail y del showcase usan los nombres de la v0.3 como texto de
   pantalla; los nombres del cable los fija el adaptador.
