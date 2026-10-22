@@ -106,3 +106,44 @@ tests.
 - ¿El modo `Always` debería valer por sesión (conmutable con un comando) en vez de por
   configuración? Aquí queda por configuración.
 - Cuándo y cómo entra el clasificador (A12b) y con qué señal de confianza.
+
+## Estado (2026-10-22)
+
+**Implementado.** Plan: `docs/plans/2026-10-22-codeloom-a2a-delegation-choice.md`. Commits:
+`7cd4aab` (modo `[agents] confirm_delegation` en la configuración), `1c12360` (la regla de
+elección en el prompt del padre, `with_delegation_confirm` y cableado en `main.rs`) y
+`c71f53e` (etiqueta del agente de cada hijo en el rail y en la cabecera de actividad).
+
+**Cómo se usa.** Sin tocar nada, el modo es `doubt`: el padre delega sin preguntar cuando un
+agente encaja con claridad y pregunta con `ask_user` cuando duda entre varios. Para cambiarlo,
+en `codeloom.toml`:
+
+```toml
+[agents]
+confirm_delegation = "always"   # "doubt" (por defecto), "always" o "never"
+```
+
+**Decisiones tomadas al implementar** (además de las de arriba):
+
+- La etiqueta se muestra **siempre** que el agente se conozca, incluido `default`, por la
+  decisión de la persona usuaria sobre la observabilidad (corrige el borrador inicial, que no
+  la mostraba para `default`). Formato: `[front]`, y `[front·project]` o `[front·remote]` cuando
+  el origen es de proyecto o remoto. En el rail va tenue antes del nombre; en la cabecera de
+  actividad, tras el nombre, y **el estado A2A entre paréntesis sigue siendo lo último**.
+- Un nombre de agente vacío se trata como desconocido, para no pintar `[]`.
+- En la aplicación real el registro siempre está cableado, así que una delegación sin `agent`
+  queda registrada como `default` (origen `built-in`) y su etiqueta se ve.
+
+**Limitaciones reales:**
+
+- **La regla del prompt no es una garantía.** Un modelo puede no preguntar cuando debía, o
+  preguntar de más. Solo se comprueba por test que la regla llega al prompt; su cumplimiento no
+  se puede probar sin un modelo real. Lo que sí queda a la vista es lo ocurrido: la pregunta, la
+  respuesta y el agente de cada hijo.
+- No se muestra el **motivo** de la elección como dato: vive en el texto del padre.
+- Un hijo creado antes de A13, o lanzado sin registro, no tiene agente y no muestra etiqueta.
+- La etiqueta puede recortarse en un rail muy estrecho, como el resto de sus líneas. No se ha
+  visto en una terminal real.
+- El modo es global y fijo por configuración; no hay comando para cambiarlo en la sesión.
+
+**Pendiente:** A12b (clasificador o enrutador) y la pregunta abierta sobre un comando de sesión.

@@ -120,7 +120,7 @@ después el transporte (A7, A8).
   spec, una tarea terminal no se reinicia: el seguimiento es una **tarea nueva** en el
   mismo `contextId`, con `reference_task_ids`. El nombre `follow_up_of` es nuestro;
   valorar si debe alinearse con `reference_task_ids`. Los ids los genera el servidor.
-- [ ] **A12. Delegar por perfil, con modelo y esfuerzo (idea del 2026-10-22).** Elegir
+- [x] **A12. Delegar por perfil, con modelo y esfuerzo (idea del 2026-10-22).** Elegir
   al especialista según la tarea (front, Rust, etc.) a partir de las `skills[]` con
   `tags` de su tarjeta (A6) y de su `AgentProfile`. **A2A no fija cómo se elige** al
   agente: es decisión nuestra y se rotula como propia. Opciones: que decida el modelo
@@ -134,6 +134,13 @@ después el transporte (A7, A8).
   no del protocolo; para uno remoto, el agente es opaco y solo cabría una extensión
   declarada en su tarjeta o `metadata` libre, ambas cosas propias y sin garantía de que
   el otro lado las atienda. Requiere su propia spec antes de implementar.
+    - **Hecho (2026-10-22):** el padre ve la lista de agentes en su prompt y, según
+      `[agents] confirm_delegation` (`doubt` por defecto, `always`, `never`), pregunta con
+      `ask_user` cuando duda entre varios; la interfaz muestra siempre el agente de cada
+      hijo. Commits `871576e` (spec), `9631385` (plan), `7cd4aab`, `1c12360` y `c71f53e`.
+      Spec: `docs/specs/2026-10-22-codeloom-a2a-delegation-choice-design.md`, sección «Estado».
+    - **A12b, pendiente:** clasificador o enrutador automático (idea del usuario,
+      «interesante más adelante»). El hueco es `regla_de_eleccion` en `registry/mod.rs`.
 - [x] **A13. Registro de agentes con fuentes intercambiables (prerrequisito de A12).**
   Replanteada el 2026-10-22 por el usuario: la fuente de agentes **no debe ser solo un
   fichero**. El denominador común es la **tarjeta** (`AgentCard`, A6): quien delega
@@ -175,8 +182,8 @@ después el transporte (A7, A8).
     Spec: `docs/specs/2026-10-22-codeloom-a2a-agent-registry-design.md`, sección «Estado
     (2026-10-22)». Plan: `docs/plans/2026-10-22-codeloom-a2a-agent-registry.md`.
   - **Abierto:**
-    - **A12 sigue pendiente.** `subagent` acepta el argumento `agent`, pero nada elige el
-      agente por la tarea: quien llama lo nombra.
+    - La elección del agente la resuelve A12: el padre pregunta cuando duda (regla del prompt).
+      La elección automática, sin preguntar, queda para A12b.
     - La aprobación ya se hace desde el popup de `/agents` (`a`/`r`); quedan sin detallar
       los problemas de carga y el popup no se refresca con la recarga en caliente.
     - `AgentRegistryChanged` se emite, pero la TUI no lo muestra.
