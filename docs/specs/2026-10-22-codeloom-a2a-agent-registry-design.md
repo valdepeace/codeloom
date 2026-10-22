@@ -105,8 +105,18 @@ editar un fichero **no** altera a un subagente que ya está trabajando.
 - **Confianza.** Un perfil de proyecto llega con el repositorio y es contenido de un
   tercero: puede traer un prompt de sistema o elegir un modelo caro. **No puede ampliar
   permisos**: toda herramienta pasa igualmente por `PermissionService`. Se muestra siempre
-  su origen. Si se pide aprobación al cargar por primera vez un agente de proyecto queda
-  como pregunta abierta.
+  su origen.
+- **Aprobación de los agentes de proyecto (decisión del usuario, 2026-10-22: sí).** Un
+  agente de nivel `Project` **no se puede usar** hasta que el usuario lo aprueba. Mientras
+  tanto figura en el registro como `pendiente` y `start` lo rechaza con un error que lo
+  dice. Los de nivel `Global` y el integrado no la requieren: son del propio usuario.
+  Lectura nuestra de los detalles: la aprobación se identifica por (raíz canónica del
+  proyecto, nombre, huella del contenido), de modo que **cualquier cambio del fichero la
+  invalida**; así un `git pull` que modifique un agente no se cuela. Se guarda en el
+  directorio de datos del usuario (`~/.codeloom`), nunca en el repositorio. Una opción de
+  `codeloom.toml` permite confiar en todo un proyecto (`trust_project_agents`); por
+  defecto, desactivada. Esta spec solo exige la API de aprobar y revocar; el diálogo de la
+  interfaz es posterior.
 
 ## Cambio en `SubagentLauncher::start`
 
@@ -157,7 +167,7 @@ herencia cuando faltan. Validación visual en terminal real: pendiente.
 
 ## Preguntas abiertas
 
-- ¿Aprobación la primera vez que se carga un agente de proyecto?
+- (Resuelta) Aprobación de los agentes de proyecto: sí, ver «Confianza».
 - Nombre y ubicación exactos de la clave de configuración de las rutas en `codeloom.toml`.
 - Qué formato de `skills[]` de la tarjeta se deriva cuando el perfil solo trae `description`
   y `persona` (¿una skill sintética con la descripción?). Hasta decidirlo, la lista va vacía.
