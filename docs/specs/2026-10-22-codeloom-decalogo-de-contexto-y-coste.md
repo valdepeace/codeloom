@@ -3,6 +3,18 @@
 Estado: vigente desde el 2026-10-22. Nace de un incidente real y se amplía con lo que se vaya
 aprendiendo.
 
+## Qué es y qué no es
+
+**No es un estándar.** Es una síntesis propia, escrita a partir de un incidente y de lo que se ve
+en el código. Lo único externo que se ha localizado es la entrada *Unbounded Consumption* del
+OWASP Top 10 for LLM Applications (LLM06 en la edición 2026; las fuentes secundarias no coinciden
+en la numeración), cuyas mitigaciones respaldan las reglas 1, 7 y 10: topes de herramientas,
+tokens y gasto por tarea, límites de pasos y cortacircuitos. Solo se han leído resúmenes de
+terceros, no el documento original. **No consta** referencia normativa sobre el tamaño de la
+salida de una herramienta (ni en MCP ni en guías de truncado): una búsqueda sin resultado no
+prueba que no exista. Las cifras (20 000 bytes, 300 coincidencias, 200 elementos) son decisiones
+**propias**, sin respaldo externo.
+
 ## Por qué existe
 
 Un `glob **/*` devolvió casi seis megabytes de rutas (recorría `target/`). Se guardaron en la
