@@ -102,4 +102,5 @@ Limitaciones conocidas:
 - Validación visual en terminal real: pendiente.
 
 Pendientes de la línea: Fase O2 (vista de árbol y entrada al transcript de un
-hijo) y Fase O3 (causalidad y artefactos).
+hijo). La Fase O3 (causalidad y ficheros por hijo) está implementada, ver
+`2026-10-22-codeloom-agent-observability-o3-design.md`.

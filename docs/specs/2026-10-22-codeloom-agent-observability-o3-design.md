@@ -83,3 +83,34 @@ pendiente.
   Reconstruir los ficheros desde las llamadas `edit` del historial de cada hijo
   evitaría tocar el esquema; queda como siguiente paso.
 - La causa solo cubre al padre de la sesión abierta.
+
+## Estado (2026-10-22)
+
+Fase O3 implementada en dos tareas: ficheros por hijo (commit `3cde1dd`) y causa
+del despertar en el transcript (pendiente de commit en el momento de escribir
+esto). Verificado: `cargo test` en `codeloom-core` (147), `codeloom-tui` (364) y
+`codeloom-cli` (3 + 3 + 1), `cargo clippy -p codeloom-core -p codeloom-tui --
+-D warnings` y `rustfmt --check` limpios en `app.rs`, sin red.
+
+Decisiones tomadas al implementar:
+
+- El texto de la causa va en inglés, como los demás estados de la interfaz
+  (`auto-turn`, `working`): `⟳ auto-turn · woken by «review» (completed)`. Con
+  varias causas, `(+N more)` con las descartadas. La spec proponía castellano;
+  el plan fijó el inglés y se ha seguido el plan.
+- La causa se pinta como `LineKind::System` en el transcript, no como elemento
+  de actividad. No entra en el historial del modelo ni se persiste.
+- `wake_causes` se vacía al empezar el turno despertado, al pulsar Esc
+  (`request_cancel`), al cambiar de sesión y cuando el presupuesto de turnos
+  agotado descarta el despertar. Este último caso no estaba en la spec: sin él,
+  las causas de un despertar descartado se contarían en el siguiente.
+- Un turno del usuario no emite línea y no toca `wake_causes`.
+
+Limitaciones reales:
+
+- Causa y ficheros viven solo en memoria de la TUI: se pierden al cerrar y
+  reabrir la sesión.
+- `wake_causes` no tiene tope; en la práctica crece con el número de hijos que
+  terminan o preguntan antes de un turno despertado.
+- Solo `edit` emite `FileDiff`; lo que escriba `bash` no aparece.
+- Validación visual en terminal real: pendiente.

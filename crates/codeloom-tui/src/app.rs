@@ -424,6 +424,9 @@ pub struct App {
     pub wake_pending: bool,
     /// Despertar ya pedido al trabajador, sin turno iniciado ni `WakeIdle` de respuesta.
     pub wake_in_flight: bool,
+    /// Causas `(hijo, motivo)` de los despertares pendientes desde el último turno despertado.
+    /// Motivos: `"completed"`, `"failed"` o `"asks input"`. Solo son memoria de la interfaz.
+    pub wake_causes: Vec<(i64, &'static str)>,
     /// Turnos automáticos que quedan antes de exigir un mensaje del usuario.
     pub auto_turns_left: u32,
     /// Diálogo de permiso abierto, si hay.
@@ -632,6 +635,7 @@ impl App {
             turn_in_flight: false,
             wake_pending: false,
             wake_in_flight: false,
+            wake_causes: Vec::new(),
             auto_turns_left: MAX_AUTO_TURNS,
             permission: None,
             permission_queue: VecDeque::new(),
@@ -728,6 +732,8 @@ impl App {
         }
         if self.auto_turns_left == 0 {
             self.wake_pending = false;
+            // Las causas descartadas no deben contarse en el próximo despertar.
+            self.wake_causes.clear();
             self.status = "auto-turns exhausted — write to continue".into();
             return false;
         }
@@ -746,6 +752,28 @@ impl App {
     pub fn request_cancel(&mut self) {
         self.cancel_requested = true;
         self.wake_pending = false;
+        self.wake_causes.clear();
+    }
+
+    /// Línea de interfaz que explica el último despertar del padre. Con varias causas
+    /// pendientes muestra la más reciente y cuántas más quedan. Un hijo que no se conoce
+    /// se nombra por su identificador de agente.
+    fn wake_cause_line(&self) -> Option<String> {
+        let (child, motivo) = *self.wake_causes.last()?;
+        let etiqueta = self
+            .subagents
+            .get(&child)
+            .map(|subagent| subagent.label.clone())
+            .unwrap_or_else(|| format!("agent #{child}"));
+        let mas = self.wake_causes.len() - 1;
+        let sufijo = if mas > 0 {
+            format!(" (+{mas} more)")
+        } else {
+            String::new()
+        };
+        Some(format!(
+            "⟳ auto-turn · woken by «{etiqueta}» ({motivo}){sufijo}"
+        ))
     }
 
     pub fn set_provider_settings(&mut self, settings: ProviderSettings) {
@@ -1268,6 +1296,7 @@ impl App {
         // Un aviso de la sesión anterior no debe despertar a la nueva.
         if self.session_id != Some(session) {
             self.wake_pending = false;
+            self.wake_causes.clear();
         }
         self.session_id = Some(session);
         // Una navegación con `open_child` o `go_parent` conserva la pila de padres;
@@ -1979,6 +2008,16 @@ impl App {
                 let woken = std::mem::take(&mut self.wake_in_flight);
                 if woken {
                     self.auto_turns_left = self.auto_turns_left.saturating_sub(1);
+                    // La causa del despertar se apunta en el transcript como línea de interfaz;
+                    // no pasa al historial del modelo ni se persiste.
+                    if let Some(line) = self.wake_cause_line() {
+                        self.transcript.push_entry(
+                            batten::state::LineKind::System,
+                            batten::state::Format::Plain,
+                            line,
+                        );
+                    }
+                    self.wake_causes.clear();
                 }
                 self.turn_in_flight = true;
                 self.status = if woken { "auto-turn" } else { "working" }.into();
@@ -2139,6 +2178,7 @@ impl App {
                     self.awaiting_input.insert(child.0);
                     // Una pregunta del hijo pide que el padre lea el aviso.
                     self.wake_pending = true;
+                    self.wake_causes.push((child.0, "asks input"));
                 }
             }
             LiveEvent::SubagentInputResolved { child, .. } => {
@@ -2163,17 +2203,21 @@ impl App {
                     self.apply_child_event(child, *event);
                 }
             }
-            LiveEvent::SubagentSettled { parent, status, .. } => {
+            LiveEvent::SubagentSettled {
+                parent,
+                child,
+                status,
+            } => {
                 // Un hijo que termina bien o con fallo despierta al padre; uno matado
                 // por el usuario o interrumpido no.
-                if Some(parent) == self.session_id
-                    && matches!(
-                        status,
-                        codeloom_core::session::SubagentStatus::Completed
-                            | codeloom_core::session::SubagentStatus::Failed
-                    )
-                {
+                let motivo = match status {
+                    codeloom_core::session::SubagentStatus::Completed => Some("completed"),
+                    codeloom_core::session::SubagentStatus::Failed => Some("failed"),
+                    _ => None,
+                };
+                if let Some(motivo) = motivo.filter(|_| Some(parent) == self.session_id) {
                     self.wake_pending = true;
+                    self.wake_causes.push((child.0, motivo));
                 }
             }
         }
@@ -4134,6 +4178,117 @@ mod tests {
         assert!(app.wake_pending);
         app.load_session(SessionId(2), Vec::new());
         assert!(!app.wake_pending);
+        assert!(app.wake_causes.is_empty());
+    }
+
+    /// Lista de textos de las líneas de sistema del transcript.
+    fn system_lines(app: &App) -> Vec<String> {
+        app.transcript
+            .iter()
+            .filter(|l| l.kind == batten::state::LineKind::System)
+            .map(|l| l.plain().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn settled_child_records_wake_cause() {
+        let mut app = idle_parent_app();
+        app.apply(settled(SubagentStatus::Completed));
+        assert_eq!(app.wake_causes, vec![(9, "completed")]);
+
+        let mut app = idle_parent_app();
+        app.apply(settled(SubagentStatus::Failed));
+        assert_eq!(app.wake_causes, vec![(9, "failed")]);
+    }
+
+    #[test]
+    fn input_request_records_wake_cause() {
+        let mut app = idle_parent_app();
+        app.apply(LiveEvent::SubagentInputRequested {
+            parent: SessionId(1),
+            child: SessionId(9),
+            label: "review".into(),
+        });
+        assert_eq!(app.wake_causes, vec![(9, "asks input")]);
+    }
+
+    #[test]
+    fn killed_child_records_no_cause() {
+        let mut app = idle_parent_app();
+        app.apply(settled(SubagentStatus::Killed));
+        assert!(app.wake_causes.is_empty());
+    }
+
+    #[test]
+    fn woken_turn_emits_cause_line_and_clears_causes() {
+        let mut app = idle_parent_app();
+        app.apply(LiveEvent::SubagentChanged(sub(
+            "review",
+            SubagentStatus::Running,
+            SessionId(1),
+        )));
+        app.apply(settled(SubagentStatus::Completed));
+        assert!(app.take_wake());
+        app.apply(LiveEvent::TurnStarted);
+        assert_eq!(
+            system_lines(&app),
+            vec!["⟳ auto-turn · woken by «review» (completed)".to_string()]
+        );
+        assert!(app.wake_causes.is_empty());
+    }
+
+    #[test]
+    fn user_turn_emits_no_cause_line() {
+        let mut app = idle_parent_app();
+        app.apply(settled(SubagentStatus::Completed));
+        // Turno del usuario: no hay `wake_in_flight`, así que no hay línea ni se toca la causa.
+        app.apply(LiveEvent::TurnStarted);
+        assert!(system_lines(&app).is_empty());
+        assert_eq!(app.wake_causes, vec![(9, "completed")]);
+    }
+
+    #[test]
+    fn cause_line_with_several_causes_shows_latest_and_count() {
+        let mut app = idle_parent_app();
+        app.apply(LiveEvent::SubagentChanged(sub(
+            "review",
+            SubagentStatus::Running,
+            SessionId(1),
+        )));
+        app.wake_causes = vec![(9, "completed"), (9, "failed"), (9, "asks input")];
+        assert_eq!(
+            app.wake_cause_line().as_deref(),
+            Some("⟳ auto-turn · woken by «review» (asks input) (+2 more)")
+        );
+    }
+
+    #[test]
+    fn cause_line_uses_agent_id_for_unknown_child() {
+        let mut app = idle_parent_app();
+        app.wake_causes = vec![(42, "completed")];
+        assert_eq!(
+            app.wake_cause_line().as_deref(),
+            Some("⟳ auto-turn · woken by «agent #42» (completed)")
+        );
+        assert_eq!(App::new().wake_cause_line(), None);
+    }
+
+    #[test]
+    fn exhausted_budget_drops_wake_causes() {
+        let mut app = idle_parent_app();
+        app.apply(settled(SubagentStatus::Completed));
+        app.auto_turns_left = 0;
+        assert!(!app.take_wake());
+        assert!(app.wake_causes.is_empty());
+    }
+
+    #[test]
+    fn escape_clears_wake_causes() {
+        let mut app = idle_parent_app();
+        app.apply(settled(SubagentStatus::Completed));
+        assert!(!app.wake_causes.is_empty());
+        app.request_cancel();
+        assert!(app.wake_causes.is_empty());
     }
 
     /// Evento de un hijo tal como lo reenvía el lanzador al bus del padre.
