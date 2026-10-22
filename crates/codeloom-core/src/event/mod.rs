@@ -54,6 +54,14 @@ pub enum LiveEvent {
         session: crate::session::SessionId,
         items: Vec<crate::todo::TodoItem>,
     },
+    /// El registro de agentes se recargó y hubo diferencias: altas, bajas, cambios o
+    /// nuevos problemas de carga (`problems` es el total vigente).
+    AgentRegistryChanged {
+        added: Vec<String>,
+        removed: Vec<String>,
+        changed: Vec<String>,
+        problems: usize,
+    },
     /// Un despertar del padre no encontró avisos: no hubo turno. Permite a la
     /// interfaz limpiar su marca de despertar en curso.
     WakeIdle,
@@ -99,6 +107,7 @@ impl LiveEvent {
             | LiveEvent::SubagentInputRequested { .. }
             | LiveEvent::SubagentInputResolved { .. }
             | LiveEvent::TodosChanged { .. }
+            | LiveEvent::AgentRegistryChanged { .. }
             | LiveEvent::WakeIdle
             | LiveEvent::SubagentSettled { .. }
             | LiveEvent::ChildEvent { .. } => false,

@@ -2259,6 +2259,9 @@ impl App {
                     self.wake_causes.push((child.0, motivo));
                 }
             }
+            // El registro de agentes cambió. La interfaz aún no lo muestra: mostrarlo no es
+            // objetivo del registro (spec del registro de agentes, «Eventos y observabilidad»).
+            LiveEvent::AgentRegistryChanged { .. } => {}
         }
     }
 
