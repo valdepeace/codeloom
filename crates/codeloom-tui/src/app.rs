@@ -2460,6 +2460,8 @@ impl App {
                 let session = self.session_id.unwrap_or(SessionId(0));
                 self.record_live_usage(session, input_tokens, output_tokens);
             }
+            // El resumen llega como mensaje propio (`MessageAdded`); su pintado es la Tarea 5.
+            LiveEvent::ContextCompacted { .. } => {}
             LiveEvent::ToolStarted { call_id, name } => {
                 self.set_phase("running tools");
                 let tool = self.tool_mut(&call_id, &name);

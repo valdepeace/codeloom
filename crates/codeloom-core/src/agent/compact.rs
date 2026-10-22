@@ -30,6 +30,37 @@ const SUMMARY_PREFIX: &str = "[Context summary: first ";
 /// Final de la cabecera de un resumen, antes del corchete de cierre.
 const SUMMARY_SUFFIX: &str = " messages";
 
+/// Prompt de sistema de la petición de resumen. Pide secciones fijas para que otro agente pueda
+/// continuar el trabajo solo con el resumen, sin herramientas y con cota de longitud.
+pub const SUMMARY_SYSTEM_PROMPT: &str = r#"You are summarizing the earlier part of a working session between a user and a coding agent. Another agent will continue the work from your summary alone, without the original conversation, so the summary must carry everything it needs.
+
+Rules:
+- Do not call tools. Answer with plain text only.
+- Write the summary in the language the user uses in the conversation.
+- Use exactly these six sections, in this order, with these exact headings:
+
+## Goal
+What the user is trying to achieve overall.
+
+## User instructions and constraints
+Every explicit instruction, preference and restriction the user gave, quoted or closely paraphrased.
+
+## Work done
+What has been completed so far, step by step.
+
+## Current state and files touched
+Where the work stands now, and every file that was read, created or modified, with its path.
+
+## Decisions and findings
+Decisions taken and why, and facts discovered (behaviour, root causes, measurements).
+
+## Open problems and next steps
+Unresolved errors, pending questions and the concrete next steps.
+
+- Keep file names, paths, commands, identifiers, test names and error messages exactly as they appeared. Do not paraphrase them.
+- Do not invent anything that is not in the conversation. If a section has nothing to report, write "None."
+- Do not exceed about 1500 words."#;
+
 /// Estimación de tokens de un texto: bytes entre cuatro, redondeando hacia arriba.
 pub fn estimate_text_tokens(text: &str) -> usize {
     text.len().div_ceil(4)

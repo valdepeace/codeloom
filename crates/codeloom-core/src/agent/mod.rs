@@ -33,6 +33,13 @@ fn contenido_de_herramienta(spill: Option<&ToolSpill>, call_id: &str, content: &
     crate::tools::limit_output(content).into_owned()
 }
 
+/// Instrucción final de la petición de resumen, después de los mensajes que se resumen.
+const INSTRUCCION_DE_RESUMEN: &str =
+    "Summarize the conversation above following your instructions.";
+
+/// Bytes que se reservan para el marcador de omisión que `limit_bytes` añade al recortar.
+const MARCADOR_DE_RECORTE: usize = 64;
+
 pub struct TurnOutcome {
     pub session: SessionId,
     pub final_text: String,
@@ -492,6 +499,95 @@ impl AgentLoop {
             final_text,
             steps,
         })
+    }
+
+    /// Resume lo antiguo del historial de `session` y lo persiste como mensaje de resumen. Devuelve
+    /// `Ok(true)` si compactó, y `Ok(false)` si no había nada que resumir, si el modelo devolvió un
+    /// resumen vacío o si se canceló (en cuyo caso no se persiste nada). Un fallo del proveedor se
+    /// propaga como `Err`.
+    // Se retira en la tarea siguiente, cuando `run_turn` lo invoque.
+    #[allow(dead_code)]
+    async fn compact(
+        &self,
+        session: SessionId,
+        history: &[Message],
+        tokens_before: u64,
+        cancel: &CancellationToken,
+    ) -> Result<bool> {
+        let Some(cut) = compact::choose_cut(history) else {
+            return Ok(false);
+        };
+        let provider = self.provider.read().unwrap().clone();
+        let config = self.config.read().unwrap().clone();
+
+        // Lo que se resume: lo efectivo anterior al corte (incluido el resumen previo, si lo hay).
+        let anteriores: Vec<Message> = compact::effective_indices(history)
+            .into_iter()
+            .filter(|&i| i < cut)
+            .map(|i| history[i].clone())
+            .collect();
+        let mut mensajes = clear::clear_old_tool_results(&anteriores, clear::KEEP_TOOL_RESULTS);
+        mensajes.push(Message::user(INSTRUCCION_DE_RESUMEN));
+
+        let req = ProviderRequest {
+            model: config.model.clone(),
+            system: compact::SUMMARY_SYSTEM_PROMPT.to_string(),
+            messages: mensajes,
+            tools: vec![],
+            temperature: 0.0,
+            max_tokens: compact::SUMMARY_MAX_TOKENS,
+            effort: None,
+        };
+        let mut stream = tokio::select! {
+            _ = cancel.cancelled() => return Ok(false),
+            result = provider.stream(req, cancel.clone()) => result?,
+        };
+        let mut recogido = String::new();
+        // Un flujo que acaba en error o sin `Done` ha podido quedarse a medias: un resumen
+        // truncado por un fallo se descarta en lugar de presentarse como bueno.
+        let mut cierre: Option<FinishReason> = None;
+        loop {
+            let chunk = tokio::select! {
+                _ = cancel.cancelled() => return Ok(false),
+                chunk = stream.next() => chunk,
+            };
+            match chunk {
+                Some(StreamChunk::TextDelta(t)) => recogido.push_str(&t),
+                Some(StreamChunk::Done(razon)) => {
+                    cierre = Some(razon);
+                    break;
+                }
+                None => break,
+                Some(_) => {}
+            }
+        }
+        if cancel.is_cancelled() {
+            return Ok(false);
+        }
+        if matches!(cierre, None | Some(FinishReason::Error)) {
+            tracing::warn!("el flujo del resumen terminó sin cierre válido; se descarta");
+            return Ok(false);
+        }
+
+        let recogido = recogido.trim();
+        if recogido.is_empty() {
+            return Ok(false);
+        }
+        // El marcador de `limit_bytes` se suma al texto conservado: se le reserva hueco para que
+        // el resumen entero respete `MAX_SUMMARY_BYTES`.
+        let resumen = limit_bytes(
+            recogido,
+            compact::MAX_SUMMARY_BYTES.saturating_sub(MARCADOR_DE_RECORTE),
+        );
+        let mensaje = compact::summary_message(cut, &resumen);
+        self.store.append_message(session, &mensaje).await?;
+        self.bus.publish(LiveEvent::MessageAdded(mensaje));
+        self.bus.publish(LiveEvent::ContextCompacted {
+            replaced: cut,
+            tokens_before,
+            summary_bytes: resumen.len(),
+        });
+        Ok(true)
     }
 
     /// Entrega los avisos pendientes de jobs y subagentes. Devuelve cuántos se
@@ -1845,5 +1941,231 @@ Cuerpo.
         let stored = contents_of(&store.messages(sid).await.unwrap());
         assert_eq!(stored.len(), 10);
         assert!(stored.iter().all(|c| c.len() == 1000));
+    }
+
+    /// Proveedor simulado de la compactación: responde siempre el mismo texto y guarda cada
+    /// petición completa que recibe.
+    struct SummaryProvider {
+        texto: String,
+        /// Cierre del flujo: `None` simula un flujo que se corta sin `Done`.
+        cierre: Mutex<Option<FinishReason>>,
+        seen: Mutex<Vec<ProviderRequest>>,
+    }
+
+    #[async_trait]
+    impl Provider for SummaryProvider {
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                tool_use: false,
+                reasoning: false,
+                streaming: true,
+            }
+        }
+        async fn stream(
+            &self,
+            req: ProviderRequest,
+            _cancel: CancellationToken,
+        ) -> Result<ProviderStream> {
+            self.seen.lock().unwrap().push(req);
+            let mut chunks = vec![StreamChunk::TextDelta(self.texto.clone())];
+            if let Some(razon) = *self.cierre.lock().unwrap() {
+                chunks.push(StreamChunk::Done(razon));
+            }
+            Ok(Box::pin(futures::stream::iter(chunks)))
+        }
+    }
+
+    /// Entorno de compactación: un almacén con el historial persistido y un agente cuyo
+    /// proveedor responde `texto`.
+    struct EntornoDeResumen {
+        _dir: tempfile::TempDir,
+        store: Arc<SqliteStore>,
+        sid: SessionId,
+        proveedor: Arc<SummaryProvider>,
+        bus: EventBus,
+        agente: AgentLoop,
+    }
+
+    async fn entorno_de_resumen(texto: &str, historial: &[Message]) -> EntornoDeResumen {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SqliteStore::open(dir.path().join("r.db").to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+        let sid = store.create_session("/p").await.unwrap();
+        for mensaje in historial {
+            store.append_message(sid, mensaje).await.unwrap();
+        }
+        let proveedor = Arc::new(SummaryProvider {
+            texto: texto.to_string(),
+            cierre: Mutex::new(Some(FinishReason::Stop)),
+            seen: Mutex::new(Vec::new()),
+        });
+        let bus = EventBus::new(64);
+        let cfg = CodeLoomConfig {
+            provider: crate::config::ProviderConfig {
+                kind: crate::config::ProviderKind::OpenAiCompat,
+                base_url: "http://x".into(),
+                api_key_env: "K".into(),
+            },
+            model: "m".into(),
+            max_steps: 5,
+            effort: None,
+        };
+        let agente = AgentLoop::new(
+            proveedor.clone(),
+            store.clone(),
+            Arc::new(ToolRegistry::new()),
+            bus.clone(),
+            Arc::new(PermissionService::allow_all()),
+            cfg,
+            dir.path().to_path_buf(),
+        );
+        EntornoDeResumen {
+            _dir: dir,
+            store,
+            sid,
+            proveedor,
+            bus,
+            agente,
+        }
+    }
+
+    /// `n` mensajes de usuario de 4 000 bytes, es decir, 1 000 tokens estimados cada uno.
+    fn historial_grande(n: usize) -> Vec<Message> {
+        (0..n).map(|_| Message::user("x".repeat(4000))).collect()
+    }
+
+    #[tokio::test]
+    async fn compact_persists_a_summary_message_and_leaves_the_log_intact() {
+        let e = entorno_de_resumen("resumen", &historial_grande(100)).await;
+        let antes = e.store.messages(e.sid).await.unwrap();
+        let cut = compact::choose_cut(&antes).expect("hay historia que resumir");
+
+        let cancel = CancellationToken::new();
+        assert!(e.agente.compact(e.sid, &antes, 0, &cancel).await.unwrap());
+
+        let despues = e.store.messages(e.sid).await.unwrap();
+        assert_eq!(despues.len(), antes.len() + 1);
+        assert_eq!(&despues[..antes.len()], antes.as_slice());
+        let (covers, texto) =
+            compact::parse_summary(despues.last().unwrap()).expect("el resumen va al final");
+        assert_eq!(covers, cut);
+        assert_eq!(texto, "resumen");
+    }
+
+    #[tokio::test]
+    async fn compact_request_has_no_tools_and_ends_with_the_summarize_instruction() {
+        let e = entorno_de_resumen("resumen", &historial_grande(100)).await;
+        let antes = e.store.messages(e.sid).await.unwrap();
+        let cancel = CancellationToken::new();
+        e.agente.compact(e.sid, &antes, 0, &cancel).await.unwrap();
+
+        let vistas = e.proveedor.seen.lock().unwrap();
+        assert_eq!(vistas.len(), 1, "una sola petición de resumen");
+        let req = &vistas[0];
+        assert!(req.tools.is_empty());
+        assert_eq!(req.system, compact::SUMMARY_SYSTEM_PROMPT);
+        assert_eq!(req.temperature, 0.0);
+        assert_eq!(req.max_tokens, compact::SUMMARY_MAX_TOKENS);
+        assert!(req.effort.is_none());
+        let ultimo = req.messages.last().expect("la petición lleva mensajes");
+        assert_eq!(ultimo.role, Role::User);
+        assert_eq!(
+            ultimo.text(),
+            "Summarize the conversation above following your instructions."
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_caps_an_oversized_summary() {
+        let e = entorno_de_resumen(&"y".repeat(40_000), &historial_grande(100)).await;
+        let antes = e.store.messages(e.sid).await.unwrap();
+        let cancel = CancellationToken::new();
+        assert!(e.agente.compact(e.sid, &antes, 0, &cancel).await.unwrap());
+
+        let despues = e.store.messages(e.sid).await.unwrap();
+        let (_, texto) = compact::parse_summary(despues.last().unwrap()).unwrap();
+        // El tope es exacto: el hueco del marcador de omisión sale del propio tope.
+        assert!(
+            texto.len() <= compact::MAX_SUMMARY_BYTES,
+            "el resumen mide {} bytes",
+            texto.len()
+        );
+        assert!(texto.len() < 40_000, "el recorte debe haber actuado");
+    }
+
+    #[tokio::test]
+    async fn compact_returns_false_when_the_model_returns_nothing() {
+        let e = entorno_de_resumen("  \n ", &historial_grande(100)).await;
+        let antes = e.store.messages(e.sid).await.unwrap();
+        let cancel = CancellationToken::new();
+        assert!(!e.agente.compact(e.sid, &antes, 0, &cancel).await.unwrap());
+        assert_eq!(e.store.messages(e.sid).await.unwrap().len(), antes.len());
+    }
+
+    #[tokio::test]
+    async fn compact_discards_a_summary_whose_stream_ended_in_error_or_was_cut() {
+        for cierre in [Some(FinishReason::Error), None] {
+            let e = entorno_de_resumen("resumen a medias", &historial_grande(100)).await;
+            *e.proveedor.cierre.lock().unwrap() = cierre;
+            let antes = e.store.messages(e.sid).await.unwrap();
+            let cancel = CancellationToken::new();
+            assert!(!e.agente.compact(e.sid, &antes, 0, &cancel).await.unwrap());
+            assert_eq!(
+                e.store.messages(e.sid).await.unwrap().len(),
+                antes.len(),
+                "no se persiste un resumen truncado ({cierre:?})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_returns_false_when_there_is_nothing_to_summarize() {
+        let historial = [Message::user("hola"), Message::user("adiós")];
+        let e = entorno_de_resumen("resumen", &historial).await;
+        let antes = e.store.messages(e.sid).await.unwrap();
+        let cancel = CancellationToken::new();
+        assert!(!e.agente.compact(e.sid, &antes, 0, &cancel).await.unwrap());
+        assert!(
+            e.proveedor.seen.lock().unwrap().is_empty(),
+            "no debe haber petición de resumen"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_publishes_context_compacted() {
+        let e = entorno_de_resumen("resumen", &historial_grande(100)).await;
+        let antes = e.store.messages(e.sid).await.unwrap();
+        let cut = compact::choose_cut(&antes).expect("hay historia que resumir");
+        let mut rx = e.bus.subscribe();
+
+        let cancel = CancellationToken::new();
+        assert!(e
+            .agente
+            .compact(e.sid, &antes, 1234, &cancel)
+            .await
+            .unwrap());
+
+        let mut eventos = Vec::new();
+        while let Ok(evento) = rx.try_recv() {
+            eventos.push(evento);
+        }
+        let compactado = eventos.iter().find_map(|evento| match evento {
+            LiveEvent::ContextCompacted {
+                replaced,
+                tokens_before,
+                summary_bytes,
+            } => Some((*replaced, *tokens_before, *summary_bytes)),
+            _ => None,
+        });
+        assert_eq!(compactado, Some((cut, 1234, "resumen".len())));
+        assert!(
+            eventos
+                .iter()
+                .any(|evento| matches!(evento, LiveEvent::MessageAdded(_))),
+            "el mensaje de resumen también se publica"
+        );
     }
 }

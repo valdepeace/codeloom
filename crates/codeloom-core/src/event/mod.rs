@@ -19,6 +19,13 @@ pub enum LiveEvent {
         input_tokens: u32,
         output_tokens: u32,
     },
+    /// La sesión resumió su historial antiguo: `replaced` mensajes quedaron cubiertos por un
+    /// resumen de `summary_bytes` bytes, tras estimar `tokens_before` tokens de contexto.
+    ContextCompacted {
+        replaced: usize,
+        tokens_before: u64,
+        summary_bytes: usize,
+    },
     MessageAdded(Message),
     SessionMessageAdded {
         session: crate::session::SessionId,
@@ -96,6 +103,7 @@ impl LiveEvent {
             | LiveEvent::ToolStarted { .. }
             | LiveEvent::ToolFinished { .. }
             | LiveEvent::Usage { .. }
+            | LiveEvent::ContextCompacted { .. }
             | LiveEvent::FileDiff { .. }
             | LiveEvent::MessageAdded(_)
             | LiveEvent::TurnEnded
