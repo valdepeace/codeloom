@@ -2631,6 +2631,17 @@ impl App {
         if self.tool_inline() && self.apply_notice(text) {
             return;
         }
+        // Con el look clásico el aviso se conserva entero, pero es del sistema: atribuirlo a la
+        // persona usuaria (`You`) confundiría a los actores.
+        if parse_notice(text).is_some() {
+            self.transcript.push_entry(
+                batten::state::LineKind::System,
+                batten::state::Format::Plain,
+                text,
+            );
+            self.assistant = None;
+            return;
+        }
         self.push_user(text);
     }
 
@@ -4229,7 +4240,7 @@ linea 2",
     }
 
     #[test]
-    fn classic_look_keeps_notices_as_user_messages_and_shows_the_activity_header() {
+    fn classic_look_shows_notices_as_system_lines_and_the_activity_header() {
         let mut app = App::new(); // tema Batten = Classic
         app.session_id = Some(SessionId(1));
         app.apply(LiveEvent::SubagentChanged(sub(
@@ -4241,12 +4252,19 @@ linea 2",
         let lines = texts(&app);
         assert!(lines.iter().any(|t| t == "[Subagent review completed]"));
         assert!(lines.iter().any(|t| t == "ready"));
+        // El aviso lo emite el sistema: nunca se atribuye a la persona usuaria.
         let user_count = app
             .transcript
             .iter()
             .filter(|l| l.kind == batten::state::LineKind::User)
             .count();
-        assert_eq!(user_count, 2);
+        assert_eq!(user_count, 0, "ningún aviso del sistema sale como «You»");
+        let avisos = app
+            .transcript
+            .iter()
+            .filter(|l| l.kind == batten::state::LineKind::System)
+            .count();
+        assert_eq!(avisos, 2, "cabecera y cuerpo del aviso, como sistema");
         assert_eq!(
             heads(&app).len(),
             1,

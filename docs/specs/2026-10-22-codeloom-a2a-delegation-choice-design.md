@@ -163,6 +163,9 @@ sigue en la tarjeta fija y en el inspector (Ctrl+T). La llamada a `subagent` nom
 elegido en su propia cabecera: `subagent  [rust] leer fichero`. Se reescribieron seis tests que
 defendían la regla anterior («el look clásico no deja rastro»), por decisión expresa.
 
-**Sigue abierto:** el aviso de fin de un subagente (`[Subagent … completed]`) entra en el
-transcript como mensaje de **usuario** (`LineKind::User`) y por eso aparece como si lo hubiera
-escrito la persona usuaria. Distinguir actores exige un tipo de línea propio para ese aviso.
+**Resuelto después:** el aviso de fin de un subagente o de un job (`[Subagent … completed]`)
+entraba en el transcript como mensaje de **usuario** y aparecía rotulado `You`, como si lo
+hubiera escrito la persona usuaria. Ahora, con el look clásico, se conserva entero pero como
+línea de **sistema** (`LineKind::System`), sin la etiqueta `You`; su cabecera nombra al actor.
+**Sigue abierto:** esa línea de sistema no lleva etiqueta propia (`Subagent`) ni color
+distintivo; solo deja de atribuirse a la persona usuaria.
