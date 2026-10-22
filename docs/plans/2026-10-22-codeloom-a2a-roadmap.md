@@ -134,7 +134,7 @@ después el transporte (A7, A8).
   no del protocolo; para uno remoto, el agente es opaco y solo cabría una extensión
   declarada en su tarjeta o `metadata` libre, ambas cosas propias y sin garantía de que
   el otro lado las atienda. Requiere su propia spec antes de implementar.
-- [ ] **A13. Registro de agentes con fuentes intercambiables (prerrequisito de A12).**
+- [x] **A13. Registro de agentes con fuentes intercambiables (prerrequisito de A12).**
   Replanteada el 2026-10-22 por el usuario: la fuente de agentes **no debe ser solo un
   fichero**. El denominador común es la **tarjeta** (`AgentCard`, A6): quien delega
   consulta un registro de tarjetas y no sabe, ni le importa, de dónde vienen. Una fuente
@@ -170,8 +170,22 @@ después el transporte (A7, A8).
     3. **Externos (remotos):** no se pueden enviar modelo ni esfuerzo; la interfaz indica
        que los decide el agente remoto, y un `model` en un perfil remoto se ignora con
        aviso.
-  - No consta aún ningún código de perfiles ni de registro; es una pieza nueva. Requiere
-    su propia spec.
+  - **Hecho el 2026-10-22** en los commits `1f4787a`, `73a4e41`, `a492f73`, `128cfcd`,
+    `89329b7`, `f3f0240`, `27dd8e4` y `05dc0ac`. Módulo `crates/codeloom-core/src/registry/`.
+    Spec: `docs/specs/2026-10-22-codeloom-a2a-agent-registry-design.md`, sección «Estado
+    (2026-10-22)». Plan: `docs/plans/2026-10-22-codeloom-a2a-agent-registry.md`.
+  - **Abierto:**
+    - **A12 sigue pendiente.** `subagent` acepta el argumento `agent`, pero nada elige el
+      agente por la tarea: quien llama lo nombra.
+    - Sin diálogo de aprobación en la interfaz. Un agente de proyecto solo se usa con
+      `trust_project_agents = true` o aprobándolo por API.
+    - `AgentRegistryChanged` se emite, pero la TUI no lo muestra.
+    - Sin fuente remota (A8) ni edición desde la TUI.
+    - `scope`, `delegation`, `transport` y `a2a` se leen y no se aplican; `max_depth` tampoco.
+    - `skills[]` de la tarjeta sintetizada va vacío.
+    - La recarga por sondeo no detecta un cambio con misma fecha y tamaño.
+    - Validación visual en terminal real: pendiente.
+    - Lista completa de limitaciones en la spec del registro, sección «Estado (2026-10-22)».
 
 ## Cruces con otras líneas
 

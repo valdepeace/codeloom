@@ -171,3 +171,72 @@ herencia cuando faltan. Validación visual en terminal real: pendiente.
 - Nombre y ubicación exactos de la clave de configuración de las rutas en `codeloom.toml`.
 - Qué formato de `skills[]` de la tarjeta se deriva cuando el perfil solo trae `description`
   y `persona` (¿una skill sintética con la descripción?). Hasta decidirlo, la lista va vacía.
+
+## Estado (2026-10-22)
+
+Implementado en los ocho commits de A13, en orden cronológico:
+
+- `1f4787a`: lectura y validación de perfiles de agente (`registry/profile.rs`).
+- `73a4e41`: registro con fuente de ficheros y agente `default` (`registry/mod.rs`, `registry/source.rs`).
+- `a492f73`: la persona del perfil viaja con la entrada y compone el prompt.
+- `128cfcd`: recarga en caliente del registro (`registry/watch.rs`).
+- `89329b7`: aprobación de los agentes de proyecto (`registry/trust.rs`).
+- `f3f0240`: el descriptor del subagente recuerda con qué agente arrancó.
+- `27dd8e4`: el lanzador de subagentes admite elegir agente del registro.
+- `05dc0ac`: el registro de agentes se construye al arrancar.
+
+### Decisiones que esta spec no fijaba
+
+- **Parser YAML:** `serde_yaml_bw` 2.5.8. Se descartaron `serde_yaml` (archivado) y `serde_yml` (obsoleto).
+- **Recarga por sondeo, no por `notify`.** Cada 250 ms se comparan fecha de modificación y tamaño de los `*.md` de los directorios vigilados. El mismo intervalo hace de *debounce*. Corre en un hilo propio, nunca en el de la interfaz, y no añade ninguna dependencia.
+- **Aprobación de agentes de proyecto.** La huella es SHA-256 (`sha2` 0.10) del contenido. La clave de aprobación es la terna (raíz canónica del proyecto, nombre, huella). El almacén vive en `<home>/.codeloom/agent-trust.json` y se escribe de forma atómica; un JSON corrupto cuenta como «nada aprobado». Los remotos se deniegan por defecto. No hay bloqueo entre procesos.
+- **Orden de validación de `start`**, siempre sin crear tarea: agente inexistente, agente remoto, agente pendiente de aprobación y modelo fuera del catálogo.
+- **Persona.** Se añade tras el contexto del proyecto (`AGENTS.md` y similares) y no lo sustituye. Si hay persona, antepone las líneas `Rol:`, `Objetivo:` y `Contexto:` (en español) al cuerpo.
+- **`max_turns`** se aplica como `max_steps` de la sesión hija y **sustituye** al del padre, aunque sea mayor.
+- **`max_depth`** se lee y no se aplica. La sesión hija no recibe la herramienta `subagent`, así que no puede anidar subagentes.
+- **Descriptor.** Guarda `agent` y `agent_origin` (`built-in`, `global:<ruta>`, `project:<ruta>` o `remote:<url>`). Las columnas se añaden de forma idempotente; las filas antiguas leen `None`.
+- **Configuración.** Sección opcional `[agents]` con `global_dir`, `project_dir` y `trust_project_agents`. Es un tipo propio (`AgentsConfig`), aparte de `CodeLoomConfig`.
+- **Sin directorio home** solo se usan la fuente de proyecto y la integrada.
+- **Evento** `LiveEvent::AgentRegistryChanged`, con altas, bajas, cambios y número de problemas. Solo se emite si hubo diferencias.
+- **Última versión válida.** Si un fichero se rompe, se conserva la entrada anterior y se anota el problema. Si se borra, la entrada se retira.
+
+### Limitaciones reales
+
+- `scope`, `delegation`, `transport` y `a2a` se leen y se declaran, pero no se aplican. Un perfil que los declara recibe el aviso «declarado y no aplicado». `max_depth` tampoco se aplica, y se lee sin aviso.
+- **Sin diálogo de aprobación en la interfaz.** Hoy un agente de proyecto solo se usa con `trust_project_agents = true` o aprobándolo por API.
+- `AgentRegistryChanged` se emite, pero la TUI lo recibe y no lo muestra.
+- **Sin fuente remota** (A8). `Execution::Remote` existe y `start` lo rechaza con «agente remoto no disponible».
+- **Sin edición desde la TUI.** Los ficheros se editan a mano o con cualquier editor.
+- `skills[]` de la tarjeta sintetizada va vacío, como dice la pregunta abierta de esta spec.
+- **Recarga por sondeo.** Un cambio que deja la misma fecha de modificación y el mismo tamaño no se detecta.
+- Un `default.md` de proyecto o global se anota como `Shadowed` del integrado, aunque sea una redefinición legítima.
+- Un enlace simbólico roto `*.md` se ignora en silencio.
+- La regla del directorio ilegible no tiene test.
+- No hay test de extremo a extremo de `AgentLoop` con un agente del registro.
+- Preexistente: si no hay home, `main.rs` usa el cwd como directorio de datos, así que `sessions.db` queda dentro del repositorio.
+- La vigilancia también arranca en modo `--print`.
+- Validación visual en terminal real: pendiente.
+
+### Cómo usarlo
+
+Perfil global mínimo, en `~/.agents/agents/rust.md` (el nombre del fichero debe coincidir con `name`):
+
+```markdown
+---
+name: rust
+description: Especialista en Rust para cambios en el núcleo
+model: <id de un modelo del catálogo>
+effort: low
+---
+
+Eres un especialista en Rust. Cambia solo lo que la tarea pide y ejecuta
+las pruebas del crate afectado antes de dar el trabajo por terminado.
+```
+
+La herramienta `subagent` acepta `prompt` (obligatorio) y `agent` (opcional: nombre de un agente del registro; omitido equivale a `default`):
+
+```json
+{"prompt": "Revisa el manejo de errores de crates/codeloom-core/src/registry/trust.rs", "agent": "rust"}
+```
+
+Los perfiles de proyecto viven en `.agents/agents/` de la raíz del repositorio. Un perfil de proyecto solo se usa si `trust_project_agents = true` o si se ha aprobado por API; en otro caso, `start` lo rechaza con «pendiente de aprobación».

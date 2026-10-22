@@ -152,6 +152,16 @@ Reglas:
   `tool_permissions`, `risk_level`, allow-list de red) puede añadirse *encima*, sin
   que el resto dependa de él. Se documenta como extensión, **no** como requisito.
 
+> **Nota (2026-10-22, registro de agentes, A13).** Lo que el código interpreta ya de este
+> formato: `name`, `description`, `version`, `persona.{role,goal,backstory}` (el cuerpo es el
+> prompt de sistema, que va tras el contexto del proyecto), `model`, `effort` y `max_turns`
+> (límite de pasos de la sesión hija). Se leen y se conservan, pero **no se aplican** todavía:
+> `scope`, `delegation`, `transport` y `a2a` (un perfil que los declara recibe el aviso
+> «declarado y no aplicado»), y `max_depth`, que se lee sin aviso. Los detalles y las
+> limitaciones están en `docs/specs/2026-10-22-codeloom-a2a-agent-registry-design.md`,
+> sección «Estado (2026-10-22)». Esta nota no reescribe lo anterior: la tabla y las reglas de
+> arriba siguen siendo la intención del formato.
+
 ## 3. Scope = allowlist (la aportación de CodeLoom)
 
 - **Lo fuera de scope no se carga**: los MCP/skills fuera de la allowlist no entran
