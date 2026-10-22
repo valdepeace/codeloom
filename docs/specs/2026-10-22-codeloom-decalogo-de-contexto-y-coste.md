@@ -35,6 +35,9 @@ aprendiendo.
   - **No dan** umbral de compactación, tamaño de página por defecto, ni presupuesto por
     herramienta distinto de esos 25 000 tokens.
 
+Las URL consultadas, con fecha y lo que respalda cada una, están en
+`docs/references/contexto-y-coste/fuentes.md`.
+
 Consecuencia: las reglas 1, 3, 4, 5 y 8 tienen respaldo de Anthropic; la 7 lo tiene solo en parte
 (OWASP cubre timeouts y cuotas, **no** el límite de pasos ni el presupuesto de tokens, que son
 decisión propia); la 2, la 6, la 9 y la 10 son propias. Las cifras de Codeloom (20 000 bytes
