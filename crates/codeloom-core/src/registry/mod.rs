@@ -134,6 +134,9 @@ mod tests {
             defecto.execution,
             Execution::Local(LocalSpec {
                 body: String::new(),
+                persona_role: None,
+                persona_goal: None,
+                persona_backstory: None,
                 model: None,
                 effort: None,
                 max_turns: None,

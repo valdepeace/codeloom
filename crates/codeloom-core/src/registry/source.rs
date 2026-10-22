@@ -40,10 +40,49 @@ pub enum AgentOrigin {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalSpec {
     pub body: String,
+    /// Rol de la persona (`persona.role` del perfil).
+    pub persona_role: Option<String>,
+    /// Objetivo de la persona (`persona.goal` del perfil).
+    pub persona_goal: Option<String>,
+    /// Contexto de la persona (`persona.backstory` del perfil).
+    pub persona_backstory: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
     pub max_turns: Option<u32>,
     pub max_depth: Option<u32>,
+}
+
+impl LocalSpec {
+    /// Prompt de sistema que recibe la sesión hija.
+    ///
+    /// Con persona, antepone un bloque con una línea por cada campo presente (`Rol`,
+    /// `Objetivo`, `Contexto`), una línea en blanco y el cuerpo. Sin persona devuelve el
+    /// cuerpo tal cual; sin persona y con cuerpo vacío, cadena vacía (herencia del padre).
+    pub fn system_prompt(&self) -> String {
+        // Un campo de persona vacío cuenta como ausente: no aporta nada al prompt.
+        let lineas: Vec<String> = [
+            ("Rol", self.persona_role.as_deref()),
+            ("Objetivo", self.persona_goal.as_deref()),
+            ("Contexto", self.persona_backstory.as_deref()),
+        ]
+        .into_iter()
+        .filter_map(|(etiqueta, valor)| {
+            valor
+                .filter(|v| !v.trim().is_empty())
+                .map(|v| format!("{etiqueta}: {v}"))
+        })
+        .collect();
+
+        if lineas.is_empty() {
+            return self.body.clone();
+        }
+        let bloque = lineas.join("\n");
+        if self.body.is_empty() {
+            bloque
+        } else {
+            format!("{bloque}\n\n{}", self.body)
+        }
+    }
 }
 
 /// Cómo se ejecuta un agente.
@@ -207,6 +246,9 @@ fn entrada_desde_perfil(perfil: AgentProfile, origin: AgentOrigin) -> AgentEntry
         card: AgentCard::local(perfil.name, perfil.description, version),
         execution: Execution::Local(LocalSpec {
             body: perfil.body,
+            persona_role: perfil.persona_role,
+            persona_goal: perfil.persona_goal,
+            persona_backstory: perfil.persona_backstory,
             model: perfil.model,
             effort: perfil.effort,
             max_turns: perfil.max_turns,
@@ -242,6 +284,9 @@ impl AgentSource for BuiltInSource {
             ),
             execution: Execution::Local(LocalSpec {
                 body: String::new(),
+                persona_role: None,
+                persona_goal: None,
+                persona_backstory: None,
                 model: None,
                 effort: None,
                 max_turns: None,
@@ -296,5 +341,86 @@ mod tests {
 
         assert!(carga.entries.is_empty());
         assert!(carga.problems.is_empty());
+    }
+
+    /// `LocalSpec` sin persona ni modelo, solo con cuerpo.
+    fn spec_con_cuerpo(cuerpo: &str) -> LocalSpec {
+        LocalSpec {
+            body: cuerpo.to_string(),
+            persona_role: None,
+            persona_goal: None,
+            persona_backstory: None,
+            model: None,
+            effort: None,
+            max_turns: None,
+            max_depth: None,
+        }
+    }
+
+    #[test]
+    fn system_prompt_without_persona_is_the_body() {
+        let spec = spec_con_cuerpo("Eres el agente.");
+        assert_eq!(spec.system_prompt(), "Eres el agente.");
+    }
+
+    #[test]
+    fn system_prompt_prepends_the_persona_lines_present() {
+        let spec = LocalSpec {
+            persona_role: Some("Ingeniero de frontend".to_string()),
+            persona_goal: Some("Implementar y revisar la UI".to_string()),
+            persona_backstory: Some("Prefiere componentes pequeños".to_string()),
+            ..spec_con_cuerpo("Eres el agente de frontend.")
+        };
+        assert_eq!(
+            spec.system_prompt(),
+            "Rol: Ingeniero de frontend\nObjetivo: Implementar y revisar la UI\nContexto: Prefiere componentes pequeños\n\nEres el agente de frontend."
+        );
+    }
+
+    #[test]
+    fn system_prompt_skips_absent_persona_fields() {
+        let spec = LocalSpec {
+            persona_goal: Some("Revisar la UI".to_string()),
+            ..spec_con_cuerpo("Cuerpo.")
+        };
+        assert_eq!(spec.system_prompt(), "Objetivo: Revisar la UI\n\nCuerpo.");
+    }
+
+    #[test]
+    fn system_prompt_is_empty_for_the_builtin_default() {
+        let carga = BuiltInSource.load();
+        let entrada = carga
+            .entries
+            .iter()
+            .find(|e| e.name == AGENTE_POR_DEFECTO)
+            .expect("el integrado aporta `default`");
+        match &entrada.execution {
+            Execution::Local(spec) => assert_eq!(spec.system_prompt(), ""),
+            Execution::Remote => panic!("el integrado es local"),
+        }
+    }
+
+    #[test]
+    fn persona_is_carried_from_the_profile_into_the_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        escribir(
+            dir.path(),
+            "frontend.md",
+            "---\nname: frontend\ndescription: UI\npersona:\n  role: Ingeniero de frontend\n  goal: Revisar la UI\n  backstory: Componentes pequeños\n---\n\nCuerpo.\n",
+        );
+
+        let carga = FileSource::new(dir.path().to_path_buf(), ProfileLevel::Global).load();
+
+        match &carga.entries[0].execution {
+            Execution::Local(spec) => {
+                assert_eq!(spec.persona_role.as_deref(), Some("Ingeniero de frontend"));
+                assert_eq!(spec.persona_goal.as_deref(), Some("Revisar la UI"));
+                assert_eq!(
+                    spec.persona_backstory.as_deref(),
+                    Some("Componentes pequeños")
+                );
+            }
+            Execution::Remote => panic!("un perfil de fichero es local"),
+        }
     }
 }

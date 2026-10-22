@@ -65,7 +65,10 @@ pub fn is_valid_agent_name(name: &str) -> bool   // solo a-z, 0-9 y '-', no vac�
 pub enum ProfileLevel { Global, Project }
 pub enum AgentOrigin { BuiltIn, File { path: PathBuf, level: ProfileLevel }, Remote { card_url: String } }
 pub struct LocalSpec { pub body: String, pub model: Option<String>, pub effort: Option<String>,
-                       pub max_turns: Option<u32>, pub max_depth: Option<u32> }
+                       pub max_turns: Option<u32>, pub max_depth: Option<u32>,
+                       pub persona_role: Option<String>, pub persona_goal: Option<String>,
+                       pub persona_backstory: Option<String> }   // añadidos en la corrección posterior a la tarea 2
+impl LocalSpec { pub fn system_prompt(&self) -> String }          // persona + cuerpo; ver tarea 6
 pub enum Execution { Local(LocalSpec), Remote }
 pub struct AgentEntry { pub name: String, pub origin: AgentOrigin, pub card: AgentCard, pub execution: Execution }
 pub enum LoadProblem { Profile { path: PathBuf, problem: ProfileProblem }, Shadowed { name: String, by: AgentOrigin, loser: AgentOrigin },
