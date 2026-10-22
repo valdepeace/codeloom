@@ -137,4 +137,31 @@ mod tests {
         assert!(out.content.contains("matches shown; narrow the pattern"));
         assert!(out.content.lines().count() <= MAX_HITS + 1);
     }
+
+    /// Peor caso real (regla 10 del decálogo de contexto): el incidente fue un `**/*` sobre este
+    /// mismo repositorio, con `target/` dentro. Se ignora por defecto porque depende del disco.
+    #[tokio::test]
+    #[ignore = "recorre el repositorio real; ejecutar con --ignored"]
+    async fn glob_everything_on_the_real_repository_stays_small() {
+        let raiz = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .unwrap()
+            .to_path_buf();
+        let out = GlobTool
+            .run(
+                ctx(&raiz),
+                serde_json::json!({"pattern":"**/*"}),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        println!(
+            "glob **/* -> {} bytes, {} líneas",
+            out.content.len(),
+            out.content.lines().count()
+        );
+        assert!(out.content.len() < 60_000, "{} bytes", out.content.len());
+        assert!(!out.content.contains("target"), "no debe recorrer target/");
+    }
 }
