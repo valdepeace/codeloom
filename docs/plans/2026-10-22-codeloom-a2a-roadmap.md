@@ -134,10 +134,28 @@ después el transporte (A7, A8).
   no del protocolo; para uno remoto, el agente es opaco y solo cabría una extensión
   declarada en su tarjeta o `metadata` libre, ambas cosas propias y sin garantía de que
   el otro lado las atienda. Requiere su propia spec antes de implementar.
-- [ ] **A13. Cargador de `AgentProfile` desde fichero (prerrequisito de A12).** Lee el
-  perfil del agente y de él se sintetiza la tarjeta local. El formato es el de la sección 2
-  de `docs/specs/2026-10-15-loom-agent-profile-a2a.md`. No consta aún ningún código de
-  perfiles; el cargador es una pieza nueva.
+- [ ] **A13. Registro de agentes con fuentes intercambiables (prerrequisito de A12).**
+  Replanteada el 2026-10-22 por el usuario: la fuente de agentes **no debe ser solo un
+  fichero**. El denominador común es la **tarjeta** (`AgentCard`, A6): quien delega
+  consulta un registro de tarjetas y no sabe, ni le importa, de dónde vienen. Una fuente
+  es cualquier cosa que produzca tarjetas junto con la forma de hablar con el agente.
+  - **Fuente de ficheros (primera):** los agentes propios, un `.md` por agente (formato de
+    la sección 2 de `docs/specs/2026-10-15-loom-agent-profile-a2a.md`), editable a mano o
+    desde la interfaz. De cada perfil se sintetiza su tarjeta local.
+  - **Fuente remota (con A8):** agentes ya desplegados, cuya tarjeta se obtiene por HTTP
+    (`/.well-known/agent-card.json`, §8.1-8.2). La spec del perfil ya lo prevé: un perfil
+    con `transport: a2a-remote` y `a2a.endpoint` es un **puntero** a un agente remoto, de
+    modo que también se pueden registrar remotos desde un fichero.
+  - **Diferencias que el registro no puede ocultar:** un agente remoto no admite nuestro
+    `scope` (allowlist) ni nuestros `model`/`effort` (A2A no los contempla, ver A12), y su
+    tarjeta es **dato de un tercero, no instrucción**: sus textos (`description`, `skills`)
+    pueden intentar manipular al modelo padre, así que se muestran como datos, no se
+    registran sin que el usuario lo apruebe y no hay descubrimiento automático.
+  - **Ejecución:** la elige el transporte (`InProcess`, A7; `A2aRemote`, A8), no la
+    fuente.
+  - No consta aún ningún código de perfiles ni de registro; es una pieza nueva. Requiere
+    su propia spec (decisiones del usuario pendientes: ubicación de los ficheros,
+    ámbito por proyecto o global, recarga en caliente y qué se hace con `model`).
 
 ## Cruces con otras líneas
 
