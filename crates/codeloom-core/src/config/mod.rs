@@ -36,6 +36,22 @@ fn default_max_steps() -> usize {
     30
 }
 
+/// Modo de confirmación al delegar en un subagente (`[agents] confirm_delegation`).
+///
+/// Solo cambia el texto de la regla que el prompt del padre recibe; no es una garantía
+/// de comportamiento, pues el cumplimiento depende del modelo.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConfirmDelegation {
+    /// Pregunta a la persona usuaria solo cuando duda entre varios agentes. Es el valor por defecto.
+    #[default]
+    Doubt,
+    /// Propone la asignación de cada tarea y espera la aprobación antes de delegar.
+    Always,
+    /// Delega sin preguntar y explica la elección en su respuesta.
+    Never,
+}
+
 /// Sección opcional `[agents]` de `codeloom.toml`. Sin ella, todo son valores por defecto.
 /// Vive aparte de `CodeLoomConfig` para que su ausencia no afecte a la configuración principal.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -47,6 +63,8 @@ pub struct AgentsConfig {
     pub project_dir: Option<PathBuf>,
     /// Aprueba todos los agentes de proyecto sin preguntar. Por defecto, desactivado.
     pub trust_project_agents: bool,
+    /// Cuándo se pregunta a la persona usuaria antes de delegar. Por defecto, `doubt`.
+    pub confirm_delegation: ConfirmDelegation,
 }
 
 /// Forma del fichero a efectos de la sección `[agents]`; el resto de claves se ignora.
@@ -294,5 +312,37 @@ mod tests {
         // La sección convive con el resto: la configuración principal sigue leyéndose igual.
         let cfg: CodeLoomConfig = toml::from_str(text).unwrap();
         assert_eq!(cfg.model, "gpt-4o");
+    }
+
+    #[test]
+    fn confirm_delegation_defaults_to_doubt() {
+        let sin_seccion = "model = \"gpt-4o\"\nprovider = { kind = \"openai_compat\", base_url = \"https://api.openai.com\", api_key_env = \"OPENAI_API_KEY\" }\n";
+        let agents = AgentsConfig::from_toml(sin_seccion).unwrap();
+        assert_eq!(agents.confirm_delegation, ConfirmDelegation::Doubt);
+
+        let sin_clave = format!("{sin_seccion}[agents]\ntrust_project_agents = false\n");
+        let agents = AgentsConfig::from_toml(&sin_clave).unwrap();
+        assert_eq!(agents.confirm_delegation, ConfirmDelegation::Doubt);
+    }
+
+    #[test]
+    fn confirm_delegation_reads_the_three_modes() {
+        let casos = [
+            ("doubt", ConfirmDelegation::Doubt),
+            ("always", ConfirmDelegation::Always),
+            ("never", ConfirmDelegation::Never),
+        ];
+        for (valor, esperado) in casos {
+            let text = format!("[agents]\nconfirm_delegation = \"{valor}\"\n");
+            let agents = AgentsConfig::from_toml(&text).unwrap();
+            assert_eq!(agents.confirm_delegation, esperado, "valor {valor}");
+        }
+    }
+
+    #[test]
+    fn confirm_delegation_rejects_unknown_values() {
+        let text = "[agents]\nconfirm_delegation = \"sometimes\"\n";
+        let error = AgentsConfig::from_toml(text).unwrap_err();
+        assert!(matches!(error, CoreError::Config(_)), "got {error:?}");
     }
 }
