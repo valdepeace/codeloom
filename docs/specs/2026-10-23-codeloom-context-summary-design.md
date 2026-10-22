@@ -105,3 +105,43 @@ anterior más lo que vino después.
   mensajes `user` consecutivos. Se comprueba con las serializaciones de OpenAI y Anthropic.
 - La estimación bytes/4 subestima el texto no latino; el ancla real lo corrige tras la primera
   respuesta.
+
+## Estado
+
+Implementado el 2026-10-23, **sin verlo aún en una terminal real ni contra un proveedor real**.
+Commits: `99d9c34` (ventana de contexto en el catálogo), `005bd7e` (funciones puras),
+`854f91c` (llamada de resumen y evento), `356b1a8` (integración en el bucle), `c7dd41b` (aviso
+propio en la TUI) y `cd04d13` (apunte del consumo de la llamada de resumen).
+
+### Desviaciones respecto al diseño original, todas deliberadas
+
+- **El corte nunca cae antes de un resumen previo.** El plan lo permitía y se perdía ese resumen;
+  lo detectó la implementación y se fijó con un test. Si el presupuesto de cola se agota antes del
+  resumen, la cola queda más corta que `KEEP_TAIL_TOKENS`.
+- **Un resumen truncado se descarta.** Un flujo que acaba en `Done(Error)` o sin `Done` no se
+  persiste: guardarlo envenenaría el contexto de toda la sesión.
+- **El tope de `MAX_SUMMARY_BYTES` es exacto.** El hueco del marcador de omisión de `limit_bytes`
+  (64 bytes) sale del propio tope.
+- **«Nada que resumir» no es un fallo.** Se comprueba que hay corte posible antes de llamar, de
+  modo que no se apaga la compactación el resto del turno.
+- **El consumo de la llamada de resumen se apunta** en el almacén y se publica a los contadores,
+  se acepte el resumen o no. Sin eso, el coste de compactar quedaba invisible.
+- **El resumen no entra en el historial del composer** (flecha arriba), y se reconoce desde la
+  cadena sin construir un `Message` por línea.
+
+### Lo que no consta o queda pendiente
+
+- **No se ha probado contra un proveedor real.** La calidad del resumen (qué conserva y qué pierde)
+  es una hipótesis hasta verla en sesiones largas.
+- **Dos mensajes `user` seguidos** (resumen y cola que empieza por usuario): ya ocurrían con los
+  avisos `[Job …]` tras un resultado de herramienta, y la API de Anthropic admite turnos
+  consecutivos del mismo rol, pero **no se ha contrastado** con la API real.
+- **Caché de prompt de Anthropic:** si algún día se activa, `input_tokens` puede no contar los
+  tokens cacheados y la estimación se quedaría corta; habría que sumar los campos de caché.
+- **Sin ventana conocida no se compacta** (modelo ausente del catálogo, catálogo sin descargar o
+  sin red). La limpieza de resultados antiguos sigue activa.
+- **`/compact` manual** y **reintento reactivo** ante un rechazo por contexto excedido: sin hacer.
+- **Presupuesto de tokens de gasto:** decisión de producto sin tomar.
+- **Subagentes:** heredan el mecanismo porque usan el mismo bucle y el catálogo compartido, pero
+  no hay un test específico de un hijo que compacte.
+- **Look clásico:** el cuerpo del resumen no se pliega (igual que el aviso de subagente).

@@ -78,7 +78,8 @@ Comparativa en `docs/references/contexto-y-coste/comparativa-herramientas.md`. C
 ## Preguntas abiertas
 
 - Al alcanzar un presupuesto de tokens: ¿parar el turno, preguntar, o solo avisar?
-- ¿Basta la limpieza de resultados o hará falta resumir con el modelo? Se mide con sesiones reales.
+- ¿Basta la limpieza de resultados o hará falta resumir con el modelo? Se decidió resumir, como
+  hacen los demás agentes: `2026-10-23-codeloom-context-summary-design.md`.
 
 ## Estado
 
@@ -88,7 +89,7 @@ avisos y de `grep`), `c4eb8d0` (limpieza de resultados antiguos en la petición)
 
 Limitaciones reales: el marcador de la limpieza de resultados antiguos **no** lleva la ruta del
 volcado (decisión 6, a medias); los avisos de subagente y de job se recortan pero **no** se
-vuelcan a disco (no tienen `call_id` a mano); un resumen del historial con el modelo, el
+vuelcan a disco (no tienen `call_id` a mano); el resumen del historial con el modelo se hizo después (véase la spec del 2026-10-23); el
 presupuesto de tokens y el tope de `AGENTS.md` siguen pendientes; las cifras son decisiones
 propias; el test de limpieza cubre una petición de un paso, no un bucle largo real; el volcado se
 poda solo al arrancar.

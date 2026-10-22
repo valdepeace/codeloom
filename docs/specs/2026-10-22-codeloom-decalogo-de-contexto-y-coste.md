@@ -70,10 +70,12 @@ que no tiene cota acabará, tarde o temprano, desbordándose.**
 4. **Recortar avisa y orienta.** Un recorte silencioso engaña al modelo. El aviso dice cuánto se
    mostró, cuánto había y qué hacer («estrecha el patrón», «usa `offset`»).
 5. **El historial no crece sin límite.** Cada paso reenvía toda la conversación. Hace falta
-   compactación o resumen de lo antiguo. *Estado: **parcial**. Hecha la limpieza de resultados
-   antiguos de herramientas en la petición (`2026-10-22-codeloom-context-compaction-design.md`);
-   el resumen del historial con el modelo sigue pendiente. Véase también
-   `2026-10-14-loom-kpis-prompt-compression.md`.*
+   compactación o resumen de lo antiguo. *Estado: **hecho en lo esencial**. Limpieza de
+   resultados antiguos de herramientas (`2026-10-22-codeloom-context-compaction-design.md`) y,
+   desde el 2026-10-23, resumen del historial con el modelo al alcanzar el 80 % de la ventana
+   (`2026-10-23-codeloom-context-summary-design.md`). Faltan `/compact` manual y el reintento
+   reactivo ante un rechazo por contexto excedido; sin ventana conocida no se compacta. Véase
+   también `2026-10-14-loom-kpis-prompt-compression.md`.*
 6. **El prompt de sistema también tiene cota.** Ficheros de contexto (`AGENTS.md`,
    `CODELOOM.md`), lista de agentes, habilidades y memoria se inyectan en cada petición.
    *Estado: **pendiente**; hoy se cargan enteros y sin tope.*
@@ -105,4 +107,5 @@ que no tiene cota acabará, tarde o temprano, desbordándose.**
   prudente, muy por debajo de los 25 000 tokens de Claude Code, y no una medida afinada. Conviene
   medir con sesiones reales.
 - ¿Presupuesto de tokens por turno y por sesión, con aviso a la persona usuaria al acercarse?
-- ¿Compactación automática o a petición (`/compact`)?
+- ¿Compactación a petición (`/compact`)? La automática ya existe; falta el mando manual, que
+  exige una infraestructura de comandos con barra que la TUI no tiene.
