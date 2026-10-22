@@ -300,6 +300,7 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &mut App, panes: &mut Vec
             && !app.queue_open
             && !app.settings_open
             && !app.help_open
+            && !app.agents_open
             && !app.tools_open,
         &app.model,
         &app.theme,
@@ -1031,6 +1032,48 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+/// Popup de `/agents`: el informe del registro, con desplazamiento vertical.
+fn draw_agents_overlay(frame: &mut Frame, area: Rect, app: &App) {
+    let width = area.width.min(96).saturating_sub(2);
+    let contenido = app.agents_text.len() as u16;
+    // Marco (2) más una línea en blanco y la de cierre.
+    let height = (contenido + 4).min(area.height.saturating_sub(2));
+    if width < 40 || height < 5 {
+        draw_resize_hint(frame, area, "Agents", app);
+        return;
+    }
+    let popup = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(" Agents ")
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(app.theme.styles.border);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let visibles = inner.height.saturating_sub(2) as usize;
+    let maximo = app.agents_text.len().saturating_sub(visibles) as u16;
+    let desde = app.agents_scroll.min(maximo) as usize;
+    let mut lineas: Vec<Line> = app
+        .agents_text
+        .iter()
+        .skip(desde)
+        .take(visibles)
+        .map(|l| Line::from(l.as_str()))
+        .collect();
+    lineas.push(Line::from(""));
+    lineas.push(Line::styled(
+        "↑/↓ scroll · Esc or Enter to close",
+        app.theme.styles.muted,
+    ));
+    frame.render_widget(Paragraph::new(lineas), inner);
+}
+
 /// Glifos de borde que el indicador de foco recolorea (nunca el texto del título).
 const BORDER_GLYPHS: [&str; 6] = ["─", "│", "╭", "╮", "╰", "╯"];
 
@@ -1329,6 +1372,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     if app.help_open {
         draw_help_overlay(frame, area, app);
     }
+    if app.agents_open {
+        draw_agents_overlay(frame, area, app);
+    }
     if app.tools_open {
         draw_tool_inspector(frame, area, app);
     }
@@ -1616,6 +1662,21 @@ mod tests {
         assert!(content.contains("Keyboard shortcuts"));
         assert!(content.contains("Ctrl+J"));
         assert!(content.contains("Ctrl+B"));
+    }
+
+    #[test]
+    fn agents_overlay_shows_the_loaded_agents() {
+        let mut app = App::new();
+        app.set_agent_registry(std::sync::Arc::new(
+            codeloom_core::registry::AgentRegistry::new(vec![Box::new(
+                codeloom_core::registry::BuiltInSource,
+            )]),
+        ));
+        app.show_agents();
+        let content = buffer_of(&mut app, 100, 30);
+        assert!(content.contains("Agents"), "{content}");
+        assert!(content.contains("Loaded agents:"), "{content}");
+        assert!(content.contains("default [usable] built-in"), "{content}");
     }
 
     #[test]

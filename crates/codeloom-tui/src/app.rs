@@ -502,6 +502,10 @@ pub struct App {
     /// Índice de la fila resaltada dentro de `picker_items()`.
     pub picker_selected: usize,
     pub help_open: bool,
+    /// Popup de `/agents` abierto, con el informe que mostraba el registro al abrirlo.
+    pub agents_open: bool,
+    pub agents_text: Vec<String>,
+    pub agents_scroll: u16,
 }
 
 impl Default for App {
@@ -680,6 +684,9 @@ impl App {
             picker_query: String::new(),
             picker_selected: 0,
             help_open: false,
+            agents_open: false,
+            agents_text: Vec::new(),
+            agents_scroll: 0,
             sidebar_expanded: false,
             rail_hidden: false,
         }
@@ -702,6 +709,7 @@ impl App {
             || self.session_loading
             || self.settings_open
             || self.help_open
+            || self.agents_open
             || self.tools_open
             || self.queue_open
             || self.slash_dismissed.as_deref() == Some(text)
@@ -804,18 +812,16 @@ impl App {
         self.agent_registry = Some(registry);
     }
 
-    /// Informe de los agentes cargados, como línea de interfaz del transcript (no pasa al
-    /// historial del modelo ni se persiste). Lee la instantánea vigente en el momento.
+    /// Abre el popup de `/agents` con el informe de la instantánea vigente del registro. Se
+    /// toma una copia al abrir: el popup no cambia mientras está a la vista.
     pub fn show_agents(&mut self) {
         let texto = match &self.agent_registry {
             Some(registro) => registro.snapshot().report(),
             None => "No agent registry available".to_string(),
         };
-        self.transcript.push_entry(
-            batten::state::LineKind::System,
-            batten::state::Format::Plain,
-            texto,
-        );
+        self.agents_text = texto.lines().map(str::to_owned).collect();
+        self.agents_scroll = 0;
+        self.agents_open = true;
     }
 
     pub fn open_settings(&mut self) {
@@ -1760,6 +1766,7 @@ impl App {
         self.queue_open = false;
         self.queue_editing = false;
         self.help_open = false;
+        self.agents_open = false;
         self.settings_open = false;
         self.settings_editing = false;
         self.permission_queue.push_back((req, reply));
@@ -1802,6 +1809,7 @@ impl App {
         self.queue_open = false;
         self.queue_editing = false;
         self.help_open = false;
+        self.agents_open = false;
         self.settings_open = false;
         self.settings_editing = false;
         self.question_queue.push_back((questions, reply));
@@ -3239,29 +3247,24 @@ mod tests {
     }
 
     #[test]
-    fn show_agents_writes_the_registry_report_to_the_transcript() {
+    fn show_agents_opens_a_popup_with_the_registry_report() {
         let mut app = App::new();
         app.show_agents();
-        let ultima = app.transcript.entry_count() - 1;
-        assert_eq!(
-            app.transcript.entry_lines(ultima)[0].plain(),
-            "No agent registry available"
-        );
+        assert!(app.agents_open);
+        assert_eq!(app.agents_text, vec!["No agent registry available"]);
 
         let registro = codeloom_core::registry::AgentRegistry::new(vec![Box::new(
             codeloom_core::registry::BuiltInSource,
         )]);
         app.set_agent_registry(Arc::new(registro));
         app.show_agents();
-        let ultima = app.transcript.entry_count() - 1;
-        let texto: Vec<&str> = app
-            .transcript
-            .entry_lines(ultima)
-            .iter()
-            .map(|l| l.plain())
-            .collect();
-        assert_eq!(texto[0], "Loaded agents:");
-        assert!(texto[1].contains("default [usable] built-in"), "{texto:?}");
+        assert_eq!(app.agents_text[0], "Loaded agents:");
+        assert!(
+            app.agents_text[1].contains("default [usable] built-in"),
+            "{:?}",
+            app.agents_text
+        );
+        assert_eq!(app.agents_scroll, 0);
     }
 
     #[test]

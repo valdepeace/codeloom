@@ -217,6 +217,21 @@ pub fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Option<St
         }
         return None;
     }
+    if app.agents_open {
+        match code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => app.agents_open = false,
+            KeyCode::Up => app.agents_scroll = app.agents_scroll.saturating_sub(1),
+            KeyCode::Down | KeyCode::PageDown => {
+                let paso = if code == KeyCode::Down { 1 } else { 10 };
+                let tope = app.agents_text.len().saturating_sub(1) as u16;
+                app.agents_scroll = app.agents_scroll.saturating_add(paso).min(tope);
+            }
+            KeyCode::PageUp => app.agents_scroll = app.agents_scroll.saturating_sub(10),
+            KeyCode::Home => app.agents_scroll = 0,
+            _ => {}
+        }
+        return None;
+    }
     if app.tools_open {
         match code {
             KeyCode::Esc => {
@@ -894,6 +909,7 @@ pub fn handle_event(app: &mut App, ev: Event) -> Option<String> {
                 && !app.queue_open
                 && !app.settings_open
                 && !app.help_open
+                && !app.agents_open
                 && !app.tools_open
                 && match k.code {
                     KeyCode::Char(_) => app.focus == Focus::Composer,
@@ -917,6 +933,7 @@ pub fn handle_event(app: &mut App, ev: Event) -> Option<String> {
                 && !app.session_loading
                 && !app.settings_open
                 && !app.help_open
+                && !app.agents_open
                 && !app.tools_open
                 && !app.queue_open
                 && app.permission.is_none()
@@ -945,6 +962,7 @@ pub fn handle_event(app: &mut App, ev: Event) -> Option<String> {
             if !app.session_picker_open
                 && !app.session_loading
                 && !app.help_open
+                && !app.agents_open
                 && !app.tools_open
                 && app.permission.is_none()
                 && app.question.is_none() =>
@@ -3068,6 +3086,25 @@ mod tests {
         assert_eq!(app.theme_preset, ThemePreset::Batten);
         assert_eq!(app.theme.look, Look::classic());
         assert_eq!(app.slash_feedback.as_deref(), Some("Theme: Batten"));
+    }
+
+    #[test]
+    fn agents_command_opens_a_popup_that_esc_closes() {
+        let mut app = App::new();
+        app.composer.set_text("/agents");
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE),
+            None
+        );
+        assert!(app.agents_open);
+        assert!(app.composer.is_empty());
+
+        // Con el popup abierto, las teclas no llegan al composer.
+        handle_key(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert!(app.composer.is_empty());
+
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!app.agents_open);
     }
 
     #[test]
