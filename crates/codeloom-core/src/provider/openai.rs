@@ -525,6 +525,7 @@ mod effort_tests {
         let wire = super::wire_messages(&msgs);
         let sent = wire[0]["content"].as_str().unwrap();
         assert!(sent.len() < big.len());
-        assert!(sent.contains("[output truncated:"));
+        // ADAPTADO: el resultado se recorta ahora con cabeza y cola y el marcador «bytes omitted».
+        assert!(sent.contains("bytes omitted ...]"));
     }
 }

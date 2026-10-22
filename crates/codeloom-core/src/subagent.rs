@@ -842,7 +842,8 @@ mod tests {
             "medía {}",
             texto.len()
         );
-        assert!(texto.contains("[output truncated:"));
+        // ADAPTADO: el aviso se recorta ahora con cabeza y cola y el marcador «bytes omitted».
+        assert!(texto.contains("bytes omitted ...]"));
     }
 
     #[tokio::test]

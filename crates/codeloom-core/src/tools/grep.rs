@@ -10,6 +10,31 @@ const MAX_GREP_MATCHES: usize = 200;
 /// Caracteres que se conservan de cada línea coincidente.
 const MAX_GREP_LINE_CHARS: usize = 300;
 
+/// Indica si `path` casa con el filtro `glob`. Se compara con la ruta relativa a `cwd` y, si el
+/// patrón no contiene `/` (`por_nombre`), también con el nombre del fichero, de modo que `*.rs`
+/// case con `src/a.rs`.
+fn glob_matches(
+    pattern: &glob::Pattern,
+    por_nombre: bool,
+    cwd: &std::path::Path,
+    path: &std::path::Path,
+) -> bool {
+    let relativa = path.strip_prefix(cwd).unwrap_or(path);
+    // Con separador literal, `*` no cruza directorios (`src/*.rs` no casa con `src/hondo/a.rs`);
+    // para recorrerlos está `**`.
+    let opciones = glob::MatchOptions {
+        require_literal_separator: true,
+        ..Default::default()
+    };
+    if pattern.matches_path_with(relativa, opciones) {
+        return true;
+    }
+    por_nombre
+        && path
+            .file_name()
+            .is_some_and(|nombre| pattern.matches(&nombre.to_string_lossy()))
+}
+
 /// Recorta `line` a `max` caracteres por una frontera de carácter, marcando el corte.
 fn cut_line(line: &str, max: usize) -> String {
     match line.char_indices().nth(max) {
@@ -46,6 +71,15 @@ impl Tool for GrepTool {
     ) -> Result<ToolOutput> {
         let pattern = input["pattern"].as_str().unwrap_or_default();
         let re = regex::Regex::new(pattern).map_err(|e| CoreError::Tool(e.to_string()))?;
+        // Patrón `glob` opcional y si debe casar también con el nombre del fichero.
+        let filtro = match input["glob"].as_str() {
+            Some(texto) => {
+                let patron = glob::Pattern::new(texto)
+                    .map_err(|e| CoreError::Tool(format!("glob inválido «{texto}»: {e}")))?;
+                Some((patron, !texto.contains('/')))
+            }
+            None => None,
+        };
         let cwd = ctx.cwd.clone();
         let (hits, total) = tokio::task::spawn_blocking(move || {
             let mut shown = Vec::new();
@@ -53,6 +87,11 @@ impl Tool for GrepTool {
             for entry in ignore::WalkBuilder::new(&cwd).build().flatten() {
                 if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
                     continue;
+                }
+                if let Some((patron, por_nombre)) = &filtro {
+                    if !glob_matches(patron, *por_nombre, &cwd, entry.path()) {
+                        continue;
+                    }
                 }
                 let Ok(content) = std::fs::read_to_string(entry.path()) else {
                     continue;
@@ -163,5 +202,55 @@ mod tests {
         assert!(!out.content.contains(&"ñ".repeat(301)));
         // Sin aviso final: hay una sola coincidencia.
         assert!(!out.content.contains("matches shown"));
+    }
+
+    #[tokio::test]
+    async fn grep_honours_the_glob_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "needle\n").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "needle\n").unwrap();
+        let out = GrepTool
+            .run(
+                ctx(dir.path()),
+                serde_json::json!({"pattern":"needle","glob":"*.rs"}),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(out.content.contains("a.rs:1: needle"));
+        assert!(!out.content.contains("b.txt"));
+    }
+
+    #[tokio::test]
+    async fn grep_glob_star_does_not_cross_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/hondo")).unwrap();
+        std::fs::write(dir.path().join("src/a.rs"), "needle\n").unwrap();
+        std::fs::write(dir.path().join("src/hondo/b.rs"), "needle\n").unwrap();
+        let out = GrepTool
+            .run(
+                ctx(dir.path()),
+                serde_json::json!({"pattern":"needle","glob":"src/*.rs"}),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(out.content.contains("a.rs:1: needle"));
+        assert!(!out.content.contains("b.rs"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn grep_rejects_an_invalid_glob() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "needle\n").unwrap();
+        let err = GrepTool
+            .run(
+                ctx(dir.path()),
+                serde_json::json!({"pattern":"needle","glob":"[abc"}),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CoreError::Tool(_)));
     }
 }

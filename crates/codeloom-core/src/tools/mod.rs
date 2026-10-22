@@ -56,22 +56,29 @@ pub const MAX_TOOL_OUTPUT_BYTES: usize = 20_000;
 /// entra al historial como mensaje de usuario, por el que el tope de herramientas no pasa.
 pub const MAX_NOTICE_BYTES: usize = 8_000;
 
-/// Recorta `content` a `max` bytes por una frontera de carácter y añade un aviso con el
-/// tamaño original. Si cabe, lo devuelve intacto.
+/// Recorta `content` conservando `max / 2` bytes del principio y `max / 2` del final, y
+/// sustituye lo omitido por un marcador con el número de bytes suprimidos. Ambos cortes
+/// caen en frontera de carácter: el de cabeza retrocede y el de cola avanza, de modo que
+/// nunca se conserva más de `max` bytes. Si `content` cabe en `max`, lo devuelve intacto.
 pub fn limit_bytes(content: &str, max: usize) -> std::borrow::Cow<'_, str> {
     if content.len() <= max {
         return std::borrow::Cow::Borrowed(content);
     }
-    let mut end = max;
-    while !content.is_char_boundary(end) {
-        end -= 1;
+    let half = max / 2;
+    let mut head_end = half;
+    while !content.is_char_boundary(head_end) {
+        head_end -= 1;
     }
+    let mut tail_start = content.len() - half;
+    while !content.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    let kept = head_end + (content.len() - tail_start);
+    let omitted = content.len() - kept;
     std::borrow::Cow::Owned(format!(
-        "{}
-[output truncated: {} of {} bytes shown; narrow the request]",
-        &content[..end],
-        end,
-        content.len()
+        "{}\n[... {omitted} bytes omitted ...]\n{}",
+        &content[..head_end],
+        &content[tail_start..]
     ))
 }
 
@@ -179,18 +186,47 @@ mod tests {
         let big = "ñ".repeat(MAX_TOOL_OUTPUT_BYTES);
         let out = limit_output(&big);
         assert!(out.len() < big.len());
-        assert!(out.contains("[output truncated:"));
-        assert!(out.contains(&format!("of {} bytes", big.len())));
+        // ADAPTADO: el marcador es ahora «[... N bytes omitted ...]» (cabeza y cola), no el antiguo
+        // «[output truncated: ...]». La cota de tamaño se mantiene: el marcador es corto.
+        assert!(out.len() < MAX_TOOL_OUTPUT_BYTES + 100);
+        assert!(out.contains("\n[... 20000 bytes omitted ...]\n"));
     }
 
     #[test]
     fn limit_bytes_respects_the_given_cap() {
         assert_eq!(limit_bytes("corto", 10), "corto");
-        // Cada «ñ» ocupa 2 bytes: el corte de 51 bytes cae a mitad de carácter y retrocede a 50.
+        // Cada «ñ» ocupa 2 bytes. ADAPTADO: con cabeza y cola, cada extremo recibe 25 bytes, que
+        // los cortes ajustan a 24 (12 «ñ») y se omiten 152 de 200. El tope sigue verificándose:
+        // lo conservado (sin el marcador) no supera los 51 bytes pedidos.
         let big = "ñ".repeat(100);
         let out = limit_bytes(&big, 51);
-        assert!(out.starts_with(&"ñ".repeat(25)));
-        assert!(!out.starts_with(&"ñ".repeat(26)));
-        assert!(out.contains("[output truncated: 50 of 200 bytes"));
+        let marcador = "\n[... 152 bytes omitted ...]\n";
+        assert!(out.starts_with(&"ñ".repeat(12)));
+        assert!(!out.starts_with(&"ñ".repeat(13)));
+        assert!(out.contains(marcador));
+        assert!(out.len() - marcador.len() <= 51);
+    }
+
+    #[test]
+    fn limit_bytes_keeps_head_and_tail() {
+        let original = format!("{}{}{}", "a".repeat(100), "m".repeat(800), "z".repeat(100));
+        let out = limit_bytes(&original, 200);
+        // Se conservan 100 bytes de cada extremo; omitidos = 1 000 − 200 = 800.
+        assert!(out.starts_with(&"a".repeat(100)));
+        assert!(out.ends_with(&"z".repeat(100)));
+        assert!(out.contains("\n[... 800 bytes omitted ...]\n"));
+        assert!(out.len() < original.len());
+    }
+
+    #[test]
+    fn limit_bytes_cuts_on_char_boundaries_at_both_ends() {
+        // Cada «ñ» ocupa 2 bytes. Con max 51 el corte de cabeza (25) cae a mitad de carácter y
+        // retrocede a 24; el de cola (175) también y avanza a 176. Se conservan 48 bytes.
+        let original = "ñ".repeat(100);
+        let out = limit_bytes(&original, 51);
+        assert!(out.starts_with(&"ñ".repeat(12)));
+        assert!(!out.starts_with(&"ñ".repeat(13)));
+        assert!(out.ends_with(&"ñ".repeat(12)));
+        assert!(out.contains("\n[... 152 bytes omitted ...]\n"));
     }
 }

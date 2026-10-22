@@ -1190,7 +1190,8 @@ mod tests {
             "medía {}",
             aviso.len()
         );
-        assert!(aviso.contains("[output truncated:"));
+        // ADAPTADO: el aviso se recorta ahora con cabeza y cola y el marcador «bytes omitted».
+        assert!(aviso.contains("bytes omitted ...]"));
     }
 
     /// Catálogo con `acme` (`https://acme.example/v1`) y dos modelos con precios distintos.
