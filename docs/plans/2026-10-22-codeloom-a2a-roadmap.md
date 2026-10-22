@@ -153,9 +153,25 @@ después el transporte (A7, A8).
     registran sin que el usuario lo apruebe y no hay descubrimiento automático.
   - **Ejecución:** la elige el transporte (`InProcess`, A7; `A2aRemote`, A8), no la
     fuente.
+  - **Decisiones del usuario (2026-10-22).** Ubicación: global en `~/.agents/agents/` y
+    por proyecto en una carpeta del repo, configurables ambas; el proyecto prevalece sobre
+    lo global si coinciden (precedencia nuestra). A2A **no** recomienda carpeta alguna:
+    su §8.2 solo da tres vías de descubrimiento («Well-Known URI», «Registries/Catalogs»
+    y «Direct Configuration: Pre-configured Agent Card URLs or content»); nuestros
+    ficheros son la tercera y los remotos la primera. Recarga en caliente: sí, desde el
+    principio.
+  - **Tres niveles de agente** (modelo y esfuerzo son configuración de **ejecución local**,
+    no parte del protocolo ni de la tarjeta, y no viajan en ella):
+    1. **Default:** agente genérico local, para cuando no hay candidato o el modelo padre
+       no sabe cuál elegir; hereda modelo y esfuerzo del padre. La caída al default debe
+       ser visible y razonada en la interfaz.
+    2. **Propios (ficheros):** mandan el `model` y el `effort` del perfil; si faltan,
+       heredan del padre.
+    3. **Externos (remotos):** no se pueden enviar modelo ni esfuerzo; la interfaz indica
+       que los decide el agente remoto, y un `model` en un perfil remoto se ignora con
+       aviso.
   - No consta aún ningún código de perfiles ni de registro; es una pieza nueva. Requiere
-    su propia spec (decisiones del usuario pendientes: ubicación de los ficheros,
-    ámbito por proyecto o global, recarga en caliente y qué se hace con `model`).
+    su propia spec.
 
 ## Cruces con otras líneas
 
