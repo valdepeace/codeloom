@@ -238,6 +238,14 @@ impl AgentLoop {
         }
 
         let mut system = crate::config::context::load_context_files(&self.cwd).join("\n\n");
+        // Con la herramienta `subagent` y un registro, el modelo recibe la lista vigente de agentes:
+        // se lee en cada turno, de modo que la recarga en caliente también le llega.
+        if let (Some(_), Some(registro)) = (&self.subagents, &self.registry) {
+            if !system.is_empty() {
+                system.push_str("\n\n");
+            }
+            system.push_str(&registro.snapshot().prompt_section());
+        }
         // El prompt propio del agente va detrás del contexto del proyecto, sin sustituirlo.
         if let Some(extra) = self
             .system_extra
@@ -1326,6 +1334,98 @@ mod tests {
         assert!(
             (total - 0.00057).abs() < 1e-12,
             "total de la sesión: {total}"
+        );
+    }
+
+    /// Proveedor que anota el prompt de sistema de cada petición que recibe.
+    struct SystemSpy {
+        seen: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl Provider for SystemSpy {
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                tool_use: false,
+                reasoning: false,
+                streaming: true,
+            }
+        }
+        async fn stream(
+            &self,
+            req: ProviderRequest,
+            _cancel: CancellationToken,
+        ) -> Result<ProviderStream> {
+            self.seen.lock().unwrap().push(req.system.clone());
+            Ok(Box::pin(futures::stream::iter(vec![StreamChunk::Done(
+                FinishReason::Stop,
+            )])))
+        }
+    }
+
+    #[tokio::test]
+    async fn the_model_is_told_which_agents_it_can_delegate_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let agentes = dir.path().join("agentes");
+        std::fs::create_dir(&agentes).unwrap();
+        std::fs::write(
+            agentes.join("rust.md"),
+            "---
+name: rust
+description: Experto en Rust
+---
+
+Cuerpo.
+",
+        )
+        .unwrap();
+        let registro = Arc::new(crate::registry::AgentRegistry::new(vec![
+            Box::new(crate::registry::BuiltInSource),
+            Box::new(crate::registry::FileSource::new(
+                agentes,
+                crate::registry::ProfileLevel::Global,
+            )),
+        ]));
+        let provider = Arc::new(SystemSpy {
+            seen: Mutex::new(Vec::new()),
+        });
+        let store = Arc::new(
+            SqliteStore::open(dir.path().join("s.db").to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+        let sid = store.create_session("/p").await.unwrap();
+        let cfg = CodeLoomConfig {
+            provider: crate::config::ProviderConfig {
+                kind: crate::config::ProviderKind::OpenAiCompat,
+                base_url: "http://x".into(),
+                api_key_env: "K".into(),
+            },
+            model: "m".into(),
+            max_steps: 5,
+            effort: None,
+        };
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(crate::tools::subagent::SubagentTool));
+        let agent = AgentLoop::new(
+            provider.clone(),
+            store,
+            Arc::new(tools),
+            EventBus::new(64),
+            Arc::new(PermissionService::allow_all()),
+            cfg,
+            dir.path().to_path_buf(),
+        )
+        .with_agent_registry(registro);
+        agent
+            .run(sid, "hi".into(), CancellationToken::new())
+            .await
+            .unwrap();
+        let vistos = provider.seen.lock().unwrap();
+        assert!(
+            vistos[0].contains("- rust (global): Experto en Rust"),
+            "el modelo debe ver el agente: {}",
+            vistos[0]
         );
     }
 }

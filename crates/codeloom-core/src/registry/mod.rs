@@ -79,6 +79,57 @@ impl RegistrySnapshot {
             AgentOrigin::Remote { .. } => Approval::Pending,
         })
     }
+
+    /// Sección del prompt de sistema que enumera los agentes a los que la herramienta
+    /// `subagent` puede delegar. Sin ella el modelo no tiene forma de saber cuáles existen.
+    ///
+    /// Los agentes que aún no se pueden usar (de proyecto sin aprobar, remotos sin transporte)
+    /// no se ofrecen: solo se nombran aparte, para que el modelo no los intente invocar.
+    pub fn prompt_section(&self) -> String {
+        let mut disponibles = Vec::new();
+        let mut pendientes = Vec::new();
+        for entrada in self.entries() {
+            let usable = matches!(
+                self.approval(&entrada.name),
+                Some(Approval::NotRequired | Approval::Approved)
+            );
+            if !usable {
+                pendientes.push(entrada.name.as_str());
+                continue;
+            }
+            let origen = match &entrada.origin {
+                AgentOrigin::BuiltIn => "built-in",
+                AgentOrigin::File {
+                    level: ProfileLevel::Global,
+                    ..
+                } => "global",
+                AgentOrigin::File {
+                    level: ProfileLevel::Project,
+                    ..
+                } => "project",
+                AgentOrigin::Remote { .. } => "remote",
+            };
+            let descripcion = entrada.card.description.trim();
+            if descripcion.is_empty() {
+                disponibles.push(format!("- {} ({origen})", entrada.name));
+            } else {
+                disponibles.push(format!("- {} ({origen}): {descripcion}", entrada.name));
+            }
+        }
+        let mut texto = String::from(
+            "## Available agents\n\
+             The `subagent` tool delegates work to one of these agents through its optional \
+             `agent` argument; omit it to use `default`.\n",
+        );
+        texto.push_str(&disponibles.join("\n"));
+        if !pendientes.is_empty() {
+            texto.push_str(&format!(
+                "\nNot usable yet (awaiting approval: {}).",
+                pendientes.join(", ")
+            ));
+        }
+        texto
+    }
 }
 
 /// Registro de agentes. Las fuentes se pasan de menor a mayor precedencia: la última gana.
@@ -305,6 +356,35 @@ mod tests {
             })
         );
         assert!(instantanea.problems().is_empty());
+    }
+
+    #[test]
+    fn prompt_section_lists_usable_agents_and_flags_the_pending_ones() {
+        let global = tempfile::tempdir().unwrap();
+        let proyecto = tempfile::tempdir().unwrap();
+        escribir(global.path(), "rust.md", &perfil("rust", "Experto en Rust"));
+        escribir(
+            proyecto.path(),
+            "front.md",
+            &perfil("front", "Interfaz del proyecto"),
+        );
+
+        let seccion = registro_con_global_y_proyecto(global.path(), proyecto.path())
+            .snapshot()
+            .prompt_section();
+
+        assert!(seccion.contains("`subagent`"), "{seccion}");
+        assert!(seccion.contains("- default (built-in)"), "{seccion}");
+        assert!(
+            seccion.contains("- rust (global): Experto en Rust"),
+            "{seccion}"
+        );
+        // El de proyecto sin aprobar no se ofrece como disponible, pero se nombra.
+        assert!(!seccion.contains("- front"), "{seccion}");
+        assert!(
+            seccion.contains("awaiting approval: front"),
+            "se debe avisar del agente pendiente: {seccion}"
+        );
     }
 
     #[test]
