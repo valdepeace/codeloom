@@ -104,6 +104,20 @@ después el transporte (A7, A8).
   spec, una tarea terminal no se reinicia: el seguimiento es una **tarea nueva** en el
   mismo `contextId`, con `reference_task_ids`. El nombre `follow_up_of` es nuestro;
   valorar si debe alinearse con `reference_task_ids`. Los ids los genera el servidor.
+- [ ] **A12. Delegar por perfil, con modelo y esfuerzo (idea del 2026-10-22).** Elegir
+  al especialista según la tarea (front, Rust, etc.) a partir de las `skills[]` con
+  `tags` de su tarjeta (A6) y de su `AgentProfile`. **A2A no fija cómo se elige** al
+  agente: es decisión nuestra y se rotula como propia. Opciones: que decida el modelo
+  padre viendo las tarjetas, regla determinista por etiquetas, o un enrutador
+  (`model.route` de la pista Jevalan, con la guarda «regla antes que clasificador»).
+  Debe quedar visible qué especialista se eligió y por qué (observabilidad).
+  **Modelo y esfuerzo:** en la especificación (`spec.md` y `a2a.proto`) **no consta**
+  ningún campo de modelo ni de esfuerzo de razonamiento; `SendMessageConfiguration` solo
+  trae `accepted_output_modes`, la configuración de notificaciones push, `history_length`
+  y `return_immediately`. Para un subagente local es un parámetro nuestro del lanzador,
+  no del protocolo; para uno remoto, el agente es opaco y solo cabría una extensión
+  declarada en su tarjeta o `metadata` libre, ambas cosas propias y sin garantía de que
+  el otro lado las atienda. Requiere su propia spec antes de implementar.
 
 ## Cruces con otras líneas
 
