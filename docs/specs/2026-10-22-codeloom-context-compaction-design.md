@@ -54,6 +54,27 @@ decisiones propias.**
 - Un aviso de subagente con 50 000 bytes llega al historial recortado a 8 000 más el aviso.
 - `grep` sobre un directorio con miles de coincidencias devuelve 200 y el aviso.
 
+## Revisión tras contrastar con otras herramientas (2026-10-22)
+
+Comparativa en `docs/references/contexto-y-coste/comparativa-herramientas.md`. Cambia lo siguiente
+(sigue siendo decisión propia, ahora con precedentes):
+
+4. **Cabeza y cola, no solo cabeza.** `limit_bytes` conservará mitad de presupuesto al principio y
+   mitad al final, con un marcador que cuenta los bytes omitidos
+   (`[... N bytes omitted ...]`). Precedentes: codex, crush, deepseek-harness, qwen-code. Cortes
+   siempre en frontera de carácter.
+5. **Volcado a disco de lo recortado.** Cuatro de cinco agentes con bucle propio (crush, opencode,
+   qwen-code, deepseek-harness) guardan la salida completa y ponen la ruta en el marcador. Codeloom
+   guardará el original en `<datos>/tool-output/` (retención de 7 días y tope de 256 MiB por
+   directorio, como crush) y el marcador dirá la ruta, que el modelo puede leer con `view`.
+   Sin directorio de datos configurado (tests), no se vuelca y el marcador no lleva ruta.
+6. **La limpieza de resultados antiguos** (decisión 1) sigue el modelo de qwen-code: marcador fijo,
+   se conservan los más recientes. Si el resultado se volcó a disco, el marcador incluye la ruta.
+7. **Sin tope para `AGENTS.md` por ahora.** Hay precedentes de 32-64 KiB, pero aquí no hay un
+   incidente que lo justifique; se anota como pendiente en el decálogo (regla 6).
+8. **Fallo preexistente detectado:** el parámetro `glob` de `grep` figura en la descripción y en el
+   esquema, pero el código no lo usa.
+
 ## Preguntas abiertas
 
 - Al alcanzar un presupuesto de tokens: ¿parar el turno, preguntar, o solo avisar?

@@ -46,6 +46,36 @@ más allá de `keep` y cuyo `content.len() > CLEAR_MIN_BYTES` tienen su `content
   sigue completo.
 - [ ] Implementar. Verificar. No commitear.
 
-## Tarea 3: documentación
+## Tarea 3: cabeza y cola en `limit_bytes`
+
+**Fichero:** `crates/codeloom-core/src/tools/mod.rs`. `limit_bytes(content, max)` conserva `max/2` bytes
+del principio y `max/2` del final (ambos cortes en frontera de carácter) y entre ellos
+`
+[... {omitidos} bytes omitted ...]
+`; cabe sin tocar si `len <= max`. Se conservan los tests
+actuales ajustando sus aserciones al nuevo marcador (márcalos `ADAPTADO`) y se añaden
+`limit_bytes_keeps_head_and_tail` y `limit_bytes_cuts_on_char_boundaries_at_both_ends` (con `ñ`).
+
+## Tarea 4: volcado a disco de lo recortado
+
+**Ficheros:** nuevo `crates/codeloom-core/src/tools/spill.rs`, `tools/mod.rs`, `agent/mod.rs`,
+`codeloom-cli/src/main.rs` (cableado). `ToolSpill { dir: PathBuf }` con
+`fn save(&self, call_id: &str, content: &str) -> Option<PathBuf>`: escribe
+`<dir>/tool-<call_id saneado>.txt` y, al abrir, borra ficheros de más de 7 días y, si el directorio
+pasa de 256 MiB, los más antiguos. `AgentLoop::with_spill(ToolSpill)`; al crear el `ToolResult`, si
+`out.content` supera el tope y hay `spill`, se guarda el original y el marcador añade
+`full output: {ruta}`. Fallo al guardar: se deja el recorte sin ruta, nunca se convierte un éxito en
+error. Tests: guarda y devuelve ruta; limpia por antigüedad; sin `spill` no hay ruta; nombre de
+fichero saneado (sin `..` ni separadores).
+
+## Tarea 5: el parámetro `glob` de `grep`
+
+**Fichero:** `tools/grep.rs`. Aplicar el filtro `glob` (patrón relativo a `cwd`, con
+`glob::Pattern`) o retirarlo del esquema y la descripción. Test: `grep_honours_the_glob_filter`.
+
+## Tarea 6: documentación
+
+Estado en la spec; decálogo: reglas 3, 4, 5 (parcial) y 8; comparativa enlazada.
+
 
 Estado en la spec; decálogo: reglas 5 (parcial: limpieza hecha, resumen pendiente), 3 y 8 (hechas).

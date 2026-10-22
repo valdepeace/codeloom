@@ -33,3 +33,7 @@ páginas externas cambian: se anota la versión o la fecha que mostraban.
 
 Resúmenes de terceros que dieron la numeración errónea «LLM06:2026» y que no se usan como
 fuente: superwise.ai, cycode.com, dev.to/lusivision, aigl.blog, getmaxim.ai, imperva.com.
+
+## Comparativa de otras herramientas
+
+Véase `comparativa-herramientas.md` (código leído de los repos de referencia, no URL).
