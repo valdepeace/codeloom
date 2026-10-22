@@ -196,6 +196,8 @@ impl InProcessSubagentLauncher {
             status: TaskStatus::new(TaskState::Rejected).with_message(MENSAJE_CAPACIDAD),
             artifacts: Vec::new(),
             notice_delivered: false,
+            agent: None,
+            agent_origin: None,
         };
         self.store.save_subagent(&descriptor).await?;
         self.bus.publish(LiveEvent::SubagentChanged(descriptor));
@@ -367,6 +369,8 @@ impl SubagentLauncher for InProcessSubagentLauncher {
             status: TaskStatus::new(TaskState::Submitted),
             artifacts: Vec::new(),
             notice_delivered: false,
+            agent: None,
+            agent_origin: None,
         };
         if let Err(error) = self.store.save_subagent(&descriptor).await {
             let _ = self.jobs.kill(parent, job.id());
@@ -1750,6 +1754,8 @@ mod tests {
                 status: TaskStatus::new(TaskState::Completed),
                 artifacts: vec![Artifact::text_artifact("hecho")],
                 notice_delivered: false,
+                agent: None,
+                agent_origin: None,
             })
             .await
             .unwrap();

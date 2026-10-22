@@ -2865,6 +2865,8 @@ mod tests {
                     "partial output",
                 )],
                 notice_delivered: false,
+                agent: None,
+                agent_origin: None,
             }],
         );
         assert_eq!(
@@ -2885,6 +2887,8 @@ mod tests {
             status: TaskStatus::new(TaskState::Working),
             artifacts: Vec::new(),
             notice_delivered: false,
+            agent: None,
+            agent_origin: None,
         }
     }
 
@@ -3502,6 +3506,8 @@ mod tests {
             status: TaskStatus::new(state),
             artifacts: Vec::new(),
             notice_delivered: false,
+            agent: None,
+            agent_origin: None,
         }
     }
 
@@ -4536,6 +4542,8 @@ mod tests {
             status: TaskStatus::new(state),
             artifacts: Vec::new(),
             notice_delivered: false,
+            agent: None,
+            agent_origin: None,
         }
     }
 

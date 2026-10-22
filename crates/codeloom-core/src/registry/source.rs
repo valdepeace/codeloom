@@ -34,6 +34,24 @@ pub enum AgentOrigin {
     },
 }
 
+impl AgentOrigin {
+    /// Texto estable del origen, tal como se guarda en el descriptor del subagente:
+    /// `built-in`, `global:<ruta>`, `project:<ruta>` o `remote:<url>`.
+    pub fn as_text(&self) -> String {
+        match self {
+            AgentOrigin::BuiltIn => "built-in".to_string(),
+            AgentOrigin::File { path, level } => {
+                let nivel = match level {
+                    ProfileLevel::Global => "global",
+                    ProfileLevel::Project => "project",
+                };
+                format!("{nivel}:{}", path.display())
+            }
+            AgentOrigin::Remote { card_url } => format!("remote:{card_url}"),
+        }
+    }
+}
+
 /// Configuración de ejecución local. No viaja en la tarjeta.
 ///
 /// `body` es el prompt de sistema. Cadena vacía y sin modelo ni esfuerzo significa «heredar

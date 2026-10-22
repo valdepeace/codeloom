@@ -544,6 +544,8 @@ mod tests {
             status: TaskStatus::new(TaskState::Working),
             artifacts: Vec::new(),
             notice_delivered: false,
+            agent: None,
+            agent_origin: None,
         }
     }
 

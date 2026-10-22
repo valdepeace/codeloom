@@ -858,6 +858,8 @@ mod tests {
                 status: crate::task::TaskStatus::new(crate::task::TaskState::Working),
                 artifacts: Vec::new(),
                 notice_delivered: false,
+                agent: None,
+                agent_origin: None,
             })
             .await
             .unwrap();

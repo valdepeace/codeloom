@@ -27,6 +27,11 @@ pub struct SubagentDescriptor {
     /// Resultado de la tarea, como `Artifact`s de A2A. Vacío mientras no ha terminado.
     pub artifacts: Vec<Artifact>,
     pub notice_delivered: bool,
+    /// Nombre del agente con el que arrancó (`None` si la tarea no se lanzó con agente).
+    pub agent: Option<String>,
+    /// Origen del agente, en texto: `built-in`, `global:<ruta>`, `project:<ruta>` o
+    /// `remote:<url>`. Se guarda para saber de dónde salió la definición aunque después cambie.
+    pub agent_origin: Option<String>,
 }
 
 impl SubagentDescriptor {
@@ -155,6 +160,8 @@ mod tests {
             status: TaskStatus::new(TaskState::Working),
             artifacts: Vec::new(),
             notice_delivered: false,
+            agent: None,
+            agent_origin: None,
         }
     }
 

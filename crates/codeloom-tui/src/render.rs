@@ -1444,6 +1444,8 @@ mod tests {
                     status: codeloom_core::task::TaskStatus::new(status),
                     artifacts: Vec::new(),
                     notice_delivered: false,
+                    agent: None,
+                    agent_origin: None,
                 },
             );
         }
@@ -1465,6 +1467,8 @@ mod tests {
                     status: TaskStatus::new(state),
                     artifacts: Vec::new(),
                     notice_delivered: false,
+                    agent: None,
+                    agent_origin: None,
                 },
             );
         }
@@ -1510,6 +1514,8 @@ mod tests {
                     status: TaskStatus::new(state),
                     artifacts: Vec::new(),
                     notice_delivered: false,
+                    agent: None,
+                    agent_origin: None,
                 },
             );
         }
@@ -1557,6 +1563,8 @@ mod tests {
                 status: TaskStatus::new(TaskState::Failed),
                 artifacts: Vec::new(),
                 notice_delivered: false,
+                agent: None,
+                agent_origin: None,
             },
         );
         let mut term = Terminal::new(TestBackend::new(100, 3)).unwrap();
@@ -2148,6 +2156,8 @@ mod tests {
             status: TaskStatus::new(TaskState::Working),
             artifacts: Vec::new(),
             notice_delivered: false,
+            agent: None,
+            agent_origin: None,
         }));
         app
     }

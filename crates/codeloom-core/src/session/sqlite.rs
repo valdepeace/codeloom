@@ -77,6 +77,11 @@ impl SqliteStore {
                 "artifacts_json",
                 "ALTER TABLE subagents ADD COLUMN artifacts_json TEXT",
             ),
+            ("agent", "ALTER TABLE subagents ADD COLUMN agent TEXT"),
+            (
+                "agent_origin",
+                "ALTER TABLE subagents ADD COLUMN agent_origin TEXT",
+            ),
         ] {
             if !columnas.iter().any(|existente| existente == columna) {
                 sqlx::query(ddl)
@@ -207,8 +212,8 @@ impl SessionStore for SqliteStore {
 
     async fn save_subagent(&self, descriptor: &SubagentDescriptor) -> Result<()> {
         sqlx::query(
-            "INSERT INTO subagents (parent_session_id, child_session_id, job_id, label, status, status_message, status_timestamp_ms, artifacts_json, created_at_ms)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO subagents (parent_session_id, child_session_id, job_id, label, status, status_message, status_timestamp_ms, artifacts_json, agent, agent_origin, created_at_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(descriptor.parent.0)
         .bind(descriptor.child.0)
@@ -218,6 +223,8 @@ impl SessionStore for SqliteStore {
         .bind(encode_status_message(descriptor.status.message.as_ref())?)
         .bind(descriptor.status.timestamp_ms)
         .bind(encode_artifacts(&descriptor.artifacts)?)
+        .bind(&descriptor.agent)
+        .bind(&descriptor.agent_origin)
         .bind(crate::message::now_ms())
         .execute(&self.pool)
         .await
@@ -276,7 +283,8 @@ impl SessionStore for SqliteStore {
     async fn list_subagents(&self, parent: SessionId) -> Result<Vec<SubagentDescriptor>> {
         let rows = sqlx::query(
             "SELECT parent_session_id, child_session_id, job_id, label, status, status_message,
-                    status_timestamp_ms, created_at_ms, artifacts_json, result, notice_delivered
+                    status_timestamp_ms, created_at_ms, artifacts_json, result, notice_delivered,
+                    agent, agent_origin
              FROM subagents WHERE parent_session_id = ? ORDER BY created_at_ms, child_session_id",
         )
         .bind(parent.0)
@@ -307,6 +315,8 @@ impl SessionStore for SqliteStore {
                         child,
                     )?,
                     notice_delivered: row.get::<i64, _>("notice_delivered") != 0,
+                    agent: row.get("agent"),
+                    agent_origin: row.get("agent_origin"),
                 })
             })
             .collect()
@@ -598,6 +608,8 @@ mod tests {
             status: TaskStatus::new(state),
             artifacts: Vec::new(),
             notice_delivered: false,
+            agent: None,
+            agent_origin: None,
         }
     }
 
@@ -957,6 +969,8 @@ mod tests {
                 status: TaskStatus::new(TaskState::Completed),
                 artifacts: Vec::new(),
                 notice_delivered: false,
+                agent: None,
+                agent_origin: None,
             })
             .await
             .unwrap();
@@ -1024,6 +1038,8 @@ mod tests {
                 status: TaskStatus::new(TaskState::Completed),
                 artifacts: Vec::new(),
                 notice_delivered: false,
+                agent: None,
+                agent_origin: None,
             })
             .await
             .unwrap();
@@ -1318,5 +1334,94 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn agent_name_and_origin_roundtrip_through_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(dir.path().join("agente.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let parent = store.create_session("/proj").await.unwrap();
+        let child = store.create_session("/proj").await.unwrap();
+        let con_agente = SubagentDescriptor {
+            agent: Some("reviewer".into()),
+            agent_origin: Some("project:/proj/.codeloom/agents/reviewer.md".into()),
+            ..descriptor(parent, child, TaskState::Working)
+        };
+        store.save_subagent(&con_agente).await.unwrap();
+        assert_eq!(
+            store.list_subagents(parent).await.unwrap(),
+            vec![con_agente]
+        );
+    }
+
+    /// Base anterior a las columnas de agente: tiene las de A2A y los artefactos, pero no
+    /// `agent` ni `agent_origin`. Contiene una fila terminada.
+    async fn base_sin_columnas_de_agente(path: &std::path::Path) {
+        let pool =
+            sqlx::SqlitePool::connect(&format!("sqlite://{}?mode=rwc", path.to_str().unwrap()))
+                .await
+                .unwrap();
+        sqlx::query(
+            "CREATE TABLE subagents (
+                parent_session_id INTEGER NOT NULL,
+                child_session_id INTEGER NOT NULL PRIMARY KEY,
+                job_id TEXT NOT NULL,
+                label TEXT NOT NULL,
+                status TEXT NOT NULL,
+                status_message TEXT,
+                status_timestamp_ms INTEGER,
+                result TEXT,
+                artifacts_json TEXT,
+                notice_delivered INTEGER NOT NULL DEFAULT 0,
+                created_at_ms INTEGER NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO subagents (parent_session_id, child_session_id, job_id, label, status, status_timestamp_ms, artifacts_json, created_at_ms)
+             VALUES (1, 2, 'subagent-old', 'review', 'TASK_STATE_COMPLETED', 1, '[]', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn old_rows_without_agent_columns_read_as_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("viejo-agente.db");
+        base_sin_columnas_de_agente(&path).await;
+
+        let store = SqliteStore::open(path.to_str().unwrap()).await.unwrap();
+        let leido = store.list_subagents(SessionId(1)).await.unwrap();
+        assert_eq!(leido.len(), 1);
+        assert_eq!(leido[0].agent, None);
+        assert_eq!(leido[0].agent_origin, None);
+    }
+
+    #[tokio::test]
+    async fn agent_columns_migration_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("columnas-agente.db");
+        base_sin_columnas_de_agente(&path).await;
+
+        let primera_apertura = SqliteStore::open(path.to_str().unwrap()).await.unwrap();
+        let primera = primera_apertura.list_subagents(SessionId(1)).await.unwrap();
+        drop(primera_apertura);
+
+        // Segunda apertura: las columnas ya existen, no vuelven a añadirse ni fallan.
+        let again = SqliteStore::open(path.to_str().unwrap()).await.unwrap();
+        assert_eq!(again.list_subagents(SessionId(1)).await.unwrap(), primera);
+        let columnas: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('subagents')")
+                .fetch_all(&again.pool)
+                .await
+                .unwrap();
+        assert_eq!(columnas.iter().filter(|c| *c == "agent").count(), 1);
+        assert_eq!(columnas.iter().filter(|c| *c == "agent_origin").count(), 1);
     }
 }

@@ -162,6 +162,17 @@ Comportamiento: `None` = `default`. Sin registro configurado, `Some(nombre)` dis
 
 ---
 
+### Tarea 6b: cableado en el arranque (hueco detectado al planificar la 6)
+
+**Ficheros:** `crates/codeloom-cli/src/main.rs` (y el módulo de configuración que corresponda: `grep` de `codeloom.toml` en `codeloom-core/src/config/`), y donde se construye `InProcessSubagentLauncher`.
+
+Construye al arrancar el `AgentRegistry` con las fuentes `[BuiltInSource, FileSource(global ~/.agents/agents, Global), FileSource(<raíz del proyecto>/.agents/agents, Project)]` (menor a mayor precedencia), con `TrustStore::open(~/.codeloom)` y `with_trust(..., trust_project_agents)`, lanza `spawn_watcher` con los dos directorios y mantén vivo el `WatcherHandle` mientras viva la aplicación; pásalo al lanzador con `with_registry`. Claves nuevas **opcionales** en `codeloom.toml` (sección `[agents]`): `global_dir`, `project_dir` y `trust_project_agents` (bool, por defecto `false`); sin la sección todo funciona con los valores por defecto. La herramienta de delegar acepta un argumento opcional `agent` (nombre; omitido = `default`) y lo pasa a `start`; su descripción dice que es el nombre de un agente registrado. Si no hay directorio home, solo se usa la fuente de proyecto y la integrada, sin pánico.
+
+- [ ] **Paso 1: tests en rojo:** `agents_section_is_optional_in_config`, `agents_config_parses_dirs_and_trust_flag`, `delegate_tool_passes_the_agent_argument_to_start`, `delegate_tool_without_agent_passes_none`, `startup_without_home_directory_does_not_panic` (si es testeable sin tocar el entorno real; si no, di por qué).
+- [ ] **Paso 2: implementar. Paso 3: verificar** build, tests de los cuatro crates, clippy, rustfmt, LF. **Paso 4: no commitear.**
+
+---
+
 ### Tarea 7: documentación
 
 **Ficheros:** `docs/specs/2026-10-22-codeloom-a2a-agent-registry-design.md`, `docs/specs/2026-10-15-loom-agent-profile-a2a.md`, `docs/plans/2026-10-22-codeloom-a2a-roadmap.md`.
