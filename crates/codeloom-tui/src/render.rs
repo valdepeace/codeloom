@@ -1442,7 +1442,7 @@ mod tests {
                     job_id: format!("subagent-{child}"),
                     label: "test".into(),
                     status: codeloom_core::task::TaskStatus::new(status),
-                    result: None,
+                    artifacts: Vec::new(),
                     notice_delivered: false,
                 },
             );
@@ -1463,7 +1463,7 @@ mod tests {
                     job_id: format!("subagent-{child}"),
                     label: "review".into(),
                     status: TaskStatus::new(state),
-                    result: None,
+                    artifacts: Vec::new(),
                     notice_delivered: false,
                 },
             );
@@ -1508,7 +1508,7 @@ mod tests {
                     job_id: format!("subagent-{child}"),
                     label: "review".into(),
                     status: TaskStatus::new(state),
-                    result: None,
+                    artifacts: Vec::new(),
                     notice_delivered: false,
                 },
             );
@@ -1555,7 +1555,7 @@ mod tests {
                 job_id: "subagent-9".into(),
                 label: "review".into(),
                 status: TaskStatus::new(TaskState::Failed),
-                result: None,
+                artifacts: Vec::new(),
                 notice_delivered: false,
             },
         );
@@ -2146,7 +2146,7 @@ mod tests {
             job_id: "subagent-1".into(),
             label: "review".into(),
             status: TaskStatus::new(TaskState::Working),
-            result: None,
+            artifacts: Vec::new(),
             notice_delivered: false,
         }));
         app

@@ -1,3 +1,4 @@
+use crate::a2a::{artifacts_text, Artifact};
 use crate::error::Result;
 use crate::message::Message;
 use crate::task::TaskStatus;
@@ -23,8 +24,26 @@ pub struct SubagentDescriptor {
     pub label: String,
     /// Estado de la tarea del subagente, según A2A: el estado es el `TaskState` mismo.
     pub status: TaskStatus,
-    pub result: Option<String>,
+    /// Resultado de la tarea, como `Artifact`s de A2A. Vacío mientras no ha terminado.
+    pub artifacts: Vec<Artifact>,
     pub notice_delivered: bool,
+}
+
+impl SubagentDescriptor {
+    /// Texto del resultado: el de todos los artefactos, unidos con `"\n"`. `None` si el
+    /// subagente no tiene artefactos.
+    pub fn result_text(&self) -> Option<String> {
+        if self.artifacts.is_empty() {
+            None
+        } else {
+            Some(artifacts_text(&self.artifacts))
+        }
+    }
+
+    /// Identificador de contexto de A2A: la sesión del padre, en texto.
+    pub fn context_id(&self) -> String {
+        self.parent.0.to_string()
+    }
 }
 
 /// Apunte de consumo: los tokens de una respuesta del proveedor y el precio vigente
@@ -68,11 +87,12 @@ pub trait SessionStore: Send + Sync {
         status: TaskStatus,
     ) -> Result<()>;
     async fn list_subagents(&self, parent: SessionId) -> Result<Vec<SubagentDescriptor>>;
+    /// Marca el hijo como `Completed` y guarda su resultado como artefactos.
     async fn complete_subagent(
         &self,
         parent: SessionId,
         child: SessionId,
-        result: &str,
+        artifacts: &[Artifact],
     ) -> Result<()>;
     async fn append_subagent_notice(
         &self,
@@ -123,5 +143,39 @@ mod tests {
             None,
             "sin precio de salida no hay coste"
         );
+    }
+
+    fn descriptor_sin_artefactos() -> SubagentDescriptor {
+        use crate::task::TaskState;
+        SubagentDescriptor {
+            parent: SessionId(7),
+            child: SessionId(8),
+            job_id: "subagent-8".into(),
+            label: "review".into(),
+            status: TaskStatus::new(TaskState::Working),
+            artifacts: Vec::new(),
+            notice_delivered: false,
+        }
+    }
+
+    #[test]
+    fn result_text_is_none_without_artifacts() {
+        use crate::a2a::Artifact;
+        let sin = descriptor_sin_artefactos();
+        assert_eq!(sin.result_text(), None);
+
+        let con = SubagentDescriptor {
+            artifacts: vec![
+                Artifact::text_artifact("uno"),
+                Artifact::text_artifact("dos"),
+            ],
+            ..sin
+        };
+        assert_eq!(con.result_text().as_deref(), Some("uno\ndos"));
+    }
+
+    #[test]
+    fn context_id_is_the_parent_session_id() {
+        assert_eq!(descriptor_sin_artefactos().context_id(), "7");
     }
 }

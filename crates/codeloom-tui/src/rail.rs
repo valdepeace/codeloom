@@ -542,7 +542,7 @@ mod tests {
             job_id: format!("subagent-{child}"),
             label: label.into(),
             status: TaskStatus::new(TaskState::Working),
-            result: None,
+            artifacts: Vec::new(),
             notice_delivered: false,
         }
     }

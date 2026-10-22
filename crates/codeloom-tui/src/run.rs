@@ -3156,7 +3156,7 @@ mod tests {
                         job_id: format!("subagent-{id}"),
                         label: "review".into(),
                         status: TaskStatus::new(TaskState::Working),
-                        result: None,
+                        artifacts: Vec::new(),
                         notice_delivered: false,
                     },
                 )

@@ -2564,11 +2564,13 @@ impl App {
     fn sync_subagent_activity(&mut self, subagent: &codeloom_core::session::SubagentDescriptor) {
         let state = subagent.status.state;
         let status = subagent_tool_status(state);
-        let body = if status == batten::state::ToolStatus::Running {
+        // El cuerpo es el texto de los artefactos del resultado, el mismo que antes daba `result`.
+        let resultado = if status == batten::state::ToolStatus::Running {
             None
         } else {
-            subagent.result.as_deref()
+            subagent.result_text()
         };
+        let body = resultado.as_deref();
         // Regla de trazabilidad: el estado A2A exacto va entre paréntesis tras la etiqueta, de modo
         // que el aspecto agrupado de `ToolStatus` nunca sustituya al estado real.
         let titulo = format!("{} ({})", subagent.label, agent_state(state).label());
@@ -2856,7 +2858,9 @@ mod tests {
                 job_id: "subagent-1".into(),
                 label: "review".into(),
                 status: TaskStatus::new(TaskState::Failed),
-                result: Some("partial output".into()),
+                artifacts: vec![codeloom_core::a2a::Artifact::text_artifact(
+                    "partial output",
+                )],
                 notice_delivered: false,
             }],
         );
@@ -2876,7 +2880,7 @@ mod tests {
             job_id: format!("subagent-{child}"),
             label: "review".into(),
             status: TaskStatus::new(TaskState::Working),
-            result: None,
+            artifacts: Vec::new(),
             notice_delivered: false,
         }
     }
@@ -3493,7 +3497,7 @@ mod tests {
             job_id: "subagent-1".into(),
             label: label.into(),
             status: TaskStatus::new(state),
-            result: None,
+            artifacts: Vec::new(),
             notice_delivered: false,
         }
     }
@@ -3582,7 +3586,7 @@ mod tests {
         );
 
         let mut done = sub("review", TaskState::Completed, SessionId(1));
-        done.result = Some("listo".into());
+        done.artifacts = vec![codeloom_core::a2a::Artifact::text_artifact("listo")];
         app.apply(LiveEvent::SubagentChanged(done));
         assert_eq!(app.transcript.entry_count(), 1);
         assert_eq!(
@@ -3593,6 +3597,22 @@ mod tests {
             )]
         );
         assert!(texts(&app).iter().any(|t| t == "listo"));
+    }
+
+    #[test]
+    fn tui_shows_the_same_result_text_as_before() {
+        let mut app = crush_app();
+        app.session_id = Some(SessionId(1));
+        let mut done = sub("review", TaskState::Completed, SessionId(1));
+        done.artifacts = vec![
+            codeloom_core::a2a::Artifact::text_artifact("primera"),
+            codeloom_core::a2a::Artifact::text_artifact("segunda"),
+        ];
+        app.apply(LiveEvent::SubagentChanged(done));
+        // Antes el cuerpo era `result` = "primera\nsegunda"; ahora sale de los artefactos y debe igualarlo.
+        let lines = texts(&app);
+        assert!(lines.iter().any(|t| t == "primera"), "{lines:?}");
+        assert!(lines.iter().any(|t| t == "segunda"), "{lines:?}");
     }
 
     #[test]
@@ -3771,7 +3791,7 @@ mod tests {
         let mut app = crush_app();
         app.session_id = Some(SessionId(1));
         let mut done = sub("review", TaskState::Completed, SessionId(1));
-        done.result = Some("listo".into());
+        done.artifacts = vec![codeloom_core::a2a::Artifact::text_artifact("listo")];
         app.apply(LiveEvent::SubagentChanged(done));
         let count = app.transcript.entry_count();
         app.apply(notice_for("[Subagent review completed]\nlisto"));
@@ -3795,7 +3815,7 @@ mod tests {
         app.session_id = Some(SessionId(1));
         app.apply(notice_for("[Subagent review completed]\nlisto"));
         let mut done = sub("review", TaskState::Completed, SessionId(1));
-        done.result = Some("listo".into());
+        done.artifacts = vec![codeloom_core::a2a::Artifact::text_artifact("listo")];
         app.apply(LiveEvent::SubagentChanged(done));
         assert_eq!(app.transcript.entry_count(), 2);
         assert!(!has_user_line(&app));
@@ -4511,7 +4531,7 @@ mod tests {
             job_id: format!("subagent-{child}"),
             label: format!("hijo-{child}"),
             status: TaskStatus::new(state),
-            result: None,
+            artifacts: Vec::new(),
             notice_delivered: false,
         }
     }

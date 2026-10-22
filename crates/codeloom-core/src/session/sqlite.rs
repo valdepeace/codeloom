@@ -1,4 +1,5 @@
 use super::{SessionId, SessionInfo, SessionStore, SubagentDescriptor, UsageRecord};
+use crate::a2a::{self, Artifact};
 use crate::error::{CoreError, Result};
 use crate::message::{self, Message};
 use crate::task::{TaskState, TaskStatus};
@@ -72,6 +73,10 @@ impl SqliteStore {
                 "status_timestamp_ms",
                 "ALTER TABLE subagents ADD COLUMN status_timestamp_ms INTEGER",
             ),
+            (
+                "artifacts_json",
+                "ALTER TABLE subagents ADD COLUMN artifacts_json TEXT",
+            ),
         ] {
             if !columnas.iter().any(|existente| existente == columna) {
                 sqlx::query(ddl)
@@ -103,7 +108,9 @@ impl SqliteStore {
              WHERE status IN (?, ?, ?, ?, 'running')",
         )
         .bind(TaskState::Failed.proto_name())
-        .bind(INTERRUPTED_AT_SHUTDOWN)
+        .bind(encode_status_message(Some(&a2a::Message::agent_text(
+            INTERRUPTED_AT_SHUTDOWN,
+        )))?)
         .bind(message::now_ms())
         .bind(TaskState::Submitted.proto_name())
         .bind(TaskState::Working.proto_name())
@@ -200,16 +207,17 @@ impl SessionStore for SqliteStore {
 
     async fn save_subagent(&self, descriptor: &SubagentDescriptor) -> Result<()> {
         sqlx::query(
-            "INSERT INTO subagents (parent_session_id, child_session_id, job_id, label, status, status_message, status_timestamp_ms, created_at_ms)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO subagents (parent_session_id, child_session_id, job_id, label, status, status_message, status_timestamp_ms, artifacts_json, created_at_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(descriptor.parent.0)
         .bind(descriptor.child.0)
         .bind(&descriptor.job_id)
         .bind(&descriptor.label)
         .bind(descriptor.status.state.proto_name())
-        .bind(&descriptor.status.message)
+        .bind(encode_status_message(descriptor.status.message.as_ref())?)
         .bind(descriptor.status.timestamp_ms)
+        .bind(encode_artifacts(&descriptor.artifacts)?)
         .bind(crate::message::now_ms())
         .execute(&self.pool)
         .await
@@ -252,7 +260,7 @@ impl SessionStore for SqliteStore {
              WHERE parent_session_id = ? AND child_session_id = ?",
         )
         .bind(status.state.proto_name())
-        .bind(&status.message)
+        .bind(encode_status_message(status.message.as_ref())?)
         .bind(status.timestamp_ms)
         .bind(parent.0)
         .bind(child.0)
@@ -268,7 +276,7 @@ impl SessionStore for SqliteStore {
     async fn list_subagents(&self, parent: SessionId) -> Result<Vec<SubagentDescriptor>> {
         let rows = sqlx::query(
             "SELECT parent_session_id, child_session_id, job_id, label, status, status_message,
-                    status_timestamp_ms, created_at_ms, result, notice_delivered
+                    status_timestamp_ms, created_at_ms, artifacts_json, result, notice_delivered
              FROM subagents WHERE parent_session_id = ? ORDER BY created_at_ms, child_session_id",
         )
         .bind(parent.0)
@@ -278,21 +286,26 @@ impl SessionStore for SqliteStore {
         rows.into_iter()
             .map(|row| {
                 let status: String = row.get("status");
+                let child: i64 = row.get("child_session_id");
                 // Una fila antigua no tiene marca de tiempo propia: se usa la de su creación.
                 let timestamp_ms = row
                     .get::<Option<i64>, _>("status_timestamp_ms")
                     .unwrap_or_else(|| row.get("created_at_ms"));
                 Ok(SubagentDescriptor {
                     parent: SessionId(row.get("parent_session_id")),
-                    child: SessionId(row.get("child_session_id")),
+                    child: SessionId(child),
                     job_id: row.get("job_id"),
                     label: row.get("label"),
                     status: TaskStatus {
                         state: parse_task_state(&status)?,
-                        message: row.get("status_message"),
+                        message: decode_status_message(row.get("status_message"), child),
                         timestamp_ms,
                     },
-                    result: row.get("result"),
+                    artifacts: decode_artifacts(
+                        row.get("artifacts_json"),
+                        row.get("result"),
+                        child,
+                    )?,
                     notice_delivered: row.get::<i64, _>("notice_delivered") != 0,
                 })
             })
@@ -303,7 +316,7 @@ impl SessionStore for SqliteStore {
         &self,
         parent: SessionId,
         child: SessionId,
-        result: &str,
+        artifacts: &[Artifact],
     ) -> Result<()> {
         // Igual que `update_subagent_status`: un terminal no admite otra transición, tampoco esta.
         let mut tx = self
@@ -329,12 +342,12 @@ impl SessionStore for SqliteStore {
             }
         }
         sqlx::query(
-            "UPDATE subagents SET status = ?, status_message = NULL, status_timestamp_ms = ?, result = ?
+            "UPDATE subagents SET status = ?, status_message = NULL, status_timestamp_ms = ?, artifacts_json = ?
              WHERE parent_session_id = ? AND child_session_id = ?",
         )
         .bind(TaskState::Completed.proto_name())
         .bind(message::now_ms())
-        .bind(result)
+        .bind(encode_artifacts(artifacts)?)
         .bind(parent.0)
         .bind(child.0)
         .execute(&mut *tx)
@@ -453,6 +466,54 @@ fn from_sql_int(value: i64) -> Result<u64> {
     u64::try_from(value).map_err(|_| CoreError::Store(format!("negative token count: {value}")))
 }
 
+/// Serializa el mensaje de estado para la columna `status_message`: el JSON de un `Message`.
+fn encode_status_message(message: Option<&a2a::Message>) -> Result<Option<String>> {
+    message
+        .map(|message| serde_json::to_string(message).map_err(|e| CoreError::Store(e.to_string())))
+        .transpose()
+}
+
+/// Lee la columna `status_message`. Lo escrito por esta versión es el JSON de un `Message`; una
+/// fila anterior a A2A guarda texto plano, que se lee como mensaje del agente. El identificador
+/// de esa lectura se deriva de la fila, para que dos lecturas den lo mismo.
+fn decode_status_message(raw: Option<String>, child: i64) -> Option<a2a::Message> {
+    let raw = raw?;
+    match serde_json::from_str::<a2a::Message>(&raw) {
+        Ok(message) => Some(message),
+        Err(_) => {
+            let mut message = a2a::Message::agent_text(raw);
+            message.message_id = format!("estado-{child}");
+            Some(message)
+        }
+    }
+}
+
+/// Serializa los artefactos del resultado para la columna `artifacts_json`.
+fn encode_artifacts(artifacts: &[Artifact]) -> Result<String> {
+    serde_json::to_string(artifacts).map_err(|e| CoreError::Store(e.to_string()))
+}
+
+/// Lee los artefactos de una fila. Si `artifacts_json` es nulo y `result` no, la fila es
+/// anterior a A2A y su resultado de texto es un único artefacto de texto.
+fn decode_artifacts(
+    json: Option<String>,
+    legacy_result: Option<String>,
+    child: i64,
+) -> Result<Vec<Artifact>> {
+    match json {
+        Some(json) => {
+            serde_json::from_str(&json).map_err(|e| CoreError::Store(format!("artifacts: {e}")))
+        }
+        None => Ok(legacy_result
+            .map(|texto| {
+                let mut artefacto = Artifact::text_artifact(texto);
+                artefacto.artifact_id = format!("resultado-{child}");
+                vec![artefacto]
+            })
+            .unwrap_or_default()),
+    }
+}
+
 /// Estado de una fila del almacén. Acepta los nombres del proto v1.0 y las cadenas de las
 /// versiones anteriores, que se leen como su equivalente de A2A: `running` es `working`;
 /// `killed`, `canceled`; `interrupted` y `unfinished`, `failed`.
@@ -535,7 +596,7 @@ mod tests {
             job_id: format!("subagent-{}", child.0),
             label: "review".into(),
             status: TaskStatus::new(state),
-            result: None,
+            artifacts: Vec::new(),
             notice_delivered: false,
         }
     }
@@ -561,7 +622,11 @@ mod tests {
         store.save_subagent(&inicial).await.unwrap();
         assert_eq!(store.list_subagents(parent).await.unwrap(), vec![inicial]);
         store
-            .complete_subagent(parent, child, "finished")
+            .complete_subagent(
+                parent,
+                child,
+                &[crate::a2a::Artifact::text_artifact("finished")],
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -629,7 +694,7 @@ mod tests {
             let fila = listed.iter().find(|d| d.child == child).unwrap();
             assert_eq!(fila.status.state, TaskState::Failed, "hijo {child:?}");
             assert_eq!(
-                fila.status.message.as_deref(),
+                fila.status.message_text().as_deref(),
                 Some("interrupted by application shutdown")
             );
         }
@@ -650,7 +715,9 @@ mod tests {
             let guardado = SubagentDescriptor {
                 status: TaskStatus {
                     state,
-                    message: Some(format!("mensaje de {state:?}")),
+                    message: Some(crate::a2a::Message::agent_text(format!(
+                        "mensaje de {state:?}"
+                    ))),
                     timestamp_ms: 1_700_000_000_123,
                 },
                 ..descriptor(parent, child, state)
@@ -790,7 +857,11 @@ mod tests {
             );
         }
         assert!(store
-            .complete_subagent(parent, child, "otra vez")
+            .complete_subagent(
+                parent,
+                child,
+                &[crate::a2a::Artifact::text_artifact("otra vez")]
+            )
             .await
             .is_err());
         assert_eq!(
@@ -812,7 +883,11 @@ mod tests {
             .await
             .unwrap();
         store
-            .complete_subagent(parent, child, "finished")
+            .complete_subagent(
+                parent,
+                child,
+                &[crate::a2a::Artifact::text_artifact("finished")],
+            )
             .await
             .unwrap();
         assert_eq!(raw_status(&store, child).await, "TASK_STATE_COMPLETED");
@@ -880,7 +955,7 @@ mod tests {
                 job_id: "subagent-1".into(),
                 label: "review".into(),
                 status: TaskStatus::new(TaskState::Completed),
-                result: None,
+                artifacts: Vec::new(),
                 notice_delivered: false,
             })
             .await
@@ -947,7 +1022,7 @@ mod tests {
                 job_id: "subagent-1".into(),
                 label: "review".into(),
                 status: TaskStatus::new(TaskState::Completed),
-                result: None,
+                artifacts: Vec::new(),
                 notice_delivered: false,
             })
             .await
@@ -1018,5 +1093,230 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.session_usage(old).await.unwrap().len(), 1);
+    }
+
+    /// Inserta una fila con el esquema de columnas que escribía la versión anterior de `status`.
+    async fn fila_antigua(
+        store: &SqliteStore,
+        parent: SessionId,
+        child: SessionId,
+        status: &str,
+        status_message: Option<&str>,
+        result: Option<&str>,
+    ) {
+        sqlx::query(
+            "INSERT INTO subagents (parent_session_id, child_session_id, job_id, label, status, status_message, status_timestamp_ms, result, created_at_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(parent.0)
+        .bind(child.0)
+        .bind(format!("subagent-{}", child.0))
+        .bind("review")
+        .bind(status)
+        .bind(status_message)
+        .bind(crate::message::now_ms())
+        .bind(result)
+        .bind(crate::message::now_ms())
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn status_message_roundtrips_through_sqlite_as_a_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(dir.path().join("mensaje.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let parent = store.create_session("/proj").await.unwrap();
+        let child = store.create_session("/proj").await.unwrap();
+        let mensaje = crate::a2a::Message::agent_text("¿Cuál?");
+        let guardado = SubagentDescriptor {
+            status: TaskStatus {
+                state: TaskState::InputRequired,
+                message: Some(mensaje.clone()),
+                timestamp_ms: 1_700_000_000_123,
+            },
+            ..descriptor(parent, child, TaskState::InputRequired)
+        };
+        store.save_subagent(&guardado).await.unwrap();
+        let leido = store.list_subagents(parent).await.unwrap();
+        assert_eq!(leido[0].status.message, Some(mensaje));
+        assert_eq!(leido, vec![guardado]);
+    }
+
+    #[tokio::test]
+    async fn legacy_plain_text_status_message_reads_as_agent_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(dir.path().join("legacy-mensaje.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let parent = store.create_session("/proj").await.unwrap();
+        let child = store.create_session("/proj").await.unwrap();
+        fila_antigua(
+            &store,
+            parent,
+            child,
+            "TASK_STATE_INPUT_REQUIRED",
+            Some("¿Cuál?"),
+            None,
+        )
+        .await;
+        let leido = store.list_subagents(parent).await.unwrap();
+        let mensaje = leido[0]
+            .status
+            .message
+            .clone()
+            .expect("el texto plano se lee como mensaje");
+        assert_eq!(mensaje.role, crate::a2a::Role::Agent);
+        assert_eq!(mensaje.text(), "¿Cuál?");
+        // Dos lecturas dan el mismo mensaje: su identificador se deriva de la fila.
+        assert_eq!(store.list_subagents(parent).await.unwrap(), leido);
+    }
+
+    #[tokio::test]
+    async fn artifacts_roundtrip_through_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(dir.path().join("artefactos.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let parent = store.create_session("/proj").await.unwrap();
+        let child = store.create_session("/proj").await.unwrap();
+        let artefactos = vec![
+            crate::a2a::Artifact::text_artifact("resumen"),
+            crate::a2a::Artifact {
+                artifact_id: "datos".into(),
+                name: Some("datos".into()),
+                description: Some("binario y json".into()),
+                parts: vec![
+                    crate::a2a::Part {
+                        content: crate::a2a::PartContent::Raw(vec![0, 255]),
+                        metadata: None,
+                        filename: Some("d.bin".into()),
+                        media_type: Some("application/octet-stream".into()),
+                    },
+                    crate::a2a::Part {
+                        content: crate::a2a::PartContent::Data(serde_json::json!({"ok": true})),
+                        metadata: None,
+                        filename: None,
+                        media_type: None,
+                    },
+                ],
+                metadata: None,
+                extensions: vec![],
+            },
+        ];
+        let guardado = SubagentDescriptor {
+            artifacts: artefactos,
+            ..descriptor(parent, child, TaskState::Completed)
+        };
+        store.save_subagent(&guardado).await.unwrap();
+        assert_eq!(store.list_subagents(parent).await.unwrap(), vec![guardado]);
+    }
+
+    #[tokio::test]
+    async fn legacy_result_column_reads_as_one_text_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(dir.path().join("legacy-result.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let parent = store.create_session("/proj").await.unwrap();
+        let child = store.create_session("/proj").await.unwrap();
+        fila_antigua(
+            &store,
+            parent,
+            child,
+            "TASK_STATE_COMPLETED",
+            None,
+            Some("hecho"),
+        )
+        .await;
+        let leido = store.list_subagents(parent).await.unwrap();
+        assert_eq!(leido[0].artifacts.len(), 1);
+        assert_eq!(leido[0].artifacts[0].text(), "hecho");
+        assert_eq!(leido[0].result_text().as_deref(), Some("hecho"));
+    }
+
+    #[tokio::test]
+    async fn column_migration_for_artifacts_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("columna-artefactos.db");
+        {
+            // Base anterior a los artefactos: `result` existe y no hay `artifacts_json`.
+            let pool =
+                sqlx::SqlitePool::connect(&format!("sqlite://{}?mode=rwc", path.to_str().unwrap()))
+                    .await
+                    .unwrap();
+            sqlx::query(
+                "CREATE TABLE subagents (
+                    parent_session_id INTEGER NOT NULL,
+                    child_session_id INTEGER NOT NULL PRIMARY KEY,
+                    job_id TEXT NOT NULL,
+                    label TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    result TEXT,
+                    notice_delivered INTEGER NOT NULL DEFAULT 0,
+                    created_at_ms INTEGER NOT NULL)",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO subagents (parent_session_id, child_session_id, job_id, label, status, result, created_at_ms)
+                 VALUES (1, 2, 'subagent-old', 'review', 'completed', 'hecho', 1)",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            pool.close().await;
+        }
+
+        let primera_apertura = SqliteStore::open(path.to_str().unwrap()).await.unwrap();
+        let primera = primera_apertura.list_subagents(SessionId(1)).await.unwrap();
+        assert_eq!(primera[0].result_text().as_deref(), Some("hecho"));
+        drop(primera_apertura);
+
+        let again = SqliteStore::open(path.to_str().unwrap()).await.unwrap();
+        assert_eq!(again.list_subagents(SessionId(1)).await.unwrap(), primera);
+        let columnas: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('subagents')")
+                .fetch_all(&again.pool)
+                .await
+                .unwrap();
+        assert!(columnas.iter().any(|c| c == "artifacts_json"));
+    }
+
+    #[tokio::test]
+    async fn complete_subagent_stores_a_text_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(dir.path().join("completo.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let parent = store.create_session("/proj").await.unwrap();
+        let child = store.create_session("/proj").await.unwrap();
+        store
+            .save_subagent(&descriptor(parent, child, TaskState::Working))
+            .await
+            .unwrap();
+        store
+            .complete_subagent(
+                parent,
+                child,
+                &[crate::a2a::Artifact::text_artifact("finished")],
+            )
+            .await
+            .unwrap();
+        let leido = store.list_subagents(parent).await.unwrap();
+        assert_eq!(leido[0].artifacts.len(), 1);
+        assert_eq!(leido[0].artifacts[0].text(), "finished");
+        assert_eq!(leido[0].result_text().as_deref(), Some("finished"));
+        // `complete_subagent` ya no escribe la columna antigua `result`.
+        let result: Option<String> =
+            sqlx::query_scalar("SELECT result FROM subagents WHERE child_session_id = ?")
+                .bind(child.0)
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(result, None);
     }
 }

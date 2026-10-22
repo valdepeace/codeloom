@@ -1,3 +1,4 @@
+use crate::a2a::Artifact;
 use crate::agent::AgentLoop;
 use crate::catalog::Catalog;
 use crate::config::CodeLoomConfig;
@@ -193,7 +194,7 @@ impl InProcessSubagentLauncher {
             job_id: String::new(),
             label: label.to_string(),
             status: TaskStatus::new(TaskState::Rejected).with_message(MENSAJE_CAPACIDAD),
-            result: None,
+            artifacts: Vec::new(),
             notice_delivered: false,
         };
         self.store.save_subagent(&descriptor).await?;
@@ -325,7 +326,9 @@ impl SubagentLauncher for InProcessSubagentLauncher {
                     // que la tarea de reenvío termine.
                     drop(child_agent);
                     let text = outcome.final_text;
-                    child_store.complete_subagent(parent, child, &text).await?;
+                    child_store
+                        .complete_subagent(parent, child, &[Artifact::text_artifact(text.as_str())])
+                        .await?;
                     if let Err(error) = cuerpo_tracker.publish(parent, child).await {
                         tracing::warn!("publish subagent status: {error}");
                     }
@@ -362,7 +365,7 @@ impl SubagentLauncher for InProcessSubagentLauncher {
             job_id: job.id().0.clone(),
             label: descriptor_label,
             status: TaskStatus::new(TaskState::Submitted),
-            result: None,
+            artifacts: Vec::new(),
             notice_delivered: false,
         };
         if let Err(error) = self.store.save_subagent(&descriptor).await {
@@ -471,7 +474,7 @@ impl SubagentLauncher for InProcessSubagentLauncher {
             if descriptor.status.state != TaskState::Completed || descriptor.notice_delivered {
                 continue;
             }
-            if let Some(result) = descriptor.result {
+            if let Some(result) = descriptor.result_text() {
                 let message = crate::message::Message::user(format!(
                     "[Subagent {} completed]\n{result}",
                     descriptor.label
@@ -613,6 +616,63 @@ mod tests {
             .control(parent, child, "interrupt", None)
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn parent_notice_text_is_unchanged_after_the_artifact_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SqliteStore::open(dir.path().join("aviso.db").to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+        let parent = store.create_session("/project").await.unwrap();
+        let provider: Arc<dyn Provider> = Arc::new(ScriptedProvider {
+            script: vec![
+                StreamChunk::TextDelta("child result".into()),
+                StreamChunk::Done(FinishReason::Stop),
+            ],
+        });
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(SubagentTool));
+        let jobs = Arc::new(LocalJobRegistry::default());
+        let runtime = InProcessSubagentLauncher::new(
+            Arc::new(RwLock::new(provider)),
+            store.clone(),
+            Arc::new(tools),
+            Arc::new(PermissionService::allow_all()),
+            Arc::new(RwLock::new(CodeLoomConfig {
+                provider: ProviderConfig {
+                    kind: ProviderKind::OpenAiCompat,
+                    base_url: "http://localhost".into(),
+                    api_key_env: "KEY".into(),
+                },
+                model: "test".into(),
+                max_steps: 2,
+                effort: None,
+            })),
+            dir.path().to_path_buf(),
+            jobs.clone(),
+            EventBus::new(64),
+        );
+        let (_child, job) = runtime
+            .start(
+                parent,
+                "research".into(),
+                "do work".into(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        jobs.wait(parent, &job).await.unwrap();
+
+        let avisos = runtime.deliver_notices(parent).await.unwrap();
+        assert_eq!(avisos.len(), 1);
+        // Texto exacto del aviso al padre: lo que había antes del cambio a artefactos.
+        assert_eq!(
+            avisos[0].text(),
+            "[Subagent research completed]\nchild result"
+        );
     }
 
     #[tokio::test]
@@ -1521,7 +1581,7 @@ mod tests {
         let hijo = &hijos[0];
         assert_eq!(hijo.status.state, TaskState::Rejected);
         assert_eq!(
-            hijo.status.message.as_deref(),
+            hijo.status.message_text().as_deref(),
             Some("maximum of 8 active subagents reached")
         );
         assert!(hijo.job_id.is_empty(), "un rechazado no tiene trabajo");
@@ -1688,7 +1748,7 @@ mod tests {
                 job_id: "subagent-1".into(),
                 label: "obrero".into(),
                 status: TaskStatus::new(TaskState::Completed),
-                result: Some("hecho".into()),
+                artifacts: vec![Artifact::text_artifact("hecho")],
                 notice_delivered: false,
             })
             .await

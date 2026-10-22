@@ -856,7 +856,7 @@ mod tests {
                 job_id: "subagent-1".into(),
                 label: "obrero".into(),
                 status: crate::task::TaskStatus::new(crate::task::TaskState::Working),
-                result: None,
+                artifacts: Vec::new(),
                 notice_delivered: false,
             })
             .await
@@ -1072,7 +1072,9 @@ mod tests {
 
         espera_estado(store.as_ref(), parent, child, TaskState::InputRequired).await;
         assert_eq!(
-            estado_guardado(store.as_ref(), parent, child).await.message,
+            estado_guardado(store.as_ref(), parent, child)
+                .await
+                .message_text(),
             Some("¿Cuál?".into())
         );
         wait_for_pending(&broker, parent).await;
@@ -1156,7 +1158,9 @@ mod tests {
 
         espera_estado(store.as_ref(), parent, child, TaskState::AuthRequired).await;
         let resumen = estado_guardado(store.as_ref(), parent, child).await;
-        let mensaje = resumen.message.expect("auth-required lleva un resumen");
+        let mensaje = resumen
+            .message_text()
+            .expect("auth-required lleva un resumen");
         assert!(mensaje.contains("bash"), "{mensaje}");
 
         liberar.notify_one();

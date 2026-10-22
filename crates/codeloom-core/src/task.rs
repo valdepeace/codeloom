@@ -5,6 +5,7 @@
 //! (y a los de la v0.3, `input-required` y compañía) corresponde al adaptador
 //! del borde; la interfaz deriva de aquí su presentación, sin reescribirlo.
 
+use crate::a2a::Message;
 use crate::job::JobStatus;
 use crate::message::now_ms;
 
@@ -79,12 +80,11 @@ impl TaskState {
 
 /// Estado de una tarea con su mensaje y su marca de tiempo, como el `TaskStatus` del proto.
 ///
-/// Cabe señalar que `message` es texto plano: en el proto es un `Message` con `Part`s,
-/// y esa forma llega con la tarea A5 del plan de A2A.
+/// Cabe señalar que `message` es un `Message` de A2A con sus `Part`s, como en el proto.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskStatus {
     pub state: TaskState,
-    pub message: Option<String>,
+    pub message: Option<Message>,
     pub timestamp_ms: i64,
 }
 
@@ -98,10 +98,16 @@ impl TaskStatus {
         }
     }
 
-    /// Añade el mensaje que explica el estado.
+    /// Añade el mensaje de texto que explica el estado. Se guarda como un `Message` del agente
+    /// con una sola `Part` de texto, de modo que quien produce el estado no cambia.
     pub fn with_message(mut self, message: impl Into<String>) -> Self {
-        self.message = Some(message.into());
+        self.message = Some(Message::agent_text(message));
         self
+    }
+
+    /// Texto del mensaje de estado, o `None` si no tiene mensaje.
+    pub fn message_text(&self) -> Option<String> {
+        self.message.as_ref().map(Message::text)
     }
 }
 
@@ -201,6 +207,6 @@ mod tests {
         assert!(antes <= status.timestamp_ms && status.timestamp_ms <= despues);
 
         let con_texto = TaskStatus::new(TaskState::Failed).with_message("roto");
-        assert_eq!(con_texto.message.as_deref(), Some("roto"));
+        assert_eq!(con_texto.message_text().as_deref(), Some("roto"));
     }
 }
