@@ -1,6 +1,6 @@
 # Compactación ligera y topes de contexto
 
-Estado: propuesta del 2026-10-22, para implementar de inmediato. Desarrolla las reglas 3, 5 y 8 de
+Estado: implementada el 2026-10-22 (véase «Estado» al final). Desarrolla las reglas 3, 5 y 8 de
 `2026-10-22-codeloom-decalogo-de-contexto-y-coste.md`; fuentes en
 `docs/references/contexto-y-coste/fuentes.md`.
 
@@ -79,3 +79,16 @@ Comparativa en `docs/references/contexto-y-coste/comparativa-herramientas.md`. C
 
 - Al alcanzar un presupuesto de tokens: ¿parar el turno, preguntar, o solo avisar?
 - ¿Basta la limpieza de resultados o hará falta resumir con el modelo? Se mide con sesiones reales.
+
+## Estado
+
+Implementado el 2026-10-22, **sin verlo aún en una terminal real**. Commits: `e9fae69` (topes de
+avisos y de `grep`), `c4eb8d0` (limpieza de resultados antiguos en la petición), `349ccb6`
+(cabeza y cola; filtro `glob` de `grep`) y el del volcado a disco (`tool-output`, 7 días, 256 MiB).
+
+Limitaciones reales: el marcador de la limpieza de resultados antiguos **no** lleva la ruta del
+volcado (decisión 6, a medias); los avisos de subagente y de job se recortan pero **no** se
+vuelcan a disco (no tienen `call_id` a mano); un resumen del historial con el modelo, el
+presupuesto de tokens y el tope de `AGENTS.md` siguen pendientes; las cifras son decisiones
+propias; el test de limpieza cubre una petición de un paso, no un bucle largo real; el volcado se
+poda solo al arrancar.

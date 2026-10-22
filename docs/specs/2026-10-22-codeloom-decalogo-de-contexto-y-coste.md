@@ -66,13 +66,14 @@ que no tiene cota acabará, tarde o temprano, desbordándose.**
    *Estado: hecho, en los dos proveedores.*
 3. **Los listados respetan `.gitignore` y tienen su propio máximo.** Nunca entran en `.git`,
    `target/` ni `node_modules/`. El glob devuelve a lo sumo 300 coincidencias y dice cuántas
-   había. *Estado: hecho para `glob`. `grep` respeta `.gitignore` pero no tiene máximo propio
-   de coincidencias (lo cubre solo la cota general): por afinar.*
+   había. *Estado: hecho para `glob`. `grep` tiene ahora máximo de 200 coincidencias y filtro `glob`.*
 4. **Recortar avisa y orienta.** Un recorte silencioso engaña al modelo. El aviso dice cuánto se
    mostró, cuánto había y qué hacer («estrecha el patrón», «usa `offset`»).
 5. **El historial no crece sin límite.** Cada paso reenvía toda la conversación. Hace falta
-   compactación o resumen de lo antiguo. *Estado: **pendiente**; no existe. Es el mayor gasto
-   latente. Véase `2026-10-14-loom-kpis-prompt-compression.md`.*
+   compactación o resumen de lo antiguo. *Estado: **parcial**. Hecha la limpieza de resultados
+   antiguos de herramientas en la petición (`2026-10-22-codeloom-context-compaction-design.md`);
+   el resumen del historial con el modelo sigue pendiente. Véase también
+   `2026-10-14-loom-kpis-prompt-compression.md`.*
 6. **El prompt de sistema también tiene cota.** Ficheros de contexto (`AGENTS.md`,
    `CODELOOM.md`), lista de agentes, habilidades y memoria se inyectan en cada petición.
    *Estado: **pendiente**; hoy se cargan enteros y sin tope.*
@@ -80,8 +81,7 @@ que no tiene cota acabará, tarde o temprano, desbordándose.**
    presupuesto de tokens por turno ni por sesión. El sondeo (`job_output` en bucle) es un bucle
    disfrazado: se evita en el prompt, pero no se garantiza. *Estado: **parcial**.*
 8. **Lo que cruza de un agente a otro también se acota.** El resultado de un subagente vuelve al
-   padre y lo paga cada paso siguiente. *Estado: por comprobar que el resultado del hijo tenga
-   cota propia (hoy solo le alcanza la general de herramientas).*
+   padre y lo paga cada paso siguiente. *Estado: hecho: el aviso de finalización del hijo se recorta a 8 000 bytes.*
 9. **La memoria de la interfaz tiene cota.** Registros por hijo (200 elementos), cachés de
    líneas, transcript. *Estado: cumplido en el registro de hijos; el resto, por auditar.*
 10. **Se prueba el peor caso, no el caso feliz.** Toda herramienta nueva trae un test con una
