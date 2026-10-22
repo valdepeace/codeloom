@@ -1,107 +1,126 @@
 # Productores de los estados A2A que faltan (`submitted`, `rejected`, `auth-required`)
 
-Estado: propuesta del 2026-10-22 (tarea A2 de `docs/plans/2026-10-22-codeloom-a2a-roadmap.md`).
+Estado: propuesta del 2026-10-22, revisada el mismo día bajo la regla «no inventar nada
+que no esté contemplado en A2A» (tarea A2 de
+`docs/plans/2026-10-22-codeloom-a2a-roadmap.md`). Plan:
+`docs/plans/2026-10-22-codeloom-a2a-states-producers.md`.
 Relacionado: `2026-10-15-loom-agent-profile-a2a.md` (secciones «Fuente normativa de los
-estados» y «Lectura de la especificación», de donde salen todas las citas),
-`2026-10-21-codeloom-subagent-input-required-design.md`,
-`2026-10-22-codeloom-a2a-states-ui.md` (plan que ya pinta los ocho estados).
+estados» y «Lectura de la especificación», de donde salen las citas),
+`2026-10-21-codeloom-subagent-input-required-design.md`.
 
 ## Intención
 
-Premisa: el protocolo A2A, sin inventar. El rail y el showcase ya pintan los ocho
-estados de tarea, pero el runtime solo produce cinco (`working`, `input-required`,
-`completed`, `failed`, `canceled`). Se pretende que el runtime emita los tres que
-faltan **solo donde la especificación los define y nuestro código tiene un hecho que
-los respalde**, y rotular como decisión nuestra todo lo que la especificación no fija.
+El rail y el showcase ya pintan los ocho estados de tarea, pero el runtime solo produce
+cinco (`working`, `input-required`, `completed`, `failed`, `canceled`). Se pretende que
+emita `submitted`, `rejected` y `auth-required` **únicamente donde el protocolo los
+define o los ejemplifica y nuestro código tiene un hecho que los respalde**. Todo lo
+que A2A no fija se rotula como nuestro y se mantiene al mínimo.
 
-## Qué dice A2A (literal) y qué no
+## Qué contempla A2A (literal, fuente de cada punto entre paréntesis)
 
 - `submitted`: «Indicates that a task has been successfully submitted and acknowledged.»
-  **No consta** cuándo lo emite el agente ni que sea obligatorio.
+  (proto). **Único uso en la especificación:** la respuesta a `SendMessage` de una
+  tarea larga, con `"state": "TASK_STATE_SUBMITTED"` y el trabajo continuando después
+  (§6.6). Los ejemplos de streaming, en cambio, abren con `TASK_STATE_WORKING` (§6.2):
+  `submitted` no es obligatorio.
+- `working`: «actively being processed by the agent.» (proto).
 - `rejected`: «Indicates that the agent has decided to not perform the task. This may be
   done during initial task creation or later once an agent has determined it can't or
-  won't proceed. This is a terminal state.» Los errores de validación de entrada tienen
-  otra vía: error `-32602 Invalid params` (§3.3.2), sin tarea.
-- `auth-required`: el agente «MUST use a Task», «MUST transition the TaskState to
-  `TASK_STATE_AUTH_REQUIRED`» y «MUST include a TaskStatus message explaining the
-  required authorization»; entre los ejemplos, «An agent requiring human approval
-  before a destructive action is taken». «Agents MUST NOT treat the
-  `TASK_STATE_AUTH_REQUIRED` state transition, by itself, as authorization.» Es un
-  estado «interrupted», no terminal.
-- **No consta** una tabla de transiciones ni quién provoca cada una (salvo que
-  `input-required` y `auth-required` los fija el agente).
+  won't proceed. This is a terminal state.» (proto). **La especificación no incluye
+  ningún ejemplo** de emisión de `rejected`.
+- Errores de validación de entrada: categoría aparte, «Servers MUST validate all input
+  parameters before processing», con el código `-32602 Invalid params` (§3.3.2). No
+  producen tarea rechazada.
+- `auth-required` (§7.6): el agente «MUST use a Task», «MUST transition the TaskState to
+  `TASK_STATE_AUTH_REQUIRED`», «MUST include a TaskStatus message explaining the required
+  authorization»; entre los ejemplos, «An agent requiring human approval before a
+  destructive action is taken». El cliente puede «send a response message to the Task to
+  negotiate, correct, or reject the authorization request» o cumplirla «out-of-band».
+  Tras recibir la credencial, «The agent MAY immediately continue Task processing».
+  «Agents MUST NOT treat the `TASK_STATE_AUTH_REQUIRED` state transition, by itself, as
+  authorization for any particular operation.»
+- Un `SendMessage` devuelve una `Task` o un `Message`; si la tarea existe, su estado es
+  uno de los de la enumeración. Por tanto, **un rechazo es una `Task` en
+  `TASK_STATE_REJECTED`**, no la ausencia de tarea.
+
+## Qué NO contempla A2A
+
+- Cuándo exactamente emite el agente `submitted`; una tabla de transiciones; quién
+  provoca cada una salvo las que fijan `input-required` y `auth-required` (el agente).
+- Qué motivos concretos justifican un `rejected` (nada de capacidad ni de límites).
+- Qué ocurre si el cliente rechaza una petición de `auth-required` (a qué estado pasa
+  la tarea).
 
 ## Objetivos
 
-1. Un hijo recién creado y reconocido aparece como `submitted` y pasa a `working` al
-   empezar a ejecutarse.
-2. Un hijo que no se admite por falta de capacidad aparece como `rejected`, terminal.
-3. Un hijo que espera la aprobación de un permiso aparece como `auth-required` y
-   vuelve a `working` al resolverse.
+1. Un hijo reconocido por el lanzador aparece como `submitted` y pasa a `working` cuando
+   su agente empieza a ejecutarse.
+2. Un hijo que el lanzador no admite por agotarse la capacidad aparece como una tarea
+   `rejected`.
+3. Un hijo que espera la aprobación de un permiso aparece como `auth-required`, con un
+   mensaje que lo explica, y vuelve a `working` al resolverse.
 
 ## No objetivos
 
-- Autenticación de transporte, tarjetas del agente o cualquier cosa remota (A6, A8).
-- Que `auth-required` autorice nada por sí mismo: la decisión sigue en
-  `PermissionService`.
-- Persistir `auth-required`: es transitorio, como `input-required` (se deriva de
-  eventos y no se guarda).
+- Autenticación de transporte, tarjetas del agente o nada remoto (A6, A8).
+- Que `auth-required` autorice: la decisión sigue en `PermissionService`.
+- Persistir `auth-required` (es transitorio, como `input-required`).
 - Cambiar el esquema SQLite (la columna `status` es `TEXT NOT NULL`).
 
 ## Anti-objetivos
 
-- Un `rejected` por validación de entrada: eso es un error del parámetro, no una
-  tarea rechazada (la especificación lo trata con `Invalid params`).
-- Parpadeos o trabajo extra en el camino del composer.
-- Inventar semántica para `submitted` más allá de «recibida y reconocida».
+- Convertir en `rejected` los errores de validación (prompt vacío o demasiado largo,
+  etiqueta demasiado larga): son errores de parámetros, y siguen siéndolo.
+- Retener artificialmente `submitted` para que se vea.
 
-## Decisiones de diseño (mías, marcadas para revisión)
+## Decisiones, clasificadas
 
-- **`submitted`.** Se persiste al guardar el descriptor del hijo, que es el instante en
-  que el lanzador ha reconocido la tarea (sesión creada, trabajo lanzado). Pasa a
-  `Running` cuando arranca la ejecución del agente del hijo
-  (`update_subagent_status` ya existe). Puede durar milisegundos: es honesto y no se
-  retiene artificialmente. *Alternativa descartada:* emitirlo solo en memoria; se
-  perdería al reabrir una sesión con hijos aún no arrancados (caso raro).
-- **`rejected`.** Solo la **capacidad agotada** («maximum of 8 active subagents
-  reached»): es un «can't proceed» del agente, que encaja con la definición. Se crea el
-  descriptor del hijo con estado `Rejected` (para que la tarea exista y sea visible,
-  como exige que `rejected` sea un estado de una `Task`) y se sigue devolviendo el
-  error al padre para que el modelo lo vea. *Pregunta abierta para el usuario:* si se
-  prefiere no crear sesión ni descriptor y dejar este caso solo como error.
-- **`auth-required`.** Mientras `ChildResponder::decide` espera al servicio de
-  permisos del padre, el hijo se marca `auth-required`; al resolver, vuelve a
-  `working`. Dos eventos nuevos en el bus (petición y resolución), con una
-  descripción corta de lo solicitado (herramienta y resumen), para cumplir «MUST
-  include a TaskStatus message explaining the required authorization». La TUI lo
-  guarda en memoria junto a `awaiting_input`.
-- **Despertar del padre.** `auth-required` **no** despierta al padre: el diálogo de
-  permiso ya se muestra en la propia interfaz del padre, que lo está esperando. Sin
-  cambios en `wake_pending`.
-- **Variantes nuevas** en `SubagentStatus`: `Submitted` y `Rejected`, con cadenas
-  `"submitted"` y `"rejected"` en SQLite y proyección a `TaskState::Submitted` y
-  `TaskState::Rejected`. `Rejected` es terminal (`is_terminal` ya lo contempla) y no
-  despierta al padre (el modelo ya recibe el error).
-- **Rail y showcase.** Sin trabajo de pintado nuevo: `AgentState` ya tiene los ocho. La
-  columna «productor» del showcase pasa a decir «runtime» para los ocho.
+### Respaldadas por el protocolo
+
+| Decisión | Respaldo |
+|---|---|
+| `submitted` es el estado de la tarea cuando el lanzador la ha reconocido y el trabajo sigue en segundo plano; pasa después a `working` | definición de `submitted` y ejemplo §6.6; `working` en §6.2 |
+| `auth-required` se produce cuando el hijo espera la aprobación humana de una acción | ejemplo de §7.6 |
+| El hijo usa su `Task` (su sesión) y su cambio de estado incluye un mensaje explicativo | §7.6.1 |
+| Al resolverse la aprobación, el hijo vuelve a `working` | «The agent MAY immediately continue Task processing» |
+| Un rechazo es una `Task` en `rejected` | `SendMessage` devuelve `Task` o `Message`; `rejected` es un estado de `Task` |
+| Los errores de validación no producen `rejected` | §3.3.2 |
+| `rejected` y `auth-required` no los inventa el cliente: los fija el agente | `TaskStatusUpdateEvent` «sent by the agent» |
+
+### Lectura nuestra de la definición (no explícita en A2A)
+
+- **Capacidad agotada = `rejected`.** La definición dice «can't or won't proceed»; que
+  el límite de ocho hijos activos sea un «can't» es una lectura nuestra, la única razón
+  de rechazo que hoy tiene el lanzador además de la validación. Si no se acepta la
+  lectura, `rejected` queda sin productor y no se inventa otro.
+- **El mensaje de estado de `auth-required`** es un resumen de la petición (herramienta
+  y argumentos resumidos), no el diálogo completo.
+- **Denegar el permiso** hace volver al hijo a `working` con la herramienta fallida;
+  A2A no dice a qué estado pasa la tarea tras un rechazo del cliente.
+
+### Nuestras, no del protocolo (interfaz y plomería)
+
+- Que `rejected` conserve el error que ya recibe el modelo del padre (`is_error`).
+- Que `rejected` y `auth-required` **no despierten** al padre (el padre ya ve el error y
+  el diálogo de permiso respectivamente).
+- Los eventos internos del bus que comunican el cambio, y su forma.
+- Los glifos y colores (ya implementados en `AgentState`).
 
 ## Qué se deja al implementador
 
-Nombres de los eventos nuevos, forma exacta del mensaje de estado de
-`auth-required` y dónde se hace el paso `Submitted → Running` dentro del cierre del
-trabajo.
+Nombres de los eventos nuevos, forma exacta del mensaje de `auth-required` y dónde se
+hace el paso `Submitted → Running` dentro del cierre del trabajo.
 
 ## Verificación
 
 Pruebas puras (sin red) de: estado inicial `Submitted` y paso a `Running`; rechazo por
-capacidad con descriptor `Rejected` y error devuelto; lectura de las cadenas nuevas en
-SQLite; `decide` que marca y desmarca `auth-required` con su mensaje; que `rejected` y
-`auth-required` no despiertan al padre; proyección a `TaskState`; el rail con cada uno.
-Validación visual en terminal real: pendiente.
+capacidad con tarea `Rejected` visible y error devuelto; que los errores de validación
+**no** crean tarea; lectura de las cadenas nuevas en SQLite; `auth-required` marcado y
+desmarcado con su mensaje; que no despiertan al padre; proyección a `TaskState`; el rail
+con cada uno. Validación visual en terminal real: pendiente.
 
 ## Limitaciones previstas
 
-- `submitted` puede ser imperceptible en la práctica.
-- El mensaje de `auth-required` es un resumen de la petición, no el diálogo completo.
-- La cancelación de un hijo en `auth-required` o `input-required` no está definida por
-  A2A (no consta); hoy el usuario puede matarlo y se proyecta a `canceled`.
+- `submitted` puede durar milisegundos y ser imperceptible.
+- A2A no define la cancelación en `auth-required` o `input-required`; hoy el usuario
+  puede matar al hijo y se proyecta a `canceled`.
