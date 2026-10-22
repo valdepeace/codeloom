@@ -19,21 +19,13 @@ impl AgentStatesDemo {
     }
 }
 
-/// Estados que el runtime todavía no produce; se pintan igualmente.
-fn sin_productor(estado: AgentState) -> bool {
-    matches!(
-        estado,
-        AgentState::Submitted | AgentState::AuthRequired | AgentState::Rejected
-    )
-}
-
 impl Demo for AgentStatesDemo {
     fn title(&self) -> &str {
         "agent states"
     }
 
     fn hint(&self) -> &str {
-        "los ocho estados de A2A · «sin productor»: el runtime aún no los emite"
+        "los ocho estados de A2A · productor: el runtime los emite todos"
     }
 
     fn render(&mut self, f: &mut Frame, area: Rect, theme: &Theme) {
@@ -42,11 +34,6 @@ impl Demo for AgentStatesDemo {
             theme.styles.muted,
         ))];
         for estado in AgentState::ALL {
-            let productor = if sin_productor(estado) {
-                "sin productor"
-            } else {
-                "runtime"
-            };
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("{:<6}", estado.glyph()),
@@ -56,7 +43,7 @@ impl Demo for AgentStatesDemo {
                     format!("{:<16}", estado.label()),
                     estado.style(&theme.styles),
                 ),
-                Span::styled(productor, theme.styles.muted),
+                Span::styled("runtime", theme.styles.muted),
             ]));
         }
         f.render_widget(Paragraph::new(lines), area);
@@ -95,6 +82,15 @@ mod tests {
                     .iter()
                     .any(|fila| fila.contains(estado.label()) && fila.contains(estado.glyph())),
                 "falta la fila de {}",
+                estado.label()
+            );
+        }
+        for estado in AgentState::ALL {
+            assert!(
+                filas
+                    .iter()
+                    .any(|fila| { fila.contains(estado.label()) && fila.contains("runtime") }),
+                "la fila de {} no declara como productor al runtime",
                 estado.label()
             );
         }

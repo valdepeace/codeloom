@@ -128,3 +128,35 @@ con cada uno. Validación visual en terminal real: pendiente.
 - `submitted` puede durar milisegundos y ser imperceptible.
 - A2A no define la cancelación en `auth-required` o `input-required`; hoy el usuario
   puede matar al hijo y se proyecta a `canceled`.
+
+## Estado (2026-10-22)
+
+Cabe señalar que los productores descritos en esta spec están implementados (commit
+`6365c58`, tarea 2 del plan `docs/plans/2026-10-22-codeloom-a2a-task-model.md`). El
+runtime produce los ocho estados de tarea de A2A.
+
+### Lo implementado
+
+- `submitted` al reconocer la tarea y `working` al ejecutarla.
+- `rejected` cuando se agota la capacidad. La validación de entrada sigue siendo un error
+  y no crea tarea.
+- `input-required` mientras el hijo espera respuesta del padre.
+- `auth-required` solo cuando el padre va a preguntar de verdad a una persona
+  (`PermissionService::would_prompt`).
+- `canceled` cuando el padre interrumpe al hijo con Esc.
+
+### Decisiones tomadas que A2A no fija
+
+- Texto de `input-required`: las preguntas pendientes se unen con salto de línea.
+- `auth-required`: «herramienta acción: detalle», con 160 caracteres como máximo.
+- Capacidad agotada: `rejected` con el mensaje `maximum of 8 active subagents reached`.
+- Lo no terminado al reabrir pasa a `failed` con el mensaje `interrupted by application
+  shutdown`.
+
+### Limitaciones reales
+
+- La cabecera plana puede recortar el resumen en terminales estrechas. Ahí se incumple
+  la regla de trazabilidad, porque los estados originales de A2A pueden quedar fuera de
+  la vista.
+- La cabecera del workspace pasa de 2 a 3 líneas cuando hay subagentes.
+- La validación visual en una terminal real está pendiente.

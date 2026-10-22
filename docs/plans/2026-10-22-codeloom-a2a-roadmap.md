@@ -63,21 +63,20 @@ después el transporte (A7, A8).
   cosa. Hecho el 2026-10-22: nuevo nombre `SubagentStatus::Unfinished`, cadena en SQLite
   `unfinished` con lectura de la cadena antigua `interrupted` para no perder sesiones.
   Sigue proyectándose a `Failed`, decisión nuestra ya rotulada.
-- [ ] **A2. Productores de los estados que faltan.** Hoy el runtime produce `working`,
-  `input-required`, `completed`, `failed` y `canceled`. Faltan:
-  - `submitted` («successfully submitted and acknowledged»): decidir el instante del
-    acuse en el lanzador del hijo; la spec no lo fija.
-  - `rejected` («the agent has decided to not perform the task», al crear la tarea o
-    después): decidir qué rechazos son del agente (límites, perfil desconocido,
-    permiso denegado) frente a un fallo de ejecución.
-  - `auth-required`: la spec (§7.6) cita como ejemplo «requiring human approval
-    before a destructive action is taken». Hoy el permiso de un hijo se delega al
-    padre sin cambiar su estado (`ChildResponder::decide`); candidato a productor.
-    Cuidado: «Agents MUST NOT treat the `TASK_STATE_AUTH_REQUIRED` state transition,
-    by itself, as authorization».
-  Requiere variantes nuevas de `SubagentStatus` y su cadena en SQLite (la columna es
-  `TEXT NOT NULL`, sin cambio de esquema), y actualizar la columna «productor» del
-  showcase.
+  Absorbida por el plan `2026-10-22-codeloom-a2a-task-model.md` (el renombrado desaparece
+  con la variante `Unfinished`).
+- [x] **A2. Productores de los estados que faltan.** Hecho el 2026-10-22, absorbido por el
+  plan `2026-10-22-codeloom-a2a-task-model.md` (commit `6365c58`). El runtime produce los
+  ocho estados de tarea. Lo implementado y las decisiones tomadas (que A2A no fija) figuran
+  en `docs/specs/2026-10-22-codeloom-a2a-states-producers-design.md`, sección «Estado».
+  Cuidado de siempre: «Agents MUST NOT treat the `TASK_STATE_AUTH_REQUIRED` state transition,
+  by itself, as authorization».
+  - **Abierto (divergencias temporales declaradas):** `result` sigue siendo texto y el
+    mensaje de estado (`TaskStatus.message`) es texto, no `Message`/`Part`; no hay
+    `contextId` ni `reference_task_ids`. Quedan para A5 (tipos del protocolo) y A11
+    (tareas enlazadas).
+  - **Abierto (no consta en A2A):** qué pasa con `input-required` o `auth-required` si el
+    usuario cancela al hijo (hoy pasa a `canceled`; ver A10).
 - [x] **A3. Leer lo que falta de la especificación** (hecho el 2026-10-22, parcial).
   Leído en literal: el `a2a.proto` completo y, de la especificación, las secciones 3.1,
   3.3, 3.4 y 7.6. Anotado en la spec A2A qué consta y qué no. **Quedan por leer en

@@ -247,7 +247,7 @@ fn get_funcionalidades() -> Vec<FuncionalidadEntrada> {
         ),
         FuncionalidadEntrada::new(
             "Flock/subagentes",
-            "Estados A2A: el runtime produce 5 de los 8; submitted, auth-required y rejected sin productor",
+            "Estados A2A: el runtime produce los 8 estados de tarea (submitted, working, input-required, auth-required, completed, failed, canceled, rejected)",
             "Rail y showcase pintan los 8 estados (glifo, etiqueta y color propios)",
             "No hay eventos/modelos que conecten UI y motor",
             FuncionalidadEstado::Visual,

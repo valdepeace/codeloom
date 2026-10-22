@@ -124,3 +124,43 @@ en terminal real: pendiente.
 - La spec no define la cancelación en `input-required` ni `auth-required`; hoy el
   usuario puede matar al hijo y la tarea pasa a `canceled`.
 - `submitted` puede durar milisegundos.
+
+## Estado (2026-10-22)
+
+Cabe señalar que la tarea 1 (modelo) y la tarea 2 (productores) del plan
+`docs/plans/2026-10-22-codeloom-a2a-task-model.md` están implementadas, con los commits
+`45807b2` y `6365c58`. La tarea 3 (presentación y documentación) cierra el plan.
+
+### Lo implementado
+
+- El estado de un subagente es `TaskState` con su `TaskStatus` (`state`, `message`,
+  `timestamp_ms`). `SubagentStatus`, `Killed` y `Unfinished` han desaparecido.
+- SQLite guarda los nombres del proto v1.0 y lee las cadenas antiguas. Las columnas
+  `status_message` y `status_timestamp_ms` se añaden de forma idempotente.
+- Al reabrir la aplicación, todo estado no terminal pasa a `failed` con el mensaje
+  `interrupted by application shutdown`.
+- Un único punto de transición valida las reglas de A2A, persiste y publica
+  `SubagentChanged`. Una tarea terminal no admite transición posterior.
+- El runtime produce los ocho estados. La interfaz deriva su aspecto de `TaskState` con
+  `match` exhaustivo, sin comodín.
+
+### Decisiones tomadas que A2A no fija
+
+- Texto de `input-required`: las preguntas pendientes se unen con salto de línea.
+- `auth-required`: el texto es «herramienta acción: detalle», con 160 caracteres como
+  máximo. Solo se produce cuando el padre va a preguntar de verdad a una persona, es
+  decir, cuando `PermissionService::would_prompt` lo confirma. `--yolo` o un permiso ya
+  concedido no lo activan.
+- Esc del padre sobre el hijo lleva a este a `canceled`.
+- Capacidad agotada: `rejected` con el mensaje `maximum of 8 active subagents reached`.
+  Los errores de validación de entrada no crean tarea.
+- Lo no terminado al reabrir pasa a `failed` con el mensaje indicado arriba.
+
+### Limitaciones reales
+
+- La cabecera plana puede recortar el resumen en terminales estrechas. Ahí se incumple
+  la regla de trazabilidad, porque el texto con los estados originales de A2A puede
+  quedar fuera de la vista.
+- La cabecera del workspace pasa de 2 a 3 líneas cuando hay subagentes.
+- La validación visual en una terminal real está pendiente. Las pruebas son puras y no
+  sustituyen una comprobación en pantalla.

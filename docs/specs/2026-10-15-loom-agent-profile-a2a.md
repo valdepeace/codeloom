@@ -211,32 +211,27 @@ La card es la **vista externa**; el `AgentProfile` es la **vista interna**.
 - **Versionado**: se pinea `A2A-Version` (`1.0`) y se envuelve en tipos propios
   (`AgentCard`, `Task`); un cambio del spec se absorbe en el crate.
 
-### Estado de tarea (2026-10-21)
+### Estado de tarea (2026-10-22)
 
-Ciertamente, ya existe `codeloom_core::task::TaskState`, enumerado puro con los
-estados de tarea de A2A, que se obtiene por proyección desde los estados
-internos. Cabe señalar que **no lleva serialización**: los nombres del cable
-dependen de la versión (v1.0: `TASK_STATE_INPUT_REQUIRED`; v0.3:
-`input-required`) y los fija el adaptador, no el core.
+Ciertamente, el estado de un subagente **es** `codeloom_core::task::TaskState`, el
+enumerado de los ocho estados de tarea de A2A, acompañado de su `TaskStatus`
+(`state`, `message`, `timestamp_ms`). No existe enum paralelo ni proyección en el
+núcleo: `SubagentStatus`, `Killed` y `Unfinished` ya no existen. El estado persistido
+en SQLite usa los nombres del proto v1.0 (`TASK_STATE_SUBMITTED`, `TASK_STATE_WORKING`,
+`TASK_STATE_INPUT_REQUIRED`, ...); las cadenas antiguas (`running`, `killed`,
+`unfinished`, ...) se siguen leyendo y se traducen a su estado equivalente. Cabe
+señalar que el núcleo **no lleva serialización al cable**: los nombres JSON los fija
+el adaptador (A4), no el núcleo.
 
-| Estado interno                                       | `TaskState`  |
-|------------------------------------------------------|--------------|
-| `JobStatus::Running`, `JobStatus::Stopping`          | `Working`    |
-| `JobStatus::Completed`, `SubagentStatus::Completed`  | `Completed`  |
-| `JobStatus::Failed`, `SubagentStatus::Failed`, `SubagentStatus::Unfinished` | `Failed` |
-| `JobStatus::Killed`, `SubagentStatus::Killed`        | `Canceled`   |
+El runtime produce los ocho estados (`submitted`, `working`, `input-required`,
+`auth-required`, `completed`, `failed`, `canceled`, `rejected`) mediante un único punto
+de transición que valida las reglas de A2A. La interfaz deriva su aspecto de
+`TaskState` a través de `batten::state::AgentState`, sin alterar el modelo.
 
-Cabe señalar que `Unfinished -> Failed` es decisión nuestra: A2A carece de un
-equivalente a «interrumpida», de modo que la tarea se proyecta a fallo por haber
-quedado sin terminar. El modelo interno (`JobStatus`, `SubagentStatus` y el
-esquema SQLite) no cambia; la traducción vive solo en el borde.
-
-Cabe señalar que los ocho estados se pintan tanto en el rail de loom como en el
-showcase de `batten`, a partir de `batten::state::AgentState`, al que el rail
-proyecta `TaskState`. El runtime solo produce hoy `working`, `input-required`,
-`completed`, `failed` y `canceled`; `submitted`, `rejected` y `auth-required`
-quedan pendientes de un productor. Para generarlos bastará con añadir variantes
-a `SubagentStatus` con su cadena en SQLite, sin cambio de esquema.
+Nota (historial): hasta el 2026-10-22 el subagente tenía un enum propio
+(`SubagentStatus`) que se proyectaba a `TaskState` en el borde, con `Killed` como
+`Canceled` y `Unfinished` como `Failed`. Ese enfoque se sustituye por la spec
+`2026-10-22-codeloom-a2a-task-model-design.md`.
 
 ### Fuente normativa de los estados (2026-10-22)
 
