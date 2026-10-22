@@ -24,6 +24,7 @@ use codeloom_core::tools::job_kill::JobKillTool;
 use codeloom_core::tools::job_list::JobListTool;
 use codeloom_core::tools::job_output::JobOutputTool;
 use codeloom_core::tools::job_start::JobStartTool;
+use codeloom_core::tools::spill::ToolSpill;
 use codeloom_core::tools::subagent::SubagentTool;
 use codeloom_core::tools::subagent_control::SubagentControlTool;
 use codeloom_core::tools::subagent_list::SubagentListTool;
@@ -204,7 +205,8 @@ async fn main() -> Result<()> {
         )
         .with_catalog(catalog.clone())
         .with_agent_registry(registro_agentes.clone())
-        .with_delegation_confirm(agents_cfg.confirm_delegation),
+        .with_delegation_confirm(agents_cfg.confirm_delegation)
+        .with_spill(ToolSpill::new(data_dir.join("tool-output"))),
     );
 
     if let Some(prompt) = cli.print {

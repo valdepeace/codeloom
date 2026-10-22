@@ -11,11 +11,26 @@ use crate::message::{ContentPart, FinishReason, Message, Role, Usage};
 use crate::permission::PermissionService;
 use crate::provider::{Provider, ProviderRequest, StreamChunk};
 use crate::session::{SessionId, SessionStore, UsageRecord};
-use crate::tools::{limit_bytes, ToolCtx, ToolRegistry, MAX_NOTICE_BYTES};
+use crate::tools::spill::ToolSpill;
+use crate::tools::{limit_bytes, ToolCtx, ToolRegistry, MAX_NOTICE_BYTES, MAX_TOOL_OUTPUT_BYTES};
 use futures::StreamExt;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use tokio_util::sync::CancellationToken;
+
+/// Contenido que recibe el modelo para el resultado de una herramienta. Si supera el tope y hay
+/// volcado, guarda el original y añade su ruta tras el recorte; la reserva de 256 bytes deja
+/// margen al marcador para que el total siga dentro de `MAX_TOOL_OUTPUT_BYTES`. Si no hay
+/// volcado o no se pudo escribir, se recorta sin ruta, como antes.
+fn contenido_de_herramienta(spill: Option<&ToolSpill>, call_id: &str, content: &str) -> String {
+    if content.len() > MAX_TOOL_OUTPUT_BYTES {
+        if let Some(ruta) = spill.and_then(|spill| spill.save(call_id, content)) {
+            let recorte = limit_bytes(content, MAX_TOOL_OUTPUT_BYTES - 256);
+            return format!("{recorte}\n[full output saved to: {}]", ruta.display());
+        }
+    }
+    crate::tools::limit_output(content).into_owned()
+}
 
 pub struct TurnOutcome {
     pub session: SessionId,
@@ -43,6 +58,8 @@ pub struct AgentLoop {
     registry: Option<Arc<crate::registry::AgentRegistry>>,
     /// Modo de confirmación al delegar; viaja a `RegistrySnapshot::prompt_section` en cada turno.
     delegation_confirm: ConfirmDelegation,
+    /// Volcado a disco de las salidas recortadas; `None` no guarda nada y no añade ruta.
+    spill: Option<ToolSpill>,
 }
 
 impl AgentLoop {
@@ -74,6 +91,7 @@ impl AgentLoop {
             system_extra: None,
             registry: None,
             delegation_confirm: ConfirmDelegation::default(),
+            spill: None,
             cwd,
         };
         if has_subagents {
@@ -122,6 +140,17 @@ impl AgentLoop {
         self
     }
 
+    /// Activa el volcado a disco de las salidas de herramienta que superan el tope. Sin él, el
+    /// recorte no lleva ruta.
+    pub fn with_spill(mut self, spill: ToolSpill) -> Self {
+        self.spill = Some(spill);
+        // Igual que `with_catalog`: si el lanzador ya existía, se reconstruye con el volcado.
+        if self.subagents.is_some() {
+            self.subagents = Some(self.subagent_launcher());
+        }
+        self
+    }
+
     /// Lanzador de subagentes con el estado actual de este agente, catálogo y registro incluidos.
     fn subagent_launcher(&self) -> Arc<dyn crate::subagent::SubagentLauncher> {
         let lanzador = crate::subagent::InProcessSubagentLauncher::new(
@@ -137,6 +166,10 @@ impl AgentLoop {
         .with_catalog(self.catalog.clone());
         let lanzador = match &self.registry {
             Some(registro) => lanzador.with_registry(registro.clone()),
+            None => lanzador,
+        };
+        let lanzador = match &self.spill {
+            Some(spill) => lanzador.with_spill(spill.clone()),
             None => lanzador,
         };
         Arc::new(lanzador)
@@ -438,11 +471,12 @@ impl AgentLoop {
                         }
                     }
                 }
+                let contenido = contenido_de_herramienta(self.spill.as_ref(), &id, &out.content);
                 let tr = Message::new(
                     Role::Tool,
                     vec![ContentPart::ToolResult {
                         call_id: id,
-                        content: crate::tools::limit_output(&out.content).into_owned(),
+                        content: contenido,
                         is_error: out.is_error,
                     }],
                 );
@@ -1195,6 +1229,123 @@ mod tests {
     }
 
     /// Catálogo con `acme` (`https://acme.example/v1`) y dos modelos con precios distintos.
+    struct Voluminosa;
+
+    #[async_trait]
+    impl Tool for Voluminosa {
+        fn name(&self) -> &str {
+            "voluminosa"
+        }
+        fn description(&self) -> &str {
+            "n"
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object"})
+        }
+        fn execution_mode(&self, _i: &serde_json::Value) -> ExecutionMode {
+            ExecutionMode::Exclusive
+        }
+        async fn run(
+            &self,
+            _c: ToolCtx,
+            _i: serde_json::Value,
+            _x: CancellationToken,
+        ) -> Result<ToolOutput> {
+            Ok(ToolOutput::ok("x".repeat(50_000)))
+        }
+    }
+
+    /// Un turno en el que el modelo llama a `voluminosa`. Devuelve el contenido del resultado
+    /// de herramienta tal como queda en el historial.
+    async fn resultado_de_voluminosa(spill: Option<ToolSpill>, dir: &std::path::Path) -> String {
+        let scripts = vec![
+            vec![
+                StreamChunk::ToolCallComplete {
+                    id: "c1".into(),
+                    name: "voluminosa".into(),
+                    input: serde_json::json!({}),
+                },
+                StreamChunk::Done(FinishReason::ToolCalls),
+            ],
+            vec![
+                StreamChunk::TextDelta("fin".into()),
+                StreamChunk::Done(FinishReason::Stop),
+            ],
+        ];
+        let provider = Arc::new(QueueProvider {
+            scripts: Mutex::new(scripts.into()),
+        });
+        let store = Arc::new(
+            SqliteStore::open(dir.join("l.db").to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+        let sid = store.create_session("/p").await.unwrap();
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(Voluminosa));
+        let cfg = CodeLoomConfig {
+            provider: crate::config::ProviderConfig {
+                kind: crate::config::ProviderKind::OpenAiCompat,
+                base_url: "http://x".into(),
+                api_key_env: "K".into(),
+            },
+            model: "m".into(),
+            max_steps: 5,
+            effort: None,
+        };
+        let mut agent = AgentLoop::new(
+            provider,
+            store.clone(),
+            Arc::new(tools),
+            EventBus::new(64),
+            Arc::new(PermissionService::allow_all()),
+            cfg,
+            dir.to_path_buf(),
+        );
+        if let Some(spill) = spill {
+            agent = agent.with_spill(spill);
+        }
+        agent
+            .run(sid, "hi".into(), CancellationToken::new())
+            .await
+            .unwrap();
+        let msgs = store.messages(sid).await.unwrap();
+        msgs.iter()
+            .flat_map(|m| m.parts.iter())
+            .find_map(|p| match p {
+                ContentPart::ToolResult { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .expect("debe haber un resultado de herramienta")
+    }
+
+    #[tokio::test]
+    async fn oversized_tool_result_is_spilled_and_the_path_is_in_the_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let spill = ToolSpill::new(dir.path().join("spill"));
+        let contenido = resultado_de_voluminosa(Some(spill), dir.path()).await;
+
+        assert!(
+            contenido.contains("[full output saved to: "),
+            "sin ruta en el recorte"
+        );
+        assert!(contenido.len() <= MAX_TOOL_OUTPUT_BYTES);
+        assert!(contenido.ends_with(']'));
+        let inicio =
+            contenido.find("[full output saved to: ").unwrap() + "[full output saved to: ".len();
+        let ruta = &contenido[inicio..contenido.len() - 1];
+        let guardado = std::fs::read_to_string(ruta).unwrap();
+        assert_eq!(guardado, "x".repeat(50_000));
+    }
+
+    #[tokio::test]
+    async fn without_spill_the_tool_result_has_no_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let contenido = resultado_de_voluminosa(None, dir.path()).await;
+        assert!(!contenido.contains("saved to"));
+        assert!(contenido.contains("bytes omitted"));
+    }
+
     fn priced_catalog() -> Arc<RwLock<crate::catalog::Catalog>> {
         let catalog = crate::catalog::Catalog::from_json(
             r#"{"acme": {"id": "acme", "npm": "@ai-sdk/openai-compatible",

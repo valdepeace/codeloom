@@ -11,6 +11,7 @@ use crate::registry::{AgentEntry, AgentRegistry, Approval, Execution, AGENTE_POR
 use crate::session::{SessionId, SessionStore, SubagentDescriptor};
 use crate::subagent_input::{ChildResponder, InputBroker, PendingInput};
 use crate::task::{TaskState, TaskStatus};
+use crate::tools::spill::ToolSpill;
 use crate::tools::ToolRegistry;
 use async_trait::async_trait;
 use std::path::PathBuf;
@@ -76,6 +77,8 @@ pub struct InProcessSubagentLauncher {
     /// Registro de agentes. Sin él solo existe el agente `default`, y el lanzador se comporta
     /// exactamente como antes de la tarea 6.
     registry: Option<Arc<AgentRegistry>>,
+    /// Volcado de salidas recortadas que reciben los hijos; `None` como en el agente padre.
+    spill: Option<ToolSpill>,
 }
 
 /// Descarta la pregunta pendiente del hijo al terminar su trabajo, sea cual sea la
@@ -177,7 +180,14 @@ impl InProcessSubagentLauncher {
             broker: Arc::new(InputBroker::default()),
             catalog: Arc::new(RwLock::new(Catalog::default())),
             registry: None,
+            spill: None,
         }
+    }
+
+    /// Comparte el volcado a disco con los hijos que lance, como `with_catalog`.
+    pub fn with_spill(mut self, spill: ToolSpill) -> Self {
+        self.spill = Some(spill);
+        self
     }
 
     /// Comparte el registro de agentes: `start` resuelve ahí el agente pedido.
@@ -364,6 +374,7 @@ impl SubagentLauncher for InProcessSubagentLauncher {
         let child_cwd = self.cwd.clone();
         let child_jobs = self.jobs.clone();
         let child_catalog = self.catalog.clone();
+        let child_spill = self.spill.clone();
         let descriptor_label = label.clone();
         // El bus del hijo se crea y se suscribe antes de lanzarlo, para no perder ningún
         // evento de su arranque. Su canal se cierra cuando se sueltan todos sus emisores.
@@ -394,7 +405,7 @@ impl SubagentLauncher for InProcessSubagentLauncher {
                     {
                         tracing::warn!("persist subagent status: {error}");
                     }
-                    let child_agent = AgentLoop::new(
+                    let mut child_agent = AgentLoop::new(
                         child_provider,
                         child_store.clone(),
                         child_tools,
@@ -406,6 +417,9 @@ impl SubagentLauncher for InProcessSubagentLauncher {
                     .with_jobs(child_jobs)
                     .with_catalog(child_catalog)
                     .with_system_extra(child_system);
+                    if let Some(spill) = child_spill {
+                        child_agent = child_agent.with_spill(spill);
+                    }
                     let child_cancel = CancellationToken::new();
                     let outcome = tokio::select! {
                         result = child_agent.run(child, prompt, child_cancel.clone()) => result?,

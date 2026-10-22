@@ -14,6 +14,7 @@ pub mod job_kill;
 pub mod job_list;
 pub mod job_output;
 pub mod job_start;
+pub mod spill;
 pub mod subagent;
 pub mod subagent_control;
 pub mod subagent_list;
