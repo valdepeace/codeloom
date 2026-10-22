@@ -119,13 +119,19 @@ fn ask_user(input: &Value) -> Option<ToolFacts> {
     })
 }
 
-/// Entrada de `subagent`: `prompt` obligatorio y `label` opcional. El resumen es
-/// la etiqueta si la hay y no está en blanco; si no, el objetivo.
+/// Entrada de `subagent`: `prompt` obligatorio, `label` y `agent` opcionales. El resumen es
+/// la etiqueta si la hay y no está en blanco; si no, el objetivo. Con `agent`, se antepone
+/// entre corchetes (`[front] revisión`), igual que en el rail: se ve a quién se delega.
 fn subagent(input: &Value) -> Option<ToolFacts> {
     let prompt = text(input, "prompt")?;
     let label = optional_text(input, "label")?.filter(|label| !label.trim().is_empty());
+    let agent = optional_text(input, "agent")?.filter(|agent| !agent.trim().is_empty());
+    let resumen = label.unwrap_or(prompt);
     Some(ToolFacts {
-        primary: Some(label.unwrap_or(prompt)),
+        primary: Some(match agent {
+            Some(agent) => format!("[{agent}] {resumen}"),
+            None => resumen,
+        }),
         ..ToolFacts::default()
     })
 }
@@ -285,6 +291,17 @@ mod tests {
         );
         assert_eq!(facts.primary.as_deref(), Some("tests"));
         let facts = tool_facts("subagent", &json!({ "prompt": "revisa los tests" }));
+        assert_eq!(facts.primary.as_deref(), Some("revisa los tests"));
+        // El agente elegido se ve en la propia llamada.
+        let facts = tool_facts(
+            "subagent",
+            &json!({ "prompt": "revisa los tests", "label": "tests", "agent": "rust" }),
+        );
+        assert_eq!(facts.primary.as_deref(), Some("[rust] tests"));
+        let facts = tool_facts(
+            "subagent",
+            &json!({ "prompt": "revisa los tests", "agent": "  " }),
+        );
         assert_eq!(facts.primary.as_deref(), Some("revisa los tests"));
 
         let facts = tool_facts(

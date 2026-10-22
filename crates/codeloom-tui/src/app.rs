@@ -2508,6 +2508,17 @@ impl App {
         self.theme.look.tool == batten::widgets::ToolStyle::Inline
     }
 
+    /// Líneas que una herramienta o un elemento de actividad deja en el transcript. Con el
+    /// look `Inline`, todas; con el compacto, solo la cabecera. El transcript es el diario de
+    /// toda iteración: ningún look puede dejar una llamada sin rastro.
+    fn shown_lines(&self, lines: &[batten::state::Line]) -> Vec<batten::state::Line> {
+        if self.tool_inline() {
+            lines.to_vec()
+        } else {
+            lines.iter().take(1).cloned().collect()
+        }
+    }
+
     /// Sincroniza las líneas de una herramienta con su entrada del transcript.
     /// Solo reemplaza la entrada si sus líneas cambiaron: no se llama desde el
     /// camino de los deltas, que se ejecuta por cada token.
@@ -2517,27 +2528,30 @@ impl App {
         };
         let lines = batten::state::tool_lines_with(item, &item.facts);
         let todo = item.name == TODO_TOOL;
-        let inline = self.tool_inline() && !todo;
+        // La lista de tareas tiene su propia entrada: la llamada que la escribe no se repite.
+        let shown = if todo {
+            Vec::new()
+        } else {
+            self.shown_lines(&lines)
+        };
         match self.tool_entries.get_mut(call_id) {
             Some((id, cache)) => {
                 if *cache == lines {
                     return;
                 }
-                let shown = if inline { lines.clone() } else { Vec::new() };
                 *cache = lines;
                 self.transcript.replace(*id, shown);
             }
-            // La entrada se crea siempre, para que un cambio posterior de look
-            // la encuentre en su sitio cronológico. Con el look clásico nace
-            // vacía y no corta el texto del asistente.
+            // La entrada se crea siempre, en su sitio cronológico. Si deja alguna línea visible,
+            // corta el texto del asistente: lo que diga después va en una entrada nueva, debajo.
             None => {
-                let shown = if inline { lines.clone() } else { Vec::new() };
+                let visible = !shown.is_empty();
                 let id = self.transcript.push_lines(shown);
                 self.tool_entries.insert(call_id.to_string(), (id, lines));
                 if todo {
                     self.todo_tool_calls.insert(call_id.to_string());
                 }
-                if inline {
+                if visible {
                     self.assistant = None;
                 }
             }
@@ -2549,19 +2563,15 @@ impl App {
     pub fn sync_all_tools(&mut self) {
         let inline = self.tool_inline();
         for (call_id, (id, lines)) in &self.tool_entries {
-            let shown = if inline && !self.todo_tool_calls.contains(call_id) {
-                lines.clone()
-            } else {
+            let shown = if self.todo_tool_calls.contains(call_id) {
                 Vec::new()
+            } else {
+                self.shown_lines(lines)
             };
             self.transcript.replace(*id, shown);
         }
         for entry in &self.activity_entries {
-            let shown = if inline {
-                entry.lines.clone()
-            } else {
-                Vec::new()
-            };
+            let shown = self.shown_lines(&entry.lines);
             self.transcript.replace(entry.id, shown);
         }
         if let Some((id, lines)) = &self.todo_entry {
@@ -2635,25 +2645,18 @@ impl App {
         lines: Vec<batten::state::Line>,
         from_notice: bool,
     ) {
-        let inline = self.tool_inline();
+        let shown = self.shown_lines(&lines);
         if let Some(entry) = self.activity_entries.iter_mut().find(|e| e.key == key) {
             if entry.lines == lines {
                 return;
             }
             entry.label = label.to_string();
             entry.lines = lines;
-            let shown = if inline {
-                entry.lines.clone()
-            } else {
-                Vec::new()
-            };
             self.transcript.replace(entry.id, shown);
             return;
         }
-        // Como con las herramientas, la entrada se crea siempre para que un
-        // cambio de look la encuentre en su sitio. Con el look clásico nace
-        // vacía y no corta el texto del asistente.
-        let shown = if inline { lines.clone() } else { Vec::new() };
+        // Como con las herramientas, la entrada se crea en su sitio cronológico y, al dejar
+        // una línea visible, corta el texto del asistente.
         let id = self.transcript.push_lines(shown);
         self.activity_entries.push(ActivityEntry {
             key: key.to_string(),
@@ -2664,9 +2667,7 @@ impl App {
             from_notice,
             notice_consumed: false,
         });
-        if inline {
-            self.assistant = None;
-        }
+        self.assistant = None;
     }
 
     /// Elemento de actividad de un job de esta sesión. Los jobs de tipo
@@ -3226,16 +3227,51 @@ mod tests {
             ),
         ]);
 
-        // Con el look clásico la entrada de la tool existe pero está vacía: lo
-        // visible son solo las dos líneas de los mensajes.
-        assert_eq!(app.transcript.len(), 2);
+        // Con el look clásico la llamada deja solo su cabecera, entre los dos mensajes: el
+        // transcript es el diario de toda iteración.
+        assert_eq!(app.transcript.len(), 3);
         assert_eq!(app.transcript.line(0).unwrap().plain(), "hola");
         assert_eq!(app.transcript.line(1).unwrap().plain(), "respuesta");
+        assert!(app
+            .transcript
+            .line(2)
+            .unwrap()
+            .plain()
+            .to_lowercase()
+            .contains("view"));
         assert_eq!(app.history.prev(""), Some("hola"));
         assert_eq!(app.tools.len(), 1);
         assert_eq!(app.tools[0].output.as_deref(), Some("contenido"));
         assert_eq!(app.tools[0].status(), batten::state::ToolStatus::Success);
         assert_eq!((app.turn_input_tokens, app.turn_output_tokens), (0, 0));
+    }
+
+    #[test]
+    fn classic_look_shows_the_subagent_call_with_its_agent_in_the_conversation() {
+        let mut app = App::new(); // tema Batten = Classic
+        app.restore_messages(vec![
+            Message::user("lee un fichero"),
+            Message::assistant(vec![ContentPart::ToolCall {
+                id: "c1".into(),
+                name: "subagent".into(),
+                input: serde_json::json!({
+                    "prompt": "lee rustfmt.toml",
+                    "label": "leer fichero",
+                    "agent": "rust"
+                }),
+            }]),
+        ]);
+        let texts: Vec<String> = app
+            .transcript
+            .iter()
+            .map(|l| l.plain().to_string())
+            .collect();
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("subagent") && t.contains("[rust] leer fichero")),
+            "la llamada a subagent debe verse con su agente: {texts:?}"
+        );
     }
 
     #[test]
@@ -3584,30 +3620,66 @@ Cuerpo de front.
     }
 
     #[test]
-    fn switching_look_hides_and_restores_tool_entries() {
+    fn switching_look_keeps_the_tool_header_and_restores_the_body() {
         let mut app = crush_app();
         app.apply(LiveEvent::ToolStarted {
             call_id: "c1".into(),
             name: "View".into(),
         });
-        assert!(app.transcript.iter().any(|l| l.plain().starts_with("View")));
+        app.apply_message_added(tool_result_message(
+            "c1",
+            "linea 1
+linea 2",
+            false,
+        ));
+        let con_cuerpo = app
+            .transcript
+            .iter()
+            .filter(|l| l.plain() == "linea 1")
+            .count();
+        assert_eq!(con_cuerpo, 1, "el look Crush muestra el cuerpo");
         app.theme = batten::widgets::Theme::preset(batten::widgets::ThemePreset::Batten);
         app.sync_all_tools();
-        assert!(!app.transcript.iter().any(|l| l.plain().starts_with("View")));
+        assert_eq!(
+            app.transcript
+                .iter()
+                .filter(|l| l.plain().starts_with("View"))
+                .count(),
+            1,
+            "la cabecera nunca desaparece"
+        );
+        assert!(!app.transcript.iter().any(|l| l.plain() == "linea 1"));
         app.theme = batten::widgets::Theme::preset(batten::widgets::ThemePreset::Crush);
         app.sync_all_tools();
-        assert!(app.transcript.iter().any(|l| l.plain().starts_with("View")));
+        assert!(app.transcript.iter().any(|l| l.plain() == "linea 1"));
     }
 
     #[test]
-    fn classic_look_keeps_the_transcript_free_of_tool_lines() {
+    fn classic_look_leaves_one_header_line_per_tool_call_and_folds_the_output() {
         let mut app = App::new(); // tema Batten = Classic
         app.apply(LiveEvent::ToolStarted {
             call_id: "c1".into(),
             name: "View".into(),
         });
-        assert!(!app.transcript.iter().any(|l| l.plain().starts_with("View")));
+        assert_eq!(
+            app.transcript
+                .iter()
+                .filter(|l| l.plain().starts_with("View"))
+                .count(),
+            1,
+            "toda llamada deja su cabecera en el transcript"
+        );
         assert_eq!(app.tools.len(), 1);
+        app.apply_message_added(tool_result_message(
+            "c1",
+            "linea 1
+linea 2",
+            false,
+        ));
+        assert!(
+            !app.transcript.iter().any(|l| l.plain() == "linea 1"),
+            "el cuerpo sigue en la tarjeta fija y en el inspector, no en el transcript"
+        );
     }
 
     #[test]
@@ -3637,7 +3709,7 @@ Cuerpo de front.
     }
 
     #[test]
-    fn classic_look_does_not_split_the_assistant_text_around_a_tool() {
+    fn classic_look_orders_the_assistant_text_around_a_tool_chronologically() {
         let mut app = App::new();
         app.push_assistant("uno");
         app.apply(LiveEvent::ToolStarted {
@@ -3650,7 +3722,13 @@ Cuerpo de front.
             .iter()
             .map(|l| l.plain().to_string())
             .collect();
-        assert!(texts.iter().any(|t| t == "uno dos"));
+        let uno = texts.iter().position(|t| t == "uno").unwrap();
+        let herramienta = texts.iter().position(|t| t.starts_with("View")).unwrap();
+        let dos = texts.iter().position(|t| t.contains("dos")).unwrap();
+        assert!(
+            uno < herramienta && herramienta < dos,
+            "el texto posterior a la llamada va debajo de ella: {texts:?}"
+        );
     }
 
     #[test]
@@ -4151,7 +4229,7 @@ Cuerpo de front.
     }
 
     #[test]
-    fn classic_look_keeps_notices_as_user_messages_and_hides_activity() {
+    fn classic_look_keeps_notices_as_user_messages_and_shows_the_activity_header() {
         let mut app = App::new(); // tema Batten = Classic
         app.session_id = Some(SessionId(1));
         app.apply(LiveEvent::SubagentChanged(sub(
@@ -4169,11 +4247,16 @@ Cuerpo de front.
             .filter(|l| l.kind == batten::state::LineKind::User)
             .count();
         assert_eq!(user_count, 2);
-        assert!(heads(&app).is_empty());
+        assert_eq!(
+            heads(&app).len(),
+            1,
+            "la actividad del subagente deja su cabecera"
+        );
+        assert!(heads(&app)[0].0.starts_with("subagent  review"));
     }
 
     #[test]
-    fn switching_look_hides_and_restores_activity() {
+    fn switching_look_keeps_the_activity_header() {
         let mut app = crush_app();
         app.session_id = Some(SessionId(1));
         app.apply(LiveEvent::SubagentChanged(sub(
@@ -4184,16 +4267,18 @@ Cuerpo de front.
         assert_eq!(heads(&app).len(), 1);
         app.theme = batten::widgets::Theme::preset(batten::widgets::ThemePreset::Batten);
         app.sync_all_tools();
-        assert!(heads(&app).is_empty());
-        app.theme = batten::widgets::Theme::preset(batten::widgets::ThemePreset::Crush);
-        app.sync_all_tools();
+        let esperado = vec![(
+            "subagent  review (working)".to_string(),
+            ToolStatus::Running,
+        )];
         assert_eq!(
             heads(&app),
-            vec![(
-                "subagent  review (working)".to_string(),
-                ToolStatus::Running
-            )]
+            esperado,
+            "la cabecera sobrevive al look clásico"
         );
+        app.theme = batten::widgets::Theme::preset(batten::widgets::ThemePreset::Crush);
+        app.sync_all_tools();
+        assert_eq!(heads(&app), esperado);
     }
 
     /// Tarea de prueba con el contenido y el estado indicados.

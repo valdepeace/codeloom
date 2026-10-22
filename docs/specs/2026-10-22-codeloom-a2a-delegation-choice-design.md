@@ -147,3 +147,22 @@ confirm_delegation = "always"   # "doubt" (por defecto), "always" o "never"
 - El modo es global y fijo por configuración; no hay comando para cambiarlo en la sesión.
 
 **Pendiente:** A12b (clasificador o enrutador) y la pregunta abierta sobre un comando de sesión.
+
+### Adenda (2026-10-22): el transcript es el diario de toda llamada
+
+Se detectó en uso real que, con el look clásico (`ToolStyle::Pinned`, el de `theme = "batten"`),
+**ninguna llamada a herramienta dejaba rastro en la conversación**: solo la última se veía en una
+tarjeta fija junto al composer, y los subagentes y jobs tampoco aparecían. La persona usuaria lo
+declaró inaceptable: el transcript es el diario de toda iteración, y al ser varios actores debe
+verse quién es quién y qué hace.
+
+Cambio: con el look compacto, cada llamada a una herramienta y cada elemento de actividad
+(subagente o job) deja **una línea de cabecera** en su sitio cronológico, y esa línea corta el
+texto del asistente, de modo que lo que diga después va debajo de la llamada. El cuerpo largo
+sigue en la tarjeta fija y en el inspector (Ctrl+T). La llamada a `subagent` nombra el agente
+elegido en su propia cabecera: `subagent  [rust] leer fichero`. Se reescribieron seis tests que
+defendían la regla anterior («el look clásico no deja rastro»), por decisión expresa.
+
+**Sigue abierto:** el aviso de fin de un subagente (`[Subagent … completed]`) entra en el
+transcript como mensaje de **usuario** (`LineKind::User`) y por eso aparece como si lo hubiera
+escrito la persona usuaria. Distinguir actores exige un tipo de línea propio para ese aviso.
