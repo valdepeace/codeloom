@@ -28,6 +28,18 @@ estándar como modelo y se deja la proyección para donde sí corresponde: la pr
   distinta (p. ej. agrupar `submitted` y `working` bajo el mismo glifo de actividad),
   pero **nunca** reescribe ni aproxima el estado del modelo.
 
+### Regla de trazabilidad (obligatoria)
+
+La presentación puede agrupar varios estados de A2A bajo un mismo aspecto, pero **todo
+texto visible que los agrupe o los oculte nombra entre paréntesis los estados originales
+de A2A**, con sus nombres exactos (`submitted`, `working`, `input-required`,
+`auth-required`, `completed`, `failed`, `canceled`, `rejected`). Ejemplo: una cabecera
+«en curso (submitted, working, input-required, auth-required)» o, cuando se conoce el
+estado concreto, «en curso (working)». Debe poder reconstruirse siempre el estado A2A
+exacto de una tarea a partir de lo que se ve; un glifo o color por sí solos no bastan
+si dos o más estados lo comparten. Se verifica con pruebas: cada punto de agrupación
+tiene un test que comprueba que el texto lista los estados originales.
+
 ## Objetivos
 
 1. El estado persistido y en memoria de un subagente es un `TaskState` de A2A, sin enum
