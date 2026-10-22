@@ -44,6 +44,19 @@ pub enum TrustError {
     },
 }
 
+/// Errores al aprobar o revocar un agente por nombre (`AgentRegistry::approve`).
+#[derive(Debug, thiserror::Error)]
+pub enum ApprovalError {
+    #[error("no existe el agente `{0}`")]
+    Desconocido(String),
+    #[error("el agente `{0}` no necesita aprobación: solo la requieren los de proyecto")]
+    NoRequerida(String),
+    #[error("el registro no tiene almacén de confianza configurado")]
+    SinAlmacen,
+    #[error(transparent)]
+    Almacen(#[from] TrustError),
+}
+
 /// Estado de aprobación de un agente en una instantánea.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Approval {
@@ -199,6 +212,16 @@ impl Confianza {
             raiz: raiz_canonica(raiz_proyecto),
             confiar_todo,
         }
+    }
+
+    /// Aprueba la terna (raíz de esta confianza, nombre, huella).
+    pub(crate) fn aprobar(&self, nombre: &str, huella: &str) -> Result<(), TrustError> {
+        self.almacen.approve(&self.raiz, nombre, huella)
+    }
+
+    /// Revoca la aprobación de `nombre` en la raíz de esta confianza.
+    pub(crate) fn revocar(&self, nombre: &str) -> Result<(), TrustError> {
+        self.almacen.revoke(&self.raiz, nombre)
     }
 
     /// `true` si un agente de proyecto con esa huella puede usarse.

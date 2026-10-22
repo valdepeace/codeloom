@@ -23,7 +23,7 @@ pub use source::{
     AgentEntry, AgentOrigin, AgentSource, BuiltInSource, Execution, FileSource, LoadProblem,
     LocalSpec, ProfileLevel, SourceLoad, AGENTE_POR_DEFECTO,
 };
-pub use trust::{content_hash, Approval, TrustError, TrustStore};
+pub use trust::{content_hash, Approval, ApprovalError, TrustError, TrustStore};
 pub use watch::WatcherHandle;
 
 use trust::Confianza;
@@ -225,6 +225,40 @@ impl AgentRegistry {
         Arc::clone(&actual)
     }
 
+    /// Aprueba el agente de proyecto `name` tal como está cargado ahora: la huella es la de la
+    /// instantánea vigente, es decir, la del contenido que la persona usuaria ha podido ver.
+    /// Si el fichero cambia después, la aprobación deja de valer en la recarga siguiente.
+    pub fn approve(&self, name: &str) -> Result<(), ApprovalError> {
+        let (confianza, huella) = self.agente_de_proyecto(name)?;
+        Ok(confianza.aprobar(name, &huella)?)
+    }
+
+    /// Revoca la aprobación del agente de proyecto `name`. Si no estaba aprobado, no hace nada.
+    pub fn revoke(&self, name: &str) -> Result<(), ApprovalError> {
+        let (confianza, _) = self.agente_de_proyecto(name)?;
+        Ok(confianza.revocar(name)?)
+    }
+
+    /// Comprueba que `name` existe y es de proyecto; devuelve la confianza y su huella.
+    fn agente_de_proyecto(&self, name: &str) -> Result<(&Confianza, String), ApprovalError> {
+        let instantanea = self.snapshot();
+        let entrada = instantanea
+            .get(name)
+            .ok_or_else(|| ApprovalError::Desconocido(name.to_string()))?;
+        let huella = match (&entrada.origin, &entrada.content_hash) {
+            (
+                AgentOrigin::File {
+                    level: ProfileLevel::Project,
+                    ..
+                },
+                Some(huella),
+            ) => huella.clone(),
+            _ => return Err(ApprovalError::NoRequerida(name.to_string())),
+        };
+        let confianza = self.confianza.as_ref().ok_or(ApprovalError::SinAlmacen)?;
+        Ok((confianza, huella))
+    }
+
     /// Recarga bajo el cerrojo de recargas. Devuelve (anterior, nueva).
     fn recargar(&self) -> (Arc<RegistrySnapshot>, Arc<RegistrySnapshot>) {
         let _turno = self.recarga.lock().unwrap_or_else(|e| e.into_inner());
@@ -420,6 +454,67 @@ mod tests {
             seccion.contains("awaiting approval: front"),
             "se debe avisar del agente pendiente: {seccion}"
         );
+    }
+
+    #[test]
+    fn approve_and_revoke_flip_a_project_agent_and_a_change_invalidates_it() {
+        let global = tempfile::tempdir().unwrap();
+        let proyecto = tempfile::tempdir().unwrap();
+        let datos = tempfile::tempdir().unwrap();
+        escribir(global.path(), "rust.md", &perfil("rust", "Global"));
+        escribir(proyecto.path(), "front.md", &perfil("front", "Interfaz"));
+        let registro = registro_con_global_y_proyecto(global.path(), proyecto.path()).with_trust(
+            TrustStore::open(datos.path().to_path_buf()).unwrap(),
+            proyecto.path().to_path_buf(),
+            false,
+        );
+        assert_eq!(
+            registro.snapshot().approval("front"),
+            Some(Approval::Pending)
+        );
+
+        registro.approve("front").unwrap();
+        assert_eq!(
+            registro.snapshot().approval("front"),
+            Some(Approval::Approved)
+        );
+
+        // Un cambio del fichero invalida la aprobación al recargar.
+        escribir(proyecto.path(), "front.md", &perfil("front", "Otra cosa"));
+        assert_eq!(registro.reload().approval("front"), Some(Approval::Pending));
+
+        registro.approve("front").unwrap();
+        registro.revoke("front").unwrap();
+        assert_eq!(
+            registro.snapshot().approval("front"),
+            Some(Approval::Pending)
+        );
+
+        assert!(matches!(
+            registro.approve("rust"),
+            Err(ApprovalError::NoRequerida(_))
+        ));
+        assert!(matches!(
+            registro.approve("nadie"),
+            Err(ApprovalError::Desconocido(_))
+        ));
+    }
+
+    #[test]
+    fn approve_without_a_trust_store_is_an_error() {
+        let proyecto = tempfile::tempdir().unwrap();
+        escribir(proyecto.path(), "front.md", &perfil("front", "Interfaz"));
+        let registro = AgentRegistry::new(vec![
+            Box::new(BuiltInSource),
+            Box::new(FileSource::new(
+                proyecto.path().to_path_buf(),
+                ProfileLevel::Project,
+            )),
+        ]);
+        assert!(matches!(
+            registro.approve("front"),
+            Err(ApprovalError::SinAlmacen)
+        ));
     }
 
     #[test]
