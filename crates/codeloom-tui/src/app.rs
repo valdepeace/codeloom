@@ -364,9 +364,6 @@ pub struct App {
     todo_tool_calls: HashSet<String>,
     pub jobs: BTreeMap<codeloom_core::job::JobId, codeloom_core::job::JobSnapshot>,
     pub subagents: BTreeMap<i64, codeloom_core::session::SubagentDescriptor>,
-    /// Hijos de la sesión abierta que esperan una respuesta de su padre (`input-required`).
-    /// La clave es el id interno del hijo, como en `subagents`.
-    pub awaiting_input: HashSet<i64>,
     /// Métricas de los hijos de la sesión abierta, por id interno del hijo. Solo
     /// contiene hijos de esa sesión: se filtra al recibir y se limpia al cargarla.
     pub agent_stats: HashMap<i64, AgentStats>,
@@ -607,7 +604,6 @@ impl App {
             todo_tool_calls: HashSet::new(),
             jobs: BTreeMap::new(),
             subagents: BTreeMap::new(),
-            awaiting_input: HashSet::new(),
             agent_stats: HashMap::new(),
             rail_selected: None,
             parent_stack: Vec::new(),
@@ -1321,7 +1317,6 @@ impl App {
         }
         self.rail_selected = None;
         self.subagents.clear();
-        self.awaiting_input.clear();
         self.agent_stats.clear();
         // Los apuntes son de la sesión anterior; la carga posterior repone los de esta.
         self.usage_records.clear();
@@ -2193,15 +2188,12 @@ impl App {
                         .values_mut()
                         .find(|subagent| subagent.job_id == snapshot.id.0)
                     {
-                        // El estado de la tarea sigue al del job. Si no cambia, se conserva el
-                        // `TaskStatus` tal cual, con su mensaje y su marca de tiempo.
+                        // Solo el cierre del job fija el estado: mientras sigue en marcha, la tarea
+                        // conserva su estado real (`working`, `input-required`, `auth-required`...).
+                        // Si el cierre no cambia el estado, se conserva el `TaskStatus` tal cual.
                         let state = TaskState::from(snapshot.status);
-                        if subagent.status.state != state {
+                        if state.is_terminal() && subagent.status.state != state {
                             subagent.status = TaskStatus::new(state);
-                        }
-                        // Un subagente que termina ya no espera respuesta.
-                        if subagent.status.state.is_terminal() {
-                            self.awaiting_input.remove(&subagent.child.0);
                         }
                     }
                 }
@@ -2210,10 +2202,6 @@ impl App {
             }
             LiveEvent::SubagentChanged(subagent) => {
                 if Some(subagent.parent) == self.session_id {
-                    // Un hijo terminado ya no espera a su padre.
-                    if subagent.status.state.is_terminal() {
-                        self.awaiting_input.remove(&subagent.child.0);
-                    }
                     self.sync_subagent_activity(&subagent);
                     self.subagents.insert(subagent.child.0, subagent);
                 }
@@ -2225,16 +2213,16 @@ impl App {
                 }
             }
             LiveEvent::SubagentInputRequested { parent, child, .. } => {
+                // La espera la fija el estado de la tarea (`SubagentChanged`, `input-required`);
+                // aquí solo se despierta al padre.
                 if Some(parent) == self.session_id {
-                    self.awaiting_input.insert(child.0);
                     // Una pregunta del hijo pide que el padre lea el aviso.
                     self.wake_pending = true;
                     self.wake_causes.push((child.0, "asks input"));
                 }
             }
-            LiveEvent::SubagentInputResolved { child, .. } => {
-                self.awaiting_input.remove(&child.0);
-            }
+            // La vuelta a `working` llega como `SubagentChanged`: no hay nada que mantener aquí.
+            LiveEvent::SubagentInputResolved { .. } => {}
             LiveEvent::WakeIdle => self.wake_in_flight = false,
             LiveEvent::ChildEvent {
                 parent,
@@ -3708,6 +3696,61 @@ mod tests {
     }
 
     #[test]
+    fn rejected_canceled_and_auth_required_do_not_wake_the_parent() {
+        for state in [
+            TaskState::Rejected,
+            TaskState::Canceled,
+            TaskState::AuthRequired,
+        ] {
+            let mut app = App::new();
+            app.session_id = Some(SessionId(1));
+            app.apply(LiveEvent::SubagentChanged(child_descriptor(
+                9,
+                state,
+                SessionId(1),
+            )));
+            app.apply(LiveEvent::SubagentSettled {
+                parent: SessionId(1),
+                child: SessionId(9),
+                status: state,
+            });
+            assert!(!app.wake_pending, "{state:?} no debe despertar al padre");
+        }
+    }
+
+    #[test]
+    fn input_required_still_wakes_the_parent() {
+        let mut app = App::new();
+        app.session_id = Some(SessionId(1));
+        app.apply(LiveEvent::SubagentInputRequested {
+            parent: SessionId(1),
+            child: SessionId(9),
+            label: "obrero".into(),
+        });
+        assert!(app.wake_pending);
+    }
+
+    #[test]
+    fn job_snapshot_keeps_the_waiting_state_of_the_child() {
+        let mut app = crush_app();
+        app.session_id = Some(SessionId(1));
+        app.apply(LiveEvent::SubagentChanged(sub(
+            "review",
+            TaskState::InputRequired,
+            SessionId(1),
+        )));
+        // El job sigue en marcha: su snapshot no debe devolver al hijo a `working`.
+        let mut en_marcha = job("subagent-1", JobStatus::Running, SessionId(1));
+        en_marcha.kind = "subagent".into();
+        app.apply(LiveEvent::JobChanged(en_marcha));
+        assert_eq!(
+            app.subagents[&9].status.state,
+            TaskState::InputRequired,
+            "el estado de espera es de la tarea, no del job"
+        );
+    }
+
+    #[test]
     fn foreign_and_subagent_kind_jobs_are_ignored() {
         let mut app = crush_app();
         app.session_id = Some(SessionId(1));
@@ -4130,7 +4173,7 @@ mod tests {
     }
 
     #[test]
-    fn subagent_input_events_toggle_the_waiting_mark() {
+    fn subagent_input_events_drive_the_waiting_state() {
         let mut app = crush_app();
         app.session_id = Some(SessionId(1));
         app.apply(LiveEvent::SubagentChanged(sub(
@@ -4139,48 +4182,47 @@ mod tests {
             SessionId(1),
         )));
 
-        // Preguntar marca al hijo, pero solo si su padre es la sesión abierta.
-        app.apply(LiveEvent::SubagentInputRequested {
-            parent: SessionId(2),
-            child: SessionId(9),
-            label: "review".into(),
-        });
-        assert!(app.awaiting_input.is_empty());
+        // Un cambio de un hijo de otro padre no se refleja en esta sesión.
+        app.apply(LiveEvent::SubagentChanged(sub(
+            "review",
+            TaskState::InputRequired,
+            SessionId(2),
+        )));
+        assert_eq!(app.subagents[&9].status.state, TaskState::Working);
+
+        // La espera es el estado de la tarea; la pregunta solo despierta al padre.
+        app.apply(LiveEvent::SubagentChanged(sub(
+            "review",
+            TaskState::InputRequired,
+            SessionId(1),
+        )));
+        assert_eq!(app.subagents[&9].status.state, TaskState::InputRequired);
         app.apply(LiveEvent::SubagentInputRequested {
             parent: SessionId(1),
             child: SessionId(9),
             label: "review".into(),
         });
-        assert!(app.awaiting_input.contains(&9));
+        assert!(app.wake_pending);
 
-        // Un hijo que sigue en marcha conserva la marca al cambiar de estado no terminal.
+        // Responder devuelve la tarea a `working`, y el estado lo dice el propio cambio.
+        app.apply(LiveEvent::SubagentInputResolved {
+            parent: SessionId(1),
+            child: SessionId(9),
+        });
         app.apply(LiveEvent::SubagentChanged(sub(
             "review",
             TaskState::Working,
             SessionId(1),
         )));
-        assert!(app.awaiting_input.contains(&9));
+        assert_eq!(app.subagents[&9].status.state, TaskState::Working);
 
-        // Responder retira la marca.
-        app.apply(LiveEvent::SubagentInputResolved {
-            parent: SessionId(1),
-            child: SessionId(9),
-        });
-        assert!(!app.awaiting_input.contains(&9));
-
-        // Un estado terminal retira la marca aunque no llegara la resolución.
-        app.apply(LiveEvent::SubagentInputRequested {
-            parent: SessionId(1),
-            child: SessionId(9),
-            label: "review".into(),
-        });
-        assert!(app.awaiting_input.contains(&9));
+        // Un estado terminal cierra la espera.
         app.apply(LiveEvent::SubagentChanged(sub(
             "review",
             TaskState::Completed,
             SessionId(1),
         )));
-        assert!(!app.awaiting_input.contains(&9));
+        assert_eq!(app.subagents[&9].status.state, TaskState::Completed);
     }
 
     /// App en reposo con la sesión 1 abierta, que es el padre de los hijos de los tests.

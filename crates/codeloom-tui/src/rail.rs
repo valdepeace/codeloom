@@ -4,7 +4,6 @@
 use crate::app::{formato_recuento, AgentStats, App, Focus};
 use batten::state::{AgentState, ToolStatus};
 use codeloom_core::job::JobStatus;
-use codeloom_core::session::SubagentDescriptor;
 use codeloom_core::task::TaskState;
 use codeloom_core::todo::TodoStatus;
 use ratatui::layout::Rect;
@@ -216,8 +215,7 @@ fn rail_lines(app: &App, width: usize) -> Vec<Line<'_>> {
         // Un único `Instant::now()` por dibujado: el tiempo transcurrido de todos los hijos.
         let ahora = Instant::now();
         for subagent in subagents().take(SUBAGENT_LIMIT) {
-            let espera = app.awaiting_input.contains(&subagent.child.0);
-            let estado = agent_state(estado_del_rail(subagent, espera));
+            let estado = agent_state(subagent.status.state);
             // Con el foco en el rail, el hijo elegido con ↑/↓ lleva `›` de acento en vez del glifo.
             // El glifo y el `›` ocupan una columna más el espacio, así que la línea no cambia de anchura.
             let seleccionado =
@@ -276,17 +274,6 @@ pub fn agent_state(state: TaskState) -> AgentState {
         TaskState::Failed => AgentState::Failed,
         TaskState::Canceled => AgentState::Canceled,
         TaskState::Rejected => AgentState::Rejected,
-    }
-}
-
-/// Estado que el rail pinta para un hijo. Es su estado de A2A, salvo que siga en marcha y
-/// espere respuesta: entonces se pinta como `input-required`. La marca `awaiting_input`
-/// todavía vive en la TUI; lo fija el runtime en la tarea 2 del plan.
-fn estado_del_rail(subagent: &SubagentDescriptor, espera: bool) -> TaskState {
-    if espera && !subagent.status.state.is_terminal() {
-        TaskState::InputRequired
-    } else {
-        subagent.status.state
     }
 }
 
@@ -578,7 +565,7 @@ mod tests {
         app.session_id = Some(SessionId(1));
         app.subagents.insert(9, running(9, "review"));
         app.subagents.insert(10, running(10, "tests"));
-        app.awaiting_input.insert(9);
+        app.subagents.get_mut(&9).unwrap().status = TaskStatus::new(TaskState::InputRequired);
 
         let rows = rows_of(&app, 40, 20);
         let review = rows
@@ -1238,7 +1225,7 @@ mod tests {
         app.session_id = Some(SessionId(1));
         app.subagents.insert(9, running(9, "review"));
         app.subagents.insert(10, running(10, "tests"));
-        app.awaiting_input.insert(9);
+        app.subagents.get_mut(&9).unwrap().status = TaskStatus::new(TaskState::InputRequired);
 
         let rows = rows_of(&app, 40, 24);
         assert!(
@@ -1271,7 +1258,7 @@ mod tests {
     }
 
     #[test]
-    fn rail_ignores_awaiting_input_for_finished_child() {
+    fn rail_shows_completed_glyph_for_finished_child() {
         let mut app = App::new();
         app.session_id = Some(SessionId(1));
         app.subagents.insert(
@@ -1281,7 +1268,6 @@ mod tests {
                 ..running(9, "review")
             },
         );
-        app.awaiting_input.insert(9);
 
         let rows = rows_of(&app, 40, 24);
         let fila = rows
@@ -1323,7 +1309,7 @@ mod tests {
         app.subagents.insert(9, running(9, "review"));
         app.subagents.insert(10, running(10, "tests"));
         app.rail_selected = Some(9);
-        app.awaiting_input.insert(9);
+        app.subagents.get_mut(&9).unwrap().status = TaskStatus::new(TaskState::InputRequired);
         app.focus = crate::app::Focus::Rail;
 
         let rows = rows_of(&app, 40, 24);
@@ -1349,7 +1335,7 @@ mod tests {
         app.subagents.insert(10, running(10, "tests"));
         app.focus = crate::app::Focus::Rail;
         app.rail_selected = Some(9);
-        app.awaiting_input.insert(9);
+        app.subagents.get_mut(&9).unwrap().status = TaskStatus::new(TaskState::InputRequired);
         let marca = |app: &App, etiqueta: &str| {
             rail_lines(app, 40)
                 .into_iter()
@@ -1360,7 +1346,41 @@ mod tests {
         assert_eq!(marca(&app, "review"), app.theme.styles.warning);
 
         // Sin espera, el marcador vuelve al acento.
-        app.awaiting_input.clear();
+        app.subagents.get_mut(&9).unwrap().status = TaskStatus::new(TaskState::Working);
         assert_eq!(marca(&app, "review"), app.theme.styles.accent);
+    }
+
+    #[test]
+    fn rail_derives_input_and_auth_from_the_task_state() {
+        let mut app = App::new();
+        app.session_id = Some(SessionId(1));
+        app.subagents.insert(
+            9,
+            SubagentDescriptor {
+                status: TaskStatus::new(TaskState::InputRequired),
+                ..running(9, "review")
+            },
+        );
+        app.subagents.insert(
+            10,
+            SubagentDescriptor {
+                status: TaskStatus::new(TaskState::AuthRequired),
+                ..running(10, "tests")
+            },
+        );
+
+        let rows = rows_of(&app, 40, 24);
+        let glifo_espera = agent_state(TaskState::InputRequired).glyph();
+        let glifo_permiso = agent_state(TaskState::AuthRequired).glyph();
+        assert!(
+            rows.iter()
+                .any(|row| row.contains(&format!("{glifo_espera} review"))),
+            "el glifo de input-required sale del estado de la tarea: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains(&format!("{glifo_permiso} tests"))),
+            "el glifo de auth-required sale del estado de la tarea: {rows:?}"
+        );
     }
 }

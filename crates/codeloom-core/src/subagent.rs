@@ -85,6 +85,62 @@ impl Drop for DiscardOnExit {
     }
 }
 
+/// Mensaje de la tarea rechazada por capacidad agotada. Es el mismo error que recibe el padre.
+const MENSAJE_CAPACIDAD: &str = "maximum of 8 active subagents reached";
+
+/// Único punto del lanzador que cambia el estado de la tarea de un hijo. Valida la
+/// transición con `TaskState::can_transition_to`, la persiste y publica `SubagentChanged`.
+pub struct TaskTracker {
+    store: Arc<dyn SessionStore>,
+    bus: EventBus,
+}
+
+impl TaskTracker {
+    pub(crate) fn new(store: Arc<dyn SessionStore>, bus: EventBus) -> Self {
+        Self { store, bus }
+    }
+
+    /// Lleva la tarea del hijo a `status.state`. Si el estado actual no admite la
+    /// transición (un terminal no se reinicia) devuelve error y no toca el almacén.
+    pub(crate) async fn transition(
+        &self,
+        parent: SessionId,
+        child: SessionId,
+        status: TaskStatus,
+    ) -> Result<()> {
+        let mut descriptor = self.descriptor(parent, child).await?;
+        if !descriptor.status.state.can_transition_to(status.state) {
+            return Err(CoreError::Store(format!(
+                "transición no admitida: {} -> {}",
+                descriptor.status.state.proto_name(),
+                status.state.proto_name()
+            )));
+        }
+        self.store
+            .update_subagent_status(parent, child, status.clone())
+            .await?;
+        descriptor.status = status;
+        self.bus.publish(LiveEvent::SubagentChanged(descriptor));
+        Ok(())
+    }
+
+    /// Publica el descriptor guardado del hijo tal cual está, p. ej. tras fijar su resultado.
+    pub(crate) async fn publish(&self, parent: SessionId, child: SessionId) -> Result<()> {
+        let descriptor = self.descriptor(parent, child).await?;
+        self.bus.publish(LiveEvent::SubagentChanged(descriptor));
+        Ok(())
+    }
+
+    async fn descriptor(&self, parent: SessionId, child: SessionId) -> Result<SubagentDescriptor> {
+        self.store
+            .list_subagents(parent)
+            .await?
+            .into_iter()
+            .find(|descriptor| descriptor.child == child)
+            .ok_or_else(|| CoreError::Store(format!("unknown subagent {}", child.0)))
+    }
+}
+
 impl InProcessSubagentLauncher {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -127,6 +183,42 @@ impl InProcessSubagentLauncher {
     pub fn pending_inputs(&self, parent: SessionId) -> Vec<PendingInput> {
         self.broker.pending(parent)
     }
+
+    /// Guarda un hijo rechazado por capacidad agotada: tarea `rejected` sin trabajo.
+    async fn registrar_rechazo(&self, parent: SessionId, label: &str, project: &str) -> Result<()> {
+        let child = self.store.create_session(project).await?;
+        let descriptor = SubagentDescriptor {
+            parent,
+            child,
+            job_id: String::new(),
+            label: label.to_string(),
+            status: TaskStatus::new(TaskState::Rejected).with_message(MENSAJE_CAPACIDAD),
+            result: None,
+            notice_delivered: false,
+        };
+        self.store.save_subagent(&descriptor).await?;
+        self.bus.publish(LiveEvent::SubagentChanged(descriptor));
+        Ok(())
+    }
+}
+
+/// Resumen de una petición de permiso para el mensaje de `auth-required`: herramienta, acción
+/// y detalle recortado, de modo que el padre vea qué se pide sin volcar argumentos enteros.
+pub(crate) fn resumen_de_permiso(tool: &str, action: &str, detail: &str) -> String {
+    const LIMITE: usize = 160;
+    let detalle = detail.trim();
+    let resumen = if detalle.is_empty() {
+        format!("{tool} {action}")
+    } else {
+        format!("{tool} {action}: {detalle}")
+    };
+    if resumen.chars().count() <= LIMITE {
+        resumen
+    } else {
+        let mut recortado: String = resumen.chars().take(LIMITE - 1).collect();
+        recortado.push('…');
+        recortado
+    }
 }
 
 #[async_trait]
@@ -141,13 +233,17 @@ impl SubagentLauncher for InProcessSubagentLauncher {
         if prompt.trim().is_empty() || prompt.len() > 32_768 || label.len() > 128 {
             return Err(CoreError::Tool("invalid subagent prompt or label".into()));
         }
-        let permit = self
-            .active
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| CoreError::Tool("maximum of 8 active subagents reached".into()))?;
         let project = self.cwd.to_string_lossy().into_owned();
+        let permit = match self.active.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                // La validación ya pasó: la capacidad agotada sí deja constancia como tarea `rejected`.
+                self.registrar_rechazo(parent, &label, &project).await?;
+                return Err(CoreError::Tool(MENSAJE_CAPACIDAD.into()));
+            }
+        };
         let child = self.store.create_session(&project).await?;
+        let tracker = Arc::new(TaskTracker::new(self.store.clone(), self.bus.clone()));
         let child_store = self.store.clone();
         let child_tools = self.tools.clone();
         let child_provider = self.provider.read().unwrap().clone();
@@ -161,6 +257,7 @@ impl SubagentLauncher for InProcessSubagentLauncher {
                 child,
                 label.clone(),
                 self.bus.clone(),
+                tracker.clone(),
             ),
         )));
         let child_broker = self.broker.clone();
@@ -173,6 +270,9 @@ impl SubagentLauncher for InProcessSubagentLauncher {
         // evento de su arranque. Su canal se cierra cuando se sueltan todos sus emisores.
         let child_bus = EventBus::new(256);
         let mut child_rx = child_bus.subscribe();
+        // La compuerta retiene al hijo hasta que su tarea `submitted` está guardada.
+        let (abrir_puerta, puerta) = tokio::sync::oneshot::channel::<()>();
+        let cuerpo_tracker = tracker.clone();
         let job = self.jobs.start(JobSpec {
             kind: "subagent".into(),
             label,
@@ -185,6 +285,16 @@ impl SubagentLauncher for InProcessSubagentLauncher {
                         broker: child_broker,
                         child,
                     };
+                    // Si el lanzador no llega a abrir la compuerta, el hijo no arranca.
+                    if puerta.await.is_err() || job_cancel.is_cancelled() {
+                        return Ok(None);
+                    }
+                    if let Err(error) = cuerpo_tracker
+                        .transition(parent, child, TaskStatus::new(TaskState::Working))
+                        .await
+                    {
+                        tracing::warn!("persist subagent status: {error}");
+                    }
                     let child_agent = AgentLoop::new(
                         child_provider,
                         child_store.clone(),
@@ -205,6 +315,9 @@ impl SubagentLauncher for InProcessSubagentLauncher {
                         }
                         _ = parent_cancel.cancelled() => {
                             child_cancel.cancel();
+                            // Cancelar al padre cancela al hijo: el trabajo se mata para que la
+                            // tarea acabe en `canceled` y no en `completed` sin resultado.
+                            job_cancel.cancel();
                             return Ok(None);
                         }
                     };
@@ -213,6 +326,9 @@ impl SubagentLauncher for InProcessSubagentLauncher {
                     drop(child_agent);
                     let text = outcome.final_text;
                     child_store.complete_subagent(parent, child, &text).await?;
+                    if let Err(error) = cuerpo_tracker.publish(parent, child).await {
+                        tracing::warn!("publish subagent status: {error}");
+                    }
                     handle.append(&text);
                     Ok(Some(JobResult { content: text }))
                 })
@@ -239,12 +355,13 @@ impl SubagentLauncher for InProcessSubagentLauncher {
                 }
             }
         });
+        // La tarea nace `submitted` al reconocerla; el hijo empieza cuando queda guardada.
         let descriptor = SubagentDescriptor {
             parent,
             child,
             job_id: job.id().0.clone(),
             label: descriptor_label,
-            status: TaskStatus::new(TaskState::Working),
+            status: TaskStatus::new(TaskState::Submitted),
             result: None,
             notice_delivered: false,
         };
@@ -253,6 +370,8 @@ impl SubagentLauncher for InProcessSubagentLauncher {
             return Err(error);
         }
         let mut updates = self.jobs.subscribe(parent, job.id())?;
+        self.bus.publish(LiveEvent::SubagentChanged(descriptor));
+        let _ = abrir_puerta.send(());
         let store = self.store.clone();
         let settle_bus = self.bus.clone();
         tokio::spawn(async move {
@@ -272,9 +391,9 @@ impl SubagentLauncher for InProcessSubagentLauncher {
                         }
                     };
                     if !asentado {
-                        let estado = TaskStatus::new(state);
-                        if let Err(error) =
-                            store.update_subagent_status(parent, child, estado).await
+                        if let Err(error) = tracker
+                            .transition(parent, child, TaskStatus::new(state))
+                            .await
                         {
                             tracing::warn!("persist subagent status: {error}");
                         }
@@ -1223,6 +1342,367 @@ mod tests {
                 .count(),
             1,
             "{child_events:?}"
+        );
+    }
+
+    /// Lanzador cuyo hijo pregunta al padre y se queda esperando `input-required`.
+    fn lanzador_que_pregunta(
+        dir: &std::path::Path,
+        store: Arc<SqliteStore>,
+        jobs: Arc<LocalJobRegistry>,
+        bus: EventBus,
+    ) -> InProcessSubagentLauncher {
+        let provider: Arc<dyn Provider> = Arc::new(QueueProvider {
+            scripts: std::sync::Mutex::new(
+                vec![vec![
+                    StreamChunk::ToolCallComplete {
+                        id: "c1".into(),
+                        name: "ask_user".into(),
+                        input: serde_json::json!({"questions": [{
+                            "question": "¿Cuál?",
+                            "options": [{"label": "Sí"}, {"label": "No"}]
+                        }]}),
+                    },
+                    StreamChunk::Done(FinishReason::ToolCalls),
+                ]]
+                .into(),
+            ),
+        });
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(crate::tools::ask_user::AskUserTool));
+        InProcessSubagentLauncher::new(
+            Arc::new(RwLock::new(provider)),
+            store,
+            Arc::new(tools),
+            Arc::new(PermissionService::allow_all()),
+            Arc::new(RwLock::new(CodeLoomConfig {
+                provider: ProviderConfig {
+                    kind: ProviderKind::OpenAiCompat,
+                    base_url: "http://localhost".into(),
+                    api_key_env: "KEY".into(),
+                },
+                model: "test".into(),
+                max_steps: 4,
+                effort: None,
+            })),
+            dir.to_path_buf(),
+            jobs,
+            bus,
+        )
+    }
+
+    /// Espera, con cota de tiempo, a que el almacén registre el estado pedido para el hijo.
+    async fn espera_estado_del_hijo(
+        store: &SqliteStore,
+        parent: SessionId,
+        child: SessionId,
+        estado: TaskState,
+    ) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let actual = store
+                    .list_subagents(parent)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|d| d.child == child)
+                    .map(|d| d.status.state);
+                if actual == Some(estado) {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("el hijo debería quedar en {estado:?}"));
+    }
+
+    #[tokio::test]
+    async fn launcher_saves_the_child_as_submitted_then_working() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SqliteStore::open(dir.path().join("submitted.db").to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+        let parent = store.create_session("/project").await.unwrap();
+        let bus = EventBus::new(256);
+        let mut rx = bus.subscribe();
+        let runtime = echo_launcher(
+            dir.path(),
+            store.clone(),
+            Arc::new(LocalJobRegistry::default()),
+            bus,
+            vec![vec![
+                StreamChunk::TextDelta("listo".into()),
+                StreamChunk::Done(FinishReason::Stop),
+            ]],
+        );
+
+        let (child, _job) = runtime
+            .start(
+                parent,
+                "obrero".into(),
+                "termina".into(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let estados = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut visto = Vec::new();
+            loop {
+                match rx.recv().await {
+                    Ok(LiveEvent::SubagentChanged(descriptor)) if descriptor.child == child => {
+                        visto.push(descriptor.status.state);
+                    }
+                    Ok(LiveEvent::SubagentSettled { child: settled, .. }) if settled == child => {
+                        return visto;
+                    }
+                    Ok(_) => {}
+                    Err(error) => panic!("el bus debería seguir abierto: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("el hijo debería asentarse");
+
+        assert_eq!(
+            estados,
+            vec![
+                TaskState::Submitted,
+                TaskState::Working,
+                TaskState::Completed
+            ],
+            "cada transición se publica en orden"
+        );
+    }
+
+    #[tokio::test]
+    async fn launcher_rejects_when_capacity_is_exhausted_and_records_a_rejected_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SqliteStore::open(dir.path().join("rejected.db").to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+        let parent = store.create_session("/project").await.unwrap();
+        let bus = EventBus::new(64);
+        let mut rx = bus.subscribe();
+        let runtime = echo_launcher(
+            dir.path(),
+            store.clone(),
+            Arc::new(LocalJobRegistry::default()),
+            bus,
+            vec![],
+        );
+        // Se ocupan los ocho puestos a mano: el noveno hijo debe rechazarse.
+        let _ocupados: Vec<_> = (0..8)
+            .map(|_| runtime.active.clone().try_acquire_owned().unwrap())
+            .collect();
+
+        let error = runtime
+            .start(
+                parent,
+                "noveno".into(),
+                "hazlo".into(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("maximum of 8 active subagents reached"),
+            "{error}"
+        );
+
+        let hijos = store.list_subagents(parent).await.unwrap();
+        assert_eq!(hijos.len(), 1, "queda una tarea rechazada");
+        let hijo = &hijos[0];
+        assert_eq!(hijo.status.state, TaskState::Rejected);
+        assert_eq!(
+            hijo.status.message.as_deref(),
+            Some("maximum of 8 active subagents reached")
+        );
+        assert!(hijo.job_id.is_empty(), "un rechazado no tiene trabajo");
+
+        let publicado = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await {
+                    Ok(LiveEvent::SubagentChanged(descriptor))
+                        if descriptor.child == hijo.child =>
+                    {
+                        return descriptor.status.state;
+                    }
+                    Ok(_) => {}
+                    Err(error) => panic!("el bus debería seguir abierto: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("el rechazo debería publicarse");
+        assert_eq!(publicado, TaskState::Rejected);
+    }
+
+    #[tokio::test]
+    async fn launcher_validation_errors_create_no_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SqliteStore::open(dir.path().join("validation.db").to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+        let parent = store.create_session("/project").await.unwrap();
+        let runtime = echo_launcher(
+            dir.path(),
+            store.clone(),
+            Arc::new(LocalJobRegistry::default()),
+            EventBus::new(16),
+            vec![],
+        );
+
+        let casos = [
+            ("obrero".to_string(), "   ".to_string()),
+            ("obrero".to_string(), "x".repeat(32_769)),
+            ("x".repeat(129), "hola".to_string()),
+        ];
+        for (etiqueta, prompt) in casos {
+            assert!(
+                runtime
+                    .start(parent, etiqueta, prompt, CancellationToken::new())
+                    .await
+                    .is_err(),
+                "debería rechazarse la entrada inválida"
+            );
+        }
+        assert!(
+            store.list_subagents(parent).await.unwrap().is_empty(),
+            "la validación no crea tarea"
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupt_moves_the_task_to_canceled() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SqliteStore::open(dir.path().join("interrupt_canceled.db").to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+        let parent = store.create_session("/project").await.unwrap();
+        let bus = EventBus::new(256);
+        let mut rx = bus.subscribe();
+        let jobs = Arc::new(LocalJobRegistry::default());
+        let runtime = lanzador_que_pregunta(dir.path(), store.clone(), jobs.clone(), bus);
+        let (child, _job) = runtime
+            .start(
+                parent,
+                "obrero".into(),
+                "decide algo".into(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.pending_inputs(parent).is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("el hijo debería quedar esperando una respuesta");
+
+        runtime
+            .control(parent, child, "interrupt", None)
+            .await
+            .unwrap();
+        espera_estado_del_hijo(&store, parent, child, TaskState::Canceled).await;
+        let publicado = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await {
+                    Ok(LiveEvent::SubagentChanged(descriptor))
+                        if descriptor.child == child
+                            && descriptor.status.state == TaskState::Canceled =>
+                    {
+                        return true;
+                    }
+                    Ok(_) => {}
+                    Err(error) => panic!("el bus debería seguir abierto: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("la cancelación debería publicarse");
+        assert!(publicado);
+    }
+
+    #[tokio::test]
+    async fn parent_cancel_moves_the_child_to_canceled() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SqliteStore::open(dir.path().join("parent_cancel.db").to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+        let parent = store.create_session("/project").await.unwrap();
+        let jobs = Arc::new(LocalJobRegistry::default());
+        let runtime =
+            lanzador_que_pregunta(dir.path(), store.clone(), jobs.clone(), EventBus::new(64));
+        let padre = CancellationToken::new();
+        let (child, job) = runtime
+            .start(parent, "obrero".into(), "decide algo".into(), padre.clone())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.pending_inputs(parent).is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("el hijo debería quedar esperando una respuesta");
+
+        // Esc del padre: cancela su turno, y con él al hijo, que no puede terminar en `completed`.
+        padre.cancel();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), jobs.wait(parent, &job))
+            .await
+            .expect("el hijo debería terminar al cancelar al padre")
+            .unwrap();
+        assert_eq!(outcome.status, JobStatus::Killed);
+        espera_estado_del_hijo(&store, parent, child, TaskState::Canceled).await;
+        assert!(runtime.pending_inputs(parent).is_empty());
+    }
+
+    #[tokio::test]
+    async fn tracker_refuses_to_leave_a_terminal_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SqliteStore::open(dir.path().join("tracker.db").to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+        let parent = store.create_session("/project").await.unwrap();
+        let child = store.create_session("/project").await.unwrap();
+        store
+            .save_subagent(&SubagentDescriptor {
+                parent,
+                child,
+                job_id: "subagent-1".into(),
+                label: "obrero".into(),
+                status: TaskStatus::new(TaskState::Completed),
+                result: Some("hecho".into()),
+                notice_delivered: false,
+            })
+            .await
+            .unwrap();
+        let tracker = TaskTracker::new(store.clone(), EventBus::new(8));
+
+        let error = tracker
+            .transition(parent, child, TaskStatus::new(TaskState::Working))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, CoreError::Store(_)), "{error:?}");
+        assert_eq!(
+            store.list_subagents(parent).await.unwrap()[0].status.state,
+            TaskState::Completed
         );
     }
 }

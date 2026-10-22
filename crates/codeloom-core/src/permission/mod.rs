@@ -27,6 +27,14 @@ pub trait PermissionResponder: Send + Sync {
     async fn ask(&self, _questions: &[Question]) -> Option<Vec<Answer>> {
         None
     }
+
+    /// Indica si este responder puede pedir una aprobación humana al decidir. Un responder
+    /// que siempre decide sin preguntar (modo yolo, `AllowAll`) devuelve `false`: así no se
+    /// anuncia una aprobación que no existe. No recibe la petición: quien necesite saber si
+    /// esta petición concreta se preguntará debe usar `PermissionService::would_prompt`.
+    fn requires_user(&self) -> bool {
+        false
+    }
 }
 
 pub struct AllowAll;
@@ -83,6 +91,19 @@ impl PermissionService {
             return Decision::Allow;
         }
         decision
+    }
+    /// Indica si `check` de esta petición pediría una aprobación humana. Es `false` si el
+    /// `tool:action` ya está concedido en la sesión; si no, depende del responder.
+    pub async fn would_prompt(&self, req: &PermissionRequest) -> bool {
+        if self
+            .persistent
+            .lock()
+            .await
+            .contains(&Self::key(&req.tool, &req.action))
+        {
+            return false;
+        }
+        self.responder.requires_user()
     }
     pub async fn grant_persistent(&self, tool: &str, action: &str) {
         self.persistent.lock().await.insert(Self::key(tool, action));
@@ -166,6 +187,43 @@ mod tests {
         let svc = PermissionService::with_responder(Box::new(DenyAll));
         assert_eq!(svc.ask_user(&[]).await, None);
         assert_eq!(PermissionService::allow_all().ask_user(&[]).await, None);
+    }
+
+    /// Responder que dice pedir al usuario, para comprobar `would_prompt` sin tocar `decide`.
+    struct PreguntaUsuario;
+
+    #[async_trait]
+    impl PermissionResponder for PreguntaUsuario {
+        async fn decide(&self, _req: &PermissionRequest) -> Decision {
+            Decision::Allow
+        }
+
+        fn requires_user(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn would_prompt_is_false_for_persistent_grants() {
+        let svc = PermissionService::with_responder(Box::new(PreguntaUsuario));
+        assert!(svc.would_prompt(&req("bash", "run")).await);
+        svc.grant_persistent("bash", "run").await;
+        assert!(!svc.would_prompt(&req("bash", "run")).await);
+        assert!(svc.would_prompt(&req("bash", "other")).await);
+    }
+
+    #[tokio::test]
+    async fn would_prompt_follows_the_responder_when_nothing_is_granted() {
+        assert!(
+            !PermissionService::allow_all()
+                .would_prompt(&req("bash", "run"))
+                .await
+        );
+        assert!(
+            !PermissionService::with_responder(Box::new(DenyAll))
+                .would_prompt(&req("bash", "run"))
+                .await
+        );
     }
 
     #[tokio::test]

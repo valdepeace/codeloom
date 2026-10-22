@@ -44,6 +44,11 @@ impl PermissionResponder for UiPermissionResponder {
         reply_rx.await.unwrap_or(Decision::Deny)
     }
 
+    /// Pide aprobación al usuario salvo en modo yolo (`auto_allow`), que decide sin preguntar.
+    fn requires_user(&self) -> bool {
+        !self.auto_allow
+    }
+
     async fn ask(&self, questions: &[Question]) -> Option<Vec<Answer>> {
         let tx = self.questions.as_ref()?;
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -114,6 +119,15 @@ mod tests {
         }];
         reply.send(Some(answers.clone())).unwrap();
         assert_eq!(handle.await.unwrap(), Some(answers));
+    }
+
+    #[test]
+    fn ui_permission_responder_requires_user() {
+        let (tx, _rx) = mpsc::channel(1);
+        assert!(UiPermissionResponder::new(tx, false).requires_user());
+        // En modo yolo nunca se pregunta: no hay aprobación humana que anunciar.
+        let (tx, _rx) = mpsc::channel(1);
+        assert!(!UiPermissionResponder::new(tx, true).requires_user());
     }
 
     #[tokio::test]
