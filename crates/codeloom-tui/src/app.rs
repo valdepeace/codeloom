@@ -373,6 +373,17 @@ fn recortar(texto: &str, maximo: usize) -> String {
     texto.chars().take(maximo).collect()
 }
 
+/// Clave de la entrada de actividad de un subagente, por id interno del hijo.
+fn node_key(child: i64) -> String {
+    format!("subagent:{child}")
+}
+
+/// Aplana `texto` a una sola línea: los saltos de línea pasan a espacio y se recorta el
+/// sobrante de los extremos.
+fn una_linea(texto: &str) -> String {
+    texto.replace(['\n', '\r'], " ").trim().to_string()
+}
+
 /// Una fila del popup de agentes: lo que se muestra de un agente del registro.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentRow {
@@ -468,6 +479,9 @@ pub struct App {
     /// Registro acotado de cada hijo de la sesión abierta, por id interno del hijo. Se
     /// alimenta de los mismos `ChildEvent` que `agent_stats` y se limpia al cargar otra sesión.
     pub child_logs: HashMap<i64, ChildLog>,
+    /// Nodos de subagente desplegados, por id interno del hijo. Vacío significa que todos
+    /// están plegados. Vive solo en memoria de la interfaz: no se persiste.
+    pub expanded_nodes: HashSet<i64>,
     /// Subagente resaltado en el rail (clave de `subagents`), si hay. Solo se mueve
     /// con el foco en el rail y se descarta si el hijo deja de existir.
     pub rail_selected: Option<i64>,
@@ -715,6 +729,7 @@ impl App {
             subagents: BTreeMap::new(),
             agent_stats: HashMap::new(),
             child_logs: HashMap::new(),
+            expanded_nodes: HashSet::new(),
             rail_selected: None,
             parent_stack: Vec::new(),
             nav_keep_stack: false,
@@ -1495,6 +1510,7 @@ impl App {
         self.subagents.clear();
         self.agent_stats.clear();
         self.child_logs.clear();
+        self.expanded_nodes.clear();
         // Los apuntes son de la sesión anterior; la carga posterior repone los de esta.
         self.usage_records.clear();
         self.session_selected = 0;
@@ -2182,6 +2198,18 @@ impl App {
     /// Actualiza las métricas y el registro de un hijo de la sesión abierta. Solo toca
     /// `agent_stats` y `child_logs`: el turno, el transcript y los contadores del padre
     /// quedan intactos.
+    /// Vuelve a dibujar el nodo del hijo, si existe, tras un cambio en su registro o en sus
+    /// métricas. `sync_activity` no reemplaza la entrada si sus líneas no cambian, así que
+    /// el coste de un evento que no altera el nodo es mínimo.
+    fn refresh_child_node(&mut self, child: i64) {
+        let Some(subagent) = self.subagents.get(&child) else {
+            return;
+        };
+        let lines = self.subagent_node_lines(subagent);
+        let label = subagent.label.clone();
+        self.sync_activity(&node_key(child), "subagent", &label, lines, false);
+    }
+
     fn apply_child_event(&mut self, child: SessionId, event: LiveEvent) {
         // Los eventos que no se reenvían no crean métricas.
         if !event.is_child_relevant() {
@@ -2501,7 +2529,12 @@ impl App {
                     {
                         self.record_live_usage(child, *input_tokens, *output_tokens);
                     }
+                    // Un evento que cambia el registro o las métricas del hijo redibuja su nodo.
+                    let relevante = event.is_child_relevant();
                     self.apply_child_event(child, *event);
+                    if relevante {
+                        self.refresh_child_node(child.0);
+                    }
                 }
             }
             LiveEvent::SubagentSettled {
@@ -2697,7 +2730,7 @@ impl App {
             self.transcript.replace(*id, shown);
         }
         for entry in &self.activity_entries {
-            let shown = self.shown_lines(&entry.lines);
+            let shown = self.shown_activity_lines(entry.kind, entry.from_notice, &entry.lines);
             self.transcript.replace(entry.id, shown);
         }
         if let Some((id, lines)) = &self.todo_entry {
@@ -2782,7 +2815,7 @@ impl App {
         lines: Vec<batten::state::Line>,
         from_notice: bool,
     ) {
-        let shown = self.shown_lines(&lines);
+        let shown = self.shown_activity_lines(kind, from_notice, &lines);
         if let Some(entry) = self.activity_entries.iter_mut().find(|e| e.key == key) {
             if entry.lines == lines {
                 return;
@@ -2837,38 +2870,133 @@ impl App {
         self.sync_activity(&key, "job", &job.label, lines, false);
     }
 
-    /// Elemento de actividad de un subagente de esta sesión.
+    /// Elemento de actividad de un subagente de esta sesión: su nodo en el árbol.
     fn sync_subagent_activity(&mut self, subagent: &codeloom_core::session::SubagentDescriptor) {
-        let state = subagent.status.state;
-        let status = subagent_tool_status(state);
-        // El cuerpo es el texto de los artefactos del resultado, el mismo que antes daba `result`.
-        let resultado = if status == batten::state::ToolStatus::Running {
-            None
-        } else {
-            subagent.result_text()
-        };
-        let body = resultado.as_deref();
-        // Regla de trazabilidad: el estado A2A exacto va entre paréntesis tras la etiqueta, de modo
-        // que el aspecto agrupado de `ToolStatus` nunca sustituya al estado real.
-        // La etiqueta del agente va tras el nombre; el estado A2A sigue siendo lo último.
-        let titulo = match agent_tag(subagent) {
-            Some(etiqueta) => format!(
-                "{} {etiqueta} ({})",
-                subagent.label,
-                agent_state(state).label()
-            ),
-            None => format!("{} ({})", subagent.label, agent_state(state).label()),
-        };
-        let view = batten::state::ActivityView {
-            kind: "subagent",
-            label: &titulo,
-            status,
-            progress: None,
-            body,
-        };
-        let lines = batten::state::activity_lines(&view);
-        let key = format!("subagent:{}", subagent.child.0);
+        let lines = self.subagent_node_lines(subagent);
+        let key = node_key(subagent.child.0);
         self.sync_activity(&key, "subagent", &subagent.label, lines, false);
+    }
+
+    /// Líneas del nodo de un subagente: una cabecera y, si está desplegado, una línea por hijo.
+    /// Regla de trazabilidad: el estado A2A exacto va entre paréntesis tras la etiqueta, de modo
+    /// que el icono y el aspecto agrupado nunca sustituyan al estado real.
+    fn subagent_node_lines(
+        &self,
+        subagent: &codeloom_core::session::SubagentDescriptor,
+    ) -> Vec<batten::state::Line> {
+        let state = subagent.status.state;
+        let agente = agent_state(state);
+        let tag = agent_tag(subagent);
+        let summary = self.node_summary(subagent.child.0);
+        let expanded = self.expanded_nodes.contains(&subagent.child.0);
+        // Un nodo plegado no pinta a sus hijos: no se construyen para no gastar trabajo.
+        let filas = if expanded {
+            self.node_children(subagent)
+        } else {
+            Vec::new()
+        };
+        let children: Vec<batten::state::NodeChild<'_>> = filas
+            .iter()
+            .map(|(glyph, text)| batten::state::NodeChild {
+                glyph: glyph.as_str(),
+                text: text.as_str(),
+            })
+            .collect();
+        let view = batten::state::NodeView {
+            glyph: agente.glyph(),
+            kind: "subagent",
+            label: &subagent.label,
+            tag: tag.as_deref(),
+            state: agente.label(),
+            status: subagent_tool_status(state),
+            summary: summary.as_deref(),
+            expanded,
+            children: &children,
+        };
+        batten::state::node_lines(&view)
+    }
+
+    /// Resumen de progreso de un nodo, p. ej. `step 2/30 · read_file`. Omite lo que falte: el
+    /// paso solo si el hijo conoce su máximo, y la herramienta solo si está ejecutando algo.
+    fn node_summary(&self, child: i64) -> Option<String> {
+        let stats = self.agent_stats.get(&child)?;
+        let paso =
+            (stats.max_steps > 0).then(|| format!("step {}/{}", stats.step, stats.max_steps));
+        let herramienta = stats.tool.as_deref().filter(|tool| !tool.is_empty());
+        match (paso, herramienta) {
+            (Some(paso), Some(tool)) => Some(format!("{paso} · {tool}")),
+            (Some(paso), None) => Some(paso),
+            (None, Some(tool)) => Some(tool.to_string()),
+            (None, None) => None,
+        }
+    }
+
+    /// Filas de los hijos de un nodo, como pares (icono, texto), en el orden del registro. El
+    /// texto de un mensaje del hijo y de una herramienta va en una sola línea. Si el subagente
+    /// ha terminado y tiene resultado, la última fila es su primera línea no vacía.
+    fn node_children(
+        &self,
+        subagent: &codeloom_core::session::SubagentDescriptor,
+    ) -> Vec<(String, String)> {
+        use batten::state::ToolStatus;
+        let mut filas: Vec<(String, String)> = self
+            .child_logs
+            .get(&subagent.child.0)
+            .map(|log| {
+                log.items
+                    .iter()
+                    .map(|item| match item {
+                        ChildItem::Text(texto) => ("›".to_string(), una_linea(texto)),
+                        ChildItem::Tool {
+                            name,
+                            summary,
+                            status,
+                            ..
+                        } => {
+                            let glifo = match status {
+                                ToolStatus::Running => "…",
+                                ToolStatus::Success => "✓",
+                                ToolStatus::Error => "✗",
+                                _ => "·",
+                            };
+                            let texto = match summary.as_deref().filter(|s| !s.is_empty()) {
+                                Some(summary) => format!("{name} {summary}"),
+                                None => name.clone(),
+                            };
+                            (glifo.to_string(), una_linea(&texto))
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if subagent.status.state.is_terminal() {
+            let resultado = subagent.result_text().unwrap_or_default();
+            let primera = resultado
+                .lines()
+                .map(str::trim)
+                .find(|linea| !linea.is_empty());
+            if let Some(primera) = primera {
+                filas.push(("✓".to_string(), format!("result: {primera}")));
+            }
+        }
+        filas
+    }
+
+    /// Líneas visibles de una entrada de actividad. Un nodo de subagente muestra **todas** sus
+    /// líneas también con el look compacto: ya es plegable por sí mismo. Las demás entradas
+    /// (jobs, avisos) solo muestran su cabecera con el look compacto. Los elementos que nacen
+    /// de un aviso no son nodos: conservan su cuerpo y su visibilidad de siempre.
+    fn shown_activity_lines(
+        &self,
+        kind: &str,
+        from_notice: bool,
+        lines: &[batten::state::Line],
+    ) -> Vec<batten::state::Line> {
+        if (kind == "subagent" && !from_notice) || self.tool_inline() {
+            lines.to_vec()
+        } else {
+            lines.iter().take(1).cloned().collect()
+        }
     }
 
     /// Convierte un aviso en elemento de actividad. Devuelve `false` si el texto
@@ -3946,12 +4074,14 @@ linea 2",
             .collect()
     }
 
-    /// Cabeceras de actividad con su texto y su estado.
+    /// Cabeceras de actividad con su texto y su estado: las de los jobs (`ActivityHead`) y
+    /// las de los nodos de subagente (`NodeHead`).
     fn heads(app: &App) -> Vec<(String, ToolStatus)> {
         app.transcript
             .iter()
             .filter_map(|l| match l.kind {
-                batten::state::LineKind::ActivityHead(status) => {
+                batten::state::LineKind::ActivityHead(status)
+                | batten::state::LineKind::NodeHead(status) => {
                     Some((l.plain().to_string(), status))
                 }
                 _ => None,
@@ -4006,10 +4136,11 @@ linea 2",
             TaskState::Working,
             SessionId(1),
         )));
+        // ADAPTADO: la cabecera del subagente es ahora la de un nodo plegado (`▸ <icono>`).
         assert_eq!(
             heads(&app),
             vec![(
-                "subagent  review (working)".to_string(),
+                "▸ ● subagent  review (working)".to_string(),
                 ToolStatus::Running
             )]
         );
@@ -4021,11 +4152,16 @@ linea 2",
         assert_eq!(
             heads(&app),
             vec![(
-                "subagent  review (completed)".to_string(),
+                "▸ ✓ subagent  review (completed)".to_string(),
                 ToolStatus::Success
             )]
         );
-        assert!(texts(&app).iter().any(|t| t == "listo"));
+        // ADAPTADO: plegado, el resultado no va en el cuerpo; se ve como línea `result:` del nodo
+        // al desplegarlo (ver `subagent_node_is_one_folded_line_by_default`).
+        assert!(!texts(&app).iter().any(|t| t == "listo"));
+        app.expanded_nodes.insert(9);
+        app.refresh_child_node(9);
+        assert!(texts(&app).iter().any(|t| t == "└─ ✓ result: listo"));
     }
 
     #[test]
@@ -4038,10 +4174,16 @@ linea 2",
             codeloom_core::a2a::Artifact::text_artifact("segunda"),
         ];
         app.apply(LiveEvent::SubagentChanged(done));
-        // Antes el cuerpo era `result` = "primera\nsegunda"; ahora sale de los artefactos y debe igualarlo.
+        // ADAPTADO: el nodo muestra la primera línea del resultado en su línea `result:`; el
+        // resultado entero sigue en la sesión del hijo. Sigue saliendo de los artefactos.
+        app.expanded_nodes.insert(9);
+        app.refresh_child_node(9);
         let lines = texts(&app);
-        assert!(lines.iter().any(|t| t == "primera"), "{lines:?}");
-        assert!(lines.iter().any(|t| t == "segunda"), "{lines:?}");
+        assert!(
+            lines.iter().any(|t| t == "└─ ✓ result: primera"),
+            "{lines:?}"
+        );
+        assert!(!lines.iter().any(|t| t.contains("segunda")), "{lines:?}");
     }
 
     #[test]
@@ -4073,10 +4215,12 @@ linea 2",
                 SessionId(1),
             )));
             let nombre = agent_state(state).label();
+            let glifo = agent_state(state).glyph();
+            // ADAPTADO: la cabecera es un nodo (`▸ <icono> subagent  review (estado)`).
             assert_eq!(
                 heads(&app),
                 vec![(
-                    format!("subagent  review ({nombre})"),
+                    format!("▸ {glifo} subagent  review ({nombre})"),
                     subagent_tool_status(state)
                 )],
                 "{state:?}"
@@ -4130,10 +4274,12 @@ linea 2",
             hijo.agent = Some("front".into());
             app.apply(LiveEvent::SubagentChanged(hijo));
             let nombre = agent_state(state).label();
+            let glifo = agent_state(state).glyph();
+            // ADAPTADO: la cabecera es un nodo; la etiqueta del agente va antes del estado A2A.
             assert_eq!(
                 heads(&app),
                 vec![(
-                    format!("subagent  review [front] ({nombre})"),
+                    format!("▸ {glifo} subagent  review [front] ({nombre})"),
                     subagent_tool_status(state)
                 )],
                 "{state:?}"
@@ -4396,7 +4542,9 @@ linea 2",
             1,
             "la actividad del subagente deja su cabecera"
         );
-        assert!(heads(&app)[0].0.starts_with("subagent  review"));
+        // ADAPTADO: la entrada viva del subagente es ahora un nodo (`▸ ● …`); el aviso la reclama
+        // sin crear otra. Sigue comprobándose que la cabecera nombra al subagente.
+        assert!(heads(&app)[0].0.starts_with("▸ ● subagent  review"));
     }
 
     #[test]
@@ -4411,8 +4559,9 @@ linea 2",
         assert_eq!(heads(&app).len(), 1);
         app.theme = batten::widgets::Theme::preset(batten::widgets::ThemePreset::Batten);
         app.sync_all_tools();
+        // ADAPTADO: la cabecera del subagente es un nodo (`▸ ● …`), no una cabecera de actividad.
         let esperado = vec![(
-            "subagent  review (working)".to_string(),
+            "▸ ● subagent  review (working)".to_string(),
             ToolStatus::Running,
         )];
         assert_eq!(
@@ -4423,6 +4572,160 @@ linea 2",
         app.theme = batten::widgets::Theme::preset(batten::widgets::ThemePreset::Crush);
         app.sync_all_tools();
         assert_eq!(heads(&app), esperado);
+    }
+
+    #[test]
+    fn subagent_node_is_one_folded_line_by_default() {
+        // Con el look compacto (el de `App::new`), un nodo plegado sigue siendo una sola línea
+        // aunque su hijo tenga registro.
+        let mut app = App::new();
+        app.session_id = Some(SessionId(1));
+        app.apply(LiveEvent::SubagentChanged(sub(
+            "review",
+            TaskState::Working,
+            SessionId(1),
+        )));
+        app.apply(child_event(
+            SessionId(1),
+            9,
+            LiveEvent::MessageAdded(Message::assistant(vec![ContentPart::Text {
+                text: "voy a mirar".into(),
+            }])),
+        ));
+        assert_eq!(
+            texts(&app),
+            vec!["▸ ● subagent  review (working)".to_string()]
+        );
+        assert!(app.expanded_nodes.is_empty());
+    }
+
+    #[test]
+    fn each_a2a_state_has_its_own_glyph_and_exact_name() {
+        let mut glifos = std::collections::HashSet::new();
+        for state in TaskState::ALL {
+            let mut app = App::new();
+            app.session_id = Some(SessionId(1));
+            app.apply(LiveEvent::SubagentChanged(sub(
+                "review",
+                state,
+                SessionId(1),
+            )));
+            let glifo = agent_state(state).glyph();
+            let nombre = agent_state(state).label();
+            let cabecera = texts(&app).into_iter().next().expect("cabecera");
+            assert!(
+                cabecera.starts_with(&format!("▸ {glifo} subagent")),
+                "{state:?}: {cabecera}"
+            );
+            assert!(
+                cabecera.contains(&format!("({nombre})")),
+                "{state:?}: {cabecera}"
+            );
+            glifos.insert(glifo);
+        }
+        assert_eq!(glifos.len(), TaskState::ALL.len(), "glifos repetidos");
+    }
+
+    #[test]
+    fn node_summary_shows_step_and_current_tool() {
+        let mut app = App::new();
+        app.session_id = Some(SessionId(1));
+        app.apply(LiveEvent::SubagentChanged(sub(
+            "review",
+            TaskState::Working,
+            SessionId(1),
+        )));
+        app.apply(child_event(
+            SessionId(1),
+            9,
+            LiveEvent::StepStarted {
+                step: 2,
+                max_steps: 30,
+            },
+        ));
+        app.apply(child_event(
+            SessionId(1),
+            9,
+            LiveEvent::ToolStarted {
+                call_id: "c1".into(),
+                name: "read_file".into(),
+            },
+        ));
+        assert_eq!(
+            texts(&app),
+            vec!["▸ ● subagent  review (working) · step 2/30 · read_file".to_string()]
+        );
+        app.apply(child_event(
+            SessionId(1),
+            9,
+            LiveEvent::ToolFinished {
+                call_id: "c1".into(),
+                is_error: false,
+            },
+        ));
+        assert_eq!(
+            texts(&app),
+            vec!["▸ ● subagent  review (working) · step 2/30".to_string()]
+        );
+    }
+
+    #[test]
+    fn classic_look_shows_every_line_of_a_subagent_node() {
+        let mut app = App::new(); // look compacto: solo la cabecera en las demás herramientas
+        app.session_id = Some(SessionId(1));
+        app.apply(LiveEvent::SubagentChanged(sub(
+            "review",
+            TaskState::Working,
+            SessionId(1),
+        )));
+        app.apply(child_event(
+            SessionId(1),
+            9,
+            LiveEvent::MessageAdded(Message::assistant(vec![ContentPart::Text {
+                text: "voy a mirar".into(),
+            }])),
+        ));
+        app.apply(child_event(
+            SessionId(1),
+            9,
+            LiveEvent::MessageAdded(Message::assistant(vec![ContentPart::ToolCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                input: json!({ "command": "cargo test" }),
+            }])),
+        ));
+        // Desplegado a mano: el nodo enseña sus dos hijos con guías de árbol.
+        app.expanded_nodes.insert(9);
+        app.refresh_child_node(9);
+        assert_eq!(
+            texts(&app),
+            vec![
+                "▾ ● subagent  review (working)".to_string(),
+                "├─ › voy a mirar".to_string(),
+                "└─ … bash cargo test".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn expanded_node_ends_with_the_result_line_once_finished() {
+        let mut app = App::new();
+        app.session_id = Some(SessionId(1));
+        let mut hecho = sub("review", TaskState::Completed, SessionId(1));
+        hecho.artifacts = vec![codeloom_core::a2a::Artifact::text_artifact(
+            "\nprimera línea\nsegunda",
+        )];
+        app.apply(LiveEvent::SubagentChanged(hecho));
+        app.expanded_nodes.insert(9);
+        app.refresh_child_node(9);
+        // Sin registro de hijo, solo queda la línea del resultado; se toma la primera no vacía.
+        assert_eq!(
+            texts(&app),
+            vec![
+                "▾ ✓ subagent  review (completed)".to_string(),
+                "└─ ✓ result: primera línea".to_string(),
+            ]
+        );
     }
 
     /// Tarea de prueba con el contenido y el estado indicados.
