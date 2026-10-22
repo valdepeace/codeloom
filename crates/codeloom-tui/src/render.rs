@@ -1032,13 +1032,22 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-/// Popup de `/agents`: el informe del registro, con desplazamiento vertical.
+/// Texto del estado de aprobación, tal como se rotula en el popup de agentes.
+fn approval_label(approval: codeloom_core::registry::Approval) -> &'static str {
+    use codeloom_core::registry::Approval;
+    match approval {
+        Approval::NotRequired => "usable",
+        Approval::Approved => "approved",
+        Approval::Pending => "awaiting approval",
+    }
+}
+
+/// Popup de `/agents`: la lista del registro con el agente seleccionado y, debajo, su detalle
+/// (origen y prompt), que es lo que se revisa antes de aprobar un agente de proyecto.
 fn draw_agents_overlay(frame: &mut Frame, area: Rect, app: &App) {
-    let width = area.width.min(96).saturating_sub(2);
-    let contenido = app.agents_text.len() as u16;
-    // Marco (2) más una línea en blanco y la de cierre.
-    let height = (contenido + 4).min(area.height.saturating_sub(2));
-    if width < 40 || height < 5 {
+    let width = area.width.min(100).saturating_sub(2);
+    let height = area.height.min(30).saturating_sub(2);
+    if width < 40 || height < 10 {
         draw_resize_hint(frame, area, "Agents", app);
         return;
     }
@@ -1056,22 +1065,80 @@ fn draw_agents_overlay(frame: &mut Frame, area: Rect, app: &App) {
         .border_style(app.theme.styles.border);
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
-    let visibles = inner.height.saturating_sub(2) as usize;
-    let maximo = app.agents_text.len().saturating_sub(visibles) as u16;
-    let desde = app.agents_scroll.min(maximo) as usize;
-    let mut lineas: Vec<Line> = app
-        .agents_text
+
+    // Reparto vertical: lista (la mitad), detalle (el resto) y dos líneas de pie.
+    let util = inner.height.saturating_sub(2);
+    let alto_lista = (util / 2).max(2);
+    let por_pagina = (alto_lista / 2).max(1) as usize;
+    let desde = app
+        .agents_selected
+        .saturating_sub(por_pagina.saturating_sub(1));
+    let mut lineas: Vec<Line> = Vec::new();
+    for (indice, fila) in app
+        .agent_rows
         .iter()
+        .enumerate()
         .skip(desde)
-        .take(visibles)
-        .map(|l| Line::from(l.as_str()))
-        .collect();
-    lineas.push(Line::from(""));
-    lineas.push(Line::styled(
-        "↑/↓ scroll · Esc or Enter to close",
+        .take(por_pagina)
+    {
+        let marca = if indice == app.agents_selected {
+            "›"
+        } else {
+            " "
+        };
+        let cabecera = format!(
+            "{marca} {} [{}] {} — {}",
+            fila.name,
+            approval_label(fila.approval),
+            fila.origin,
+            fila.execution
+        );
+        let estilo = if indice == app.agents_selected {
+            app.theme.styles.border
+        } else {
+            Style::default()
+        };
+        lineas.push(Line::styled(cabecera, estilo));
+        lineas.push(Line::styled(
+            format!("    {}", fila.description),
+            app.theme.styles.muted,
+        ));
+    }
+    if app.agent_rows.is_empty() {
+        lineas.push(Line::from("No agents loaded (no registry available)"));
+    }
+    while lineas.len() < alto_lista as usize {
+        lineas.push(Line::from(""));
+    }
+    lineas.truncate(alto_lista as usize);
+    if let Some(fila) = app.agent_rows.get(app.agents_selected) {
+        lineas.push(Line::styled(
+            format!("── Prompt of `{}` ──", fila.name),
+            app.theme.styles.muted,
+        ));
+        let restante = util.saturating_sub(alto_lista).saturating_sub(1) as usize;
+        if fila.body.trim().is_empty() {
+            lineas.push(Line::styled(
+                "(empty: inherits the parent's behaviour)",
+                app.theme.styles.muted,
+            ));
+        } else {
+            lineas.extend(fila.body.lines().take(restante).map(Line::from));
+        }
+    }
+    let pie = app.agents_status.clone().unwrap_or_default();
+    let mut todo = lineas;
+    // El pie va siempre en las dos últimas filas del interior.
+    todo.truncate(util as usize);
+    while todo.len() < util as usize {
+        todo.push(Line::from(""));
+    }
+    todo.push(Line::styled(pie, app.theme.styles.muted));
+    todo.push(Line::styled(
+        "↑/↓ select · a approve · r revoke · Esc close",
         app.theme.styles.muted,
     ));
-    frame.render_widget(Paragraph::new(lineas), inner);
+    frame.render_widget(Paragraph::new(todo), inner);
 }
 
 /// Glifos de borde que el indicador de foco recolorea (nunca el texto del título).
@@ -1665,18 +1732,42 @@ mod tests {
     }
 
     #[test]
-    fn agents_overlay_shows_the_loaded_agents() {
+    fn agents_overlay_shows_the_list_and_the_prompt_of_the_selected_agent() {
+        let proyecto = tempfile::tempdir().unwrap();
+        std::fs::write(
+            proyecto.path().join("front.md"),
+            "---
+name: front
+description: Interfaz
+---
+
+Cuerpo de front.
+",
+        )
+        .unwrap();
+        let registro = codeloom_core::registry::AgentRegistry::new(vec![
+            Box::new(codeloom_core::registry::BuiltInSource),
+            Box::new(codeloom_core::registry::FileSource::new(
+                proyecto.path().to_path_buf(),
+                codeloom_core::registry::ProfileLevel::Project,
+            )),
+        ]);
         let mut app = App::new();
-        app.set_agent_registry(std::sync::Arc::new(
-            codeloom_core::registry::AgentRegistry::new(vec![Box::new(
-                codeloom_core::registry::BuiltInSource,
-            )]),
-        ));
+        app.set_agent_registry(std::sync::Arc::new(registro));
         app.show_agents();
         let content = buffer_of(&mut app, 100, 30);
         assert!(content.contains("Agents"), "{content}");
-        assert!(content.contains("Loaded agents:"), "{content}");
         assert!(content.contains("default [usable] built-in"), "{content}");
+        assert!(
+            content.contains("front [awaiting approval] project:"),
+            "{content}"
+        );
+
+        app.agents_move(1);
+        let content = buffer_of(&mut app, 100, 30);
+        assert!(content.contains("Prompt of `front`"), "{content}");
+        assert!(content.contains("Cuerpo de front."), "{content}");
+        assert!(content.contains("a approve"), "{content}");
     }
 
     #[test]

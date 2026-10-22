@@ -219,15 +219,14 @@ pub fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Option<St
     }
     if app.agents_open {
         match code {
-            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => app.agents_open = false,
-            KeyCode::Up => app.agents_scroll = app.agents_scroll.saturating_sub(1),
-            KeyCode::Down | KeyCode::PageDown => {
-                let paso = if code == KeyCode::Down { 1 } else { 10 };
-                let tope = app.agents_text.len().saturating_sub(1) as u16;
-                app.agents_scroll = app.agents_scroll.saturating_add(paso).min(tope);
-            }
-            KeyCode::PageUp => app.agents_scroll = app.agents_scroll.saturating_sub(10),
-            KeyCode::Home => app.agents_scroll = 0,
+            KeyCode::Esc | KeyCode::Char('q') => app.agents_open = false,
+            KeyCode::Up => app.agents_move(-1),
+            KeyCode::Down => app.agents_move(1),
+            KeyCode::PageUp => app.agents_move(-5),
+            KeyCode::PageDown => app.agents_move(5),
+            KeyCode::Home => app.agents_move(isize::MIN / 2),
+            KeyCode::Char('a') => app.agents_decide(true),
+            KeyCode::Char('r') => app.agents_decide(false),
             _ => {}
         }
         return None;

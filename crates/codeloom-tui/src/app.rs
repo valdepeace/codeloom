@@ -319,6 +319,50 @@ pub struct AgentStats {
     pub finished_at: Option<Instant>,
 }
 
+/// Una fila del popup de agentes: lo que se muestra de un agente del registro.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentRow {
+    pub name: String,
+    /// Origen en texto estable (`built-in`, `global:<ruta>`, `project:<ruta>`, `remote:<url>`).
+    pub origin: String,
+    pub approval: codeloom_core::registry::Approval,
+    /// Modelo y esfuerzo propios del perfil, o la herencia.
+    pub execution: String,
+    pub description: String,
+    /// Prompt de sistema del perfil: lo que la persona usuaria revisa antes de aprobar.
+    pub body: String,
+}
+
+impl AgentRow {
+    fn from_entry(
+        entrada: &codeloom_core::registry::AgentEntry,
+        instantanea: &codeloom_core::registry::RegistrySnapshot,
+    ) -> Self {
+        use codeloom_core::registry::Execution;
+        let (execution, body) = match &entrada.execution {
+            Execution::Local(local) => (
+                format!(
+                    "model {} / effort {}",
+                    local.model.as_deref().unwrap_or("inherits"),
+                    local.effort.as_deref().unwrap_or("inherits")
+                ),
+                local.system_prompt(),
+            ),
+            Execution::Remote => ("remote".to_string(), String::new()),
+        };
+        AgentRow {
+            name: entrada.name.clone(),
+            origin: entrada.origin.as_text(),
+            approval: instantanea
+                .approval(&entrada.name)
+                .unwrap_or(codeloom_core::registry::Approval::Pending),
+            execution,
+            description: entrada.card.description.trim().to_string(),
+            body,
+        }
+    }
+}
+
 pub struct App {
     /// Transcript persistente: se actualiza con los eventos, no por frame.
     pub transcript: batten::state::Transcript,
@@ -504,8 +548,10 @@ pub struct App {
     pub help_open: bool,
     /// Popup de `/agents` abierto, con el informe que mostraba el registro al abrirlo.
     pub agents_open: bool,
-    pub agents_text: Vec<String>,
-    pub agents_scroll: u16,
+    pub agent_rows: Vec<AgentRow>,
+    pub agents_selected: usize,
+    /// Resultado de la última aprobación o revocación, para pintarlo en el popup.
+    pub agents_status: Option<String>,
 }
 
 impl Default for App {
@@ -685,8 +731,9 @@ impl App {
             picker_selected: 0,
             help_open: false,
             agents_open: false,
-            agents_text: Vec::new(),
-            agents_scroll: 0,
+            agent_rows: Vec::new(),
+            agents_selected: 0,
+            agents_status: None,
             sidebar_expanded: false,
             rail_hidden: false,
         }
@@ -812,16 +859,59 @@ impl App {
         self.agent_registry = Some(registry);
     }
 
-    /// Abre el popup de `/agents` con el informe de la instantánea vigente del registro. Se
-    /// toma una copia al abrir: el popup no cambia mientras está a la vista.
+    /// Abre el popup de `/agents` con los agentes de la instantánea vigente del registro.
     pub fn show_agents(&mut self) {
-        let texto = match &self.agent_registry {
-            Some(registro) => registro.snapshot().report(),
-            None => "No agent registry available".to_string(),
-        };
-        self.agents_text = texto.lines().map(str::to_owned).collect();
-        self.agents_scroll = 0;
+        self.agents_selected = 0;
+        self.agents_status = None;
+        self.refresh_agent_rows();
         self.agents_open = true;
+    }
+
+    /// Reconstruye las filas desde la instantánea vigente, conservando la selección acotada.
+    /// El estado de aprobación se consulta en vivo, así que aprobar se refleja sin recargar.
+    fn refresh_agent_rows(&mut self) {
+        self.agent_rows = match &self.agent_registry {
+            Some(registro) => {
+                let instantanea = registro.snapshot();
+                instantanea
+                    .entries()
+                    .into_iter()
+                    .map(|entrada| AgentRow::from_entry(entrada, &instantanea))
+                    .collect()
+            }
+            None => Vec::new(),
+        };
+        self.agents_selected = self
+            .agents_selected
+            .min(self.agent_rows.len().saturating_sub(1));
+    }
+
+    /// Mueve la selección del popup de agentes (`delta` negativo sube), sin dar la vuelta.
+    pub fn agents_move(&mut self, delta: isize) {
+        let tope = self.agent_rows.len().saturating_sub(1);
+        self.agents_selected = self.agents_selected.saturating_add_signed(delta).min(tope);
+    }
+
+    /// Aprueba (`aprobar`) o revoca el agente seleccionado y anota el resultado.
+    pub fn agents_decide(&mut self, aprobar: bool) {
+        let (Some(registro), Some(fila)) = (
+            self.agent_registry.clone(),
+            self.agent_rows.get(self.agents_selected),
+        ) else {
+            return;
+        };
+        let nombre = fila.name.clone();
+        let resultado = if aprobar {
+            registro.approve(&nombre)
+        } else {
+            registro.revoke(&nombre)
+        };
+        self.agents_status = Some(match resultado {
+            Ok(()) if aprobar => format!("Approved `{nombre}`"),
+            Ok(()) => format!("Revoked `{nombre}`"),
+            Err(error) => format!("Not changed: {error}"),
+        });
+        self.refresh_agent_rows();
     }
 
     pub fn open_settings(&mut self) {
@@ -3247,24 +3337,64 @@ mod tests {
     }
 
     #[test]
-    fn show_agents_opens_a_popup_with_the_registry_report() {
+    fn show_agents_lists_the_registry_and_approves_a_project_agent() {
+        use codeloom_core::registry::{
+            AgentRegistry, Approval, BuiltInSource, FileSource, ProfileLevel, TrustStore,
+        };
         let mut app = App::new();
         app.show_agents();
         assert!(app.agents_open);
-        assert_eq!(app.agents_text, vec!["No agent registry available"]);
+        assert!(app.agent_rows.is_empty());
 
-        let registro = codeloom_core::registry::AgentRegistry::new(vec![Box::new(
-            codeloom_core::registry::BuiltInSource,
-        )]);
+        let proyecto = tempfile::tempdir().unwrap();
+        let datos = tempfile::tempdir().unwrap();
+        std::fs::write(
+            proyecto.path().join("front.md"),
+            "---
+name: front
+description: Interfaz
+---
+
+Cuerpo de front.
+",
+        )
+        .unwrap();
+        let registro = AgentRegistry::new(vec![
+            Box::new(BuiltInSource),
+            Box::new(FileSource::new(
+                proyecto.path().to_path_buf(),
+                ProfileLevel::Project,
+            )),
+        ])
+        .with_trust(
+            TrustStore::open(datos.path().to_path_buf()).unwrap(),
+            proyecto.path().to_path_buf(),
+            false,
+        );
         app.set_agent_registry(Arc::new(registro));
         app.show_agents();
-        assert_eq!(app.agents_text[0], "Loaded agents:");
-        assert!(
-            app.agents_text[1].contains("default [usable] built-in"),
-            "{:?}",
-            app.agents_text
-        );
-        assert_eq!(app.agents_scroll, 0);
+        assert_eq!(app.agent_rows.len(), 2);
+        assert_eq!(app.agent_rows[0].name, "default");
+        assert_eq!(app.agent_rows[1].name, "front");
+        assert_eq!(app.agent_rows[1].approval, Approval::Pending);
+        assert!(app.agent_rows[1].body.contains("Cuerpo de front."));
+
+        app.agents_move(1);
+        app.agents_move(5);
+        assert_eq!(app.agents_selected, 1, "la selección no sale de la lista");
+        app.agents_decide(true);
+        assert_eq!(app.agent_rows[1].approval, Approval::Approved);
+        assert_eq!(app.agents_status.as_deref(), Some("Approved `front`"));
+        app.agents_decide(false);
+        assert_eq!(app.agent_rows[1].approval, Approval::Pending);
+
+        // `default` no es de proyecto: no se puede aprobar y se explica por qué.
+        app.agents_move(-1);
+        app.agents_decide(true);
+        assert!(app
+            .agents_status
+            .as_deref()
+            .is_some_and(|s| s.starts_with("Not changed:")));
     }
 
     #[test]
