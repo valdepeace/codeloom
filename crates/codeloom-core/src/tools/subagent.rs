@@ -12,7 +12,7 @@ impl Tool for SubagentTool {
     }
 
     fn description(&self) -> &str {
-        "Start an in-process child agent to work on a task independently. Returns child_id and job_id; use job_list/job_output/job_kill to manage it. Params: prompt, optional label, and optional agent: the name of a registered agent (omitted = default)."
+        "Start an in-process child agent to work on a task independently. Returns child_id and job_id at once; the child runs in the background and its result is delivered to you automatically when it finishes, so do not poll job_output: tell the user what you delegated and end your turn (job_list/job_kill remain available). Params: prompt, optional label, and optional agent: the name of a registered agent (omitted = default)."
     }
 
     fn schema(&self) -> serde_json::Value {

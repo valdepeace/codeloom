@@ -124,7 +124,9 @@ impl RegistrySnapshot {
         let mut texto = String::from(
             "## Available agents\n\
              The `subagent` tool delegates work to one of these agents through its optional \
-             `agent` argument; omit it to use `default`.\n",
+             `agent` argument; omit it to use `default`. A subagent runs in the background and \
+             reports back on its own when it finishes: after calling `subagent`, tell the user \
+             what you delegated and end your turn; do not poll `job_output`.\n",
         );
         texto.push_str(&disponibles.join("\n"));
         if !pendientes.is_empty() {
@@ -437,6 +439,7 @@ mod tests {
             .prompt_section(ConfirmDelegation::Doubt);
 
         assert!(seccion.contains("`subagent`"), "{seccion}");
+        assert!(seccion.contains("do not poll `job_output`"), "{seccion}");
         assert!(seccion.contains("- default (built-in)"), "{seccion}");
         assert!(
             seccion.contains("- rust (global): Experto en Rust"),
