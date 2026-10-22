@@ -3,7 +3,7 @@ pub mod dispatch;
 pub mod stop;
 
 use crate::catalog::Catalog;
-use crate::config::CodeLoomConfig;
+use crate::config::{CodeLoomConfig, ConfirmDelegation};
 use crate::error::Result;
 use crate::event::{EventBus, LiveEvent};
 use crate::message::{ContentPart, FinishReason, Message, Role, Usage};
@@ -40,6 +40,8 @@ pub struct AgentLoop {
     system_extra: Option<String>,
     /// Registro de agentes compartido con los subagentes; `None` deja solo el agente `default`.
     registry: Option<Arc<crate::registry::AgentRegistry>>,
+    /// Modo de confirmación al delegar; viaja a `RegistrySnapshot::prompt_section` en cada turno.
+    delegation_confirm: ConfirmDelegation,
 }
 
 impl AgentLoop {
@@ -70,6 +72,7 @@ impl AgentLoop {
             catalog: Arc::new(RwLock::new(Catalog::default())),
             system_extra: None,
             registry: None,
+            delegation_confirm: ConfirmDelegation::default(),
             cwd,
         };
         if has_subagents {
@@ -108,6 +111,13 @@ impl AgentLoop {
         if self.subagents.is_some() {
             self.subagents = Some(self.subagent_launcher());
         }
+        self
+    }
+
+    /// Fija cuándo pregunta la persona usuaria antes de delegar (`[agents] confirm_delegation`).
+    /// Por defecto, `Doubt`. Solo cambia la regla del prompt; no garantiza el comportamiento.
+    pub fn with_delegation_confirm(mut self, confirm: ConfirmDelegation) -> Self {
+        self.delegation_confirm = confirm;
         self
     }
 
@@ -244,7 +254,7 @@ impl AgentLoop {
             if !system.is_empty() {
                 system.push_str("\n\n");
             }
-            system.push_str(&registro.snapshot().prompt_section());
+            system.push_str(&registro.snapshot().prompt_section(self.delegation_confirm));
         }
         // El prompt propio del agente va detrás del contexto del proyecto, sin sustituirlo.
         if let Some(extra) = self
@@ -1425,6 +1435,73 @@ Cuerpo.
         assert!(
             vistos[0].contains("- rust (global): Experto en Rust"),
             "el modelo debe ver el agente: {}",
+            vistos[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_model_receives_the_configured_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let agentes = dir.path().join("agentes");
+        std::fs::create_dir(&agentes).unwrap();
+        std::fs::write(
+            agentes.join("rust.md"),
+            "---
+name: rust
+description: Experto en Rust
+---
+
+Cuerpo.
+",
+        )
+        .unwrap();
+        let registro = Arc::new(crate::registry::AgentRegistry::new(vec![
+            Box::new(crate::registry::BuiltInSource),
+            Box::new(crate::registry::FileSource::new(
+                agentes,
+                crate::registry::ProfileLevel::Global,
+            )),
+        ]));
+        let provider = Arc::new(SystemSpy {
+            seen: Mutex::new(Vec::new()),
+        });
+        let store = Arc::new(
+            SqliteStore::open(dir.path().join("s.db").to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+        let sid = store.create_session("/p").await.unwrap();
+        let cfg = CodeLoomConfig {
+            provider: crate::config::ProviderConfig {
+                kind: crate::config::ProviderKind::OpenAiCompat,
+                base_url: "http://x".into(),
+                api_key_env: "K".into(),
+            },
+            model: "m".into(),
+            max_steps: 5,
+            effort: None,
+        };
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(crate::tools::subagent::SubagentTool));
+        let agent = AgentLoop::new(
+            provider.clone(),
+            store,
+            Arc::new(tools),
+            EventBus::new(64),
+            Arc::new(PermissionService::allow_all()),
+            cfg,
+            dir.path().to_path_buf(),
+        )
+        .with_agent_registry(registro)
+        .with_delegation_confirm(ConfirmDelegation::Always);
+        agent
+            .run(sid, "hi".into(), CancellationToken::new())
+            .await
+            .unwrap();
+        let vistos = provider.seen.lock().unwrap();
+        assert!(
+            vistos[0].contains("Do not start any subagent until"),
+            "el modelo debe recibir la regla configurada: {}",
             vistos[0]
         );
     }

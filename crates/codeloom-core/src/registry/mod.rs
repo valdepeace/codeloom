@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
+use crate::config::ConfirmDelegation;
 use crate::event::{EventBus, LiveEvent};
 
 pub use profile::{is_valid_agent_name, parse_profile, AgentProfile, ProfileProblem};
@@ -85,7 +86,11 @@ impl RegistrySnapshot {
     ///
     /// Los agentes que aún no se pueden usar (de proyecto sin aprobar, remotos sin transporte)
     /// no se ofrecen: solo se nombran aparte, para que el modelo no los intente invocar.
-    pub fn prompt_section(&self) -> String {
+    ///
+    /// Al final añade la regla de elección según `confirm` (`[agents] confirm_delegation`).
+    /// Este es el único lugar donde se construye esa regla; un futuro clasificador (A12b)
+    /// que preseleccione agente deberá integrarse aquí.
+    pub fn prompt_section(&self, confirm: ConfirmDelegation) -> String {
         let mut disponibles = Vec::new();
         let mut pendientes = Vec::new();
         for entrada in self.entries() {
@@ -128,7 +133,31 @@ impl RegistrySnapshot {
                 pendientes.join(", ")
             ));
         }
+        texto.push_str("\n\n");
+        texto.push_str(regla_de_eleccion(confirm));
         texto
+    }
+}
+
+/// Regla de elección de agente que lee el modelo padre, según el modo configurado.
+/// Es una petición al modelo, no una garantía de su comportamiento.
+fn regla_de_eleccion(confirm: ConfirmDelegation) -> &'static str {
+    match confirm {
+        ConfirmDelegation::Doubt => {
+            "Choosing an agent: if one agent clearly fits a task, or only `default` exists, \
+             delegate directly and say in your reply which agent you chose and why. If more \
+             than one agent could fit and you are not sure, call `ask_user` first, naming the \
+             agent you would pick and why, and wait for the answer before calling `subagent`."
+        }
+        ConfirmDelegation::Always => {
+            "Choosing an agent: before calling `subagent`, call `ask_user` with your proposed \
+             agent for each task and the reason, and wait for the answer. Do not start any \
+             subagent until the user agrees."
+        }
+        ConfirmDelegation::Never => {
+            "Choosing an agent: pick the best-fitting agent yourself and delegate directly. \
+             Say in your reply which agent you chose and why."
+        }
     }
 }
 
@@ -405,7 +434,7 @@ mod tests {
 
         let seccion = registro_con_global_y_proyecto(global.path(), proyecto.path())
             .snapshot()
-            .prompt_section();
+            .prompt_section(ConfirmDelegation::Doubt);
 
         assert!(seccion.contains("`subagent`"), "{seccion}");
         assert!(seccion.contains("- default (built-in)"), "{seccion}");
@@ -419,6 +448,38 @@ mod tests {
             seccion.contains("awaiting approval: front"),
             "se debe avisar del agente pendiente: {seccion}"
         );
+    }
+
+    #[test]
+    fn prompt_section_carries_only_the_rule_of_its_mode() {
+        let global = tempfile::tempdir().unwrap();
+        let proyecto = tempfile::tempdir().unwrap();
+        escribir(global.path(), "rust.md", &perfil("rust", "Experto en Rust"));
+        let instantanea = registro_con_global_y_proyecto(global.path(), proyecto.path()).snapshot();
+        let marcas = [
+            (ConfirmDelegation::Doubt, "call `ask_user` first"),
+            (ConfirmDelegation::Always, "Do not start any subagent until"),
+            (
+                ConfirmDelegation::Never,
+                "delegate directly. Say in your reply",
+            ),
+        ];
+
+        for (modo, propia) in marcas {
+            let seccion = instantanea.prompt_section(modo);
+            assert!(
+                seccion.contains(propia),
+                "{modo:?} debe llevar su regla: {seccion}"
+            );
+            for (otro, ajena) in marcas {
+                if otro != modo {
+                    assert!(
+                        !seccion.contains(ajena),
+                        "{modo:?} no debe llevar la regla de {otro:?}: {seccion}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

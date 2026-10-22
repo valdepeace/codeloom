@@ -203,7 +203,8 @@ async fn main() -> Result<()> {
             cwd,
         )
         .with_catalog(catalog.clone())
-        .with_agent_registry(registro_agentes.clone()),
+        .with_agent_registry(registro_agentes.clone())
+        .with_delegation_confirm(agents_cfg.confirm_delegation),
     );
 
     if let Some(prompt) = cli.print {
@@ -572,6 +573,7 @@ mod tests {
             global_dir: Some(PathBuf::from("~/mis-agentes")),
             project_dir: Some(PathBuf::from("config/agentes")),
             trust_project_agents: true,
+            ..AgentsConfig::default()
         };
 
         let arranque = arrancar_agentes(Some(home.path()), proyecto.path(), &agents);
