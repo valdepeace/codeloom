@@ -50,7 +50,10 @@ impl Tool for SubagentTool {
             .subagents
             .as_ref()
             .ok_or_else(|| CoreError::Tool("subagents are unavailable in this context".into()))?;
-        let (child, job) = launcher.start(ctx.session, label, prompt, cancel).await?;
+        // La herramienta todavía no elige agente: `None` es el agente `default` (tarea 6b lo cablea).
+        let (child, job) = launcher
+            .start(ctx.session, label, prompt, None, cancel)
+            .await?;
         if let Some(descriptor) = launcher
             .list(ctx.session)
             .await?

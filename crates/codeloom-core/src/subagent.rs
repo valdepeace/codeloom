@@ -7,6 +7,7 @@ use crate::event::{EventBus, LiveEvent};
 use crate::job::{JobId, JobRegistry, JobResult, JobSpec};
 use crate::permission::PermissionService;
 use crate::provider::Provider;
+use crate::registry::{AgentEntry, AgentRegistry, Approval, Execution, AGENTE_POR_DEFECTO};
 use crate::session::{SessionId, SessionStore, SubagentDescriptor};
 use crate::subagent_input::{ChildResponder, InputBroker, PendingInput};
 use crate::task::{TaskState, TaskStatus};
@@ -24,6 +25,7 @@ pub trait SubagentLauncher: Send + Sync {
         parent: SessionId,
         label: String,
         prompt: String,
+        agent: Option<String>,
         cancel: CancellationToken,
     ) -> Result<(SessionId, JobId)>;
 
@@ -71,6 +73,9 @@ pub struct InProcessSubagentLauncher {
     broker: Arc<InputBroker>,
     /// Catálogo compartido con el agente padre; cada hijo lo usa para sus apuntes de consumo.
     catalog: Arc<RwLock<Catalog>>,
+    /// Registro de agentes. Sin él solo existe el agente `default`, y el lanzador se comporta
+    /// exactamente como antes de la tarea 6.
+    registry: Option<Arc<AgentRegistry>>,
 }
 
 /// Descarta la pregunta pendiente del hijo al terminar su trabajo, sea cual sea la
@@ -171,7 +176,14 @@ impl InProcessSubagentLauncher {
             bus,
             broker: Arc::new(InputBroker::default()),
             catalog: Arc::new(RwLock::new(Catalog::default())),
+            registry: None,
         }
+    }
+
+    /// Comparte el registro de agentes: `start` resuelve ahí el agente pedido.
+    pub fn with_registry(mut self, registry: Arc<AgentRegistry>) -> Self {
+        self.registry = Some(registry);
+        self
     }
 
     /// Comparte el catálogo del agente padre con los hijos que lance.
@@ -186,7 +198,14 @@ impl InProcessSubagentLauncher {
     }
 
     /// Guarda un hijo rechazado por capacidad agotada: tarea `rejected` sin trabajo.
-    async fn registrar_rechazo(&self, parent: SessionId, label: &str, project: &str) -> Result<()> {
+    async fn registrar_rechazo(
+        &self,
+        parent: SessionId,
+        label: &str,
+        project: &str,
+        agent: Option<String>,
+        agent_origin: Option<String>,
+    ) -> Result<()> {
         let child = self.store.create_session(project).await?;
         let descriptor = SubagentDescriptor {
             parent,
@@ -196,12 +215,56 @@ impl InProcessSubagentLauncher {
             status: TaskStatus::new(TaskState::Rejected).with_message(MENSAJE_CAPACIDAD),
             artifacts: Vec::new(),
             notice_delivered: false,
-            agent: None,
-            agent_origin: None,
+            agent,
+            agent_origin,
         };
         self.store.save_subagent(&descriptor).await?;
         self.bus.publish(LiveEvent::SubagentChanged(descriptor));
         Ok(())
+    }
+
+    /// Resuelve el agente pedido (`None` = `default`) en la instantánea vigente y devuelve su
+    /// entrada copiada por valor: una recarga posterior no la altera. Sin registro, solo
+    /// `default` es válido y se devuelve `None` (sin perfil que aplicar). Todo rechazo es un
+    /// error de validación: quien llama no ha creado aún tarea ni puesto.
+    fn resolver_agente(&self, agent: Option<&str>) -> Result<Option<AgentEntry>> {
+        let nombre = agent.unwrap_or(AGENTE_POR_DEFECTO);
+        let Some(registro) = &self.registry else {
+            if nombre == AGENTE_POR_DEFECTO {
+                return Ok(None);
+            }
+            return Err(CoreError::Tool(format!(
+                "no hay registro de agentes configurado: no se puede usar el agente «{nombre}»"
+            )));
+        };
+        let instantanea = registro.snapshot();
+        let entrada = instantanea.get(nombre).ok_or_else(|| {
+            CoreError::Tool(format!("agente «{nombre}» inexistente en el registro"))
+        })?;
+        // Se comprueba antes que la aprobación: un remoto figura como pendiente y el motivo real es otro.
+        if matches!(entrada.execution, Execution::Remote) {
+            return Err(CoreError::Tool(format!(
+                "agente remoto no disponible: «{nombre}»"
+            )));
+        }
+        if instantanea.approval(nombre) == Some(Approval::Pending) {
+            return Err(CoreError::Tool(format!(
+                "agente «{nombre}» pendiente de aprobación: apruébalo antes de usarlo"
+            )));
+        }
+        if let Execution::Local(spec) = &entrada.execution {
+            if let Some(modelo) = &spec.model {
+                // Sin catálogo, o sin proveedor con esta URL base, no hay nada que comprobar.
+                let base_url = self.config.read().unwrap().provider.base_url.clone();
+                let conocido = self.catalog.read().unwrap().knows_model(&base_url, modelo);
+                if conocido == Some(false) {
+                    return Err(CoreError::Tool(format!(
+                        "el modelo «{modelo}» del agente «{nombre}» no figura en el catálogo"
+                    )));
+                }
+            }
+        }
+        Ok(Some(entrada.clone()))
     }
 }
 
@@ -231,17 +294,25 @@ impl SubagentLauncher for InProcessSubagentLauncher {
         parent: SessionId,
         label: String,
         prompt: String,
+        agent: Option<String>,
         parent_cancel: CancellationToken,
     ) -> Result<(SessionId, JobId)> {
         if prompt.trim().is_empty() || prompt.len() > 32_768 || label.len() > 128 {
             return Err(CoreError::Tool("invalid subagent prompt or label".into()));
         }
+        // El agente se valida antes de reservar puesto o crear tarea: un rechazo no deja rastro.
+        let perfil = self.resolver_agente(agent.as_deref())?;
+        let (agente, origen) = match &perfil {
+            Some(entrada) => (Some(entrada.name.clone()), Some(entrada.origin.as_text())),
+            None => (None, None),
+        };
         let project = self.cwd.to_string_lossy().into_owned();
         let permit = match self.active.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
                 // La validación ya pasó: la capacidad agotada sí deja constancia como tarea `rejected`.
-                self.registrar_rechazo(parent, &label, &project).await?;
+                self.registrar_rechazo(parent, &label, &project, agente.clone(), origen.clone())
+                    .await?;
                 return Err(CoreError::Tool(MENSAJE_CAPACIDAD.into()));
             }
         };
@@ -264,7 +335,32 @@ impl SubagentLauncher for InProcessSubagentLauncher {
             ),
         )));
         let child_broker = self.broker.clone();
-        let child_config = self.config.read().unwrap().clone();
+        // Configuración del hijo: la del padre, con lo que declare el perfil. Lo que el perfil
+        // no declara se hereda. Se copia aquí, al arrancar, y la tarea ya no depende del registro.
+        let mut child_config = self.config.read().unwrap().clone();
+        let mut child_system = None;
+        if let Some(AgentEntry {
+            execution: Execution::Local(spec),
+            ..
+        }) = &perfil
+        {
+            if let Some(modelo) = &spec.model {
+                child_config.model = modelo.clone();
+            }
+            if let Some(esfuerzo) = &spec.effort {
+                child_config.effort = Some(esfuerzo.clone());
+            }
+            // `max_turns` limita los pasos del bucle del hijo: es el límite que ya lleva `max_steps`.
+            if let Some(turnos) = spec.max_turns {
+                child_config.max_steps = usize::try_from(turnos).unwrap_or(usize::MAX);
+            }
+            // `max_depth` leído y no aplicado: el hijo no recibe la herramienta `subagent`, así
+            // que no puede anidar subagentes y no hay profundidad que limitar todavía.
+            let sistema = spec.system_prompt();
+            if !sistema.trim().is_empty() {
+                child_system = Some(sistema);
+            }
+        }
         let child_cwd = self.cwd.clone();
         let child_jobs = self.jobs.clone();
         let child_catalog = self.catalog.clone();
@@ -308,7 +404,8 @@ impl SubagentLauncher for InProcessSubagentLauncher {
                         child_cwd,
                     )
                     .with_jobs(child_jobs)
-                    .with_catalog(child_catalog);
+                    .with_catalog(child_catalog)
+                    .with_system_extra(child_system);
                     let child_cancel = CancellationToken::new();
                     let outcome = tokio::select! {
                         result = child_agent.run(child, prompt, child_cancel.clone()) => result?,
@@ -369,8 +466,8 @@ impl SubagentLauncher for InProcessSubagentLauncher {
             status: TaskStatus::new(TaskState::Submitted),
             artifacts: Vec::new(),
             notice_delivered: false,
-            agent: None,
-            agent_origin: None,
+            agent: agente,
+            agent_origin: origen,
         };
         if let Err(error) = self.store.save_subagent(&descriptor).await {
             let _ = self.jobs.kill(parent, job.id());
@@ -543,6 +640,9 @@ mod tests {
     use crate::permission::PermissionService;
     use crate::provider::testutil::ScriptedProvider;
     use crate::provider::StreamChunk;
+    use crate::registry::{
+        AgentOrigin, AgentSource, BuiltInSource, FileSource, ProfileLevel, SourceLoad, TrustStore,
+    };
     use crate::session::sqlite::SqliteStore;
     use crate::task::TaskState;
     use crate::tools::subagent::SubagentTool;
@@ -594,6 +694,7 @@ mod tests {
                 parent,
                 "research".into(),
                 "do work".into(),
+                None,
                 CancellationToken::new(),
             )
             .await
@@ -664,6 +765,7 @@ mod tests {
                 parent,
                 "research".into(),
                 "do work".into(),
+                None,
                 CancellationToken::new(),
             )
             .await
@@ -723,6 +825,7 @@ mod tests {
                 parent,
                 "research".into(),
                 "do work".into(),
+                None,
                 CancellationToken::new(),
             )
             .await
@@ -870,6 +973,7 @@ mod tests {
                 parent,
                 "obrero".into(),
                 "decide algo".into(),
+                None,
                 CancellationToken::new(),
             )
             .await
@@ -953,6 +1057,7 @@ mod tests {
                 parent,
                 "obrero".into(),
                 "decide algo".into(),
+                None,
                 CancellationToken::new(),
             )
             .await
@@ -1049,6 +1154,7 @@ mod tests {
                 parent,
                 "obrero".into(),
                 "decide algo".into(),
+                None,
                 CancellationToken::new(),
             )
             .await
@@ -1136,6 +1242,7 @@ mod tests {
                 parent,
                 "obrero".into(),
                 "decide algo".into(),
+                None,
                 CancellationToken::new(),
             )
             .await
@@ -1273,6 +1380,7 @@ mod tests {
                 parent,
                 "obrero".into(),
                 "usa echo".into(),
+                None,
                 CancellationToken::new(),
             )
             .await
@@ -1364,6 +1472,7 @@ mod tests {
                 parent,
                 "obrero".into(),
                 "termina".into(),
+                None,
                 CancellationToken::new(),
             )
             .await
@@ -1508,6 +1617,7 @@ mod tests {
                 parent,
                 "obrero".into(),
                 "termina".into(),
+                None,
                 CancellationToken::new(),
             )
             .await
@@ -1569,6 +1679,7 @@ mod tests {
                 parent,
                 "noveno".into(),
                 "hazlo".into(),
+                None,
                 CancellationToken::new(),
             )
             .await
@@ -1633,7 +1744,7 @@ mod tests {
         for (etiqueta, prompt) in casos {
             assert!(
                 runtime
-                    .start(parent, etiqueta, prompt, CancellationToken::new())
+                    .start(parent, etiqueta, prompt, None, CancellationToken::new())
                     .await
                     .is_err(),
                 "debería rechazarse la entrada inválida"
@@ -1663,6 +1774,7 @@ mod tests {
                 parent,
                 "obrero".into(),
                 "decide algo".into(),
+                None,
                 CancellationToken::new(),
             )
             .await
@@ -1713,7 +1825,13 @@ mod tests {
             lanzador_que_pregunta(dir.path(), store.clone(), jobs.clone(), EventBus::new(64));
         let padre = CancellationToken::new();
         let (child, job) = runtime
-            .start(parent, "obrero".into(), "decide algo".into(), padre.clone())
+            .start(
+                parent,
+                "obrero".into(),
+                "decide algo".into(),
+                None,
+                padre.clone(),
+            )
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -1733,6 +1851,656 @@ mod tests {
         assert_eq!(outcome.status, JobStatus::Killed);
         espera_estado_del_hijo(&store, parent, child, TaskState::Canceled).await;
         assert!(runtime.pending_inputs(parent).is_empty());
+    }
+
+    /// Proveedor que graba cada petición (modelo, sistema y esfuerzo). Si tiene puerta, la
+    /// respuesta espera a que se abra, para poder cambiar el registro con el hijo en curso.
+    struct ProveedorGrabador {
+        peticiones: Arc<std::sync::Mutex<Vec<(String, String, Option<String>)>>>,
+        puerta: Option<Arc<tokio::sync::Notify>>,
+    }
+
+    #[async_trait]
+    impl Provider for ProveedorGrabador {
+        fn capabilities(&self) -> crate::provider::Capabilities {
+            crate::provider::Capabilities {
+                tool_use: true,
+                reasoning: false,
+                streaming: true,
+            }
+        }
+        async fn stream(
+            &self,
+            req: crate::provider::ProviderRequest,
+            _cancel: CancellationToken,
+        ) -> Result<crate::provider::ProviderStream> {
+            self.peticiones.lock().unwrap().push((
+                req.model.clone(),
+                req.system.clone(),
+                req.effort.clone(),
+            ));
+            if let Some(puerta) = &self.puerta {
+                puerta.notified().await;
+            }
+            Ok(Box::pin(futures::stream::iter(vec![
+                StreamChunk::TextDelta("listo".into()),
+                StreamChunk::Done(FinishReason::Stop),
+            ])))
+        }
+    }
+
+    /// Configuración del padre de las pruebas: modelo `test` y esfuerzo `low`.
+    fn config_de_prueba() -> CodeLoomConfig {
+        CodeLoomConfig {
+            provider: ProviderConfig {
+                kind: ProviderKind::OpenAiCompat,
+                base_url: "http://localhost".into(),
+                api_key_env: "KEY".into(),
+            },
+            model: "test".into(),
+            max_steps: 4,
+            effort: Some("low".into()),
+        }
+    }
+
+    /// Lanzador de prueba con el proveedor grabador y, si se pasan, un registro y un catálogo.
+    fn lanzador_grabador(
+        dir: &std::path::Path,
+        store: Arc<SqliteStore>,
+        jobs: Arc<LocalJobRegistry>,
+        proveedor: ProveedorGrabador,
+        registro: Option<Arc<AgentRegistry>>,
+        catalogo: Option<Catalog>,
+    ) -> InProcessSubagentLauncher {
+        let provider: Arc<dyn Provider> = Arc::new(proveedor);
+        let lanzador = InProcessSubagentLauncher::new(
+            Arc::new(RwLock::new(provider)),
+            store,
+            Arc::new(ToolRegistry::new()),
+            Arc::new(PermissionService::allow_all()),
+            Arc::new(RwLock::new(config_de_prueba())),
+            dir.to_path_buf(),
+            jobs,
+            EventBus::new(64),
+        );
+        let lanzador = match catalogo {
+            Some(catalogo) => lanzador.with_catalog(Arc::new(RwLock::new(catalogo))),
+            None => lanzador,
+        };
+        match registro {
+            Some(registro) => lanzador.with_registry(registro),
+            None => lanzador,
+        }
+    }
+
+    async fn tienda_de_prueba(
+        dir: &std::path::Path,
+        nombre: &str,
+    ) -> (Arc<SqliteStore>, SessionId) {
+        let store = Arc::new(
+            SqliteStore::open(dir.join(nombre).to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+        let parent = store.create_session("/project").await.unwrap();
+        (store, parent)
+    }
+
+    /// Registro con el integrado y una carpeta global de perfiles.
+    fn registro_global(global: &std::path::Path) -> Arc<AgentRegistry> {
+        Arc::new(AgentRegistry::new(vec![
+            Box::new(BuiltInSource),
+            Box::new(FileSource::new(global.to_path_buf(), ProfileLevel::Global)),
+        ]))
+    }
+
+    fn escribir_perfil(dir: &std::path::Path, nombre: &str, texto: &str) {
+        std::fs::write(dir.join(format!("{nombre}.md")), texto).unwrap();
+    }
+
+    const PERFIL_CON_PERSONA: &str = "---\nname: frontend\ndescription: UI\npersona:\n  role: Ingeniero\nmodel: modelo-perfil\neffort: high\n---\n\nCuerpo del agente.\n";
+
+    /// Fuente de prueba con un agente remoto. Nada lo produce todavía (A8).
+    struct FuenteRemotaDePrueba;
+
+    impl AgentSource for FuenteRemotaDePrueba {
+        fn id(&self) -> &str {
+            "remota-de-prueba"
+        }
+        fn load(&self) -> SourceLoad {
+            SourceLoad {
+                entries: vec![AgentEntry {
+                    name: "remoto".into(),
+                    origin: AgentOrigin::Remote {
+                        card_url: "https://agente.example/card".into(),
+                    },
+                    card: crate::card::AgentCard::local(
+                        "remoto",
+                        "Agente remoto de prueba",
+                        "1.0.0",
+                    ),
+                    execution: Execution::Remote,
+                    content_hash: None,
+                }],
+                problems: Vec::new(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn start_without_registry_behaves_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, parent) = tienda_de_prueba(dir.path(), "sin-registro.db").await;
+        let peticiones = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let jobs = Arc::new(LocalJobRegistry::default());
+        let proveedor = ProveedorGrabador {
+            peticiones: peticiones.clone(),
+            puerta: None,
+        };
+        let lanzador = lanzador_grabador(
+            dir.path(),
+            store.clone(),
+            jobs.clone(),
+            proveedor,
+            None,
+            None,
+        );
+
+        // Sin agente y con `default`, sin registro: el mismo camino de siempre.
+        for agente in [None, Some(AGENTE_POR_DEFECTO.to_string())] {
+            let (_child, job) = lanzador
+                .start(
+                    parent,
+                    "obrero".into(),
+                    "hazlo".into(),
+                    agente,
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            jobs.wait(parent, &job).await.unwrap();
+        }
+
+        let vistas = peticiones.lock().unwrap().clone();
+        assert_eq!(vistas.len(), 2);
+        for (modelo, sistema, esfuerzo) in vistas {
+            assert_eq!(modelo, "test", "el modelo del padre");
+            assert_eq!(esfuerzo.as_deref(), Some("low"), "el esfuerzo del padre");
+            assert_eq!(
+                sistema,
+                crate::config::context::load_context_files(dir.path()).join("\n\n"),
+                "el sistema es el contexto del proyecto, sin añadidos"
+            );
+        }
+        assert!(store
+            .list_subagents(parent)
+            .await
+            .unwrap()
+            .iter()
+            .all(|hijo| hijo.agent.is_none() && hijo.agent_origin.is_none()));
+    }
+
+    #[tokio::test]
+    async fn start_with_a_named_agent_without_registry_is_a_validation_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, parent) = tienda_de_prueba(dir.path(), "sin-registro-error.db").await;
+        let jobs = Arc::new(LocalJobRegistry::default());
+        let proveedor = ProveedorGrabador {
+            peticiones: Arc::new(std::sync::Mutex::new(Vec::new())),
+            puerta: None,
+        };
+        let lanzador = lanzador_grabador(dir.path(), store.clone(), jobs, proveedor, None, None);
+
+        let error = lanzador
+            .start(
+                parent,
+                "obrero".into(),
+                "hazlo".into(),
+                Some("obrero".into()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("obrero"), "{error}");
+        assert!(store.list_subagents(parent).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn start_without_agent_uses_default_and_inherits_model() {
+        let global = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (store, parent) = tienda_de_prueba(dir.path(), "defecto.db").await;
+        let peticiones = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let jobs = Arc::new(LocalJobRegistry::default());
+        let proveedor = ProveedorGrabador {
+            peticiones: peticiones.clone(),
+            puerta: None,
+        };
+        let lanzador = lanzador_grabador(
+            dir.path(),
+            store.clone(),
+            jobs.clone(),
+            proveedor,
+            Some(registro_global(global.path())),
+            None,
+        );
+
+        let (_child, job) = lanzador
+            .start(
+                parent,
+                "obrero".into(),
+                "hazlo".into(),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        jobs.wait(parent, &job).await.unwrap();
+
+        let (modelo, sistema, esfuerzo) = peticiones.lock().unwrap()[0].clone();
+        assert_eq!(modelo, "test");
+        assert_eq!(esfuerzo.as_deref(), Some("low"));
+        assert_eq!(
+            sistema,
+            crate::config::context::load_context_files(dir.path()).join("\n\n"),
+            "`default` no aporta prompt de sistema propio"
+        );
+        let hijo = &store.list_subagents(parent).await.unwrap()[0];
+        assert_eq!(hijo.agent.as_deref(), Some(AGENTE_POR_DEFECTO));
+        assert_eq!(hijo.agent_origin.as_deref(), Some("built-in"));
+    }
+
+    #[tokio::test]
+    async fn start_with_a_file_agent_applies_persona_model_and_effort() {
+        let global = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        escribir_perfil(global.path(), "frontend", PERFIL_CON_PERSONA);
+        let (store, parent) = tienda_de_prueba(dir.path(), "perfil.db").await;
+        let peticiones = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let jobs = Arc::new(LocalJobRegistry::default());
+        let proveedor = ProveedorGrabador {
+            peticiones: peticiones.clone(),
+            puerta: None,
+        };
+        let lanzador = lanzador_grabador(
+            dir.path(),
+            store,
+            jobs.clone(),
+            proveedor,
+            Some(registro_global(global.path())),
+            None,
+        );
+
+        let (_child, job) = lanzador
+            .start(
+                parent,
+                "obrero".into(),
+                "hazlo".into(),
+                Some("frontend".into()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        jobs.wait(parent, &job).await.unwrap();
+
+        let (modelo, sistema, esfuerzo) = peticiones.lock().unwrap()[0].clone();
+        assert_eq!(modelo, "modelo-perfil");
+        assert_eq!(esfuerzo.as_deref(), Some("high"));
+        assert!(sistema.contains("Rol: Ingeniero\n"), "{sistema}");
+        assert!(sistema.contains("Cuerpo del agente."), "{sistema}");
+    }
+
+    #[tokio::test]
+    async fn start_with_missing_model_in_profile_inherits_from_parent() {
+        let global = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        escribir_perfil(
+            global.path(),
+            "revisor",
+            "---\nname: revisor\ndescription: Revisa\n---\n\nRevisa con cuidado.\n",
+        );
+        let (store, parent) = tienda_de_prueba(dir.path(), "herencia.db").await;
+        let peticiones = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let jobs = Arc::new(LocalJobRegistry::default());
+        let proveedor = ProveedorGrabador {
+            peticiones: peticiones.clone(),
+            puerta: None,
+        };
+        let lanzador = lanzador_grabador(
+            dir.path(),
+            store,
+            jobs.clone(),
+            proveedor,
+            Some(registro_global(global.path())),
+            None,
+        );
+
+        let (_child, job) = lanzador
+            .start(
+                parent,
+                "obrero".into(),
+                "hazlo".into(),
+                Some("revisor".into()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        jobs.wait(parent, &job).await.unwrap();
+
+        let (modelo, sistema, esfuerzo) = peticiones.lock().unwrap()[0].clone();
+        assert_eq!(modelo, "test", "sin modelo en el perfil, el del padre");
+        assert_eq!(
+            esfuerzo.as_deref(),
+            Some("low"),
+            "sin esfuerzo, el del padre"
+        );
+        assert!(sistema.contains("Revisa con cuidado."), "{sistema}");
+    }
+
+    #[tokio::test]
+    async fn start_with_unknown_agent_creates_no_task() {
+        let global = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (store, parent) = tienda_de_prueba(dir.path(), "inexistente.db").await;
+        let jobs = Arc::new(LocalJobRegistry::default());
+        let proveedor = ProveedorGrabador {
+            peticiones: Arc::new(std::sync::Mutex::new(Vec::new())),
+            puerta: None,
+        };
+        let lanzador = lanzador_grabador(
+            dir.path(),
+            store.clone(),
+            jobs,
+            proveedor,
+            Some(registro_global(global.path())),
+            None,
+        );
+
+        let error = lanzador
+            .start(
+                parent,
+                "obrero".into(),
+                "hazlo".into(),
+                Some("no-existe".into()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("no-existe"), "{error}");
+        assert!(store.list_subagents(parent).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn start_with_pending_project_agent_creates_no_task_and_says_so() {
+        let proyecto = tempfile::tempdir().unwrap();
+        let datos = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        escribir_perfil(
+            proyecto.path(),
+            "revisor",
+            &PERFIL_CON_PERSONA.replace("frontend", "revisor"),
+        );
+        let almacen = TrustStore::open(datos.path().to_path_buf()).unwrap();
+        let registro = AgentRegistry::new(vec![
+            Box::new(BuiltInSource),
+            Box::new(FileSource::new(
+                proyecto.path().to_path_buf(),
+                ProfileLevel::Project,
+            )),
+        ])
+        .with_trust(almacen, proyecto.path().to_path_buf(), false);
+        let (store, parent) = tienda_de_prueba(dir.path(), "pendiente.db").await;
+        let proveedor = ProveedorGrabador {
+            peticiones: Arc::new(std::sync::Mutex::new(Vec::new())),
+            puerta: None,
+        };
+        let lanzador = lanzador_grabador(
+            dir.path(),
+            store.clone(),
+            Arc::new(LocalJobRegistry::default()),
+            proveedor,
+            Some(Arc::new(registro)),
+            None,
+        );
+
+        let error = lanzador
+            .start(
+                parent,
+                "obrero".into(),
+                "hazlo".into(),
+                Some("revisor".into()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("pendiente de aprobación"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("revisor"), "{error}");
+        assert!(store.list_subagents(parent).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn start_with_remote_agent_creates_no_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let registro = AgentRegistry::new(vec![
+            Box::new(BuiltInSource),
+            Box::new(FuenteRemotaDePrueba),
+        ]);
+        let (store, parent) = tienda_de_prueba(dir.path(), "remoto.db").await;
+        let proveedor = ProveedorGrabador {
+            peticiones: Arc::new(std::sync::Mutex::new(Vec::new())),
+            puerta: None,
+        };
+        let lanzador = lanzador_grabador(
+            dir.path(),
+            store.clone(),
+            Arc::new(LocalJobRegistry::default()),
+            proveedor,
+            Some(Arc::new(registro)),
+            None,
+        );
+
+        let error = lanzador
+            .start(
+                parent,
+                "obrero".into(),
+                "hazlo".into(),
+                Some("remoto".into()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("agente remoto no disponible"),
+            "{error}"
+        );
+        assert!(store.list_subagents(parent).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn start_with_model_unknown_to_catalog_is_a_validation_error() {
+        let global = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        escribir_perfil(
+            global.path(),
+            "inventado",
+            "---\nname: inventado\ndescription: Modelo falso\nmodel: m-inventado\n---\n\nCuerpo.\n",
+        );
+        escribir_perfil(
+            global.path(),
+            "real",
+            "---\nname: real\ndescription: Modelo conocido\nmodel: m-real\n---\n\nCuerpo.\n",
+        );
+        // El catálogo tiene un proveedor con la URL base del padre (`http://localhost`).
+        let catalogo = Catalog::from_json(
+            r#"{"p": {"id": "p", "npm": "@ai-sdk/openai-compatible", "api": "http://localhost",
+                "models": {"m-real": {"id": "m-real", "tool_call": true}}}}"#,
+        )
+        .unwrap();
+        let (store, parent) = tienda_de_prueba(dir.path(), "catalogo.db").await;
+        let jobs = Arc::new(LocalJobRegistry::default());
+        let proveedor = ProveedorGrabador {
+            peticiones: Arc::new(std::sync::Mutex::new(Vec::new())),
+            puerta: None,
+        };
+        let lanzador = lanzador_grabador(
+            dir.path(),
+            store.clone(),
+            jobs.clone(),
+            proveedor,
+            Some(registro_global(global.path())),
+            Some(catalogo),
+        );
+
+        let error = lanzador
+            .start(
+                parent,
+                "obrero".into(),
+                "hazlo".into(),
+                Some("inventado".into()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("m-inventado"), "{error}");
+        assert!(store.list_subagents(parent).await.unwrap().is_empty());
+
+        let (_child, job) = lanzador
+            .start(
+                parent,
+                "obrero".into(),
+                "hazlo".into(),
+                Some("real".into()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        jobs.wait(parent, &job).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reload_after_start_does_not_change_the_running_task() {
+        let global = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        escribir_perfil(
+            global.path(),
+            "frontend",
+            "---\nname: frontend\ndescription: UI\nmodel: modelo-v1\n---\n\nv1.\n",
+        );
+        let (store, parent) = tienda_de_prueba(dir.path(), "recarga.db").await;
+        let peticiones = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let puerta = Arc::new(tokio::sync::Notify::new());
+        let jobs = Arc::new(LocalJobRegistry::default());
+        let proveedor = ProveedorGrabador {
+            peticiones: peticiones.clone(),
+            puerta: Some(puerta.clone()),
+        };
+        let registro = registro_global(global.path());
+        let lanzador = lanzador_grabador(
+            dir.path(),
+            store,
+            jobs.clone(),
+            proveedor,
+            Some(registro.clone()),
+            None,
+        );
+
+        let (_child, job) = lanzador
+            .start(
+                parent,
+                "obrero".into(),
+                "hazlo".into(),
+                Some("frontend".into()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        // El hijo queda retenido en la puerta, con su petición ya registrada.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while peticiones.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("el hijo debería haber hecho su petición");
+
+        escribir_perfil(
+            global.path(),
+            "frontend",
+            "---\nname: frontend\ndescription: UI\nmodel: modelo-v2\n---\n\nv2.\n",
+        );
+        registro.reload();
+        let recargado = match &registro.snapshot().get("frontend").unwrap().execution {
+            Execution::Local(spec) => spec.model.clone(),
+            Execution::Remote => None,
+        };
+        assert_eq!(
+            recargado.as_deref(),
+            Some("modelo-v2"),
+            "la recarga sí cambió"
+        );
+
+        puerta.notify_one();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), jobs.wait(parent, &job))
+            .await
+            .expect("el hijo debería terminar")
+            .unwrap();
+        assert_eq!(outcome.status, JobStatus::Completed);
+        assert_eq!(
+            peticiones.lock().unwrap()[0].0,
+            "modelo-v1",
+            "la tarea en curso no cambia"
+        );
+    }
+
+    #[tokio::test]
+    async fn descriptor_records_agent_name_and_origin() {
+        let global = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        escribir_perfil(global.path(), "frontend", PERFIL_CON_PERSONA);
+        let (store, parent) = tienda_de_prueba(dir.path(), "descriptor.db").await;
+        let jobs = Arc::new(LocalJobRegistry::default());
+        let proveedor = ProveedorGrabador {
+            peticiones: Arc::new(std::sync::Mutex::new(Vec::new())),
+            puerta: None,
+        };
+        let lanzador = lanzador_grabador(
+            dir.path(),
+            store.clone(),
+            jobs.clone(),
+            proveedor,
+            Some(registro_global(global.path())),
+            None,
+        );
+
+        let (_child, job) = lanzador
+            .start(
+                parent,
+                "obrero".into(),
+                "hazlo".into(),
+                Some("frontend".into()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        jobs.wait(parent, &job).await.unwrap();
+
+        let hijo = &store.list_subagents(parent).await.unwrap()[0];
+        assert_eq!(hijo.agent.as_deref(), Some("frontend"));
+        let origen = AgentOrigin::File {
+            path: global.path().join("frontend.md"),
+            level: ProfileLevel::Global,
+        };
+        assert_eq!(
+            hijo.agent_origin.as_deref(),
+            Some(origen.as_text().as_str())
+        );
     }
 
     #[tokio::test]

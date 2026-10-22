@@ -35,6 +35,9 @@ pub struct AgentLoop {
     subagents: Option<Arc<dyn crate::subagent::SubagentLauncher>>,
     /// Catálogo compartido de modelos y precios; vacío hasta que `with_catalog` lo sustituye.
     catalog: Arc<RwLock<Catalog>>,
+    /// Prompt de sistema propio del agente (perfil). Se añade tras el contexto del proyecto;
+    /// `None` o vacío no añade nada.
+    system_extra: Option<String>,
 }
 
 impl AgentLoop {
@@ -63,6 +66,7 @@ impl AgentLoop {
             jobs,
             subagents: None,
             catalog: Arc::new(RwLock::new(Catalog::default())),
+            system_extra: None,
             cwd,
         };
         if has_subagents {
@@ -84,6 +88,13 @@ impl AgentLoop {
         if self.subagents.is_some() {
             self.subagents = Some(self.subagent_launcher());
         }
+        self
+    }
+
+    /// Añade un prompt de sistema propio (el del perfil de un subagente) tras el contexto del
+    /// proyecto. `None` deja el sistema tal cual, como antes de existir esta opción.
+    pub fn with_system_extra(mut self, texto: Option<String>) -> Self {
+        self.system_extra = texto;
         self
     }
 
@@ -210,7 +221,18 @@ impl AgentLoop {
             history.push(user);
         }
 
-        let system = crate::config::context::load_context_files(&self.cwd).join("\n\n");
+        let mut system = crate::config::context::load_context_files(&self.cwd).join("\n\n");
+        // El prompt propio del agente va detrás del contexto del proyecto, sin sustituirlo.
+        if let Some(extra) = self
+            .system_extra
+            .as_deref()
+            .filter(|t| !t.trim().is_empty())
+        {
+            if !system.is_empty() {
+                system.push_str("\n\n");
+            }
+            system.push_str(extra);
+        }
         let ctx = ToolCtx {
             cwd: self.cwd.clone(),
             permission: self.permission.clone(),
@@ -852,6 +874,7 @@ mod tests {
             _parent: SessionId,
             _label: String,
             _prompt: String,
+            _agent: Option<String>,
             _cancel: CancellationToken,
         ) -> Result<(SessionId, crate::job::JobId)> {
             Err(crate::error::CoreError::Tool("not used".into()))

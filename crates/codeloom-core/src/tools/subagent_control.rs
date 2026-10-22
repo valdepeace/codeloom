@@ -120,6 +120,7 @@ mod tests {
             _parent: SessionId,
             _label: String,
             _prompt: String,
+            _agent: Option<String>,
             _cancel: CancellationToken,
         ) -> Result<(SessionId, JobId)> {
             Err(CoreError::Tool("not used".into()))

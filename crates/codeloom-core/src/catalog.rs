@@ -157,6 +157,22 @@ impl Catalog {
         self.providers.is_empty()
     }
 
+    /// Indica si el proveedor cuya URL base coincide con `base_url` publica el modelo `model`.
+    /// `None` si el catálogo no tiene ese proveedor: sin información no se puede afirmar nada.
+    pub fn knows_model(&self, base_url: &str, model: &str) -> Option<bool> {
+        let wanted = normalize_base_url(base_url);
+        let provider = self
+            .providers
+            .iter()
+            .find(|provider| normalize_base_url(&provider.base_url) == wanted)?;
+        Some(
+            provider
+                .models
+                .iter()
+                .any(|candidate| candidate.id == model),
+        )
+    }
+
     /// Precios `(entrada, salida)` por millón de tokens del modelo `model` del proveedor cuya
     /// URL base coincide con `base_url`. `None` si falta el proveedor, el modelo o alguno de
     /// los dos precios. La URL se compara sin espacios, sin barra final y en minúsculas.
