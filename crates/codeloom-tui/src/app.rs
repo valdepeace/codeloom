@@ -286,6 +286,22 @@ fn subagent_tool_status(state: TaskState) -> batten::state::ToolStatus {
     }
 }
 
+/// Etiqueta del agente de un hijo: `[front]`; con origen de proyecto o remoto,
+/// `[front·project]` o `[front·remote]`. Es política local de CodeLoom, no del protocolo A2A.
+/// Devuelve `None` si el descriptor no conoce su agente, para no pintar corchetes vacíos.
+pub(crate) fn agent_tag(subagent: &codeloom_core::session::SubagentDescriptor) -> Option<String> {
+    let agente = subagent
+        .agent
+        .as_deref()
+        .filter(|nombre| !nombre.is_empty())?;
+    let nivel = match subagent.agent_origin.as_deref() {
+        Some(origen) if origen.starts_with("project:") => "·project",
+        Some(origen) if origen.starts_with("remote:") => "·remote",
+        _ => "",
+    };
+    Some(format!("[{agente}{nivel}]"))
+}
+
 /// Formato de un recuento por estado A2A exacto: `working 1, input-required 2`.
 /// Recibe el recuento ya filtrado (solo los estados con cuenta mayor que cero).
 pub fn formato_recuento(recuento: &[(TaskState, usize)]) -> String {
@@ -2696,7 +2712,15 @@ impl App {
         let body = resultado.as_deref();
         // Regla de trazabilidad: el estado A2A exacto va entre paréntesis tras la etiqueta, de modo
         // que el aspecto agrupado de `ToolStatus` nunca sustituya al estado real.
-        let titulo = format!("{} ({})", subagent.label, agent_state(state).label());
+        // La etiqueta del agente va tras el nombre; el estado A2A sigue siendo lo último.
+        let titulo = match agent_tag(subagent) {
+            Some(etiqueta) => format!(
+                "{} {etiqueta} ({})",
+                subagent.label,
+                agent_state(state).label()
+            ),
+            None => format!("{} ({})", subagent.label, agent_state(state).label()),
+        };
         let view = batten::state::ActivityView {
             kind: "subagent",
             label: &titulo,
@@ -3838,6 +3862,63 @@ Cuerpo de front.
                 heads(&app),
                 vec![(
                     format!("subagent  review ({nombre})"),
+                    subagent_tool_status(state)
+                )],
+                "{state:?}"
+            );
+        }
+    }
+
+    /// Hijo de la sesión 1 con el agente y el origen indicados.
+    fn con_agente(agent: Option<&str>, origin: Option<&str>) -> SubagentDescriptor {
+        let mut hijo = sub("review", TaskState::Working, SessionId(1));
+        hijo.agent = agent.map(str::to_owned);
+        hijo.agent_origin = origin.map(str::to_owned);
+        hijo
+    }
+
+    #[test]
+    fn agent_tag_names_the_agent_and_flags_project_and_remote_origins() {
+        assert_eq!(agent_tag(&con_agente(None, None)), None);
+        assert_eq!(
+            agent_tag(&con_agente(Some("default"), Some("built-in"))).as_deref(),
+            Some("[default]")
+        );
+        assert_eq!(
+            agent_tag(&con_agente(Some("rust"), Some("global:C:/agentes/rust.md"))).as_deref(),
+            Some("[rust]")
+        );
+        assert_eq!(
+            agent_tag(&con_agente(
+                Some("front"),
+                Some("project:.codeloom/agents/front.md")
+            ))
+            .as_deref(),
+            Some("[front·project]")
+        );
+        assert_eq!(
+            agent_tag(&con_agente(
+                Some("ext"),
+                Some("remote:https://ext.example/a2a")
+            ))
+            .as_deref(),
+            Some("[ext·remote]")
+        );
+    }
+
+    #[test]
+    fn activity_header_keeps_the_a2a_state_last() {
+        for state in TaskState::ALL {
+            let mut app = crush_app();
+            app.session_id = Some(SessionId(1));
+            let mut hijo = sub("review", state, SessionId(1));
+            hijo.agent = Some("front".into());
+            app.apply(LiveEvent::SubagentChanged(hijo));
+            let nombre = agent_state(state).label();
+            assert_eq!(
+                heads(&app),
+                vec![(
+                    format!("subagent  review [front] ({nombre})"),
                     subagent_tool_status(state)
                 )],
                 "{state:?}"

@@ -1,7 +1,7 @@
 //! Rail derecho de contexto del look Crush: modelo, ficheros, herramientas,
 //! jobs y subagentes de la sesión abierta.
 
-use crate::app::{formato_recuento, AgentStats, App, Focus};
+use crate::app::{agent_tag, formato_recuento, AgentStats, App, Focus};
 use batten::state::{AgentState, ToolStatus};
 use codeloom_core::job::JobStatus;
 use codeloom_core::task::TaskState;
@@ -220,7 +220,8 @@ fn rail_lines(app: &App, width: usize) -> Vec<Line<'_>> {
             // El glifo y el `›` ocupan una columna más el espacio, así que la línea no cambia de anchura.
             let seleccionado =
                 app.focus == Focus::Rail && app.rail_selected == Some(subagent.child.0);
-            let line = if seleccionado {
+            // La etiqueta del agente, si se conoce, va tenue y antes del nombre del hijo.
+            let mut spans = if seleccionado {
                 // El `›` sustituye al glifo, de modo que una espera del hijo se conserva
                 // tiñéndolo con el color de aviso en lugar del acento.
                 let marca = if estado == AgentState::InputRequired {
@@ -228,19 +229,19 @@ fn rail_lines(app: &App, width: usize) -> Vec<Line<'_>> {
                 } else {
                     app.theme.styles.accent
                 };
-                Line::from(vec![
-                    Span::styled("› ", marca),
-                    Span::raw(subagent.label.as_str()),
-                ])
+                vec![Span::styled("› ", marca)]
             } else {
-                Line::from(vec![
-                    Span::styled(
-                        format!("{} ", estado.glyph()),
-                        estado.style(&app.theme.styles),
-                    ),
-                    Span::raw(subagent.label.as_str()),
-                ])
+                vec![Span::styled(
+                    format!("{} ", estado.glyph()),
+                    estado.style(&app.theme.styles),
+                )]
             };
+            if let Some(etiqueta) = agent_tag(subagent) {
+                spans.push(Span::styled(etiqueta, app.theme.styles.muted));
+                spans.push(Span::raw(" "));
+            }
+            spans.push(Span::raw(subagent.label.as_str()));
+            let line = Line::from(spans);
             out.push(line);
             // Segunda línea tenue con las métricas, solo si el hijo tiene estadísticas.
             if let Some(stats) = app.agent_stats.get(&subagent.child.0) {
@@ -583,6 +584,44 @@ mod tests {
             "falta el glifo de espera: {review:?}"
         );
         assert!(!tests.contains('?'), "glifo de espera de más: {tests:?}");
+    }
+
+    #[test]
+    fn rail_shows_the_agent_of_each_child() {
+        let mut app = App::new();
+        app.session_id = Some(SessionId(1));
+        let mut con_agente = running(9, "review");
+        con_agente.agent = Some("front".into());
+        app.subagents.insert(9, con_agente);
+        app.subagents.insert(10, running(10, "tests"));
+
+        let rows = rows_of(&app, 40, 20);
+        let review = rows
+            .iter()
+            .find(|row| row.contains("review"))
+            .expect("el rail lista el subagente review");
+        let tests = rows
+            .iter()
+            .find(|row| row.contains("tests"))
+            .expect("el rail lista el subagente tests");
+        assert!(
+            review.contains("[front] review"),
+            "falta la etiqueta del agente: {review:?}"
+        );
+        assert!(!tests.contains('['), "etiqueta de más: {tests:?}");
+
+        // Con el foco en el rail, el hijo elegido lleva `›` en lugar del glifo, con la misma etiqueta.
+        app.focus = Focus::Rail;
+        app.rail_selected = Some(9);
+        let rows = rows_of(&app, 40, 20);
+        let review = rows
+            .iter()
+            .find(|row| row.contains("review"))
+            .expect("el rail lista el subagente review seleccionado");
+        assert!(
+            review.contains("› [front] review"),
+            "falta la etiqueta con `›`: {review:?}"
+        );
     }
 
     /// Estadísticas de un hijo con paso, herramienta y tokens; `started` fija el arranque.
