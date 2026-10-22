@@ -2,6 +2,7 @@
 
 pub mod a2a;
 pub mod agent;
+pub mod card;
 pub mod catalog;
 pub mod config;
 pub mod error;
