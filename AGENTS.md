@@ -10,18 +10,16 @@ orchestration model (**agent -> subagents -> jobs**, shown in the header) is
 *execution* with Rust's real parallelism. It integrates optionally with `herdr`
 (a terminal runtime) as a plugin, without patching it, and also runs standalone.
 
-## Current state: design only, no code yet
+## Current state: implemented and in use
 
-There is **no `Cargo.toml`, no `crates/`, no `src/`**. Nothing builds. The
-repository holds:
+The workspace builds and has tests. Crates: `batten` (TUI widgets/state),
+`codeloom-core` (engine), `codeloom-a2a` (A2A wire edge, card, JSON-RPC client),
+`codeloom-tui`, `codeloom-herdr`, `codeloom-cli`. Subagents run as A2A tasks and remote
+A2A agents can be consumed (A8a). Serving (A8b), SSE (A8c) and remote auth (A8d) are not
+done; the status of every A2A task is in `docs/plans/2026-10-22-codeloom-a2a-roadmap.md`.
 
-- `docs/specs/` — the design (base spec + per-feature idea specs).
-- `docs/plans/2026-10-13-loom-mvp.md` — the **m0+m1 implementation plan**, written
-  task-by-task with steps and verification. This is the entry point to start
-  coding.
-
-To bootstrap the project, follow
-`docs/specs/2026-10-14-loom-self-hosting-bootstrap.md`.
+Every task needs its spec (`docs/specs/`) and plan (`docs/plans/`) before code.
+`docs/plans/2026-10-13-loom-mvp.md` is the original m0+m1 plan (history).
 
 ## Where the truth is
 
@@ -35,8 +33,7 @@ To bootstrap the project, follow
 
 ## Commands
 
-Once the workspace exists (after `docs/plans/2026-10-13-loom-mvp.md` Task 1),
-these are the required checks — **all three must pass on every commit** (from the
+These are the required checks — **all four must pass on every commit** (from the
 plan's Global Constraints):
 
 ```bash
@@ -47,8 +44,7 @@ cargo clippy -- -D warnings
 ```
 
 The binaries are `loom` and `codeloom` (`cargo run -p codeloom-cli --bin loom`).
-Toolchain is pinned by `rust-toolchain.toml` (edition 2021). They do not work yet:
-the workspace does not exist.
+Toolchain is pinned by `rust-toolchain.toml` (edition 2021).
 
 ## Architecture rules (hard)
 
