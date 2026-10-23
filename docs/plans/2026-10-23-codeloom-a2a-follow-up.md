@@ -31,10 +31,10 @@ resultado de este en su prompt y el enlace guardado.
 **Interfaces:** produce `SubagentDescriptor.reference_task_ids: Vec<SessionId>`, persistido en
 `subagents.reference_task_ids` como JSON (`[3,5]`); ausente o `NULL` se lee como vacío.
 
-- [ ] Test `references_roundtrip_through_sqlite` y `an_old_row_without_references_reads_empty`
+- [x] Test `references_roundtrip_through_sqlite` y `an_old_row_without_references_reads_empty`
   (siguiendo el de `agent_origin` en `sqlite.rs`).
-- [ ] Añadir el campo, la columna con su migración `ALTER TABLE`, la escritura y la lectura.
-- [ ] Verificar y commitear.
+- [x] Añadir el campo, la columna con su migración `ALTER TABLE`, la escritura y la lectura.
+- [x] Verificar y commitear.
 
 ### Tarea 2: el lanzador arranca un seguimiento
 
@@ -45,7 +45,7 @@ resultado de este en su prompt y el enlace guardado.
 (por defecto, error «subagent follow-up unavailable») y su implementación en
 `InProcessSubagentLauncher`. `start` sigue igual y delega con referencias vacías.
 
-- [ ] Tests (nombre y aserciones):
+- [x] Tests (nombre y aserciones):
   - `a_follow_up_carries_the_previous_result_in_its_prompt`: tras un hijo `completed`, el hijo
     nuevo recibe un primer mensaje que empieza por `[Follow-up of subagent`, contiene el
     resultado previo y termina con la petición; su descriptor guarda la referencia.
@@ -54,22 +54,22 @@ resultado de este en su prompt y el enlace guardado.
   - `a_follow_up_of_another_parents_child_is_not_found`: `TaskNotFound`, no se crea ningún hijo.
   - `the_previous_result_is_capped`: un resultado de 100 000 bytes entra con menos de
     `MAX_NOTICE_BYTES` + 400 bytes de encabezado.
-- [ ] Implementar: validar (`TaskNotFound`, terminal), construir el prompt (D4) con
+- [x] Implementar: validar (`TaskNotFound`, terminal), construir el prompt (D4) con
   `limit_bytes`, guardar `reference_task_ids` y arrancar como `start`.
-- [ ] Verificar y commitear.
+- [x] Verificar y commitear.
 
 ### Tarea 3: la herramienta `subagent`
 
 **Ficheros:** `crates/codeloom-core/src/tools/subagent.rs`.
 
-- [ ] Tests: `follow_up_of` válido llama a `start_follow_up` con el id; `follow_up_of` ≤ 0 o no
+- [x] Tests: `follow_up_of` válido llama a `start_follow_up` con el id; `follow_up_of` ≤ 0 o no
   entero es un error de herramienta; sin `follow_up_of` se llama a `start` como antes.
-- [ ] Esquema (`follow_up_of`: entero, mínimo 1), descripción y `run`.
-- [ ] Verificar y commitear.
+- [x] Esquema (`follow_up_of`: entero, mínimo 1), descripción y `run`.
+- [x] Verificar y commitear.
 
 ### Tarea 4: documentos
 
 **Ficheros:** la spec (sección «Estado»), la del autonomía (Fase C), la del perfil A2A
 (`reference_task_ids` ya no «nada lo escribe») y el roadmap (A11).
 
-- [ ] Estado real, commits, lo no visto en terminal real y lo que queda. Commitear.
+- [x] Estado real, commits, lo no visto en terminal real y lo que queda. Commitear.
