@@ -8,6 +8,7 @@ mod chat;
 mod chip;
 mod codeloom_tools;
 mod composer;
+mod context_meter;
 mod crush_atoms;
 mod crush_chat;
 mod crush_chrome;
@@ -325,6 +326,11 @@ pub fn catalog() -> Vec<CatalogItem> {
             "Status bar",
             "Pawan",
             Box::new(pawan_status_bar::PawanStatusBarDemo::new()),
+        ),
+        item(
+            "Context meter",
+            "Batten",
+            Box::new(context_meter::ContextMeterDemo::new()),
         ),
         item(
             "Status bar",
