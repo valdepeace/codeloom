@@ -7,6 +7,8 @@
 use codeloom_core::error::{CoreError, Result};
 use serde::Deserialize;
 
+use crate::serve::config::ServeConfig;
+
 /// Papel del proceso en A2A. Por defecto, apagado.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -41,6 +43,8 @@ pub struct A2aConfig {
     pub max_card_bytes: usize,
     /// Tamaño máximo, en bytes, del cuerpo de una respuesta remota (tarea o resultado).
     pub max_result_bytes: usize,
+    /// Sección `[a2a.serve]`: solo se usa con el rol `serve` o `both` (A8b).
+    pub serve: ServeConfig,
 }
 
 impl Default for A2aConfig {
@@ -50,6 +54,7 @@ impl Default for A2aConfig {
             request_timeout_secs: REQUEST_TIMEOUT_SECS_POR_DEFECTO,
             max_card_bytes: MAX_CARD_BYTES_POR_DEFECTO,
             max_result_bytes: MAX_RESULT_BYTES_POR_DEFECTO,
+            serve: ServeConfig::default(),
         }
     }
 }
@@ -97,6 +102,7 @@ impl A2aConfig {
                 )));
             }
         }
+        self.serve.validar_cotas()?;
         Ok(())
     }
 

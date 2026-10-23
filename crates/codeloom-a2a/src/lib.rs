@@ -7,5 +7,6 @@ pub mod client;
 pub mod config;
 pub mod remote;
 pub mod security;
+pub mod serve;
 pub mod sync;
 pub mod wire;
