@@ -1,0 +1,254 @@
+//! Puesta al día de las tarjetas de los agentes remotos del registro (A8a, T3b).
+//!
+//! Cabe señalar que el registro del núcleo no sabe de HTTP: guarda el resultado de consultar cada
+//! tarjeta y ata la aprobación a su huella. Este módulo es quien hace la consulta. Ni descargar la
+//! tarjeta ni cambiarla aprueba nada: la persona usuaria aprueba lo que ha visto.
+
+use codeloom_core::event::EventBus;
+use codeloom_core::registry::{AgentRegistry, Execution, RemoteFetched};
+use futures::stream::{self, StreamExt};
+use reqwest::Client;
+
+use crate::config::A2aConfig;
+use crate::remote::fetch_card;
+
+/// Peticiones de tarjeta simultáneas como máximo.
+const CONSULTAS_SIMULTANEAS: usize = 4;
+
+/// Qué remotos se consultaron bien y cuáles no.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RefreshReport {
+    pub ok: Vec<String>,
+    pub failed: Vec<String>,
+}
+
+/// Consulta la tarjeta de cada agente remoto de la instantánea vigente y anota el resultado en el
+/// registro, que recalcula su instantánea y publica el cambio. Un fallo de un remoto no afecta a
+/// los demás: queda como problema de carga de ese agente.
+pub async fn refresh_remote_cards(
+    registry: &AgentRegistry,
+    bus: &EventBus,
+    client: &Client,
+    config: &A2aConfig,
+) -> RefreshReport {
+    let remotos: Vec<(String, String)> = registry
+        .snapshot()
+        .entries()
+        .into_iter()
+        .filter_map(|entrada| match &entrada.execution {
+            Execution::Remote(spec) => Some((entrada.name.clone(), spec.endpoint.clone())),
+            Execution::Local(_) => None,
+        })
+        .collect();
+
+    let max_card_bytes = config.max_card_bytes;
+    let resultados: Vec<_> = stream::iter(remotos)
+        .map(|(nombre, endpoint)| async move {
+            let resultado = fetch_card(client, &endpoint, max_card_bytes).await;
+            (nombre, endpoint, resultado)
+        })
+        .buffer_unordered(CONSULTAS_SIMULTANEAS)
+        .collect()
+        .await;
+
+    let mut informe = RefreshReport::default();
+    for (nombre, endpoint, resultado) in resultados {
+        let anotado = match resultado {
+            Ok(remota) => {
+                informe.ok.push(nombre.clone());
+                Ok((
+                    remota.card,
+                    RemoteFetched {
+                        card_hash: remota.hash,
+                        jsonrpc_url: remota.jsonrpc_url,
+                        tenant: remota.tenant,
+                        requires_auth: remota.requires_auth,
+                    },
+                ))
+            }
+            Err(error) => {
+                informe.failed.push(nombre.clone());
+                Err(error.to_string())
+            }
+        };
+        registry.set_remote_card(bus, &nombre, &endpoint, anotado);
+    }
+    informe.ok.sort();
+    informe.failed.sort();
+    informe
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::A2aRole;
+    use crate::remote::http_client;
+    use codeloom_core::registry::{
+        Approval, BuiltInSource, FileSource, LoadProblem, ProfileLevel, TrustStore,
+    };
+    use serde_json::{json, Value};
+    use std::path::Path;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const TARJETA: &str = include_str!("../tests/fixtures/agent-card.sample.json");
+
+    fn config() -> A2aConfig {
+        A2aConfig {
+            role: A2aRole::Consume,
+            request_timeout_secs: 2,
+            ..A2aConfig::default()
+        }
+    }
+
+    fn tarjeta_para(servidor: &MockServer, descripcion: &str) -> Value {
+        let mut valor: Value = serde_json::from_str(TARJETA).unwrap();
+        valor["description"] = json!(descripcion);
+        for interfaz in valor["supportedInterfaces"].as_array_mut().unwrap() {
+            interfaz["url"] = json!(format!("{}/a2a/v1", servidor.uri()));
+        }
+        valor
+    }
+
+    async fn servir(servidor: &MockServer, cuerpo: Value) {
+        Mock::given(method("GET"))
+            .and(path("/.well-known/agent-card.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(cuerpo))
+            .mount(servidor)
+            .await;
+    }
+
+    fn perfil(dir: &Path, nombre: &str, endpoint: &str) {
+        std::fs::write(
+            dir.join(format!("{nombre}.md")),
+            format!(
+                "---\nname: {nombre}\ndescription: Alta manual\ntransport: a2a-remote\na2a:\n  endpoint: {endpoint}\n---\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn registro(dir: &Path, datos: &Path) -> AgentRegistry {
+        AgentRegistry::new(vec![
+            Box::new(BuiltInSource),
+            Box::new(FileSource::new(dir.to_path_buf(), ProfileLevel::Global)),
+        ])
+        .with_trust(
+            TrustStore::open(datos.to_path_buf()).unwrap(),
+            dir.to_path_buf(),
+            false,
+        )
+    }
+
+    #[tokio::test]
+    async fn the_card_of_each_remote_is_fetched_and_left_pending_until_approved() {
+        let servidor = MockServer::start().await;
+        servir(&servidor, tarjeta_para(&servidor, "Rutas")).await;
+        let dir = tempfile::tempdir().unwrap();
+        let datos = tempfile::tempdir().unwrap();
+        perfil(dir.path(), "rutas", &servidor.uri());
+        let registro = registro(dir.path(), datos.path());
+        let bus = EventBus::new(16);
+        let cliente = http_client(&config()).unwrap().unwrap();
+
+        let informe = refresh_remote_cards(&registro, &bus, &cliente, &config()).await;
+
+        assert_eq!(informe.ok, vec!["rutas".to_string()]);
+        assert!(informe.failed.is_empty());
+        let instantanea = registro.snapshot();
+        assert_eq!(
+            instantanea.get("rutas").unwrap().card.name,
+            "GeoSpatial Route Planner Agent"
+        );
+        assert_eq!(instantanea.approval("rutas"), Some(Approval::Pending));
+
+        registro.approve("rutas").unwrap();
+        assert_eq!(
+            registro.snapshot().approval("rutas"),
+            Some(Approval::Approved)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_card_that_changes_between_refreshes_returns_to_pending() {
+        let servidor = MockServer::start().await;
+        servir(&servidor, tarjeta_para(&servidor, "Rutas")).await;
+        let dir = tempfile::tempdir().unwrap();
+        let datos = tempfile::tempdir().unwrap();
+        perfil(dir.path(), "rutas", &servidor.uri());
+        let registro = registro(dir.path(), datos.path());
+        let bus = EventBus::new(16);
+        let cliente = http_client(&config()).unwrap().unwrap();
+        refresh_remote_cards(&registro, &bus, &cliente, &config()).await;
+        registro.approve("rutas").unwrap();
+        assert_eq!(
+            registro.snapshot().approval("rutas"),
+            Some(Approval::Approved)
+        );
+
+        servidor.reset().await;
+        servir(&servidor, tarjeta_para(&servidor, "Ahora hago otra cosa")).await;
+        refresh_remote_cards(&registro, &bus, &cliente, &config()).await;
+
+        assert_eq!(
+            registro.snapshot().approval("rutas"),
+            Some(Approval::Pending)
+        );
+    }
+
+    #[tokio::test]
+    async fn one_failing_remote_does_not_affect_the_others() {
+        let bueno = MockServer::start().await;
+        servir(&bueno, tarjeta_para(&bueno, "Bueno")).await;
+        let malo = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&malo)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let datos = tempfile::tempdir().unwrap();
+        perfil(dir.path(), "bueno", &bueno.uri());
+        perfil(dir.path(), "malo", &malo.uri());
+        let registro = registro(dir.path(), datos.path());
+        let bus = EventBus::new(16);
+        let cliente = http_client(&config()).unwrap().unwrap();
+
+        let informe = refresh_remote_cards(&registro, &bus, &cliente, &config()).await;
+
+        assert_eq!(informe.ok, vec!["bueno".to_string()]);
+        assert_eq!(informe.failed, vec!["malo".to_string()]);
+        let instantanea = registro.snapshot();
+        assert!(instantanea.problems().contains(&LoadProblem::Remote {
+            name: "malo".into(),
+            error: "remote answered with HTTP status 500".into(),
+        }));
+        registro.approve("bueno").unwrap();
+        assert_eq!(
+            registro.snapshot().approval("bueno"),
+            Some(Approval::Approved)
+        );
+        assert_eq!(
+            registro.snapshot().approval("malo"),
+            Some(Approval::Pending)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_registry_without_remotes_makes_no_request() {
+        let servidor = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&servidor)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let datos = tempfile::tempdir().unwrap();
+        let registro = registro(dir.path(), datos.path());
+        let bus = EventBus::new(16);
+        let cliente = http_client(&config()).unwrap().unwrap();
+
+        let informe = refresh_remote_cards(&registro, &bus, &cliente, &config()).await;
+
+        assert_eq!(informe, RefreshReport::default());
+    }
+}

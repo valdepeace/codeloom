@@ -5,4 +5,5 @@
 pub mod card;
 pub mod config;
 pub mod remote;
+pub mod sync;
 pub mod wire;
