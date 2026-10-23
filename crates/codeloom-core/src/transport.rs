@@ -7,11 +7,14 @@
 use crate::a2a::{Message, PartContent};
 use crate::card::AgentCard;
 use crate::error::{CoreError, Result};
+use crate::event::EventBus;
 use crate::registry::{AgentRegistry, AGENTE_POR_DEFECTO};
 use crate::session::{SessionId, SubagentDescriptor};
 use crate::subagent::SubagentLauncher;
 use crate::task::TaskState;
+use crate::task_events::{flujo_de_tarea, Refrescar, StreamResponse};
 use async_trait::async_trait;
+use futures::stream::BoxStream;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -59,17 +62,41 @@ pub trait AgentTransport: Send + Sync {
 
     /// Tarjeta del agente; `None` es el agente por defecto.
     async fn agent_card(&self, agent: Option<&str>) -> Result<AgentCard>;
+
+    /// `SubscribeToTask`: flujo de eventos de una tarea que aún no es terminal. Empieza con una
+    /// instantánea y se cierra tras el estado terminal. `TaskNotFound` si no existe o es de otro
+    /// padre; `UnsupportedOperation` si ya es terminal (así lo fija el proto).
+    async fn subscribe_task(
+        &self,
+        _parent: SessionId,
+        _task: SessionId,
+    ) -> Result<BoxStream<'static, StreamResponse>> {
+        Err(CoreError::UnsupportedOperation(
+            "task subscription unavailable".into(),
+        ))
+    }
 }
 
 /// Transporte en memoria: traduce cada operación a una llamada al lanzador. No abre ningún socket.
 pub struct InProcessTransport {
     launcher: Arc<dyn SubagentLauncher>,
     registry: Option<Arc<AgentRegistry>>,
+    bus: Option<EventBus>,
 }
 
 impl InProcessTransport {
     pub fn new(launcher: Arc<dyn SubagentLauncher>, registry: Option<Arc<AgentRegistry>>) -> Self {
-        Self { launcher, registry }
+        Self {
+            launcher,
+            registry,
+            bus: None,
+        }
+    }
+
+    /// Bus del que se derivan los flujos de `subscribe_task`; sin él no hay suscripción.
+    pub fn with_bus(mut self, bus: EventBus) -> Self {
+        self.bus = Some(bus);
+        self
     }
 
     /// Textos de un mensaje, uno por `Part`. Este transporte solo lleva texto: cualquier otra
@@ -177,6 +204,39 @@ impl AgentTransport for InProcessTransport {
             .map(|entrada| entrada.card.clone())
             .ok_or_else(|| CoreError::Tool(format!("unknown agent «{nombre}»")))
     }
+
+    async fn subscribe_task(
+        &self,
+        parent: SessionId,
+        task: SessionId,
+    ) -> Result<BoxStream<'static, StreamResponse>> {
+        let bus = self.bus.as_ref().ok_or_else(|| {
+            CoreError::UnsupportedOperation("task subscription unavailable".into())
+        })?;
+        // Se suscribe antes de leer la tarea: un cambio entre ambas cosas no se pierde.
+        let rx = bus.subscribe();
+        let actual = self.get_task(parent, task).await?;
+        if actual.status.state.is_terminal() {
+            return Err(CoreError::UnsupportedOperation(format!(
+                "task {} is already in a terminal state ({})",
+                task.0,
+                actual.status.state.proto_name()
+            )));
+        }
+        let lanzador = self.launcher.clone();
+        let refrescar: Refrescar = Box::new(move || {
+            let lanzador = lanzador.clone();
+            Box::pin(async move {
+                lanzador
+                    .list(parent)
+                    .await
+                    .ok()?
+                    .into_iter()
+                    .find(|descriptor| descriptor.child == task)
+            })
+        });
+        Ok(flujo_de_tarea(rx, actual, refrescar))
+    }
 }
 
 /// Suite de contrato: lo que cualquier `AgentTransport` debe cumplir, sea local o remoto.
@@ -257,6 +317,25 @@ pub mod contract {
             Err(CoreError::TaskNotFound(_))
         ));
         assert!(transporte.list_tasks(otro_padre).await.unwrap().is_empty());
+
+        // Suscribirse: una tarea ajena o inexistente no se encuentra; la propia o bien ya es
+        // terminal (no soportado) o bien abre un flujo que empieza con una instantánea.
+        assert!(matches!(
+            transporte.subscribe_task(parent, SessionId(987_654)).await,
+            Err(CoreError::TaskNotFound(987_654))
+        ));
+        assert!(matches!(
+            transporte.subscribe_task(otro_padre, tarea.child).await,
+            Err(CoreError::TaskNotFound(_))
+        ));
+        match transporte.subscribe_task(parent, tarea.child).await {
+            Err(CoreError::UnsupportedOperation(_)) => {}
+            Ok(mut flujo) => {
+                use futures::StreamExt;
+                assert!(matches!(flujo.next().await, Some(StreamResponse::Task(_))));
+            }
+            Err(otro) => panic!("suscripción inesperada: {otro:?}"),
+        }
 
         // La tarjeta del agente por defecto existe; la de un agente desconocido, no.
         assert!(transporte.agent_card(None).await.is_ok());
@@ -348,6 +427,7 @@ mod tests {
         herramientas.register(Arc::new(crate::tools::ask_user::AskUserTool));
         let registro = Arc::new(AgentRegistry::new(vec![Box::new(BuiltInSource)]));
         registro.reload();
+        let bus = EventBus::new(256);
         let lanzador = InProcessSubagentLauncher::new(
             Arc::new(RwLock::new(provider)),
             store.clone(),
@@ -365,11 +445,11 @@ mod tests {
             })),
             dir.path().to_path_buf(),
             Arc::new(LocalJobRegistry::default()),
-            EventBus::new(64),
+            bus.clone(),
         )
         .with_registry(registro.clone());
         Banco {
-            transporte: InProcessTransport::new(Arc::new(lanzador), Some(registro)),
+            transporte: InProcessTransport::new(Arc::new(lanzador), Some(registro)).with_bus(bus),
             store,
             parent,
             _dir: dir,
@@ -686,5 +766,92 @@ mod tests {
         let otro = banco.store.create_session("/project").await.unwrap();
 
         contract::transport_contract(&banco.transporte, banco.parent, otro).await;
+    }
+
+    #[tokio::test]
+    async fn subscribe_to_an_unknown_task_is_not_found() {
+        let banco = banco(vec![]).await;
+
+        match banco
+            .transporte
+            .subscribe_task(banco.parent, SessionId(987_654))
+            .await
+        {
+            Err(CoreError::TaskNotFound(id)) => assert_eq!(id, 987_654),
+            otro => panic!("se esperaba TaskNotFound, y salió {:?}", otro.err()),
+        }
+    }
+
+    #[tokio::test]
+    async fn subscribe_to_a_terminal_task_is_unsupported() {
+        let banco = banco(vec![]).await;
+        let tarea = banco
+            .transporte
+            .send_message(peticion(&banco, "haz algo"), CancellationToken::new())
+            .await
+            .unwrap();
+        espera(&banco, tarea.child, TaskState::Completed).await;
+
+        match banco
+            .transporte
+            .subscribe_task(banco.parent, tarea.child)
+            .await
+        {
+            Err(CoreError::UnsupportedOperation(texto)) => {
+                assert!(texto.contains("TASK_STATE_COMPLETED"), "{texto}");
+            }
+            otro => panic!("se esperaba UnsupportedOperation, y salió {:?}", otro.err()),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_full_run_streams_the_snapshot_then_completed() {
+        use futures::StreamExt;
+        let banco = banco(vec![pregunta()]).await;
+        let tarea = banco
+            .transporte
+            .send_message(peticion(&banco, "decide algo"), CancellationToken::new())
+            .await
+            .unwrap();
+        espera(&banco, tarea.child, TaskState::InputRequired).await;
+        let mut flujo = banco
+            .transporte
+            .subscribe_task(banco.parent, tarea.child)
+            .await
+            .unwrap();
+        let primero = tokio::time::timeout(Duration::from_secs(2), flujo.next())
+            .await
+            .unwrap();
+        match primero {
+            Some(StreamResponse::Task(t)) => {
+                assert_eq!(t.status.state, TaskState::InputRequired);
+            }
+            otro => panic!("se esperaba la instantánea, y salió {otro:?}"),
+        }
+
+        let mut respuesta = peticion(&banco, "Sí");
+        respuesta.task_id = Some(tarea.child);
+        banco
+            .transporte
+            .send_message(respuesta, CancellationToken::new())
+            .await
+            .unwrap();
+        let resto: Vec<StreamResponse> =
+            tokio::time::timeout(Duration::from_secs(5), flujo.collect::<Vec<_>>())
+                .await
+                .expect("el flujo debería cerrarse al terminar la tarea");
+
+        let estados: Vec<TaskState> = resto
+            .iter()
+            .filter_map(|e| match e {
+                StreamResponse::StatusUpdate(u) => Some(u.status.state),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(estados.last(), Some(&TaskState::Completed), "{estados:?}");
+        assert!(resto.iter().any(|e| matches!(
+            e,
+            StreamResponse::ArtifactUpdate(a) if a.artifact.text() == "listo"
+        )));
     }
 }

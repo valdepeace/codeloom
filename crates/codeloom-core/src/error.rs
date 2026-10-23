@@ -19,6 +19,10 @@ pub enum CoreError {
     /// Equivale al `TaskNotFoundError` de A2A: el hijo no existe o no es de este padre.
     #[error("task not found: {0}")]
     TaskNotFound(i64),
+    /// Equivale al `UnsupportedOperationError` de A2A: la operación no vale para el estado de la
+    /// tarea (p. ej. suscribirse a una tarea ya terminal).
+    #[error("unsupported operation: {0}")]
+    UnsupportedOperation(String),
     /// Equivale al `TaskNotCancelableError` de A2A: la tarea ya está en un estado terminal.
     #[error("task {child} is not cancelable: it is {state:?}")]
     TaskNotCancelable { child: i64, state: TaskState },
