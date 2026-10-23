@@ -105,6 +105,13 @@ fn draw_workspace_header(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+/// Sufijo de la línea de estado mientras corre el resumen anticipado: `  · resumiendo… N s`.
+/// Vacío si no corre. Va tras el estado, así que si no cabe se recorta como el resto de la línea.
+fn background_suffix(app: &App) -> String {
+    app.background_summary_label()
+        .map_or_else(String::new, |label| format!("  · {label}"))
+}
+
 /// Cabecera de una línea del chrome `Flat`: marca, directorio, modelo y estado.
 fn draw_flat_header(frame: &mut Frame, area: Rect, app: &App) {
     let status_style = if app.status.starts_with("error:") {
@@ -120,7 +127,10 @@ fn draw_flat_header(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled("╱╱╱╱", app.theme.styles.muted),
         Span::styled(format!("  {}", app.cwd), app.theme.styles.muted),
         Span::styled(format!("  • {}", app.model), app.theme.styles.muted),
-        Span::styled(format!("  • {}", app.status), status_style),
+        Span::styled(
+            format!("  • {}{}", app.status, background_suffix(app)),
+            status_style,
+        ),
     ];
     if app.queued > 0 {
         text.push(Span::styled(
@@ -1420,7 +1430,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         let text_area = split_footer_meter(frame, rows[2], app);
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(format!(" {} ", app.status), app.theme.styles.heading),
+                Span::styled(
+                    format!(" {}{} ", app.status, background_suffix(app)),
+                    app.theme.styles.heading,
+                ),
                 Span::styled(
                     app.slash_feedback.as_deref().unwrap_or(
                         "  Enter send · Ctrl+J newline · Ctrl+K queue · Ctrl+O tool · Ctrl+T inspect · F2 settings · Esc cancel",
@@ -1573,6 +1586,57 @@ mod tests {
         let row = last_row_of(&mut app, 80, 24);
         assert!(row.contains("ctx 142k (sin ventana)"), "{row}");
         assert!(!row.contains("━"), "sin barra sin ventana: {row}");
+    }
+
+    #[test]
+    fn background_events_drive_the_status_and_the_arrow() {
+        use batten::widgets::ThemePreset;
+        use codeloom_core::event::LiveEvent;
+        let mut app = footer_app(ThemePreset::Batten, "windowed");
+        // Sin resumen anticipado no hay texto de estado ni flecha en el pie. La flecha de
+        // «ahorro pendiente» se mira junto al porcentaje, porque el pie ya lleva otras «↓».
+        let row = last_row_of(&mut app, 80, 24);
+        assert!(!row.contains("resumiendo"), "{row}");
+        assert!(!row.contains("71 % ↓"), "{row}");
+
+        // Arranca el resumen: la línea de estado cuenta «resumiendo…» mientras corre.
+        app.apply(LiveEvent::BackgroundCompactionStarted {
+            tokens_before: 120_000,
+        });
+        let row = last_row_of(&mut app, 80, 24);
+        assert!(row.contains("resumiendo…"), "{row}");
+        assert!(!row.contains("71 % ↓"), "{row}");
+
+        // El resumen está listo: desaparece el texto de estado y el medidor lleva la flecha.
+        app.apply(LiveEvent::BackgroundCompactionReady { summary_bytes: 400 });
+        let row = last_row_of(&mut app, 80, 24);
+        assert!(row.contains("71 % ↓"), "{row}");
+        assert!(!row.contains("resumiendo"), "{row}");
+    }
+
+    #[test]
+    fn compacted_clears_the_ready_mark() {
+        use batten::widgets::ThemePreset;
+        use codeloom_core::event::{Activation, LiveEvent};
+        let mut app = footer_app(ThemePreset::Batten, "windowed");
+        app.apply(LiveEvent::BackgroundCompactionStarted {
+            tokens_before: 120_000,
+        });
+        app.apply(LiveEvent::BackgroundCompactionReady { summary_bytes: 400 });
+        assert!(app.context_meter().ready);
+
+        // Al activarse la compactación, la flecha desaparece y el resumen pasa a ser memoria.
+        app.apply(LiveEvent::ContextCompacted {
+            replaced: 4,
+            tokens_before: 160_000,
+            summary_bytes: 100,
+            activation: Activation::Sync,
+        });
+        assert!(!app.context_meter().ready);
+        let row = last_row_of(&mut app, 80, 24);
+        assert!(row.contains("resumen 25"), "{row}");
+        assert!(!row.contains("resumen 25 ↓"), "{row}");
+        assert!(!row.contains("resumiendo"), "{row}");
     }
 
     #[test]

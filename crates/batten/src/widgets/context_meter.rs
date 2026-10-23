@@ -3,7 +3,8 @@
 //! Dos estilos para poder compararlos: `Segments` (celdas `━`, aspecto de
 //! mastra) y `Blocks` (`█░` con `ctx N%`, aspecto de Pawan). El ancho de la
 //! salida es fijo por construcción (diez celdas y cifras formateadas), salvo el
-//! sufijo ` · resumen N`, que solo aparece cuando hay memoria.
+//! sufijo ` · resumen N`, que solo aparece cuando hay memoria, y la flecha ` ↓`,
+//! que solo aparece cuando hay un resumen anticipado listo (`ready`).
 
 use crate::widgets::theme::Theme;
 use ratatui::layout::Rect;
@@ -44,16 +45,19 @@ pub struct ContextMeter {
     pub mark_percent: u8,
     /// Tokens de `used` que son resumen de compactación (memoria). `0` si no hay.
     pub memory: u64,
+    /// Hay un resumen anticipado listo para activarse («ahorro pendiente»). Pinta la flecha ` ↓`.
+    pub ready: bool,
 }
 
 impl ContextMeter {
-    /// Crea un medidor con el umbral de aviso por defecto (80 %) y sin memoria.
+    /// Crea un medidor con el umbral de aviso por defecto (80 %), sin memoria y sin resumen listo.
     pub fn new(used: u64, window: Option<u64>) -> Self {
         Self {
             used,
             window,
             mark_percent: DEFAULT_MARK_PERCENT,
             memory: 0,
+            ready: false,
         }
     }
 
@@ -63,6 +67,11 @@ impl ContextMeter {
             memory: memory.min(self.used),
             ..self
         }
+    }
+
+    /// Indica si hay un resumen anticipado listo para activarse.
+    pub fn with_ready(self, ready: bool) -> Self {
+        Self { ready, ..self }
     }
 
     /// Porcentaje redondeado al entero más cercano, sin tope superior.
@@ -145,6 +154,15 @@ impl ContextMeter {
             memory => format!(" · resumen {}", format_tokens(memory)),
         }
     }
+
+    /// Flecha ` ↓` del resumen listo. Vacía sin `ready` o sin ventana conocida.
+    fn ready_tail(&self) -> &'static str {
+        if self.ready && self.window.is_some() {
+            " ↓"
+        } else {
+            ""
+        }
+    }
 }
 
 /// Formatea una cantidad de tokens: `850`, `142k`, `1.2M`.
@@ -170,7 +188,7 @@ pub fn meter_text(meter: &ContextMeter, style: MeterStyle) -> String {
     };
     let pct = meter.percent().unwrap_or(0);
     let (memory_cells, message_cells, free_cells) = meter.cell_split();
-    let tail = meter.summary_tail();
+    let tail = format!("{}{}", meter.summary_tail(), meter.ready_tail());
     match style {
         MeterStyle::Segments => {
             // En texto plano las diez celdas son `━`; el reparto se ve en los estilos.
@@ -256,7 +274,10 @@ pub fn meter_spans(meter: &ContextMeter, style: MeterStyle, theme: &Theme) -> Ve
                 level_style,
             ));
             spans.push(Span::styled(free_glyph.repeat(free), muted));
-            spans.push(Span::styled(meter.summary_tail(), neutral));
+            spans.push(Span::styled(
+                format!("{}{}", meter.summary_tail(), meter.ready_tail()),
+                neutral,
+            ));
         }
     }
     spans.retain(|span| !span.content.is_empty());
@@ -541,5 +562,74 @@ mod tests {
         let spans = meter_spans(&unknown, MeterStyle::Segments, &theme);
         assert_eq!(spans.len(), 1);
         assert_eq!(span_text(&spans), "ctx 142k (sin ventana)");
+    }
+
+    #[test]
+    fn ready_adds_the_arrow_and_counts_in_the_width() {
+        let theme = Theme::test();
+        // Sin memoria: la flecha va tras el porcentaje, en ambos estilos.
+        let segments = sample().with_ready(true);
+        assert_eq!(
+            text(&segments, MeterStyle::Segments),
+            "━━━━━━━━━━  142k/200k  71 % ↓"
+        );
+        assert_eq!(meter_width(&segments, MeterStyle::Segments), 29);
+        let blocks = sample().with_ready(true);
+        assert_eq!(text(&blocks, MeterStyle::Blocks), "ctx 71% ███████░░░ ↓");
+        // Con memoria: la flecha va tras el sufijo de resumen.
+        let with_memory = ContextMeter::new(100_000, Some(200_000))
+            .with_memory(25_000)
+            .with_ready(true);
+        assert_eq!(
+            text(&with_memory, MeterStyle::Segments),
+            "━━━━━━━━━━  100k/200k  50 % · resumen 25k ↓"
+        );
+        assert_eq!(
+            text(&with_memory, MeterStyle::Blocks),
+            "ctx 50% ▒████░░░░░ · resumen 25k ↓"
+        );
+        // El ancho cuenta la flecha y coincide con el texto que se pinta.
+        for style in [MeterStyle::Segments, MeterStyle::Blocks] {
+            assert_eq!(
+                meter_width(&with_memory, style) as usize,
+                text(&with_memory, style).width()
+            );
+        }
+        // Las celdas y el sufijo siguen en su sitio; la flecha va en el estilo neutro.
+        let spans = meter_spans(&segments, MeterStyle::Segments, &theme);
+        assert_eq!(span_text(&spans), text(&segments, MeterStyle::Segments));
+        assert_eq!(
+            spans.last().unwrap().content.as_ref(),
+            "  142k/200k  71 % ↓"
+        );
+        assert_eq!(spans.last().unwrap().style, theme.styles.default);
+        let blocks_spans = meter_spans(&blocks, MeterStyle::Blocks, &theme);
+        assert_eq!(span_text(&blocks_spans), text(&blocks, MeterStyle::Blocks));
+        assert_eq!(blocks_spans.last().unwrap().content.as_ref(), " ↓");
+        // Sin ventana conocida no hay flecha.
+        let unknown = ContextMeter::new(142_000, None).with_ready(true);
+        assert_eq!(
+            text(&unknown, MeterStyle::Segments),
+            "ctx 142k (sin ventana)"
+        );
+    }
+
+    #[test]
+    fn not_ready_keeps_the_previous_text() {
+        // `ready: false` (valor por defecto y `with_ready(false)`) no cambia nada.
+        assert!(!sample().ready);
+        let plain = sample();
+        let explicit = sample().with_ready(false);
+        assert_eq!(plain, explicit);
+        assert_eq!(
+            text(&explicit, MeterStyle::Segments),
+            "━━━━━━━━━━  142k/200k  71 %"
+        );
+        assert_eq!(text(&explicit, MeterStyle::Blocks), "ctx 71% ███████░░░");
+        let with_memory = ContextMeter::new(100_000, Some(200_000)).with_memory(25_000);
+        assert_eq!(
+            text(&with_memory, MeterStyle::Blocks),
+            "ctx 50% ▒████░░░░░ · resumen 25k"
+        );
     }
 }

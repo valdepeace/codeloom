@@ -474,6 +474,19 @@ struct ContextWindowCache {
     window: Option<u64>,
 }
 
+/// Estado del resumen anticipado de la compactación en segundo plano, según los eventos del núcleo.
+/// `Running` guarda el instante de arranque para contar los segundos al pintar, sin temporizadores.
+/// `Ready` marca que hay un resumen listo para activarse («ahorro pendiente» en el medidor).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum BackgroundSummary {
+    #[default]
+    None,
+    Running {
+        since: Instant,
+    },
+    Ready,
+}
+
 /// Estimación de tokens de un texto de `bytes` bytes: cuatro bytes por token, redondeo hacia arriba.
 fn estimate_tokens(bytes: usize) -> u64 {
     bytes.div_ceil(4) as u64
@@ -562,6 +575,8 @@ pub struct App {
     pub context_tokens: u64,
     /// Tokens estimados del resumen vigente (la memoria del medidor); 0 si no hay resumen.
     pub context_memory: u64,
+    /// Estado del resumen anticipado en segundo plano de la sesión mostrada.
+    background_summary: BackgroundSummary,
     context_window_cache: RefCell<Option<ContextWindowCache>>,
     pub current_step: usize,
     pub max_steps: usize,
@@ -810,6 +825,7 @@ impl App {
             turn_output_tokens: 0,
             context_tokens: 0,
             context_memory: 0,
+            background_summary: BackgroundSummary::None,
             context_window_cache: RefCell::new(None),
             current_step: 0,
             max_steps: 0,
@@ -1493,6 +1509,7 @@ impl App {
         self.turn_output_tokens = 0;
         self.context_tokens = 0;
         self.context_memory = 0;
+        self.background_summary = BackgroundSummary::None;
         for message in messages {
             if let Some(usage) = message.usage.as_ref() {
                 self.input_tokens = self
@@ -2188,6 +2205,18 @@ impl App {
             self.context_window(),
         )
         .with_memory(self.context_memory)
+        .with_ready(matches!(self.background_summary, BackgroundSummary::Ready))
+    }
+
+    /// Etiqueta de la línea de estado mientras corre el resumen anticipado: `resumiendo… N s`.
+    /// Los segundos se calculan al pintar a partir del instante de arranque; `None` si no corre.
+    pub fn background_summary_label(&self) -> Option<String> {
+        match self.background_summary {
+            BackgroundSummary::Running { since } => {
+                Some(format!("resumiendo… {}s", since.elapsed().as_secs()))
+            }
+            BackgroundSummary::None | BackgroundSummary::Ready => None,
+        }
     }
 
     /// Ventana de contexto del modelo actual según el catálogo, por el mismo camino que
@@ -2596,10 +2625,19 @@ impl App {
             // memoria del medidor: el resumen vigente pasa a contar como memoria.
             LiveEvent::ContextCompacted { summary_bytes, .. } => {
                 self.context_memory = estimate_tokens(summary_bytes);
+                // La compactación se ha activado: el resumen anticipado deja de estar pendiente.
+                self.background_summary = BackgroundSummary::None;
             }
-            // La compactación en segundo plano aún no se muestra en la interfaz (Tarea 4).
-            LiveEvent::BackgroundCompactionStarted { .. }
-            | LiveEvent::BackgroundCompactionReady { .. } => {}
+            // El resumen anticipado arranca: la línea de estado cuenta «resumiendo…» desde aquí.
+            LiveEvent::BackgroundCompactionStarted { .. } => {
+                self.background_summary = BackgroundSummary::Running {
+                    since: Instant::now(),
+                };
+            }
+            // El resumen anticipado está listo: el medidor lleva la flecha «ahorro pendiente».
+            LiveEvent::BackgroundCompactionReady { .. } => {
+                self.background_summary = BackgroundSummary::Ready;
+            }
             // El aviso de presupuesto es de CodeLoom: se pinta como línea de sistema, igual que los
             // avisos de `parse_notice`, y nunca como mensaje de la persona usuaria ni como estado de
             // A2A. Corta la entrada del asistente para que lo que llegue después no se pegue encima.

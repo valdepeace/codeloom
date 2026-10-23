@@ -25,6 +25,10 @@ const CYCLE_RISE: u64 = 4_000;
 const CYCLE_CLIMB_STEPS: u64 = 30;
 /// Pasos en los que se muestra «compactando…» con el uso en el 80 %.
 const CYCLE_COMPACT_STEPS: u64 = 8;
+/// Porcentaje a partir del cual se prepara el resumen anticipado («resumiendo…»).
+const CYCLE_SUMMARY_PERCENT: u64 = 60;
+/// Pasos finales antes de la caída en los que el resumen ya está listo (flecha ↓).
+const CYCLE_READY_STEPS: u64 = 4;
 /// Tokens del resumen vigente tras compactar.
 const SUMMARY: u64 = 25_000;
 /// Uso tras la caída: el resumen más una cola de mensajes.
@@ -53,11 +57,15 @@ fn sweep_percent(ticks: u64) -> u64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CycleState {
     meter: ContextMeter,
+    /// Se prepara el resumen anticipado (uso ya por encima del 60 %, todavía sin compactar).
+    summarizing: bool,
+    /// Fase de compactación al 80 %, con «compactando…».
     compacting: bool,
 }
 
 /// Ciclo: sube desde «resumen + cola» hasta el 80 %, se queda un rato en «compactando…»
-/// y cae de nuevo a «resumen + cola».
+/// y cae de nuevo a «resumen + cola». El resumen se prepara al 60 % («resumiendo…») y, en los
+/// últimos pasos antes de la caída, ya está listo (flecha ↓ en el medidor).
 fn cycle_state(ticks: u64) -> CycleState {
     let period = CYCLE_CLIMB_STEPS + CYCLE_COMPACT_STEPS;
     let step = (ticks / FRAMES_PER_STEP) % period;
@@ -66,8 +74,13 @@ fn cycle_state(ticks: u64) -> CycleState {
     } else {
         (AFTER_DROP + CYCLE_CLIMB_STEPS * CYCLE_RISE, true)
     };
+    let summarizing = !compacting && used * 100 >= WINDOW * CYCLE_SUMMARY_PERCENT;
+    let ready = compacting && step >= period - CYCLE_READY_STEPS;
     CycleState {
-        meter: ContextMeter::new(used, Some(WINDOW)).with_memory(SUMMARY),
+        meter: ContextMeter::new(used, Some(WINDOW))
+            .with_memory(SUMMARY)
+            .with_ready(ready),
+        summarizing,
         compacting,
     }
 }
@@ -81,6 +94,8 @@ fn rows(ticks: u64, theme: &Theme) -> Vec<Row> {
 
     let (cycle_label, cycle_label_style) = if cycle.compacting {
         ("compactando…", theme.styles.warning)
+    } else if cycle.summarizing {
+        ("resumiendo…", muted)
     } else {
         ("ciclo", muted)
     };
@@ -138,7 +153,7 @@ fn rows(ticks: u64, theme: &Theme) -> Vec<Row> {
         },
         Row::Blank,
         Row::Text(
-            "Aviso desde el 80 %: ahí salta la compactación. El resumen (color de acento del tema) es una estimación.",
+            "Aviso desde el 80 %: ahí salta la compactación. El resumen anticipado se prepara al 60 % y se activa al 80 %; la flecha ↓ marca el resumen listo. El resumen (color de acento del tema) es una estimación.",
         ),
     ]
 }
@@ -284,6 +299,34 @@ mod tests {
         assert!(!after.compacting);
         assert_eq!(after.meter.used, AFTER_DROP);
         assert_eq!(after.meter.memory, SUMMARY);
+    }
+
+    #[test]
+    fn cycle_summarizes_from_60_and_is_ready_just_before_the_drop() {
+        let at_step = |step: u64| cycle_state(step * FRAMES_PER_STEP);
+
+        // 19 pasos son 116 000 tokens (58 %): todavía no se prepara nada.
+        let below = at_step(19);
+        assert!(!below.summarizing);
+        assert!(!below.meter.ready);
+
+        // 120 000 tokens son el 60 %: aquí empieza «resumiendo…», sin flecha.
+        let from = at_step(20);
+        assert!(from.summarizing);
+        assert!(!from.meter.ready);
+
+        // El tramo listo cubre los últimos pasos antes de la caída, dentro de la compactación.
+        let period = CYCLE_CLIMB_STEPS + CYCLE_COMPACT_STEPS;
+        let before_ready = at_step(period - CYCLE_READY_STEPS - 1);
+        assert!(before_ready.compacting && !before_ready.meter.ready);
+        let ready = at_step(period - 1);
+        assert!(ready.compacting && ready.meter.ready);
+
+        // Tras el tramo listo llega la caída, sin flecha y sin «resumiendo…».
+        let dropped = at_step(period);
+        assert!(!dropped.compacting && !dropped.summarizing);
+        assert!(!dropped.meter.ready);
+        assert_eq!(dropped.meter.used, AFTER_DROP);
     }
 
     #[test]
