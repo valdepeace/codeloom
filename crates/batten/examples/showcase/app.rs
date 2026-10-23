@@ -36,6 +36,9 @@ pub struct Showcase {
     matrix_cursor: (usize, usize),
     /// `true` si el demo activo se abrió desde la matriz; `Esc` vuelve entonces a ella.
     matrix_return: bool,
+    /// Columna de la matriz que muestra el pie entre temas, fijada por `Enter` o `F8`. `None`
+    /// cuando se deduce del proveedor del demo seleccionado.
+    view_column: Option<usize>,
 }
 
 impl Showcase {
@@ -53,6 +56,7 @@ impl Showcase {
             matrix,
             matrix_cursor: (0, 0),
             matrix_return: false,
+            view_column: None,
         }
     }
 
@@ -128,6 +132,7 @@ impl Showcase {
     pub fn select(&mut self, index: usize, open: bool) {
         if index < self.demos.len() {
             self.selected = index;
+            self.view_column = None;
             if open {
                 self.focus = Focus::Demo;
             }
@@ -158,6 +163,7 @@ impl Showcase {
         let filtered = self.filtered_indices();
         if !filtered.contains(&self.selected) {
             self.selected = filtered.first().copied().unwrap_or(0);
+            self.view_column = None;
         }
     }
 
@@ -224,6 +230,7 @@ impl Showcase {
 
     /// Mueve la selección una posición abajo (con tope) y vuelve el foco al índice.
     pub fn next(&mut self) {
+        self.view_column = None;
         let filtered = self.filtered_indices();
         if let Some(position) = filtered.iter().position(|index| *index == self.selected) {
             if position + 1 < filtered.len() {
@@ -238,6 +245,7 @@ impl Showcase {
 
     /// Mueve la selección una posición arriba (con tope) y vuelve el foco al índice.
     pub fn prev(&mut self) {
+        self.view_column = None;
         let filtered = self.filtered_indices();
         if let Some(position) = filtered.iter().position(|index| *index == self.selected) {
             self.selected = filtered[position.saturating_sub(1)];
@@ -323,7 +331,67 @@ impl Showcase {
             return;
         };
         self.select(index, true);
+        self.view_column = Some(column);
         self.matrix_return = true;
+        if let Some((_, Some(preset))) = matrix::COLUMNS.get(column) {
+            self.theme_preset = *preset;
+        }
+    }
+
+    /// Columna de la matriz que corresponde al demo mostrado: la fijada por `Enter` o `F8` si la
+    /// hay; si no, la del proveedor del demo seleccionado (`None` si no es una columna).
+    pub fn current_column(&self) -> Option<usize> {
+        if self.view_column.is_some() {
+            return self.view_column;
+        }
+        let variant = self.demos.get(self.selected)?.variant;
+        let provider = demos::strict_provider(variant)?;
+        matrix::COLUMNS
+            .iter()
+            .position(|(name, _)| *name == provider)
+    }
+
+    /// Pasa a la columna siguiente (o, con `backwards`, anterior) de la fila del componente del
+    /// demo actual que no sea `Missing`, con vuelta, y abre ese demo con el tema de la columna.
+    /// Sin fila para el componente, o sin otra columna disponible, no hace nada. No cambia el
+    /// foco ni `matrix_return`.
+    pub fn cycle_component_theme(&mut self, backwards: bool) {
+        let Some(component) = self.demos.get(self.selected).map(|item| item.component) else {
+            return;
+        };
+        let Some(row) = self
+            .matrix
+            .rows
+            .iter()
+            .find(|row| row.component == component)
+        else {
+            return;
+        };
+        let columns = matrix::COLUMNS.len();
+        // Sin columna actual, el recorrido empieza antes de la primera (hacia delante) o después
+        // de la última (hacia atrás); con ella, se recorren todas menos la propia.
+        let (start, steps) = match self.current_column() {
+            Some(column) => (column, columns - 1),
+            None if backwards => (0, columns),
+            None => (columns - 1, columns),
+        };
+        let found = (1..=steps).find_map(|step| {
+            let column = if backwards {
+                (start + columns - step) % columns
+            } else {
+                (start + step) % columns
+            };
+            if row.cells[column] == Cell::Missing {
+                return None;
+            }
+            matrix::target(&self.demos, component, column).map(|index| (column, index))
+        });
+        let Some((column, index)) = found else {
+            return;
+        };
+        // `select` deja la columna sin fijar; se fija después, como hace `Enter` en la matriz.
+        self.select(index, false);
+        self.view_column = Some(column);
         if let Some((_, Some(preset))) = matrix::COLUMNS.get(column) {
             self.theme_preset = *preset;
         }
@@ -370,6 +438,7 @@ impl Showcase {
             matrix,
             matrix_cursor: (0, 0),
             matrix_return: false,
+            view_column: None,
         }
     }
 }
@@ -390,6 +459,10 @@ pub fn route(show: &mut Showcase, kind: KeyEventKind, code: KeyCode, mods: KeyMo
     }
     if code == KeyCode::F(7) {
         show.cycle_theme(mods.contains(KeyModifiers::SHIFT));
+        return Action::None;
+    }
+    if code == KeyCode::F(8) && show.focus() == Focus::Demo {
+        show.cycle_component_theme(mods.contains(KeyModifiers::SHIFT));
         return Action::None;
     }
     match show.focus {
@@ -877,5 +950,127 @@ mod tests {
         press(&mut show, KeyCode::Tab);
         press(&mut show, KeyCode::Esc);
         assert_eq!(show.focus(), Focus::Index);
+    }
+
+    /// Pulsa `F8` (o `Shift+F8` con `shift`).
+    fn f8(show: &mut Showcase, shift: bool) {
+        let mods = if shift {
+            KeyModifiers::SHIFT
+        } else {
+            KeyModifiers::NONE
+        };
+        route(show, KeyEventKind::Press, KeyCode::F(8), mods);
+    }
+
+    /// Selecciona el primer demo de (componente, proveedor) y pasa el foco al demo.
+    fn open_demo(show: &mut Showcase, component: &str, provider: &str) {
+        let index = first_demo(show, component, provider);
+        show.select(index, false);
+        press(show, KeyCode::Tab);
+        assert_eq!(show.focus(), Focus::Demo);
+    }
+
+    /// Celda de la matriz de (componente, columna), buscándolas por nombre.
+    fn cell_at(show: &Showcase, component: &str, column: &str) -> Cell {
+        let row = show
+            .matrix()
+            .rows
+            .iter()
+            .find(|row| row.component == component)
+            .expect("fila del componente");
+        row.cells[column_index(column)]
+    }
+
+    #[test]
+    fn f8_switches_theme_and_demo_together() {
+        let mut show = Showcase::new();
+        open_demo(&mut show, "Composer", "Batten");
+        f8(&mut show, false);
+        assert_eq!(show.selected(), first_demo(&show, "Composer", "Martty"));
+        assert_eq!(show.theme_preset(), ThemePreset::Martty);
+        assert_eq!(show.focus(), Focus::Demo);
+    }
+
+    #[test]
+    fn f8_skips_missing_columns() {
+        let mut show = Showcase::new();
+        // Welcome no tiene demo de Mindfork ni Batten: esa celda es Missing y se salta.
+        assert_eq!(cell_at(&show, "Welcome", "Mindfork"), Cell::Missing);
+        open_demo(&mut show, "Welcome", "Martty");
+        f8(&mut show, false);
+        assert_eq!(show.current_column(), Some(column_index("Pawan")));
+        assert_eq!(show.selected(), first_demo(&show, "Welcome", "Pawan"));
+        assert_eq!(show.theme_preset(), ThemePreset::Pawan);
+        f8(&mut show, true);
+        assert_eq!(show.current_column(), Some(column_index("Martty")));
+    }
+
+    #[test]
+    fn f8_on_a_generic_cell_opens_the_batten_demo_with_the_column_theme() {
+        let mut show = Showcase::new();
+        open_demo(&mut show, "Composer", "Mindfork");
+        f8(&mut show, false);
+        assert_eq!(cell_at(&show, "Composer", "Pawan"), Cell::Generic);
+        assert_eq!(show.selected(), first_demo(&show, "Composer", "Batten"));
+        assert_eq!(show.theme_preset(), ThemePreset::Pawan);
+    }
+
+    #[test]
+    fn f8_does_nothing_for_a_component_without_a_row() {
+        let mut show = Showcase::new();
+        // Braille graphics es de dotmax: es librería y no tiene fila en la matriz.
+        open_demo(&mut show, "Braille graphics", "dotmax");
+        let before = (show.selected(), show.theme_preset());
+        f8(&mut show, false);
+        f8(&mut show, true);
+        assert_eq!((show.selected(), show.theme_preset()), before);
+        assert_eq!(show.focus(), Focus::Demo);
+    }
+
+    #[test]
+    fn f8_wraps_around_and_shift_f8_goes_back() {
+        let mut show = Showcase::new();
+        open_demo(&mut show, "Composer", "Martty");
+        f8(&mut show, true); // Martty -> Batten
+        assert_eq!(show.current_column(), Some(column_index("Batten")));
+        f8(&mut show, true); // Batten -> CodeLoom, por la vuelta al final
+        assert_eq!(show.current_column(), Some(column_index("CodeLoom")));
+        assert_eq!(show.selected(), first_demo(&show, "Composer", "Batten"));
+        f8(&mut show, false); // CodeLoom -> Batten, por la vuelta al principio
+        assert_eq!(show.current_column(), Some(column_index("Batten")));
+    }
+
+    #[test]
+    fn f8_keeps_the_focus_on_the_demo() {
+        let mut show = Showcase::new();
+        open_demo(&mut show, "Composer", "Batten");
+        f8(&mut show, false);
+        assert_eq!(show.focus(), Focus::Demo);
+    }
+
+    #[test]
+    fn selecting_from_the_index_derives_the_column_from_the_demo() {
+        let mut show = Showcase::new();
+        press(&mut show, KeyCode::Char('m'));
+        place(&mut show, "Composer", "Pawan");
+        press(&mut show, KeyCode::Enter);
+        assert_eq!(show.current_column(), Some(column_index("Pawan")));
+        press(&mut show, KeyCode::Tab); // al índice
+        show.select(first_demo(&show, "Composer", "Crush"), true);
+        assert_eq!(show.current_column(), Some(column_index("Crush")));
+    }
+
+    #[test]
+    fn selecting_from_the_index_resets_the_view_column() {
+        let mut show = Showcase::new();
+        press(&mut show, KeyCode::Char('m'));
+        place(&mut show, "Composer", "Pawan");
+        press(&mut show, KeyCode::Enter);
+        assert_eq!(show.view_column, Some(column_index("Pawan")));
+        press(&mut show, KeyCode::Tab); // al índice
+        press(&mut show, KeyCode::Down);
+        assert_eq!(show.view_column, None);
+        show.select(0, false);
+        assert_eq!(show.view_column, None);
     }
 }

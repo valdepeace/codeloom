@@ -9,7 +9,7 @@ use crate::demos::{strict_provider, CatalogItem};
 use batten::state::StyleToken;
 use batten::widgets::{Theme, ThemePreset};
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::Modifier;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
@@ -141,6 +141,47 @@ fn is_column(provider: &str) -> bool {
     COLUMNS.iter().any(|(name, _)| *name == provider)
 }
 
+/// Símbolo de una celda y su estilo: `●` con el de éxito, `◐` con el de aviso, `·` con el atenuado.
+pub fn glyph(cell: Cell, theme: &Theme) -> (&'static str, Style) {
+    match cell {
+        Cell::Own(_) => ("●", theme.style(StyleToken::Success)),
+        Cell::Generic => ("◐", theme.style(StyleToken::Warning)),
+        Cell::Missing => ("·", theme.style(StyleToken::Muted)),
+    }
+}
+
+/// Nota de estado de una celda (componente, columna), para el pie de la vista entre temas.
+/// Con la columna CodeLoom (sin paleta propia) añade que se usa el tema activo.
+pub fn status_note(component: &str, column: usize, cell: Cell) -> String {
+    let Some((name, preset)) = COLUMNS.get(column) else {
+        return String::new();
+    };
+    let text = match cell {
+        Cell::Own(1) => format!("● {component} · {name}: demo propio"),
+        Cell::Own(n) => format!("● {component} · {name}: {n} variantes propias"),
+        // Breve a propósito: el pie recorta por la derecha y no debe perder lo esencial.
+        Cell::Generic => format!(
+            "◐ {component} · {name}: parcialmente implementado (genérico de Batten con la paleta de {name})"
+        ),
+        Cell::Missing => format!("· {component} · {name}: no existe"),
+    };
+    if preset.is_none() {
+        format!("{text} (sin paleta propia: se usa el tema activo)")
+    } else {
+        text
+    }
+}
+
+/// Tira de una fila: para cada columna, su nombre, su celda y si es la columna `current`.
+pub fn strip(row: &MatrixRow, current: Option<usize>) -> Vec<(String, Cell, bool)> {
+    COLUMNS
+        .iter()
+        .zip(row.cells)
+        .enumerate()
+        .map(|(index, ((name, _), cell))| (name.to_string(), cell, current == Some(index)))
+        .collect()
+}
+
 /// Ancho mínimo, en columnas, para dibujar la matriz; por debajo solo se muestra un aviso.
 const MIN_WIDTH: u16 = 30;
 /// Alto mínimo, en filas, para dibujar la matriz; por debajo solo se muestra un aviso.
@@ -259,11 +300,7 @@ fn row_line(
         name_style,
     )];
     for (column, cell) in row.cells.iter().enumerate() {
-        let (symbol, style) = match cell {
-            Cell::Own(_) => ("●", theme.style(StyleToken::Success)),
-            Cell::Generic => ("◐", theme.style(StyleToken::Warning)),
-            Cell::Missing => ("·", theme.style(StyleToken::Muted)),
-        };
+        let (symbol, style) = glyph(*cell, theme);
         let slot = format!("{symbol:<w$}", w = widths[column]);
         if on_cursor_row && column == cursor_col {
             spans.push(Span::styled(slot, style.add_modifier(Modifier::REVERSED)));
@@ -316,7 +353,7 @@ fn note_text(matrix: &Matrix) -> Option<String> {
 }
 
 /// Recorta `text` a `width` caracteres (no bytes), terminando en `…` si hay que cortar.
-fn fit(text: &str, width: usize) -> String {
+pub fn fit(text: &str, width: usize) -> String {
     if text.chars().count() <= width {
         return text.to_string();
     }
@@ -486,6 +523,55 @@ mod tests {
         let matrix = build(&demos::catalog());
         let composer = row(&matrix, "Composer");
         assert_eq!(composer.cells[col("Pawan")], Cell::Generic);
+    }
+
+    #[test]
+    fn status_note_names_partial_implementation_for_generic() {
+        assert_eq!(
+            status_note("Composer", col("Pawan"), Cell::Generic),
+            // ADAPTADO: texto abreviado para que quepa en el pie sin recortarse
+            "◐ Composer · Pawan: parcialmente implementado (genérico de Batten con la paleta de Pawan)"
+        );
+    }
+
+    #[test]
+    fn status_note_for_own_mentions_variants_only_when_several() {
+        assert_eq!(
+            status_note("Chip", col("Crush"), Cell::Own(1)),
+            "● Chip · Crush: demo propio"
+        );
+        assert_eq!(
+            status_note("Chip", col("Crush"), Cell::Own(3)),
+            "● Chip · Crush: 3 variantes propias"
+        );
+        assert_eq!(
+            status_note("Chip", col("Pawan"), Cell::Missing),
+            "· Chip · Pawan: no existe"
+        );
+    }
+
+    #[test]
+    fn codeloom_note_says_no_palette() {
+        let suffix = " (sin paleta propia: se usa el tema activo)";
+        for cell in [Cell::Own(1), Cell::Generic, Cell::Missing] {
+            assert!(status_note("Chip", col("CodeLoom"), cell).ends_with(suffix));
+        }
+        assert!(!status_note("Chip", col("Crush"), Cell::Own(1)).contains("sin paleta"));
+    }
+
+    #[test]
+    fn strip_marks_the_current_column() {
+        let items = vec![item("Chip", "Batten"), item("Chip", "Crush")];
+        let matrix = build(&items);
+        let entries = strip(row(&matrix, "Chip"), Some(col("Crush")));
+        assert_eq!(entries.len(), COLUMNS.len());
+        assert_eq!(entries.iter().filter(|(_, _, current)| *current).count(), 1);
+        let (name, cell, current) = &entries[col("Crush")];
+        assert_eq!(
+            (name.as_str(), *cell, *current),
+            ("Crush", Cell::Own(1), true)
+        );
+        assert_eq!(entries[col("Pawan")].1, Cell::Generic);
     }
 
     #[test]
