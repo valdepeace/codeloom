@@ -1,6 +1,8 @@
 //! Nombres del cable de A2A v1.0 y su traducción a los tipos del núcleo.
 
-use codeloom_core::a2a::Role;
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
+use codeloom_core::a2a::{Artifact, Message, Part, PartContent, Role};
 use codeloom_core::task::TaskState;
 use serde::{Deserialize, Serialize};
 
@@ -11,6 +13,10 @@ pub enum WireError {
     UnknownState(String),
     #[error("invalid timestamp `{0}`")]
     InvalidTimestamp(String),
+    #[error("a part must have exactly one of text, raw, url or data, and has {0}")]
+    PartContent(usize),
+    #[error("`raw` is not valid base64: {0}")]
+    InvalidBase64(String),
 }
 
 /// Nombre del cable de un estado: el del proto v1.0, p. ej. `TASK_STATE_WORKING`.
@@ -137,6 +143,190 @@ pub fn timestamp_from_wire(text: &str) -> Result<i64, WireError> {
     Ok(((dias * 24 + hh) * 60 + mm) * 60_000 + ss * 1_000 + millis)
 }
 
+/// `Part` en el cable: lleva exactamente una de las claves `text`, `raw`, `url` o `data`
+/// (sin clave `kind`), más `filename`, `mediaType` y `metadata` si existen. `raw` va en base64
+/// estándar: decisión nuestra, la especificación leída no lo dice.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WirePart {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+}
+
+impl From<&Part> for WirePart {
+    fn from(part: &Part) -> Self {
+        let mut wire = WirePart {
+            text: None,
+            raw: None,
+            url: None,
+            data: None,
+            filename: part.filename.clone(),
+            media_type: part.media_type.clone(),
+            metadata: part.metadata.clone(),
+        };
+        match &part.content {
+            PartContent::Text(texto) => wire.text = Some(texto.clone()),
+            PartContent::Raw(bytes) => wire.raw = Some(STANDARD.encode(bytes)),
+            PartContent::Url(url) => wire.url = Some(url.clone()),
+            PartContent::Data(valor) => wire.data = Some(valor.clone()),
+        }
+        wire
+    }
+}
+
+impl TryFrom<WirePart> for Part {
+    type Error = WireError;
+
+    fn try_from(wire: WirePart) -> Result<Self, WireError> {
+        let presentes = [
+            wire.text.is_some(),
+            wire.raw.is_some(),
+            wire.url.is_some(),
+            wire.data.is_some(),
+        ]
+        .into_iter()
+        .filter(|presente| *presente)
+        .count();
+        if presentes != 1 {
+            return Err(WireError::PartContent(presentes));
+        }
+        let content = if let Some(texto) = wire.text {
+            PartContent::Text(texto)
+        } else if let Some(raw) = wire.raw {
+            PartContent::Raw(
+                STANDARD
+                    .decode(raw)
+                    .map_err(|error| WireError::InvalidBase64(error.to_string()))?,
+            )
+        } else if let Some(url) = wire.url {
+            PartContent::Url(url)
+        } else {
+            PartContent::Data(wire.data.unwrap_or(serde_json::Value::Null))
+        };
+        Ok(Part {
+            content,
+            metadata: wire.metadata,
+            filename: wire.filename,
+            media_type: wire.media_type,
+        })
+    }
+}
+
+fn partes_a_wire(parts: &[Part]) -> Vec<WirePart> {
+    parts.iter().map(WirePart::from).collect()
+}
+
+fn partes_desde_wire(parts: Vec<WirePart>) -> Result<Vec<Part>, WireError> {
+    parts.into_iter().map(Part::try_from).collect()
+}
+
+/// `Message` en el cable. Los opcionales ausentes y las listas vacías no se emiten.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WireMessage {
+    pub message_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    pub role: WireRole,
+    pub parts: Vec<WirePart>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reference_task_ids: Vec<String>,
+}
+
+impl From<&Message> for WireMessage {
+    fn from(message: &Message) -> Self {
+        WireMessage {
+            message_id: message.message_id.clone(),
+            context_id: message.context_id.clone(),
+            task_id: message.task_id.clone(),
+            role: message.role.into(),
+            parts: partes_a_wire(&message.parts),
+            metadata: message.metadata.clone(),
+            extensions: message.extensions.clone(),
+            reference_task_ids: message.reference_task_ids.clone(),
+        }
+    }
+}
+
+impl TryFrom<WireMessage> for Message {
+    type Error = WireError;
+
+    fn try_from(wire: WireMessage) -> Result<Self, WireError> {
+        Ok(Message {
+            message_id: wire.message_id,
+            context_id: wire.context_id,
+            task_id: wire.task_id,
+            role: wire.role.into(),
+            parts: partes_desde_wire(wire.parts)?,
+            metadata: wire.metadata,
+            extensions: wire.extensions,
+            reference_task_ids: wire.reference_task_ids,
+        })
+    }
+}
+
+/// `Artifact` en el cable.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WireArtifact {
+    pub artifact_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub parts: Vec<WirePart>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<String>,
+}
+
+impl From<&Artifact> for WireArtifact {
+    fn from(artifact: &Artifact) -> Self {
+        WireArtifact {
+            artifact_id: artifact.artifact_id.clone(),
+            name: artifact.name.clone(),
+            description: artifact.description.clone(),
+            parts: partes_a_wire(&artifact.parts),
+            metadata: artifact.metadata.clone(),
+            extensions: artifact.extensions.clone(),
+        }
+    }
+}
+
+impl TryFrom<WireArtifact> for Artifact {
+    type Error = WireError;
+
+    fn try_from(wire: WireArtifact) -> Result<Self, WireError> {
+        Ok(Artifact {
+            artifact_id: wire.artifact_id,
+            name: wire.name,
+            description: wire.description,
+            parts: partes_desde_wire(wire.parts)?,
+            metadata: wire.metadata,
+            extensions: wire.extensions,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,5 +412,141 @@ mod tests {
                 "{texto}"
             );
         }
+    }
+
+    fn mensaje_completo() -> Message {
+        Message {
+            message_id: "m-1".into(),
+            context_id: Some("7".into()),
+            task_id: Some("9".into()),
+            role: Role::Agent,
+            parts: vec![
+                Part::text("hola"),
+                Part {
+                    content: PartContent::Raw(vec![0, 1, 2, 255]),
+                    metadata: Some(serde_json::json!({"k": 1})),
+                    filename: Some("a.bin".into()),
+                    media_type: Some("application/octet-stream".into()),
+                },
+                Part {
+                    content: PartContent::Url("https://e.example/x.png".into()),
+                    metadata: None,
+                    filename: None,
+                    media_type: Some("image/png".into()),
+                },
+                Part {
+                    content: PartContent::Data(serde_json::json!({"a": [1, 2]})),
+                    metadata: None,
+                    filename: None,
+                    media_type: Some("application/json".into()),
+                },
+            ],
+            metadata: Some(serde_json::json!({"m": true})),
+            extensions: vec!["urn:x".into()],
+            reference_task_ids: vec!["3".into()],
+        }
+    }
+
+    #[test]
+    fn part_text_serializes_with_only_the_text_key() {
+        let json = serde_json::to_value(WirePart::from(&Part::text("hola"))).unwrap();
+        assert_eq!(json, serde_json::json!({"text": "hola"}));
+    }
+
+    #[test]
+    fn part_raw_is_base64() {
+        let parte = Part {
+            content: PartContent::Raw(b"hola".to_vec()),
+            metadata: None,
+            filename: Some("a.txt".into()),
+            media_type: Some("text/plain".into()),
+        };
+        let json = serde_json::to_value(WirePart::from(&parte)).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"raw": "aG9sYQ==", "filename": "a.txt", "mediaType": "text/plain"})
+        );
+    }
+
+    #[test]
+    fn part_with_two_content_keys_is_rejected() {
+        let wire: WirePart = serde_json::from_str(r#"{"text":"a","url":"https://x"}"#).unwrap();
+        assert_eq!(Part::try_from(wire), Err(WireError::PartContent(2)));
+    }
+
+    #[test]
+    fn part_without_content_is_rejected() {
+        let wire: WirePart = serde_json::from_str(r#"{"filename":"a"}"#).unwrap();
+        assert_eq!(Part::try_from(wire), Err(WireError::PartContent(0)));
+    }
+
+    #[test]
+    fn invalid_base64_raw_is_rejected() {
+        let wire: WirePart = serde_json::from_str(r#"{"raw":"esto no es base64!!"}"#).unwrap();
+        assert!(matches!(
+            Part::try_from(wire),
+            Err(WireError::InvalidBase64(_))
+        ));
+    }
+
+    #[test]
+    fn message_uses_camel_case_and_omits_empty_fields() {
+        let mensaje = Message {
+            message_id: "m-1".into(),
+            context_id: None,
+            task_id: None,
+            role: Role::User,
+            parts: vec![Part::text("hola")],
+            metadata: None,
+            extensions: Vec::new(),
+            reference_task_ids: Vec::new(),
+        };
+        let json = serde_json::to_value(WireMessage::from(&mensaje)).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "messageId": "m-1",
+                "role": "ROLE_USER",
+                "parts": [{"text": "hola"}]
+            })
+        );
+        let completo = serde_json::to_value(WireMessage::from(&mensaje_completo())).unwrap();
+        assert_eq!(completo["contextId"], "7");
+        assert_eq!(completo["referenceTaskIds"], serde_json::json!(["3"]));
+        assert_eq!(completo["extensions"], serde_json::json!(["urn:x"]));
+    }
+
+    #[test]
+    fn message_roundtrips() {
+        let original = mensaje_completo();
+        let texto = serde_json::to_string(&WireMessage::from(&original)).unwrap();
+        let vuelta: WireMessage = serde_json::from_str(&texto).unwrap();
+        assert_eq!(Message::try_from(vuelta), Ok(original));
+    }
+
+    #[test]
+    fn artifact_roundtrips() {
+        let original = Artifact {
+            artifact_id: "a-1".into(),
+            name: Some("informe".into()),
+            description: Some("resultado".into()),
+            parts: vec![Part::text("listo"), Part::text("hecho")],
+            metadata: Some(serde_json::json!({"n": 2})),
+            extensions: vec!["urn:y".into()],
+        };
+        let json = serde_json::to_value(WireArtifact::from(&original)).unwrap();
+        assert_eq!(json["artifactId"], "a-1");
+        let vuelta: WireArtifact = serde_json::from_value(json).unwrap();
+        assert_eq!(Artifact::try_from(vuelta), Ok(original));
+    }
+
+    #[test]
+    fn unknown_fields_are_ignored() {
+        let wire: WireMessage = serde_json::from_str(
+            r#"{"messageId":"m","role":"ROLE_USER","parts":[{"text":"x","kind":"text"}],"nuevo":1}"#,
+        )
+        .unwrap();
+        let mensaje = Message::try_from(wire).unwrap();
+        assert_eq!(mensaje.text(), "x");
     }
 }
