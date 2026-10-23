@@ -82,7 +82,10 @@ Nada de esto está decidido. Se anota con su encaje en lo que ya existe
    petición es «resumen + cola», y el tamaño de cada parte se conoce. El medidor
    (`2026-10-23-codeloom-context-meter-design.md`) puede mostrar el resumen atenuado y la cola
    normal. **Es lo que más se parece a lo que le gusta a la persona usuaria y es barato.**
-2. **Compactación anticipada en segundo plano.** Hoy el resumen es **síncrono**: el turno se
+2. **Compactación anticipada en segundo plano.** *Adoptada el 2026-10-23, opt-in*
+   (`2026-10-23-codeloom-background-compaction-design.md`). Se toma la idea, no el mecanismo: aquí
+   hay un solo resumen que arranca al 60 % y se activa al 80 %, no varios fragmentos buferizados.
+   Texto original: hoy el resumen es **síncrono**: el turno se
    detiene mientras el modelo resume. El búfer asíncrono de mastra lo evita. Es la mejora de más
    valor de cara a la fluidez, pero exige concurrencia con el bucle y un estado de «resumen
    preparado»: una spec propia.
@@ -94,6 +97,8 @@ Nada de esto está decidido. Se anota con su encaje en lo que ya existe
    nuevo) y el tope de 16 000 bytes lo acota, pero no hay una política explícita.
 5. **Activación por inactividad** (precedente también en qwen-code): compactar cuando la persona
    usuaria se aleja, no en mitad de un turno.
-6. **Estado visible de la compactación** («Resumiendo… Ns») en la línea de estado: hoy solo se ve
+6. **Estado visible de la compactación** («Resumiendo… Ns») en la línea de estado. *Adoptado el
+   2026-10-23 solo para la compactación en segundo plano (más la flecha `↓` en el medidor); la
+   síncrona sigue sin estado.* Texto original: hoy solo se ve
    el aviso final.
 7. **Registro de resúmenes consultable en la interfaz**, como la pestaña de memoria de su estudio.

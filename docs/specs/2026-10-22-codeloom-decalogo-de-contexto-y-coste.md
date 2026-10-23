@@ -74,7 +74,10 @@ que no tiene cota acabará, tarde o temprano, desbordándose.**
    resultados antiguos de herramientas (`2026-10-22-codeloom-context-compaction-design.md`) y,
    desde el 2026-10-23, resumen del historial con el modelo al alcanzar el 80 % de la ventana
    (`2026-10-23-codeloom-context-summary-design.md`). Faltan `/compact` manual y el reintento
-   reactivo ante un rechazo por contexto excedido; sin ventana conocida no se compacta. Véase
+   reactivo ante un rechazo por contexto excedido; sin ventana conocida no se compacta. Desde el
+   mismo día existe, **opt-in** (`[compaction] background = true`), la preparación del resumen en
+   segundo plano al 60 % para activarlo al 80 % sin detener el turno
+   (`2026-10-23-codeloom-background-compaction-design.md`); su coste real está sin medir. Véase
    también `2026-10-14-loom-kpis-prompt-compression.md`.*
 6. **El prompt de sistema también tiene cota.** Ficheros de contexto (`AGENTS.md`,
    `CODELOOM.md`), lista de agentes, habilidades y memoria se inyectan en cada petición.

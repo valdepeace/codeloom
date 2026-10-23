@@ -1,6 +1,7 @@
 # Compactación anticipada en segundo plano
 
-Estado: diseño, 2026-10-23. Parte de la idea 2 de
+Estado: implementado el 2026-10-23, opt-in y sin verlo en una terminal real (véase «Estado» al
+final). Parte de la idea 2 de
 `docs/references/contexto-y-coste/memoria-observacional-mastra.md` y extiende
 `2026-10-23-codeloom-context-summary-design.md`.
 
@@ -98,3 +99,40 @@ sin mantener el cierre durante `await`.
 - **Subagentes:** el mecanismo es por bucle y por sesión, así que un hijo lo heredaría con su
   propia configuración, pero no se prueba.
 - **Medir en el mundo real** cuánto se ahorra: sin datos.
+
+## Estado
+
+Implementado el 2026-10-23 con la opción **apagada por defecto** (`[compaction] background =
+false`). **Sin verlo aún en una terminal real**: solo hay pruebas con proveedor simulado y
+`TestBackend`. Commits: `260d374` (separar generar de activar), `ac18bc4` (estado por sesión),
+`32e16e5` (registrador de consumo clonable, `Activation`, configuración), `cce1c54` (integración
+en el bucle), `c379366` (estado visible y flecha en el medidor) y `2a04751` (aviso de descarte).
+
+### Decisiones tomadas durante la implementación
+
+- **Las pruebas de concurrencia no usan `sleep`**: el proveedor simulado retiene la primera
+  petición de resumen con un semáforo y avisa de su llegada por un canal. Dos de ellas (resumen en
+  curso y plazo vencido) llaman a la función de activación directamente y no al turno, porque con
+  el turno completo la espera es una carrera con el reloj pausado.
+- **Cancelar el turno no mata el resumen**: la tarea lleva su propio token de cancelación. Solo lo
+  cancela `abort` (plazo vencido).
+- **Cada tarea lleva un identificador**: una entrega tardía tras un `abort` no pisa a la tarea
+  posterior de la misma sesión.
+- **Fallo hallado al integrar la interfaz**: si el resumen fallaba, venía vacío o se cancelaba, el
+  estado volvía a reposo sin avisar y la interfaz se quedaba en «resumiendo…». Se añadió
+  `LiveEvent::BackgroundCompactionDiscarded`, que también se publica al tirar uno caduco.
+
+### Lo que no consta o queda pendiente
+
+- **El contador «resumiendo… Ns» solo avanza cuando hay otro repintado**: no se añadió a la
+  cadencia de animación para no repintar a 20 fps durante todo el resumen, de modo que puede verse
+  congelado hasta el siguiente evento.
+- **Coste real sin medir**: si la sesión acaba entre el 60 % y el 80 %, la llamada se pierde. Por
+  eso sigue siendo opt-in. Si el plazo vence y se cae a la vía síncrona, se paga además un segundo
+  resumen.
+- **Un salto de menos del 60 % a más del 80 % en un solo paso** lanza el resumen y lo espera en el
+  mismo paso: no ahorra nada respecto a la vía síncrona.
+- **Subagentes**: no heredan la opción y usan siempre la vía síncrona.
+- **El resumen listo no se persiste**: se pierde al cerrar la aplicación, a propósito.
+- **Etiqueta en el demo**: los últimos pasos antes de la caída llevan la flecha pero conservan la
+  etiqueta «compactando…».
