@@ -106,15 +106,19 @@ después el transporte (A7, A8).
     `docs/plans/2026-10-22-codeloom-a2a-agent-card.md`.
   - **Fuera de A6:** seguridad, firmas e icono de la tarjeta, que quedan para A8.
 - [ ] **A7. Transporte `InProcess`** detrás de `AgentTransport`: mensajes en memoria,
-  sin socket, para los tests.
+  sin socket, para los tests. Spec y plan preparados el 2026-10-23
+  (`2026-10-23-codeloom-a2a-inprocess-transport-*`), pendientes de aprobación.
 - [ ] **A8. Transporte `A2aRemote`** (HTTP JSON-RPC y SSE; gRPC opcional) con roles
   `serve | consume | both`, por defecto desactivados, en el crate opcional
-  `codeloom-a2a`. Aquí cobra sentido `auth-required`.
+  `codeloom-a2a`. Aquí cobra sentido `auth-required`. Spec y plan preparados el 2026-10-23
+  (`2026-10-23-codeloom-a2a-remote-transport-*`), cortados en fases A8a–A8d y con preguntas
+  abiertas para la persona usuaria; requiere A4, A7 y A9.
   - Seguridad, firmas e icono de la tarjeta (`security_schemes`, `security_requirements`,
     `signatures`, `icon_url`) quedan para esta tarea. A6 no los modela; ver la spec de la
     tarjeta, sección «Estado».
 - [ ] **A9. Flujo de eventos** `TaskStatusUpdateEvent` y de artefactos sobre el bus de
-  eventos existente, sin canal de interfaz paralelo.
+  eventos existente, sin canal de interfaz paralelo. Spec y plan preparados el 2026-10-23
+  (`2026-10-23-codeloom-a2a-task-events-*`); requiere A7 y empieza por contrastar el proto.
 - [x] **A10. Cancelar y reanudar.** **Hecho el 2026-10-23** (decisiones nuestras, rotuladas):
   spec `docs/specs/2026-10-23-codeloom-a2a-cancel-design.md`, plan
   `docs/plans/2026-10-23-codeloom-a2a-cancel.md`. `SubagentLauncher::cancel` devuelve la tarea
@@ -152,6 +156,7 @@ después el transporte (A7, A8).
       Spec: `docs/specs/2026-10-22-codeloom-a2a-delegation-choice-design.md`, sección «Estado».
     - **A12b, pendiente:** clasificador o enrutador automático (idea del usuario,
       «interesante más adelante»). El hueco es `regla_de_eleccion` en `registry/mod.rs`.
+      Spec y plan preparados el 2026-10-23 (`2026-10-23-codeloom-a2a-agent-router-*`).
 - [x] **Árbol de subagentes (2026-10-22).** El subagente es un nodo plegable de la conversación,
   con el icono del estado A2A y su nombre exacto; desplegado, muestra su texto y sus herramientas
   y las consultas del padre sobre él. Commits `a059b49`, `1bf6ec6`, `3d4ee31`, `7cdce9b`,
