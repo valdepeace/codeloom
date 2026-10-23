@@ -14,9 +14,10 @@ orchestration model (**agent -> subagents -> jobs**, shown in the header) is
 
 The workspace builds and has tests. Crates: `batten` (TUI widgets/state),
 `codeloom-core` (engine), `codeloom-a2a` (A2A wire edge, card, JSON-RPC client),
-`codeloom-tui`, `codeloom-herdr`, `codeloom-cli`. Subagents run as A2A tasks and remote
-A2A agents can be consumed (A8a). Serving (A8b), SSE (A8c) and remote auth (A8d) are not
-done; the status of every A2A task is in `docs/plans/2026-10-22-codeloom-a2a-roadmap.md`.
+`codeloom-tui`, `codeloom-herdr`, `codeloom-cli`. Subagents run as A2A tasks; remote
+A2A agents can be consumed (A8a, with client-side auth A8d) and CodeLoom can be served as a
+read-only A2A agent (A8b). SSE (A8c) and the automatic agent router (A12b) are pending; the
+status of every A2A task is in `docs/plans/2026-10-22-codeloom-a2a-roadmap.md`.
 
 Every task needs its spec (`docs/specs/`) and plan (`docs/plans/`) before code.
 `docs/plans/2026-10-13-loom-mvp.md` is the original m0+m1 plan (history).
