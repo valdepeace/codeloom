@@ -1,7 +1,7 @@
 //! La tarjeta que el servidor anuncia en `/.well-known/agent-card.json` (A8b).
 //!
 //! Cabe señalar que se construye con los nombres del cable v1.0 (camelCase) y que declara
-//! `streaming`, `pushNotifications` y `extendedAgentCard` a `false`: lo que no se soporta no se
+//! `pushNotifications` y `extendedAgentCard` a `false` y `streaming` a `true` (A8c): lo que no se soporta no se
 //! anuncia. La seguridad que declara es la que el servidor exige de verdad.
 
 use codeloom_core::card::AgentCard;
@@ -68,7 +68,7 @@ pub fn served_card(card: &AgentCard, interface_url: &str, scheme: &ServeAuthSche
         }],
         "version": acotar(&card.version, MAX_NOMBRE),
         "capabilities": {
-            "streaming": false,
+            "streaming": true,
             "pushNotifications": false,
             "extendedAgentCard": false,
         },
@@ -102,7 +102,7 @@ mod tests {
             &ServeAuthScheme::Bearer,
         );
 
-        assert_eq!(servida.json["capabilities"]["streaming"], false);
+        assert_eq!(servida.json["capabilities"]["streaming"], true);
         assert_eq!(servida.json["capabilities"]["pushNotifications"], false);
         assert_eq!(servida.json["capabilities"]["extendedAgentCard"], false);
         assert_eq!(

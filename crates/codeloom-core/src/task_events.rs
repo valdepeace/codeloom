@@ -45,32 +45,37 @@ pub enum StreamResponse {
     ArtifactUpdate(TaskArtifactUpdateEvent),
 }
 
-/// Eventos que lleva el paso de `anterior` a `nuevo`: primero el de estado, si cambió el estado o
-/// su mensaje, y luego uno por cada artefacto nuevo. No se inventan transiciones.
+/// Eventos que lleva el paso de `anterior` a `nuevo`: el de estado, si cambió el estado o su mensaje,
+/// y uno por cada artefacto nuevo. No se inventan transiciones.
+///
+/// Orden: el estado va primero, **salvo que el nuevo estado sea terminal**: entonces los artefactos
+/// van antes y el estado terminal cierra la secuencia. La especificación obliga a cerrar el flujo al
+/// llegar a un estado terminal, y un cliente que corta al verlo no debe perderse el resultado.
 pub fn eventos_de_cambio(
     anterior: &SubagentDescriptor,
     nuevo: &SubagentDescriptor,
 ) -> Vec<StreamResponse> {
     let task_id = nuevo.child.0.to_string();
     let context_id = nuevo.context_id();
-    let mut eventos = Vec::new();
+    let mut estado = None;
     if anterior.status.state != nuevo.status.state
         || anterior.status.message != nuevo.status.message
     {
-        eventos.push(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+        estado = Some(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
             task_id: task_id.clone(),
             context_id: context_id.clone(),
             status: nuevo.status.clone(),
             metadata: None,
         }));
     }
+    let mut artefactos = Vec::new();
     for artefacto in &nuevo.artifacts {
         if anterior
             .artifacts
             .iter()
             .all(|visto| visto.artifact_id != artefacto.artifact_id)
         {
-            eventos.push(StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+            artefactos.push(StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
                 task_id: task_id.clone(),
                 context_id: context_id.clone(),
                 artifact: artefacto.clone(),
@@ -80,6 +85,13 @@ pub fn eventos_de_cambio(
             }));
         }
     }
+    let terminal = nuevo.status.state.is_terminal();
+    let mut eventos = Vec::new();
+    if !terminal {
+        eventos.extend(estado.take());
+    }
+    eventos.extend(artefactos);
+    eventos.extend(estado);
     eventos
 }
 
@@ -244,9 +256,9 @@ mod tests {
 
     #[test]
     fn events_keep_the_order_state_then_artifacts() {
-        let antes = descriptor(TaskState::Working, Vec::new());
+        let antes = descriptor(TaskState::Submitted, Vec::new());
         let despues = descriptor(
-            TaskState::Completed,
+            TaskState::Working,
             vec![Artifact::text_artifact("a"), Artifact::text_artifact("b")],
         );
 
@@ -258,6 +270,26 @@ mod tests {
                 StreamResponse::StatusUpdate(_),
                 StreamResponse::ArtifactUpdate(_),
                 StreamResponse::ArtifactUpdate(_)
+            ]
+        ));
+    }
+
+    #[test]
+    fn a_terminal_state_closes_the_sequence_after_the_artifacts() {
+        let antes = descriptor(TaskState::Working, Vec::new());
+        let despues = descriptor(
+            TaskState::Completed,
+            vec![Artifact::text_artifact("a"), Artifact::text_artifact("b")],
+        );
+
+        let eventos = eventos_de_cambio(&antes, &despues);
+
+        assert!(matches!(
+            &eventos[..],
+            [
+                StreamResponse::ArtifactUpdate(_),
+                StreamResponse::ArtifactUpdate(_),
+                StreamResponse::StatusUpdate(_)
             ]
         ));
     }
@@ -302,13 +334,14 @@ mod tests {
             siguiente(&mut flujo).await,
             Some(StreamResponse::StatusUpdate(e)) if e.status.state == TaskState::Working
         ));
-        assert!(matches!(
-            siguiente(&mut flujo).await,
-            Some(StreamResponse::StatusUpdate(e)) if e.status.state == TaskState::Completed
-        ));
+        // Los artefactos van antes del estado terminal, que cierra la secuencia.
         assert!(matches!(
             siguiente(&mut flujo).await,
             Some(StreamResponse::ArtifactUpdate(_))
+        ));
+        assert!(matches!(
+            siguiente(&mut flujo).await,
+            Some(StreamResponse::StatusUpdate(e)) if e.status.state == TaskState::Completed
         ));
         assert_eq!(siguiente(&mut flujo).await, None);
     }

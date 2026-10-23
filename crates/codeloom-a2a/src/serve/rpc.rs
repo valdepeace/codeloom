@@ -15,9 +15,12 @@ use async_trait::async_trait;
 use axum::body::{to_bytes, Body};
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use futures::stream::BoxStream;
+use futures::StreamExt;
 use serde_json::{json, Value};
 
 use super::auth::Authenticator;
@@ -48,6 +51,12 @@ const VERSION_NOT_SUPPORTED: i64 = -32009;
 /// «Servidor ocupado»: código nuestro, A2A no tiene uno (rango de errores de servidor de JSON-RPC).
 const SERVER_BUSY: i64 = -32000;
 
+/// Flujo de eventos de una tarea (`StreamResponse` en nombres del cable), listo para emitir por SSE.
+pub type EventStream = BoxStream<'static, Value>;
+
+/// Cada cuánto se emite un comentario SSE para que ningún intermediario cierre un flujo inactivo.
+const LATIDO: Duration = Duration::from_secs(15);
+
 /// Una tarea tal como la ve el cable, con el dato que el enrutador necesita para decidir si espera.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TaskView {
@@ -65,6 +74,9 @@ pub enum HostError {
     NotCancelable,
     /// Demasiadas tareas vivas.
     Busy,
+    /// La operación no es posible en este momento (p. ej. suscribirse a una tarea terminal) o este
+    /// anfitrión no sabe hacerla. Se devuelve como `UnsupportedOperationError`.
+    Unsupported,
     /// Fallo interno; el texto no se envía al cliente.
     Other(String),
 }
@@ -79,6 +91,15 @@ pub trait TaskHost: Send + Sync {
     async fn cancel(&self, id: &str) -> Result<TaskView, HostError>;
     /// Espera a un estado terminal hasta `max`; si vence, devuelve la tarea como esté.
     async fn wait_terminal(&self, id: &str, max: Duration) -> Result<TaskView, HostError>;
+    /// `SubscribeToTask`: flujo que empieza por la tarea y se cierra al estado terminal. Sin soporte,
+    /// el valor por defecto es `Unsupported`.
+    async fn subscribe(&self, _id: &str) -> Result<EventStream, HostError> {
+        Err(HostError::Unsupported)
+    }
+    /// `SendStreamingMessage`: crea la tarea y devuelve su flujo desde el `Task` inicial.
+    async fn start_streaming(&self, _prompt: String) -> Result<EventStream, HostError> {
+        Err(HostError::Unsupported)
+    }
 }
 
 /// Estado compartido del servidor.
@@ -162,6 +183,7 @@ fn desde_anfitrion(id: Value, error: HostError) -> Response {
     match error {
         HostError::NotFound => error_rpc(id, TASK_NOT_FOUND, "task not found"),
         HostError::NotCancelable => error_rpc(id, TASK_NOT_CANCELABLE, "task is not cancelable"),
+        HostError::Unsupported => error_rpc(id, UNSUPPORTED_OPERATION, "operation not supported"),
         HostError::Busy => {
             let mut respuesta = error_rpc(id, SERVER_BUSY, "server busy: too many live tasks");
             *respuesta.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
@@ -232,10 +254,12 @@ async fn rpc(State(estado): State<Arc<ServeState>>, peticion: Request) -> Respon
 
     let params = sobre.get("params").cloned().unwrap_or(Value::Null);
     match metodo {
-        "SendMessage" => enviar(&estado, id, &params).await,
+        "SendMessage" => enviar(&estado, id, &params, false).await,
+        "SendStreamingMessage" => enviar(&estado, id, &params, true).await,
+        "SubscribeToTask" => suscribir(&estado, id, &params).await,
         "GetTask" => consultar(&estado, id, &params, false).await,
         "CancelTask" => consultar(&estado, id, &params, true).await,
-        "SendStreamingMessage" | "SubscribeToTask" | "ListTasks" | "GetExtendedAgentCard" => {
+        "ListTasks" | "GetExtendedAgentCard" => {
             error_rpc(id, UNSUPPORTED_OPERATION, "operation not supported")
         }
         "CreateTaskPushNotificationConfig"
@@ -247,6 +271,33 @@ async fn rpc(State(estado): State<Arc<ServeState>>, peticion: Request) -> Respon
             "push notifications are not supported",
         ),
         _ => error_rpc(id, METHOD_NOT_FOUND, "method not found"),
+    }
+}
+
+/// Emite el flujo como SSE: cada evento es una línea `data:` con una respuesta JSON-RPC completa
+/// (§9.4.2). El flujo se cierra solo cuando se agota; los errores previos a su apertura ya viajaron
+/// como JSON-RPC normal.
+fn respuesta_sse(id: Value, eventos: EventStream) -> Response {
+    let eventos = eventos.map(move |evento| {
+        let sobre = json!({ "jsonrpc": "2.0", "id": id, "result": evento });
+        Ok::<_, std::convert::Infallible>(Event::default().data(sobre.to_string()))
+    });
+    Sse::new(eventos)
+        .keep_alive(KeepAlive::new().interval(LATIDO).text("latido"))
+        .into_response()
+}
+
+async fn suscribir(estado: &ServeState, id: Value, params: &Value) -> Response {
+    let tarea = params
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|tarea| !tarea.is_empty() && tarea.len() <= MAX_ID_BYTES);
+    let Some(tarea) = tarea else {
+        return error_rpc(id, INVALID_PARAMS, "params.id must be a task id");
+    };
+    match estado.host.subscribe(tarea).await {
+        Ok(eventos) => respuesta_sse(id, eventos),
+        Err(error) => desde_anfitrion(id, error),
     }
 }
 
@@ -269,7 +320,7 @@ async fn consultar(estado: &ServeState, id: Value, params: &Value, cancelar: boo
     }
 }
 
-async fn enviar(estado: &ServeState, id: Value, params: &Value) -> Response {
+async fn enviar(estado: &ServeState, id: Value, params: &Value, flujo: bool) -> Response {
     let invalido = |motivo: &str| error_rpc(id.clone(), INVALID_PARAMS, motivo);
     let Some(mensaje) = params.get("message") else {
         return invalido("params.message is required");
@@ -311,6 +362,12 @@ async fn enviar(estado: &ServeState, id: Value, params: &Value) -> Response {
     if prompt.len() > MAX_PROMPT_BYTES {
         return invalido("params.message is too large");
     }
+    if flujo {
+        return match estado.host.start_streaming(prompt).await {
+            Ok(eventos) => respuesta_sse(id, eventos),
+            Err(error) => desde_anfitrion(id, error),
+        };
+    }
     let sin_esperar = params
         .get("configuration")
         .and_then(|configuracion| configuracion.get("returnImmediately"))
@@ -349,6 +406,16 @@ mod tests {
         esperas: Mutex<usize>,
         ocupado: bool,
         termina_al_instante: bool,
+        con_flujo: bool,
+    }
+
+    fn flujo_falso() -> EventStream {
+        futures::stream::iter(vec![
+            json!({ "task": { "id": "t-1", "status": { "state": "TASK_STATE_WORKING" } } }),
+            json!({ "statusUpdate": { "taskId": "t-1", "contextId": "c",
+                    "status": { "state": "TASK_STATE_COMPLETED" } } }),
+        ])
+        .boxed()
     }
 
     fn tarea(estado: &str, terminal: bool) -> TaskView {
@@ -388,6 +455,25 @@ mod tests {
         async fn wait_terminal(&self, _id: &str, _max: Duration) -> Result<TaskView, HostError> {
             *self.esperas.lock().unwrap() += 1;
             Ok(tarea("TASK_STATE_COMPLETED", true))
+        }
+        async fn subscribe(&self, id: &str) -> Result<EventStream, HostError> {
+            match (self.con_flujo, id) {
+                (true, "t-1") => Ok(flujo_falso()),
+                (true, "terminada") => Err(HostError::Unsupported),
+                (true, _) => Err(HostError::NotFound),
+                (false, _) => Err(HostError::Unsupported),
+            }
+        }
+        async fn start_streaming(&self, prompt: String) -> Result<EventStream, HostError> {
+            if self.ocupado {
+                return Err(HostError::Busy);
+            }
+            self.iniciadas.lock().unwrap().push(prompt);
+            if self.con_flujo {
+                Ok(flujo_falso())
+            } else {
+                Err(HostError::Unsupported)
+            }
         }
     }
 
@@ -462,6 +548,143 @@ mod tests {
     fn envio(texto: &str) -> Value {
         json!({ "jsonrpc": "2.0", "id": 1, "method": "SendMessage",
                 "params": { "message": mensaje(texto) } })
+    }
+
+    fn flujo_peticion(metodo: &str, params: Value) -> Value {
+        json!({ "jsonrpc": "2.0", "id": 7, "method": metodo, "params": params })
+    }
+
+    /// Los objetos `result` de cada línea `data:` de un cuerpo SSE.
+    fn eventos_sse(cuerpo: &[u8]) -> Vec<Value> {
+        String::from_utf8_lossy(cuerpo)
+            .lines()
+            .filter_map(|linea| linea.strip_prefix("data:"))
+            .map(|json| serde_json::from_str::<Value>(json.trim()).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn send_streaming_message_answers_with_sse_starting_at_the_task() {
+        let (estado, host) = bearer(Falso {
+            con_flujo: true,
+            ..Falso::default()
+        });
+
+        let (http, cabeceras, bytes) = enviar_req(
+            &estado,
+            buena(flujo_peticion(
+                "SendStreamingMessage",
+                json!({ "message": mensaje("hola") }),
+            )),
+        )
+        .await;
+
+        assert_eq!(http, StatusCode::OK);
+        assert_eq!(cabeceras[header::CONTENT_TYPE], "text/event-stream");
+        let eventos = eventos_sse(&bytes);
+        assert_eq!(eventos.len(), 2, "{}", String::from_utf8_lossy(&bytes));
+        for evento in &eventos {
+            assert_eq!(evento["jsonrpc"], "2.0");
+            assert_eq!(evento["id"], 7);
+        }
+        assert_eq!(eventos[0]["result"]["task"]["id"], "t-1");
+        assert_eq!(
+            eventos[1]["result"]["statusUpdate"]["status"]["state"],
+            "TASK_STATE_COMPLETED"
+        );
+        assert_eq!(*host.iniciadas.lock().unwrap(), ["hola"]);
+    }
+
+    #[tokio::test]
+    async fn subscribe_to_task_streams_and_maps_its_errors_to_json_rpc() {
+        let (estado, _) = bearer(Falso {
+            con_flujo: true,
+            ..Falso::default()
+        });
+
+        let (_, cabeceras, bytes) = enviar_req(
+            &estado,
+            buena(flujo_peticion("SubscribeToTask", json!({ "id": "t-1" }))),
+        )
+        .await;
+        assert_eq!(cabeceras[header::CONTENT_TYPE], "text/event-stream");
+        assert_eq!(eventos_sse(&bytes).len(), 2);
+
+        let (_, terminada) = llamar(
+            &estado,
+            flujo_peticion("SubscribeToTask", json!({ "id": "terminada" })),
+        )
+        .await;
+        assert_eq!(terminada["error"]["code"], UNSUPPORTED_OPERATION);
+
+        let (_, ajena) = llamar(
+            &estado,
+            flujo_peticion("SubscribeToTask", json!({ "id": "ajena" })),
+        )
+        .await;
+        assert_eq!(ajena["error"]["code"], TASK_NOT_FOUND);
+
+        let (_, sin_id) = llamar(&estado, flujo_peticion("SubscribeToTask", json!({}))).await;
+        assert_eq!(sin_id["error"]["code"], INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn streaming_without_host_support_is_an_unsupported_operation_and_busy_is_503() {
+        let (estado, _) = bearer(Falso::default());
+        let (_, respuesta) = llamar(
+            &estado,
+            flujo_peticion(
+                "SendStreamingMessage",
+                json!({ "message": mensaje("hola") }),
+            ),
+        )
+        .await;
+        assert_eq!(respuesta["error"]["code"], UNSUPPORTED_OPERATION);
+
+        let (estado, _) = bearer(Falso {
+            con_flujo: true,
+            ocupado: true,
+            ..Falso::default()
+        });
+        let (http, respuesta) = llamar(
+            &estado,
+            flujo_peticion(
+                "SendStreamingMessage",
+                json!({ "message": mensaje("hola") }),
+            ),
+        )
+        .await;
+        assert_eq!(http, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(respuesta["error"]["code"], SERVER_BUSY);
+    }
+
+    #[tokio::test]
+    async fn the_streaming_methods_need_the_credential_and_validate_the_message_first() {
+        let (estado, host) = bearer(Falso {
+            con_flujo: true,
+            ..Falso::default()
+        });
+        let cuerpo = flujo_peticion(
+            "SendStreamingMessage",
+            json!({ "message": mensaje("hola") }),
+        );
+
+        let (http, _, bytes) = enviar_req(
+            &estado,
+            rpc_peticion(&cuerpo.to_string(), None, Some("1.0")),
+        )
+        .await;
+        assert_eq!(http, StatusCode::UNAUTHORIZED);
+        assert!(bytes.is_empty());
+
+        // Un mensaje sin texto se rechaza antes de crear nada.
+        let (_, invalido) = llamar(
+            &estado,
+            flujo_peticion("SendStreamingMessage", json!({ "message": mensaje("  ") })),
+        )
+        .await;
+        assert_eq!(invalido["error"]["code"], INVALID_PARAMS);
+        assert!(host.iniciadas.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -761,8 +984,6 @@ mod tests {
     async fn unsupported_and_unknown_methods_have_their_own_codes() {
         let (estado, _) = bearer(Falso::default());
         for (metodo, codigo) in [
-            ("SendStreamingMessage", UNSUPPORTED_OPERATION),
-            ("SubscribeToTask", UNSUPPORTED_OPERATION),
             ("ListTasks", UNSUPPORTED_OPERATION),
             ("GetExtendedAgentCard", UNSUPPORTED_OPERATION),
             ("CreateTaskPushNotificationConfig", PUSH_NOT_SUPPORTED),

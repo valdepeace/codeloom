@@ -22,11 +22,15 @@ use tokio_util::sync::CancellationToken;
 
 use super::config::ServeConfig;
 use super::confine::ConfinedView;
-use super::rpc::{HostError, TaskHost, TaskView};
-use crate::wire::WireTask;
+use super::rpc::{EventStream, HostError, TaskHost, TaskView};
+use crate::wire::{WirePart, WireStreamResponse, WireTask};
+use codeloom_core::task_events::{flujo_de_tarea, Refrescar};
+use futures::StreamExt;
 
 /// Cada cuánto se consulta el estado mientras se espera.
 const SONDEO: Duration = Duration::from_millis(50);
+/// Flujos SSE abiertos a la vez (cota propia, a revisar; véase la spec de A8c, D4).
+pub const MAX_STREAMS: usize = 16;
 /// Texto máximo que se devuelve por tarea (decálogo: nada sin cota llega al cliente).
 pub const MAX_RESULT_BYTES: usize = 32 * 1024;
 /// Etiqueta de las tareas entrantes en el almacén.
@@ -68,6 +72,8 @@ pub struct LauncherHost {
     agent: String,
     limits: HostLimits,
     bus: Option<EventBus>,
+    /// Huecos de flujos SSE abiertos; cada flujo lleva el suyo hasta que se suelta.
+    flujos: Arc<tokio::sync::Semaphore>,
     /// Serializa «contar tareas vivas y arrancar»: sin esto dos envíos simultáneos pasarían el tope.
     arranque: tokio::sync::Mutex<()>,
 }
@@ -88,6 +94,7 @@ impl LauncherHost {
             agent,
             limits,
             bus: None,
+            flujos: Arc::new(tokio::sync::Semaphore::new(MAX_STREAMS)),
             arranque: tokio::sync::Mutex::new(()),
         })
     }
@@ -116,6 +123,44 @@ impl LauncherHost {
             .ok_or(HostError::NotFound)
     }
 
+    /// Flujo de la tarea `hijo` ligado a un hueco de flujo: al soltarlo, el hueco se libera.
+    /// Se suscribe al bus **antes** de leer la tarea, para no perder cambios entre ambas cosas.
+    async fn flujo(
+        &self,
+        hijo: i64,
+        permiso: tokio::sync::OwnedSemaphorePermit,
+        permitir_terminal: bool,
+    ) -> Result<EventStream, HostError> {
+        let bus = self.bus.as_ref().ok_or(HostError::Unsupported)?;
+        let rx = bus.subscribe();
+        let actual = self.descriptor(&hijo.to_string()).await?;
+        if !permitir_terminal && actual.status.state.is_terminal() {
+            return Err(HostError::Unsupported);
+        }
+        let (lanzador, padre, id) = (self.launcher.clone(), self.parent, actual.child);
+        let refrescar: Refrescar = Box::new(move || {
+            let lanzador = lanzador.clone();
+            Box::pin(async move {
+                lanzador
+                    .list(padre)
+                    .await
+                    .ok()?
+                    .into_iter()
+                    .find(|descriptor| descriptor.child == id)
+            })
+        });
+        let maximo = self.limits.max_result_bytes;
+        Ok(flujo_de_tarea(rx, actual, refrescar)
+            .map(move |evento| {
+                // El hueco viaja dentro del cierre: se libera cuando el flujo se suelta.
+                let _permiso = &permiso;
+                let mut cable = WireStreamResponse::from(&evento);
+                acotar_evento(&mut cable, maximo);
+                serde_json::to_value(&cable).unwrap_or(serde_json::Value::Null)
+            })
+            .boxed())
+    }
+
     fn vista(&self, descriptor: &SubagentDescriptor) -> TaskView {
         let mut tarea = WireTask::from(descriptor);
         acotar_texto(&mut tarea, self.limits.max_result_bytes);
@@ -130,9 +175,26 @@ fn otro(error: CoreError) -> HostError {
     HostError::Other(error.to_string())
 }
 
+/// Acota el texto de un evento del flujo, con el mismo criterio que `GetTask`.
+fn acotar_evento(evento: &mut WireStreamResponse, max: usize) {
+    if let Some(tarea) = evento.task.as_mut() {
+        acotar_texto(tarea, max);
+    }
+    if let Some(mensaje) = evento.message.as_mut() {
+        acotar_partes(mensaje.parts.iter_mut(), max);
+    }
+    if let Some(cambio) = evento.status_update.as_mut() {
+        if let Some(mensaje) = cambio.status.message.as_mut() {
+            acotar_partes(mensaje.parts.iter_mut(), max);
+        }
+    }
+    if let Some(cambio) = evento.artifact_update.as_mut() {
+        acotar_partes(cambio.artifact.parts.iter_mut(), max);
+    }
+}
+
 /// Acota el texto total de los artefactos y del mensaje de estado a `max` bytes.
 fn acotar_texto(tarea: &mut WireTask, max: usize) {
-    let mut presupuesto = max;
     let mensajes = tarea
         .status
         .message
@@ -142,7 +204,13 @@ fn acotar_texto(tarea: &mut WireTask, max: usize) {
         .artifacts
         .iter_mut()
         .flat_map(|artefacto| artefacto.parts.iter_mut());
-    for parte in artefactos.chain(mensajes) {
+    acotar_partes(artefactos.chain(mensajes), max);
+}
+
+/// Acota el texto de unas partes a `max` bytes en total, cortando en un límite de carácter.
+fn acotar_partes<'a>(partes: impl Iterator<Item = &'a mut WirePart>, max: usize) {
+    let mut presupuesto = max;
+    for parte in partes {
         let Some(texto) = parte.text.as_mut() else {
             continue;
         };
@@ -231,6 +299,36 @@ impl TaskHost for LauncherHost {
 
         let descriptor = self.descriptor(&hijo.0.to_string()).await?;
         Ok(self.vista(&descriptor))
+    }
+
+    async fn subscribe(&self, id: &str) -> Result<EventStream, HostError> {
+        let hijo = id.parse::<i64>().map_err(|_| HostError::NotFound)?;
+        // Primero se comprueba que la tarea es de este servidor: una ajena es NotFound aunque no
+        // queden huecos, y no se revela nada por el orden de los errores.
+        self.descriptor(id).await?;
+        let permiso = self
+            .flujos
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| HostError::Busy)?;
+        self.flujo(hijo, permiso, false).await
+    }
+
+    async fn start_streaming(&self, prompt: String) -> Result<EventStream, HostError> {
+        // El hueco se toma antes de crear la tarea: sin él no se crea nada que quede sin flujo.
+        let permiso = self
+            .flujos
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| HostError::Busy)?;
+        let vista = self.start(prompt).await?;
+        let hijo = vista
+            .json
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|id| id.parse::<i64>().ok())
+            .ok_or_else(|| HostError::Other("tarea sin id".into()))?;
+        self.flujo(hijo, permiso, true).await
     }
 
     async fn get(&self, id: &str) -> Result<TaskView, HostError> {
@@ -464,6 +562,171 @@ mod tests {
             estados, sin_repetir,
             "no debe avisar dos veces del mismo estado seguido"
         );
+    }
+
+    /// Recoge un flujo entero (con un tope de tiempo para que una prueba rota no cuelgue).
+    async fn recoger(mut flujo: EventStream) -> Vec<serde_json::Value> {
+        let mut eventos = Vec::new();
+        let limite = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < limite {
+            match tokio::time::timeout(Duration::from_millis(500), flujo.next()).await {
+                Ok(Some(evento)) => eventos.push(evento),
+                Ok(None) => return eventos,
+                Err(_) => {}
+            }
+        }
+        panic!("el flujo no terminó: {eventos:?}");
+    }
+
+    #[tokio::test]
+    async fn a_stream_starts_with_the_task_and_ends_at_the_terminal_state() {
+        let montaje = montar(Arc::new(ConTexto("hola".into())), limites()).await;
+
+        let flujo = montaje.host.start_streaming("saluda".into()).await.unwrap();
+        let eventos = recoger(flujo).await;
+
+        assert!(eventos[0].get("task").is_some(), "{eventos:?}");
+        let ultimo = eventos.last().unwrap();
+        let estado = ultimo["statusUpdate"]["status"]["state"]
+            .as_str()
+            .or_else(|| ultimo["task"]["status"]["state"].as_str());
+        assert_eq!(estado, Some("TASK_STATE_COMPLETED"), "{eventos:?}");
+        // El texto del artefacto llega por el flujo, una sola vez.
+        let textos = eventos
+            .iter()
+            .filter_map(|e| e["artifactUpdate"]["artifact"]["parts"][0]["text"].as_str())
+            .chain(
+                eventos
+                    .iter()
+                    .filter_map(|e| e["task"]["artifacts"][0]["parts"][0]["text"].as_str()),
+            )
+            .collect::<Vec<_>>();
+        assert!(textos.contains(&"hola"), "{eventos:?}");
+    }
+
+    #[tokio::test]
+    async fn subscribing_follows_a_working_task_until_it_is_canceled() {
+        let montaje = montar(Arc::new(Colgado), limites()).await;
+        let inicial = montaje.host.start("larga".into()).await.unwrap();
+        let id = id_de(&inicial);
+
+        let flujo = montaje.host.subscribe(&id).await.unwrap();
+        montaje.host.cancel(&id).await.unwrap();
+        let eventos = recoger(flujo).await;
+
+        assert_eq!(eventos[0]["task"]["status"]["state"], "TASK_STATE_WORKING");
+        assert_eq!(
+            eventos.last().unwrap()["statusUpdate"]["status"]["state"],
+            "TASK_STATE_CANCELED"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribing_to_a_terminal_task_is_unsupported() {
+        let montaje = montar(Arc::new(ConTexto("ok".into())), limites()).await;
+        let inicial = montaje.host.start("a".into()).await.unwrap();
+        let id = id_de(&inicial);
+        montaje
+            .host
+            .wait_terminal(&id, Duration::from_secs(10))
+            .await
+            .unwrap();
+
+        let error = montaje.host.subscribe(&id).await.err().unwrap();
+
+        assert_eq!(error, HostError::Unsupported);
+    }
+
+    #[tokio::test]
+    async fn another_sessions_task_and_garbage_ids_cannot_be_subscribed() {
+        let montaje = montar(Arc::new(Colgado), limites()).await;
+        let (ajeno, _) = montaje
+            .launcher
+            .start(
+                montaje.otro_padre,
+                "ajena".into(),
+                "hola".into(),
+                Some("default".into()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        for id in [
+            ajeno.0.to_string(),
+            "999999".into(),
+            "abc".into(),
+            String::new(),
+        ] {
+            let error = montaje.host.subscribe(&id).await.err().unwrap();
+            assert_eq!(error, HostError::NotFound, "{id:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_seventeenth_stream_is_refused_and_a_dropped_one_frees_its_slot() {
+        let montaje = montar(Arc::new(Colgado), limites()).await;
+        let inicial = montaje.host.start("larga".into()).await.unwrap();
+        let id = id_de(&inicial);
+
+        let mut abiertos = Vec::new();
+        for _ in 0..MAX_STREAMS {
+            abiertos.push(montaje.host.subscribe(&id).await.unwrap());
+        }
+        assert_eq!(
+            montaje.host.subscribe(&id).await.err().unwrap(),
+            HostError::Busy
+        );
+        // Tampoco se crea una tarea nueva que se quedaría sin flujo.
+        assert_eq!(
+            montaje
+                .host
+                .start_streaming("otra".into())
+                .await
+                .err()
+                .unwrap(),
+            HostError::Busy
+        );
+        let hijos = montaje.launcher.list(montaje.host.parent()).await.unwrap();
+        assert_eq!(hijos.len(), 1);
+
+        abiertos.pop();
+
+        assert!(montaje.host.subscribe(&id).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn stream_text_is_bounded() {
+        let montaje = montar(
+            Arc::new(ConTexto("x".repeat(5_000))),
+            HostLimits {
+                max_result_bytes: 100,
+                ..limites()
+            },
+        )
+        .await;
+
+        let flujo = montaje
+            .host
+            .start_streaming("habla mucho".into())
+            .await
+            .unwrap();
+        let eventos = recoger(flujo).await;
+
+        let mut vistos = 0;
+        for evento in &eventos {
+            for texto in [
+                evento["artifactUpdate"]["artifact"]["parts"][0]["text"].as_str(),
+                evento["task"]["artifacts"][0]["parts"][0]["text"].as_str(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                vistos += 1;
+                assert!(texto.len() < 140, "{}", texto.len());
+            }
+        }
+        assert!(vistos > 0, "{eventos:?}");
     }
 
     #[tokio::test]

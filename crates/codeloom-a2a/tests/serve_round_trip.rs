@@ -271,6 +271,108 @@ async fn a_client_with_the_wrong_secret_is_rejected_without_echoing_either_secre
     assert!(!texto.contains(TOKEN) && !texto.contains("secreto-equivocado-456"));
 }
 
+/// Los `result` de cada línea `data:` de un cuerpo SSE.
+fn eventos_sse(cuerpo: &str) -> Vec<Value> {
+    cuerpo
+        .lines()
+        .filter_map(|linea| linea.strip_prefix("data:"))
+        .map(|json| serde_json::from_str::<Value>(json.trim()).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn send_streaming_message_streams_the_task_to_its_terminal_state_over_real_http() {
+    let servidor = arrancar(Arc::new(ConTexto("flujo de CodeLoom")), config_servidor()).await;
+    let cuerpo = json!({
+        "jsonrpc": "2.0", "id": 9, "method": "SendStreamingMessage",
+        "params": { "message": {
+            "messageId": "m1", "role": "ROLE_USER", "parts": [{ "text": "saluda" }] } }
+    });
+
+    let respuesta = reqwest::Client::new()
+        .post(format!("http://{}/a2a", servidor.addr))
+        .bearer_auth(TOKEN)
+        .header("A2A-Version", "1.0")
+        .json(&cuerpo)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(respuesta.status(), 200);
+    assert!(respuesta.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("text/event-stream"));
+    // El cuerpo termina solo: el flujo se cierra al estado terminal.
+    let texto = tokio::time::timeout(Duration::from_secs(15), respuesta.text())
+        .await
+        .expect("el flujo debía cerrarse")
+        .unwrap();
+    let eventos = eventos_sse(&texto);
+    assert!(eventos
+        .iter()
+        .all(|e| e["id"] == 9 && e["jsonrpc"] == "2.0"));
+    assert!(eventos[0]["result"]["task"].is_object(), "{texto}");
+    let ultimo = &eventos.last().unwrap()["result"];
+    assert_eq!(
+        ultimo["statusUpdate"]["status"]["state"], "TASK_STATE_COMPLETED",
+        "{texto}"
+    );
+    // El resultado llegó antes del estado terminal.
+    assert!(texto.contains("flujo de CodeLoom"), "{texto}");
+    assert!(!texto.contains(TOKEN));
+}
+
+#[tokio::test]
+async fn subscribe_to_task_follows_a_working_task_and_refuses_a_finished_one() {
+    let servidor = arrancar(Arc::new(Colgado), config_servidor()).await;
+    let cliente_rpc = cliente(&servidor, TOKEN).await;
+    let inicial = tarea(cliente_rpc.send(Message::user_text("larga")).await.unwrap());
+    let http = reqwest::Client::new();
+    let url = format!("http://{}/a2a", servidor.addr);
+    let suscribir = |id: String| {
+        let (http, url) = (http.clone(), url.clone());
+        async move {
+            http.post(url)
+                .bearer_auth(TOKEN)
+                .header("A2A-Version", "1.0")
+                .json(
+                    &json!({"jsonrpc": "2.0", "id": 3, "method": "SubscribeToTask",
+                              "params": {"id": id}}),
+                )
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    let flujo = suscribir(inicial.id.clone()).await;
+    assert!(flujo.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("text/event-stream"));
+    cliente_rpc.cancel(&inicial.id).await.unwrap();
+    let texto = tokio::time::timeout(Duration::from_secs(15), flujo.text())
+        .await
+        .expect("el flujo debía cerrarse al cancelar")
+        .unwrap();
+    let eventos = eventos_sse(&texto);
+    assert_eq!(
+        eventos[0]["result"]["task"]["status"]["state"],
+        "TASK_STATE_WORKING"
+    );
+    assert_eq!(
+        eventos.last().unwrap()["result"]["statusUpdate"]["status"]["state"],
+        "TASK_STATE_CANCELED"
+    );
+
+    // Ya terminal: no se puede suscribir (−32004); inexistente: −32001.
+    let terminal: Value = suscribir(inicial.id).await.json().await.unwrap();
+    assert_eq!(terminal["error"]["code"], -32004);
+    let ajena: Value = suscribir("424242".into()).await.json().await.unwrap();
+    assert_eq!(ajena["error"]["code"], -32001);
+}
+
 #[tokio::test]
 async fn a_running_task_can_be_canceled_by_the_client() {
     let servidor = arrancar(Arc::new(Colgado), config_servidor()).await;
