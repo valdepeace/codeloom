@@ -450,7 +450,7 @@ impl AgentRow {
                 ),
                 local.system_prompt(),
             ),
-            Execution::Remote => ("remote".to_string(), String::new()),
+            Execution::Remote(_) => ("remote".to_string(), String::new()),
         };
         AgentRow {
             name: entrada.name.clone(),

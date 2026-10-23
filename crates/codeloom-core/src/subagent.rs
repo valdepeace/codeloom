@@ -317,7 +317,7 @@ impl InProcessSubagentLauncher {
             CoreError::Tool(format!("agente «{nombre}» inexistente en el registro"))
         })?;
         // Se comprueba antes que la aprobación: un remoto figura como pendiente y el motivo real es otro.
-        if matches!(entrada.execution, Execution::Remote) {
+        if matches!(entrada.execution, Execution::Remote(_)) {
             return Err(CoreError::Tool(format!(
                 "agente remoto no disponible: «{nombre}»"
             )));
@@ -2407,7 +2407,10 @@ mod tests {
                         "Agente remoto de prueba",
                         "1.0.0",
                     ),
-                    execution: Execution::Remote,
+                    execution: Execution::Remote(crate::registry::RemoteSpec {
+                        endpoint: "https://agente.example".into(),
+                        fetched: None,
+                    }),
                     content_hash: None,
                 }],
                 problems: Vec::new(),
@@ -3093,7 +3096,7 @@ mod tests {
         registro.reload();
         let recargado = match &registro.snapshot().get("frontend").unwrap().execution {
             Execution::Local(spec) => spec.model.clone(),
-            Execution::Remote => None,
+            Execution::Remote(_) => None,
         };
         assert_eq!(
             recargado.as_deref(),

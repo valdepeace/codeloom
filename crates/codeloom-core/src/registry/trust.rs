@@ -53,6 +53,8 @@ pub enum ApprovalError {
     NoRequerida(String),
     #[error("el registro no tiene almacén de confianza configurado")]
     SinAlmacen,
+    #[error("la tarjeta del agente remoto `{0}` aún no se ha descargado: no hay nada que aprobar")]
+    TarjetaPendiente(String),
     #[error(transparent)]
     Almacen(#[from] TrustError),
 }
@@ -196,6 +198,12 @@ pub fn content_hash(text: &str) -> String {
         .collect()
 }
 
+/// Huella que se aprueba para un agente remoto: ata el punto de entrada y el contenido de su
+/// tarjeta. Cambiar cualquiera de los dos la invalida.
+pub(crate) fn clave_remota(endpoint: &str, card_hash: &str) -> String {
+    content_hash(&format!("{endpoint}\n{card_hash}"))
+}
+
 /// Configuración de confianza de un registro: dónde se aprueba y para qué proyecto.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Confianza {
@@ -222,6 +230,12 @@ impl Confianza {
     /// Revoca la aprobación de `nombre` en la raíz de esta confianza.
     pub(crate) fn revocar(&self, nombre: &str) -> Result<(), TrustError> {
         self.almacen.revoke(&self.raiz, nombre)
+    }
+
+    /// `true` si el agente remoto con esa clave está aprobado. A diferencia de los de proyecto,
+    /// `trust_project_agents` no lo aprueba: la tarjeta de un remoto es contenido de un tercero.
+    pub(crate) fn aprueba_remoto(&self, nombre: &str, clave: &str) -> bool {
+        self.almacen.is_approved(&self.raiz, nombre, clave)
     }
 
     /// `true` si un agente de proyecto con esa huella puede usarse.

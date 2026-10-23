@@ -3,7 +3,8 @@
 //! Formato de la sección 2 de `docs/specs/2026-10-15-loom-agent-profile-a2a.md`, con las
 //! decisiones de `docs/specs/2026-10-22-codeloom-a2a-agent-registry-design.md`. Hoy se
 //! interpretan `name`, `description`, `version`, `persona`, `model`, `effort`, `max_turns` y
-//! `max_depth`. `scope`, `delegation`, `transport` y `a2a` se leen, se declaran como no
+//! `max_depth`. `transport: a2a-remote` con `a2a.endpoint` declara un agente remoto (A8a) y se
+//! aplica. `scope`, `delegation` y cualquier otro `transport` o `a2a` se leen, se declaran como no
 //! aplicados y no se ejecutan. Cualquier otra clave se ignora con aviso: un campo nuevo no
 //! rompe la carga.
 
@@ -27,6 +28,9 @@ pub struct AgentProfile {
     /// Claves presentes que se leen pero no se aplican todavía: `scope`, `delegation`,
     /// `transport` y `a2a`.
     pub declared_not_applied: Vec<String>,
+    /// Punto de entrada del agente remoto (`transport: a2a-remote` y `a2a.endpoint`). Con él el
+    /// perfil es un puntero a un remoto, no un agente local: persona, modelo y cuerpo no se usan.
+    pub remote_endpoint: Option<String>,
 }
 
 /// Problema de un perfil. Los avisos viajan junto al perfil; los errores impiden cargarlo.
@@ -74,6 +78,8 @@ pub fn parse_profile(
         ));
     };
 
+    let remote_endpoint = endpoint_remoto(mapa)?;
+
     // Las claves desconocidas avisan; las declaradas-y-no-aplicadas avisan y se anotan.
     let mut avisos = Vec::new();
     let mut declared_not_applied = Vec::new();
@@ -84,6 +90,10 @@ pub fn parse_profile(
             ));
         };
         if CLAVES_CONOCIDAS.contains(&clave) {
+            continue;
+        }
+        // Un perfil remoto aplica `transport` y `a2a`: ya no son «declarados sin aplicar».
+        if remote_endpoint.is_some() && (clave == "transport" || clave == "a2a") {
             continue;
         }
         if CLAVES_NO_APLICADAS.contains(&clave) {
@@ -148,6 +158,7 @@ pub fn parse_profile(
         max_turns: entero_opcional(mapa, "max_turns")?,
         max_depth: entero_opcional(mapa, "max_depth")?,
         declared_not_applied,
+        remote_endpoint,
     };
     Ok((perfil, avisos))
 }
@@ -166,6 +177,38 @@ const CLAVES_CONOCIDAS: &[&str] = &[
 
 /// Claves que se leen y se declaran, pero que no se aplican todavía.
 const CLAVES_NO_APLICADAS: &[&str] = &["scope", "delegation", "transport", "a2a"];
+
+/// Valor de `transport` que declara un agente remoto.
+const TRANSPORTE_REMOTO: &str = "a2a-remote";
+
+/// `a2a.endpoint` de un perfil remoto. `None` si el perfil no es remoto; si lo es y falta el
+/// endpoint o no es una URL admisible (HTTPS, o HTTP solo en bucle local), el perfil no carga.
+fn endpoint_remoto(mapa: &Mapping) -> Result<Option<String>, ProfileProblem> {
+    if texto_opcional(mapa, "transport")?.as_deref() != Some(TRANSPORTE_REMOTO) {
+        return Ok(None);
+    }
+    let endpoint = match mapa.get("a2a") {
+        Some(a2a) => match a2a.as_mapping() {
+            Some(a2a) => texto_opcional(a2a, "endpoint")?,
+            None => {
+                return Err(ProfileProblem::BadFrontmatter(
+                    "`a2a` debe ser un mapa".to_string(),
+                ))
+            }
+        },
+        None => None,
+    };
+    let Some(endpoint) = endpoint
+        .map(|e| e.trim().to_string())
+        .filter(|e| !e.is_empty())
+    else {
+        return Err(ProfileProblem::MissingField("a2a.endpoint"));
+    };
+    crate::config::validate_base_url(&endpoint).map_err(|motivo| {
+        ProfileProblem::BadFrontmatter(format!("`a2a.endpoint` no es admisible: {motivo}"))
+    })?;
+    Ok(Some(endpoint))
+}
 
 /// Parte el texto (ya en LF) en frontmatter y cuerpo. El frontmatter va entre dos líneas
 /// `---`; el cuerpo es todo lo que sigue a la segunda.
@@ -320,10 +363,18 @@ Si la tarea es de otra especialidad, dilo y delega con `delegate`.
             perfil.body,
             "Eres el agente de frontend. Solo atiendes tareas de UI, componentes y accesibilidad.\nSi la tarea es de otra especialidad, dilo y delega con `delegate`."
         );
-        assert_eq!(perfil.declared_not_applied.len(), 4);
-        for clave in ["scope", "delegation", "transport", "a2a"] {
+        // `transport: a2a-remote` con `a2a.endpoint` se aplica (A8a); `scope` y `delegation`, no.
+        assert_eq!(
+            perfil.remote_endpoint.as_deref(),
+            Some("https://devops.internal/.well-known/agent-card.json")
+        );
+        assert_eq!(perfil.declared_not_applied.len(), 2);
+        for clave in ["scope", "delegation"] {
             assert!(perfil.declared_not_applied.iter().any(|c| c == clave));
             assert!(problemas.contains(&ProfileProblem::DeclaredNotApplied(clave.to_string())));
+        }
+        for clave in ["transport", "a2a"] {
+            assert!(!problemas.contains(&ProfileProblem::DeclaredNotApplied(clave.to_string())));
         }
         assert!(!problemas
             .iter()
@@ -444,5 +495,65 @@ Si la tarea es de otra especialidad, dilo y delega con `delegate`.
             .unwrap()
             .0;
         assert_eq!(crlf, lf);
+    }
+
+    fn perfil_remoto(frontmatter_extra: &str) -> String {
+        format!("---\nname: lejano\ndescription: Agente remoto\n{frontmatter_extra}---\n")
+    }
+
+    #[test]
+    fn a_remote_profile_carries_its_endpoint_and_is_not_reported_as_not_applied() {
+        let texto =
+            perfil_remoto("transport: a2a-remote\na2a:\n  endpoint: https://agente.example\n");
+
+        let (perfil, avisos) = parse_profile("lejano", &texto).unwrap();
+
+        assert_eq!(
+            perfil.remote_endpoint.as_deref(),
+            Some("https://agente.example")
+        );
+        assert!(perfil.declared_not_applied.is_empty(), "{perfil:?}");
+        assert!(avisos.is_empty(), "{avisos:?}");
+    }
+
+    #[test]
+    fn a_remote_profile_without_an_endpoint_does_not_load() {
+        for extra in [
+            "transport: a2a-remote\n",
+            "transport: a2a-remote\na2a:\n  endpoint: \"  \"\n",
+            "transport: a2a-remote\na2a:\n  otra: 1\n",
+        ] {
+            let resultado = parse_profile("lejano", &perfil_remoto(extra));
+            assert_eq!(
+                resultado,
+                Err(ProfileProblem::MissingField("a2a.endpoint")),
+                "{extra}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_remote_endpoint_over_plain_http_outside_loopback_does_not_load() {
+        let texto =
+            perfil_remoto("transport: a2a-remote\na2a:\n  endpoint: http://agente.example\n");
+
+        let resultado = parse_profile("lejano", &texto);
+
+        assert!(
+            matches!(resultado, Err(ProfileProblem::BadFrontmatter(_))),
+            "{resultado:?}"
+        );
+    }
+
+    #[test]
+    fn another_transport_stays_declared_and_not_applied() {
+        let texto = perfil_remoto("transport: in-process\n");
+
+        let (perfil, _) = parse_profile("lejano", &texto).unwrap();
+
+        assert_eq!(perfil.remote_endpoint, None);
+        assert!(perfil
+            .declared_not_applied
+            .contains(&"transport".to_string()));
     }
 }

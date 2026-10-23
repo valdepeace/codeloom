@@ -104,12 +104,34 @@ impl LocalSpec {
     }
 }
 
+/// Lo que se sabe de la tarjeta de un remoto una vez descargada (A8a). Lo calcula el crate de A2A;
+/// el núcleo solo lo guarda y ata la aprobación a `card_hash`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteFetched {
+    /// Huella del contenido de la tarjeta: si el remoto la cambia, la aprobación deja de valer.
+    pub card_hash: String,
+    /// URL de la interfaz por la que se le envían las tareas.
+    pub jsonrpc_url: String,
+    pub tenant: Option<String>,
+    /// El remoto pide autenticación, que el cliente aún no sabe dar.
+    pub requires_auth: bool,
+}
+
+/// Puntero a un agente remoto, tal como lo declara un perfil.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteSpec {
+    /// Punto de entrada (`a2a.endpoint`): de él cuelga la tarjeta.
+    pub endpoint: String,
+    /// `None` mientras la tarjeta no se haya descargado; sin ella no se puede aprobar ni usar.
+    pub fetched: Option<RemoteFetched>,
+}
+
 /// Cómo se ejecuta un agente.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Execution {
     Local(LocalSpec),
-    /// Se habla por transporte (A8). Todavía sin implementación.
-    Remote,
+    /// Se habla por transporte (A8).
+    Remote(RemoteSpec),
 }
 
 /// Un agente del registro.
@@ -144,6 +166,8 @@ pub enum LoadProblem {
     },
     /// Un fichero o directorio no se pudo leer.
     Unreadable { path: PathBuf, error: String },
+    /// La tarjeta de un agente remoto no se pudo descargar o no es válida.
+    Remote { name: String, error: String },
 }
 
 /// Resultado de cargar una fuente.
@@ -271,6 +295,20 @@ fn entrada_desde_perfil(
     let version = perfil
         .version
         .unwrap_or_else(|| VERSION_POR_DEFECTO.to_string());
+    // Un perfil remoto es un puntero: su tarjeta real se descarga después (A8a) y hasta entonces
+    // la entrada lleva solo el nombre y la descripción que escribió quien dio de alta el perfil.
+    if let Some(endpoint) = perfil.remote_endpoint {
+        return AgentEntry {
+            name: perfil.name.clone(),
+            origin,
+            card: AgentCard::local(perfil.name, perfil.description, version),
+            execution: Execution::Remote(RemoteSpec {
+                endpoint,
+                fetched: None,
+            }),
+            content_hash,
+        };
+    }
     AgentEntry {
         name: perfil.name.clone(),
         origin,
@@ -429,7 +467,7 @@ mod tests {
             .expect("el integrado aporta `default`");
         match &entrada.execution {
             Execution::Local(spec) => assert_eq!(spec.system_prompt(), ""),
-            Execution::Remote => panic!("el integrado es local"),
+            Execution::Remote(_) => panic!("el integrado es local"),
         }
     }
 
@@ -453,7 +491,7 @@ mod tests {
                     Some("Componentes pequeños")
                 );
             }
-            Execution::Remote => panic!("un perfil de fichero es local"),
+            Execution::Remote(_) => panic!("un perfil de fichero es local"),
         }
     }
 }
