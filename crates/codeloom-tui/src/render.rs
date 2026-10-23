@@ -1139,9 +1139,9 @@ fn draw_tool_inspector(frame: &mut Frame, area: Rect, app: &mut App) {
 
 fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
     let width = area.width.min(78).saturating_sub(2);
-    // Diecisiete líneas de contenido más el marco; por eso el recuadro crece a 21 filas.
-    let height = area.height.min(21).saturating_sub(2);
-    if width < 54 || height < 19 {
+    // Dieciocho líneas de contenido más el marco; por eso el recuadro crece a 22 filas.
+    let height = area.height.min(22).saturating_sub(2);
+    if width < 54 || height < 20 {
         draw_resize_hint(frame, area, "Keyboard shortcuts", app);
         return;
     }
@@ -1170,6 +1170,7 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
             Line::from("Ctrl+B      Toggle sidebar at medium width"),
             Line::from("Ctrl+K      Open prompt queue"),
             Line::from("Ctrl+O      Expand latest tool output"),
+            Line::from("Space       Fold/unfold the active long block"),
             Line::from("Ctrl+T      Inspect recent tool calls"),
             Line::from("/           Commands at start of composer"),
             Line::from("/theme      Cycle terminal color theme"),
@@ -3118,5 +3119,29 @@ tres",
 
         app.provider_settings.as_mut().unwrap().model = "claude-plain".into();
         assert!(!buffer_of(&mut app, 120, 40).contains("Effort:"));
+    }
+
+    #[test]
+    fn the_hidden_lines_hint_is_drawn_and_clicking_it_unfolds_the_block() {
+        let mut app = App::new();
+        app.push_user(
+            &(1..=25)
+                .map(|i| format!("l{i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        let term = terminal_of(&mut app, 100, 30);
+        let area = app.transcript_area.expect("el transcript fija su área");
+        // Fila del aviso: la última línea del bloque.
+        let (_, fin) = block_rows(&app, 0);
+        let y = area.y + (fin - 1 - app.viewport.top()) as u16;
+        let fila: String = (area.x..area.right())
+            .map(|x| term.backend().buffer()[(x, y)].symbol().to_string())
+            .collect();
+        assert!(fila.contains("(15 lines hidden)"), "{fila}");
+
+        app.transcript_mouse_down(area.x + 2, y);
+
+        assert_eq!(app.transcript.entry_lines(0).len(), 25);
     }
 }

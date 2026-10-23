@@ -418,6 +418,28 @@ impl Transcript {
             .unwrap_or(&[])
     }
 
+    /// Texto completo de la entrada `i`, también el que un pliegue deja fuera de la vista. Es lo
+    /// que debe copiarse: copiar las líneas visibles se llevaría el aviso en lugar del texto.
+    pub fn entry_text(&self, i: usize) -> Option<String> {
+        let entry = self.entries.get(i)?;
+        let mut completa;
+        let lines = if entry.lines.last().is_some_and(|l| l.kind == LineKind::Fold) {
+            completa = entry.clone();
+            completa.expanded = true;
+            completa.derive(self.fold_limit);
+            &completa.lines
+        } else {
+            &entry.lines
+        };
+        Some(
+            lines
+                .iter()
+                .map(|l| l.plain())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    }
+
     /// Línea global donde empieza la entrada `i`.
     pub fn entry_start(&self, i: usize) -> usize {
         self.starts.get(i).copied().unwrap_or(self.total_lines)
@@ -652,5 +674,20 @@ mod tests {
         let rev = t.entry_rev(0);
         t.settle();
         assert_eq!(t.entry_rev(0), rev, "no se re-mide lo que no cambia");
+    }
+
+    #[test]
+    fn entry_text_returns_the_hidden_lines_too() {
+        let mut t = Transcript::new();
+        t.set_fold_limit(Some(10));
+        t.push_entry(LineKind::Assistant, Format::Plain, lines_of(20));
+        t.push_entry(LineKind::User, Format::Plain, "corto");
+
+        assert_eq!(t.entry_lines(0).len(), 11);
+        assert_eq!(t.entry_text(0).unwrap(), lines_of(20));
+        assert_eq!(t.entry_text(1).unwrap(), "corto");
+        assert_eq!(t.entry_text(2), None);
+        // Consultarlo no despliega nada.
+        assert_eq!(t.entry_lines(0).len(), 11);
     }
 }

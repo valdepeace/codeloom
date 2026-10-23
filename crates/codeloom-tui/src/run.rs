@@ -131,6 +131,11 @@ fn transcript_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             return;
         }
     }
+    // Espacio o Enter pliegan y despliegan el bloque activo si es largo; si no, siguen su camino
+    // (el espacio pagina).
+    if matches!(code, KeyCode::Char(' ') | KeyCode::Enter) && app.toggle_block_fold() {
+        return;
+    }
     // Con el chrome `Flat` (Crush), flechas y j/k avanzan por bloques; Ctrl+flecha y
     // Ctrl+j siguen desplazando por líneas. Con Classic, todo igual que siempre.
     let by_block = app.theme.look.chrome == batten::widgets::ChromeStyle::Flat
@@ -3575,5 +3580,32 @@ mod tests {
         assert_eq!(app.settings_field, SETTINGS_EFFORT_FIELD);
         handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
         assert!(app.settings_save_requested);
+    }
+
+    #[test]
+    fn space_folds_the_active_long_block_and_still_pages_otherwise() {
+        let mut app = App::new();
+        app.push_user(
+            &(1..=25)
+                .map(|i| format!("l{i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        app.focus = Focus::Transcript;
+        app.block = Some(0);
+
+        handle_key(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+        assert_eq!(app.transcript.entry_lines(0).len(), 25, "espacio despliega");
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            app.transcript.entry_lines(0).len(),
+            11,
+            "Enter vuelve a plegar"
+        );
+
+        // Sin nada que plegar, el espacio sigue paginando (no toca el transcript).
+        app.block = None;
+        handle_key(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+        assert_eq!(app.transcript.entry_lines(0).len(), 11);
     }
 }

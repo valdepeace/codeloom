@@ -21,6 +21,16 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Líneas a partir de las cuales se pliega un bloque largo de la conversación.
+pub const MAX_BLOCK_LINES: usize = 10;
+
+/// Transcript vacío con el pliegue de bloques largos activado.
+fn new_transcript() -> batten::state::Transcript {
+    let mut transcript = batten::state::Transcript::new();
+    transcript.set_fold_limit(Some(MAX_BLOCK_LINES));
+    transcript
+}
+
 /// Dónde va el teclado.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Focus {
@@ -780,7 +790,7 @@ impl App {
 
     pub fn new() -> Self {
         Self {
-            transcript: batten::state::Transcript::new(),
+            transcript: new_transcript(),
             assistant: None,
             composer: batten::state::Composer::new(),
             slash_selected: 0,
@@ -1533,7 +1543,7 @@ impl App {
     }
 
     pub fn restore_messages(&mut self, messages: Vec<Message>) {
-        self.transcript = batten::state::Transcript::new();
+        self.transcript = new_transcript();
         self.assistant = None;
         self.history = batten::state::History::new();
         self.tools.clear();
@@ -1626,6 +1636,8 @@ impl App {
             }
         }
         self.assistant = None;
+        // Lo restaurado está completo: sus bloques largos se pliegan.
+        self.transcript.settle();
         for tool in &mut self.tools {
             if tool.is_spinning() {
                 tool.cancel();
@@ -1955,6 +1967,15 @@ impl App {
         self.text_drag = true;
         // El clic activa el bloque pulsado; la selección de texto no cambia.
         self.block = self.entry_at_row(at.row);
+        // Pulsar el aviso de líneas ocultas despliega (o pliega) el bloque.
+        let sobre_aviso = self
+            .layout
+            .line_at_row(at.row)
+            .and_then(|(line, _)| self.transcript.line(line))
+            .is_some_and(|line| line.kind == batten::state::LineKind::Fold);
+        if sobre_aviso {
+            self.toggle_block_fold();
+        }
     }
 
     /// Entrada del transcript que ocupa la fila de documento `row`, si la hay.
@@ -2017,14 +2038,16 @@ impl App {
     /// Texto plano del bloque activo: las líneas de la entrada unidas por `\n`.
     pub fn block_text(&self) -> Option<String> {
         let entry = self.block_index()?;
-        let text = self
-            .transcript
-            .entry_lines(entry)
-            .iter()
-            .map(|line| line.plain())
-            .collect::<Vec<_>>()
-            .join("\n");
-        Some(text)
+        // El texto completo, también el que un pliegue deja fuera de la vista.
+        self.transcript.entry_text(entry)
+    }
+
+    /// Pliega o despliega el bloque activo si es largo. `false` si no hay nada que plegar.
+    pub fn toggle_block_fold(&mut self) -> bool {
+        match self.block_index() {
+            Some(entry) => self.transcript.toggle_fold(entry),
+            None => false,
+        }
     }
 
     /// Copia el bloque activo al portapapeles y avisa del número de caracteres.
@@ -2225,9 +2248,10 @@ impl App {
         match self.assistant {
             Some(id) => self.transcript.append(id, delta),
             None => {
-                let id = self
-                    .transcript
-                    .push_entry(LineKind::Assistant, Format::Markdown, delta);
+                // Sigue llegando texto: se ve entera hasta que acabe el turno.
+                let id =
+                    self.transcript
+                        .push_streaming(LineKind::Assistant, Format::Markdown, delta);
                 self.assistant = Some(id);
             }
         }
@@ -2631,6 +2655,8 @@ impl App {
                 self.set_phase("waiting for provider");
             }
             LiveEvent::TurnEnded => {
+                // El texto ya no crece: los bloques largos se pliegan.
+                self.transcript.settle();
                 self.turn_in_flight = false;
                 self.wake_in_flight = false;
                 self.cancel_requested = false;
@@ -7827,5 +7853,64 @@ linea 2",
         };
         let settings = ProviderSettings::from(&config);
         assert_eq!(settings.effort.as_deref(), Some("low"));
+    }
+
+    fn largo(n: usize) -> String {
+        (1..=n)
+            .map(|i| format!("l{i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_long_user_message_is_folded_to_ten_lines() {
+        let mut app = App::new();
+        app.push_user(&largo(25));
+
+        assert_eq!(app.transcript.entry_lines(0).len(), MAX_BLOCK_LINES + 1);
+        assert!(app.transcript.is_foldable(0));
+    }
+
+    #[test]
+    fn a_streaming_answer_stays_whole_and_folds_when_the_turn_ends() {
+        let mut app = App::new();
+        for i in 1..=30 {
+            app.apply(LiveEvent::Delta {
+                text: format!("l{i}\n\n"),
+            });
+        }
+        let en_vivo = app.transcript.entry_lines(0).len();
+        assert!(en_vivo > 30, "se ve entera mientras llega: {en_vivo}");
+
+        app.apply(LiveEvent::TurnEnded);
+
+        assert_eq!(app.transcript.entry_lines(0).len(), MAX_BLOCK_LINES + 1);
+    }
+
+    #[test]
+    fn restored_long_messages_come_back_folded_and_toggle_opens_them() {
+        let mut app = App::new();
+        app.restore_messages(vec![
+            Message::user("hola"),
+            Message::assistant(vec![ContentPart::Text { text: largo(40) }]),
+        ]);
+
+        assert_eq!(app.transcript.entry_lines(1).len(), MAX_BLOCK_LINES + 1);
+        app.block = Some(1);
+        assert!(app.toggle_block_fold());
+        assert_eq!(app.transcript.entry_lines(1).len(), 40);
+        app.block = Some(0);
+        assert!(!app.toggle_block_fold(), "un bloque corto no se pliega");
+    }
+
+    #[test]
+    fn copying_a_folded_block_copies_the_hidden_lines_too() {
+        let mut app = App::new();
+        app.push_user(&largo(25));
+        app.block = Some(0);
+
+        assert!(app.copy_block());
+
+        assert_eq!(app.clipboard.as_deref(), Some(largo(25).as_str()));
     }
 }
