@@ -82,6 +82,36 @@ usar los campos reales; no inventes colores sueltos.
 
 ---
 
+### Tarea 1b: segmentos de memoria y mensajes (estilo mastra)
+
+**Ficheros:** `crates/batten/src/widgets/context_meter.rs`.
+
+**Cambia (aditivo; los usos actuales siguen compilando):**
+- `ContextMeter` gana `pub memory: u64` (tokens de `used` que son resumen; `new` lo deja en 0) y
+  `pub fn with_memory(self, memory: u64) -> Self` (se acota a `used`).
+- Reparto de celdas ocupadas (`occupied`, igual que hoy): `memory_cells = round(memory / used *
+  occupied)`; si `memory > 0` y `occupied >= 2`, acotar `memory_cells` a `1..=occupied - 1`
+  (siempre al menos una celda de cada clase); con `occupied < 2` toda celda es de mensajes.
+  Es la regla de mastra (`formatOMContextIndicator`).
+- `Segments`: tres spans de celdas `━` — memoria (estilo atenuado distinto de `muted`; mira
+  los estilos reales del `Theme` y elige uno visiblemente distinto de `default` y de `muted`),
+  mensajes (estilo del nivel) y libres (`muted`) — más el texto. `Blocks`: memoria `▒`, mensajes
+  `█`, libres `░`.
+- Con `memory > 0` el texto añade al final `  · resumen {n}` (con `format_tokens`). Sin
+  ventana conocida no hay segmentos ni este añadido.
+
+**Tests:** `memory_defaults_to_zero_and_is_capped_to_used`;
+`segments_split_into_memory_messages_and_free_cells` (comprobar cuántas celdas de cada estilo con
+`meter_spans`: p. ej. used 100k, memory 25k, window 200k → occupied 5, memory_cells 1, mensajes 4,
+libres 5);
+`both_classes_get_at_least_one_cell` (memory minúsculo y memory casi igual a used);
+`blocks_use_a_distinct_glyph_for_memory`; `text_mentions_the_summary_only_when_present`;
+`no_memory_keeps_the_previous_rendering` (comparar con la salida de la tarea 1).
+
+**Commit:** `feat(batten): el medidor distingue memoria (resumen) y mensajes`.
+
+---
+
 ### Tarea 2: demo en el showcase
 
 **Ficheros:** crear `crates/batten/examples/showcase/demos/context_meter.rs`; registrarlo en
@@ -92,7 +122,9 @@ usar los campos reales; no inventes colores sueltos.
 los dos estilos con la misma ventana de 200 000: el uso **avanza solo** de 0 a 120 % y vuelve a
 empezar (usa el reloj/animación que ya usen otros demos; mira `fx.rs` o `dashboard.rs`), y debajo
 tres filas fijas de referencia: 50 %, 85 % (aviso) y 105 % (crítico), más una con «sin ventana».
-Una línea de texto explica: «Warn desde el 80 %: ahí salta la compactación».
+Una línea de texto explica: «Warn desde el 80 %: ahí salta la compactación». Incluye además una
+fila con **memoria** (resumen de 25k dentro de un uso de 100k, ventana 200k) y otra que simula el
+ciclo completo: el uso sube hasta el 80 %, **cae** a «resumen + cola» y vuelve a subir.
 
 **Tests:** el showcase ya tiene pruebas de ejemplos (`cargo test -p batten --examples`); añade al
 menos una que renderice el demo en un `TestBackend` de 80×12 y compruebe que aparecen `━` y `█`.
@@ -106,11 +138,16 @@ menos una que renderice el demo en un `TestBackend` de 80×12 y compruebe que ap
 **Ficheros:** `crates/codeloom-tui/src/app.rs`, `crates/codeloom-tui/src/render.rs`.
 
 **App:**
-- Campo `context_tokens: u64` (0 al inicio, y a 0 al abrir otra sesión).
+- Campo `context_tokens: u64` (0 al inicio, y a 0 al abrir otra sesión) y `context_memory: u64`
+  (tokens estimados del resumen vigente, 0 si no hay).
+- `LiveEvent::ContextCompacted { summary_bytes, .. }`: `context_memory = summary_bytes.div_ceil(4)`.
+  En `restore_messages`, el último mensaje que `parse_summary_text` reconozca da su
+  `context_memory` por el mismo cálculo sobre el texto del resumen.
 - `LiveEvent::Usage { input_tokens, .. }`: si `input_tokens > 0`, `context_tokens = input_tokens`.
 - `restore_messages`: `context_tokens` = `usage.input_tokens` del último mensaje de asistente que
   lo lleve (0 si ninguno).
-- `fn context_meter(&self) -> batten::widgets::context_meter::ContextMeter`, con la ventana de
+- `fn context_meter(&self) -> batten::widgets::context_meter::ContextMeter` (con
+  `.with_memory(self.context_memory)`), con la ventana de
   `catalog.context_window(base_url, model)` por el mismo camino que `model_prices` (cópialo).
 
 **Render:** en los dos pies (`draw_flat_footer` y el pie clásico de la línea ~1394) reservar a la

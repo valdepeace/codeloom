@@ -23,6 +23,19 @@ Contrastado el 2026-10-23 (solo lectura; véase `docs/references/contexto-y-cost
 De mastra se toma **solo el aspecto** (celdas `━`); lo que se mide es lo de qwen-code y codex:
 la ventana real. El marcador del 80 % y los colores son **decisiones propias**.
 
+## Lo que más gusta de mastra: la memoria observacional
+
+La persona usuaria pidió expresamente **no olvidar** la memoria observacional de mastra y su forma
+de representarla. Está estudiada en
+`docs/references/contexto-y-coste/memoria-observacional-mastra.md` (qué es, qué se leyó y qué
+no, y las ideas que podría tomar CodeLoom). Lo que afecta a este medidor:
+
+- Su barra es de **tres clases de celda**: memoria (atenuada), mensajes (normal) y libres
+  (apagadas), repartidas en proporción a lo que pesa cada parte, con al menos una celda de cada
+  clase si hay de ambas.
+- Su equivalente propio y barato: tras compactar, la petición es «resumen + cola». El resumen
+  hace de **memoria**; la cola, de **mensajes**.
+
 ## Decisiones (de la persona usuaria, 2026-10-23, y propias)
 
 1. **Abajo**, en el pie de la app (de la persona usuaria).
@@ -31,6 +44,11 @@ la ventana real. El marcador del 80 % y los colores son **decisiones propias**.
    *Interpretación propia de «puesto los dos en batten»; se corrige si era otra cosa.*
 3. **En el showcase de batten** (único modo demo que existe hoy; la app no tiene uno propio).
 4. La app usa `Segments`.
+5. **Dos segmentos, resumen y mensajes** (inspirado en mastra; tarea 1b): `ContextMeter` lleva un
+   campo `memory` (tokens del resumen vigente, parte de `used`). Con `memory > 0`, `Segments`
+   pinta tres clases de celda y `Blocks` usa `▒` para la memoria; el texto añade
+   `· resumen {n}`. **`memory` es una estimación** (bytes/4 del texto del resumen) mientras que
+   `used` lo cuenta el proveedor: el reparto de celdas es aproximado y así se rotula.
 
 ## Diseño
 
