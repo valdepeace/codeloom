@@ -52,6 +52,22 @@ pub enum ConfirmDelegation {
     Never,
 }
 
+/// Elección automática de agente al delegar (`[agents] routing`, A12b).
+///
+/// Cabe señalar que A2A no fija cómo se elige un agente: es decisión propia, y por eso va apagada
+/// por defecto hasta que se mida lo que ahorra.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RoutingMode {
+    /// Sin enrutador: el padre elige como hasta ahora. Es el valor por defecto.
+    #[default]
+    Off,
+    /// Regla determinista sobre las etiquetas de las tarjetas, sin llamar al modelo.
+    Rule,
+    /// La regla primero y, si se abstiene, un clasificador barato con salida estricta.
+    Classifier,
+}
+
 /// Sección opcional `[agents]` de `codeloom.toml`. Sin ella, todo son valores por defecto.
 /// Vive aparte de `CodeLoomConfig` para que su ausencia no afecte a la configuración principal.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -65,6 +81,10 @@ pub struct AgentsConfig {
     pub trust_project_agents: bool,
     /// Cuándo se pregunta a la persona usuaria antes de delegar. Por defecto, `doubt`.
     pub confirm_delegation: ConfirmDelegation,
+    /// Elección automática de agente al delegar. Por defecto, `off`.
+    pub routing: RoutingMode,
+    /// Modelo del clasificador (solo con `routing = "classifier"`). Sin él, el del padre.
+    pub routing_model: Option<String>,
 }
 
 /// Forma del fichero a efectos de la sección `[agents]`; el resto de claves se ignora.
@@ -337,6 +357,30 @@ mod tests {
             let agents = AgentsConfig::from_toml(&text).unwrap();
             assert_eq!(agents.confirm_delegation, esperado, "valor {valor}");
         }
+    }
+
+    #[test]
+    fn routing_defaults_to_off_and_reads_its_modes_and_model() {
+        let agents = AgentsConfig::from_toml("").unwrap();
+        assert_eq!(agents.routing, RoutingMode::Off);
+        assert_eq!(agents.routing_model, None);
+
+        for (valor, esperado) in [
+            ("off", RoutingMode::Off),
+            ("rule", RoutingMode::Rule),
+            ("classifier", RoutingMode::Classifier),
+        ] {
+            let text = format!("[agents]\nrouting = \"{valor}\"\nrouting_model = \"barato\"\n");
+            let agents = AgentsConfig::from_toml(&text).unwrap();
+            assert_eq!(agents.routing, esperado, "valor {valor}");
+            assert_eq!(agents.routing_model.as_deref(), Some("barato"));
+        }
+    }
+
+    #[test]
+    fn routing_rejects_unknown_values() {
+        let error = AgentsConfig::from_toml("[agents]\nrouting = \"magic\"\n").unwrap_err();
+        assert!(matches!(error, CoreError::Config(_)), "got {error:?}");
     }
 
     #[test]
