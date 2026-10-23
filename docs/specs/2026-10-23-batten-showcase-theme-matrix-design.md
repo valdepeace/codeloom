@@ -1,6 +1,6 @@
 # Matriz de componentes por tema en el showcase de Batten
 
-Estado: diseño aprobado en lo esencial, 2026-10-23; sin implementar.
+Estado: implementado el 2026-10-23, sin verlo en una terminal real (véase «Estado» al final).
 
 ## Propósito
 
@@ -153,3 +153,60 @@ identidad visual de CodeLoom: es una propuesta construida sobre los dos colores 
 ## Preguntas abiertas
 
 - ¿Gusta la paleta propuesta? Solo el acento y el borde salen del logo.
+
+## Estado
+
+Implementado el 2026-10-23. **Sin verlo aún en una terminal real**: solo hay pruebas con
+`TestBackend`, de modo que colores, anchos y desplazamiento están sin comprobar a ojo. Commits:
+`a5dd92d` (derivación pura), `b2a102a` (modo matriz y teclas), `c64870f` (dibujo), `aeb2317`
+(`F8` y pie con la nota) y `7adbd30` (paleta de CodeLoom).
+
+### Cómo verlo
+
+`cargo run -p batten --example showcase`, y desde el índice: `m` abre la matriz; flechas o
+`hjkl` mueven el cursor; `Enter` abre el demo de la celda con el tema de su columna; `Esc` vuelve.
+Con un demo abierto, `F8` / `Shift+F8` cambia de tema dentro de su componente y `F7` solo la
+paleta.
+
+### Qué sale hoy (medido el 2026-10-23, 57 filas)
+
+| Tema | Propio `●` | Genérico `◐` | No existe `·` |
+|---|---|---|---|
+| Batten | 21 | 0 | 36 |
+| Martty | 8 | 18 | 31 |
+| Mindfork | 10 | 15 | 32 |
+| Pawan | 9 | 17 | 31 |
+| Crush | 38 | 14 | 5 |
+| MastraCode | 0 | 21 | 36 |
+| CodeLoom | 1 | 21 | 35 |
+
+Los dos componentes de dotmax (Progress catalog, Braille graphics) van a la nota del pie, y dos
+más quedan fuera por tener un proveedor no reconocido («Tool activity» y el grupo «Batten ·
+primitivas exclusivas»), con un recuento en la misma nota.
+
+### Decisiones tomadas durante la implementación
+
+- **La nota manda sobre el nombre del tema**: con la nota completa («parcialmente implementado»)
+  el sufijo `F7/Shift+F7 tema: …` solo se añade si cabe entero. La primera versión recortaba la
+  nota para conservar el sufijo y perdía lo más útil. El texto de la nota genérica se acortó
+  respecto al de la spec.
+- **`F8` es «la siguiente columna con algo»**: desde Crush va a MastraCode, no a Pawan; para
+  llegar a Pawan desde Crush se usa `Shift+F8`.
+- **El pie de dos líneas aparece también en el índice y en los filtros**, no solo con el demo
+  abierto.
+- **`ThemePreset::CodeLoom` está en `ThemePreset::ALL`**, así que también entra en el ciclo de
+  temas de la aplicación y se guarda en las preferencias como `theme = "codeloom"`.
+
+### Lo que no consta o queda pendiente
+
+- **La paleta de CodeLoom**: solo el acento y el borde salen del logo; el resto es propuesta.
+  No consta que sea la identidad visual de CodeLoom.
+- **`Generic` supone** que el demo de Batten respeta el tema activo porque `Demo::render` recibe
+  el `Theme`. No se ha comprobado demo a demo.
+- **Los nombres largos se recortan** en la columna de componentes con 100 columnas
+  («Assistant…»), porque las siete cabeceras completas ocupan casi todo el panel.
+- **`Option` en `COLUMNS`**: tras añadir el preset de CodeLoom todas las columnas llevan preset y
+  el `Option` es ya innecesario; se dejó para no ampliar el cambio.
+- **Seis entradas mal nombradas** del catálogo siguen sin corregir; la matriz las deja fuera.
+- **`clippy --example showcase` falla con 5 lints preexistentes** (`Showcase::len` sin uso fuera
+  de tests, un `else { if }` en `draw`, y tres demos). El comando del plan no los alcanza.
