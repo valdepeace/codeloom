@@ -82,8 +82,11 @@ después el transporte (A7, A8).
   dependen. Qué consta y qué no queda anotado en `docs/specs/2026-10-15-loom-agent-profile-a2a.md`,
   sección «Lectura de la especificación: descubrimiento, bindings y seguridad (2026-10-22)».
   Las dudas que siguen abiertas están en esa misma sección.
-- [ ] **A4. Adaptador de nombres del cable.** v0.3 en `kebab-case`, v1.0 en
-  `TASK_STATE_*`. Vive en el borde (crate del adaptador), nunca en el núcleo.
+- [x] **A4. Adaptador de nombres del cable.** Hecho el 2026-10-23 solo para la v1.0, en el
+  crate `codeloom-a2a` (módulo `wire`): enumerados, `Part`, `Message`, `Artifact`, `TaskStatus` y
+  `Task`. La v0.3 queda para A8. Spec `2026-10-23-codeloom-a2a-wire-names-design.md`. Texto
+  original: v0.3 en `kebab-case`, v1.0 en `TASK_STATE_*`. Vive en el borde (crate del
+  adaptador), nunca en el núcleo.
 - [x] **A5. Tipos del protocolo en el núcleo.** `Task`, `Message`, `Part`, `Artifact`,
   `TaskStatus`, con `taskId` y `contextId`. Alinear con la Fase B de la autonomía
   (artefactos) en lugar de inventar un tipo propio.

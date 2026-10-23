@@ -32,10 +32,10 @@
 `ROLE_AGENT`) con `From<Role>` y `From<WireRole> for Role`, y `timestamp_to_wire(i64) -> String` /
 `timestamp_from_wire(&str) -> Result<i64, WireError>`.
 
-- [ ] Tests: `states_roundtrip_through_wire_names` (los ocho), `unspecified_and_v03_states_are_rejected`,
+- [x] Tests: `states_roundtrip_through_wire_names` (los ocho), `unspecified_and_v03_states_are_rejected`,
   `role_serializes_as_proto_name`, `timestamps_roundtrip` (0, 1 ms, 2026-10-23 y un año bisiesto),
   `timestamp_has_millisecond_precision_and_z`, `timestamp_before_1970_or_with_offset_is_rejected`.
-- [ ] Implementar y verificar; commitear.
+- [x] Implementar y verificar; commitear.
 
 ### Tarea 2: `Part`, `Message` y `Artifact`
 
@@ -45,11 +45,11 @@
 (`Serialize`/`Deserialize`, `camelCase`, `skip_serializing_if` para ausentes y vacíos), con
 `From<&core>` hacia el cable y `TryFrom<WireX>` desde él.
 
-- [ ] Tests: `part_text_serializes_with_only_the_text_key`, `part_raw_is_base64`,
+- [x] Tests: `part_text_serializes_with_only_the_text_key`, `part_raw_is_base64`,
   `part_with_two_content_keys_is_rejected`, `part_without_content_is_rejected`,
   `invalid_base64_raw_is_rejected`, `message_uses_camel_case_and_omits_empty_fields`,
   `message_roundtrips`, `artifact_roundtrips`, `unknown_fields_are_ignored`.
-- [ ] Implementar y verificar; commitear.
+- [x] Implementar y verificar; commitear.
 
 ### Tarea 3: `TaskStatus` y `Task`
 
@@ -58,10 +58,10 @@
 **Interfaces:** produce `WireTaskStatus`, `WireTask`, con `From<&TaskStatus>` y
 `From<&SubagentDescriptor> for WireTask`.
 
-- [ ] Tests: `task_from_descriptor_has_id_context_status_and_artifacts`,
+- [x] Tests: `task_from_descriptor_has_id_context_status_and_artifacts`,
   `task_without_artifacts_omits_them`, `status_message_and_timestamp_are_translated`.
-- [ ] Implementar, verificar y commitear.
+- [x] Implementar, verificar y commitear.
 
 ### Tarea 4: documentos
 
-- [ ] Sección «Estado» de la spec y roadmap (A4 [x]). Commitear.
+- [x] Sección «Estado» de la spec y roadmap (A4 [x]). Commitear.

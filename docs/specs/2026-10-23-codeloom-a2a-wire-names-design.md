@@ -1,6 +1,7 @@
 # Adaptador de nombres del cable de A2A (A4)
 
-Estado: propuesta del 2026-10-23 (tarea A4 de `docs/plans/2026-10-22-codeloom-a2a-roadmap.md`).
+Estado: implementada el 2026-10-23 (véase «Estado» al final; tarea A4 de
+`docs/plans/2026-10-22-codeloom-a2a-roadmap.md`).
 
 ## Propósito
 
@@ -77,3 +78,34 @@ contrastarse palabra por palabra.
 - La codificación real de `raw` y los nombres exactos del proto, a contrastar con `a2a.proto`.
 - Si el mensaje de estado debe llevar `taskId` y `contextId` al salir (hoy el núcleo los deja
   vacíos).
+
+## Estado
+
+Implementada el 2026-10-23 con pruebas puras (18), **sin contrastarla con `a2a.proto` ni con un
+agente real**. Commits: `cc60373` (esta spec y su plan), `aed62e6` (crate, enumerados y marca de
+tiempo), `dfa91a4` (`Part`, `Message`, `Artifact`) y `6f0513a` (`TaskStatus` y `Task`).
+
+### Lo hecho
+
+- Crate `codeloom-a2a`, miembro del espacio de trabajo y ajeno a `codeloom-cli`; el núcleo no
+  cambia.
+- `state_to_wire` / `state_from_wire`, `WireRole`, `timestamp_to_wire` / `timestamp_from_wire`.
+- `WirePart`, `WireMessage`, `WireArtifact` con conversión de ida y de vuelta, y `WireTaskStatus` y
+  `WireTask` (esta última solo de ida, desde `SubagentDescriptor`).
+
+### Cómo se comprobó
+
+Pruebas de ida y vuelta, de rechazo (partes con cero o dos claves, base64 inválido, estados
+`UNSPECIFIED` o de la v0.3, marcas con desplazamiento o anteriores a 1970), de omisión de
+ausentes y de tolerancia a campos desconocidos. A mano se aflojó la comprobación de «exactamente
+una clave de contenido» y falló la prueba correspondiente.
+
+### Lo que no consta o queda pendiente
+
+- **`raw` en base64 es decisión nuestra**; no se leyó `a2a.proto` ni la sección 12.2.
+- **Lo leído en resumen** (nombres de campos de `Task`, `Message`, `Artifact`; formato de la
+  marca de tiempo) no se contrastó palabra por palabra con la página.
+- **No hay conversión de vuelta de `Task` ni de `TaskStatus`**: la necesitarán A7 y A8.
+- **No hay v0.3**: la aceptación de sus nombres en la v1.0 no consta.
+- **El nombre de la clave de `Part`** `data` con valor `null` se lee como ausente.
+- **Errores del cable, métodos JSON-RPC y `A2A-Version`**: A7, A8.
