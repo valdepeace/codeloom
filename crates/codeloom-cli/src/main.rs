@@ -219,6 +219,8 @@ async fn main() -> Result<()> {
     // Catálogo compartido con el agente (y sus hijos): vacío hasta que llega la carga en
     // segundo plano, así que los apuntes de antes llevan precio `NULL`.
     let catalog = Arc::new(std::sync::RwLock::new(Catalog::default()));
+    // El enrutador se construye antes de ceder el proveedor al bucle.
+    let enrutador = enrutador_de(&agents_cfg, provider.clone(), &cfg.model);
     let agent = AgentLoop::new(
         provider,
         store.clone(),
@@ -238,7 +240,7 @@ async fn main() -> Result<()> {
         Some(fabrica) => agent.with_remote_clients(fabrica),
         None => agent,
     };
-    let agent = match enrutador_de(&agents_cfg) {
+    let agent = match enrutador {
         Some(enrutador) => agent.with_router(enrutador),
         None => agent,
     };
@@ -518,12 +520,22 @@ fn arrancar_remotos(
 /// aún no existe: `classifier` usa solo la regla determinista, que ya es su primer nivel.
 fn enrutador_de(
     agents: &AgentsConfig,
+    provider: Arc<dyn Provider>,
+    modelo_por_defecto: &str,
 ) -> Option<Arc<dyn codeloom_core::registry::router::AgentRouter>> {
     use codeloom_core::config::RoutingMode;
+    use codeloom_core::registry::router::{ClassifierRouter, RuleRouter};
     match agents.routing {
         RoutingMode::Off => None,
-        RoutingMode::Rule | RoutingMode::Classifier => {
-            Some(Arc::new(codeloom_core::registry::router::RuleRouter))
+        RoutingMode::Rule => Some(Arc::new(RuleRouter)),
+        // El clasificador usa `routing_model` (barato) y, si no se indica, el modelo de la sesión.
+        RoutingMode::Classifier => {
+            let modelo = agents
+                .routing_model
+                .as_deref()
+                .filter(|m| !m.trim().is_empty())
+                .unwrap_or(modelo_por_defecto);
+            Some(Arc::new(ClassifierRouter::new(provider, modelo)))
         }
     }
 }
@@ -736,13 +748,21 @@ a2a:
     #[test]
     fn routing_is_off_by_default_and_on_with_rule_or_classifier() {
         use codeloom_core::config::RoutingMode;
-        assert!(enrutador_de(&AgentsConfig::default()).is_none());
+        // Un proveedor que no se llega a usar: construirlo no abre ninguna conexión.
+        let proveedor: Arc<dyn Provider> = Arc::new(AnthropicProvider::new(
+            "http://127.0.0.1:9".to_string(),
+            "k".to_string(),
+        ));
+        assert!(enrutador_de(&AgentsConfig::default(), proveedor.clone(), "m").is_none());
         for modo in [RoutingMode::Rule, RoutingMode::Classifier] {
             let cfg = AgentsConfig {
                 routing: modo,
                 ..AgentsConfig::default()
             };
-            assert!(enrutador_de(&cfg).is_some(), "{modo:?}");
+            assert!(
+                enrutador_de(&cfg, proveedor.clone(), "m").is_some(),
+                "{modo:?}"
+            );
         }
     }
 
