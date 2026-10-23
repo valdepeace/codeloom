@@ -2597,6 +2597,9 @@ impl App {
             LiveEvent::ContextCompacted { summary_bytes, .. } => {
                 self.context_memory = estimate_tokens(summary_bytes);
             }
+            // La compactación en segundo plano aún no se muestra en la interfaz (Tarea 4).
+            LiveEvent::BackgroundCompactionStarted { .. }
+            | LiveEvent::BackgroundCompactionReady { .. } => {}
             // El aviso de presupuesto es de CodeLoom: se pinta como línea de sistema, igual que los
             // avisos de `parse_notice`, y nunca como mensaje de la persona usuaria ni como estado de
             // A2A. Corta la entrada del asistente para que lo que llegue después no se pegue encima.

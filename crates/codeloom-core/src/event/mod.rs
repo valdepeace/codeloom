@@ -44,6 +44,15 @@ pub enum LiveEvent {
         /// Cómo entró en efecto el resumen (`Sync` en la vía síncrona de siempre).
         activation: Activation,
     },
+    /// Se ha lanzado un resumen en segundo plano, con `tokens_before` tokens de contexto estimados.
+    /// El turno no espera a él.
+    BackgroundCompactionStarted {
+        tokens_before: u64,
+    },
+    /// El resumen en segundo plano ya está listo para activarse; ocupa `summary_bytes` bytes.
+    BackgroundCompactionReady {
+        summary_bytes: usize,
+    },
     /// El gasto acumulado de la sesión cruza un umbral del presupuesto (`[budget]`). `used` y
     /// `limit` van en tokens o en dólares según `metric`; `partial` indica que el coste no suma
     /// los apuntes sin precio conocido. Solo avisa: no detiene el turno.
@@ -133,6 +142,8 @@ impl LiveEvent {
             | LiveEvent::Usage { .. }
             | LiveEvent::CompactionUsage { .. }
             | LiveEvent::ContextCompacted { .. }
+            | LiveEvent::BackgroundCompactionStarted { .. }
+            | LiveEvent::BackgroundCompactionReady { .. }
             | LiveEvent::BudgetWarning { .. }
             | LiveEvent::FileDiff { .. }
             | LiveEvent::MessageAdded(_)
@@ -247,6 +258,10 @@ mod tests {
                 input_tokens: 10,
                 output_tokens: 2,
             },
+            LiveEvent::BackgroundCompactionStarted {
+                tokens_before: 90_000,
+            },
+            LiveEvent::BackgroundCompactionReady { summary_bytes: 400 },
             LiveEvent::TurnEnded,
             LiveEvent::Error {
                 message: "fallo".into(),
