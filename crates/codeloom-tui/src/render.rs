@@ -1,5 +1,6 @@
 use crate::app::{App, Focus, SettingsPicker};
 use crate::rail;
+use batten::widgets::context_meter::{self, MeterStyle};
 use batten::widgets::{ChromeStyle, LayoutStyle};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -152,8 +153,33 @@ const FLAT_HINTS: [(&str, &str); 8] = [
     ("esc", "cancel"),
 ];
 
+/// Ancho mínimo del pie para reservar a su derecha el medidor de contexto.
+const METER_MIN_FOOTER_WIDTH: u16 = 80;
+
+/// Reserva a la derecha del pie el medidor de contexto, si hay medidor que pintar y el pie tiene
+/// al menos `METER_MIN_FOOTER_WIDTH` columnas. Devuelve el área que queda para el texto del pie;
+/// sin medidor, o en un pie más estrecho, devuelve el área entera.
+fn split_footer_meter(frame: &mut Frame, area: Rect, app: &App) -> Rect {
+    if area.width < METER_MIN_FOOTER_WIDTH {
+        return area;
+    }
+    let meter = app.context_meter();
+    let width = context_meter::meter_width(&meter, MeterStyle::Segments);
+    if width == 0 {
+        return area;
+    }
+    let [left, right] = Layout::horizontal([
+        Constraint::Min(0),
+        Constraint::Length(width.min(area.width)),
+    ])
+    .areas(area);
+    context_meter::render(frame, right, &meter, MeterStyle::Segments, &app.theme);
+    left
+}
+
 /// Pie del chrome `Flat`: el feedback de slash si lo hay; si no, atajos cortos.
 fn draw_flat_footer(frame: &mut Frame, area: Rect, app: &App) {
+    let area = split_footer_meter(frame, area, app);
     let line = if let Some(feedback) = app.slash_feedback.as_deref() {
         Line::from(Span::styled(feedback, app.theme.styles.muted))
     } else {
@@ -1391,6 +1417,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     if flat {
         draw_flat_footer(frame, rows[2], app);
     } else {
+        let text_area = split_footer_meter(frame, rows[2], app);
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(format!(" {} ", app.status), app.theme.styles.heading),
@@ -1405,7 +1432,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                     app.theme.styles.muted,
                 ),
             ])),
-            rows[2],
+            text_area,
         );
     }
 
@@ -1478,6 +1505,74 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect()
+    }
+
+    /// Última fila de la pantalla (el pie) tras pintar la app entera.
+    fn last_row_of(app: &mut App, w: u16, h: u16) -> String {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| render(f, app)).unwrap();
+        let buffer = term.backend().buffer();
+        let start = usize::from(h - 1) * usize::from(w);
+        buffer.content[start..start + usize::from(w)]
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    /// App con el tema indicado, un modelo de ventana conocida y una última petición de 142 000
+    /// tokens. `model` elige entre `windowed` (200 000) y `bare` (sin ventana).
+    fn footer_app(preset: batten::widgets::ThemePreset, model: &str) -> App {
+        let mut app = App::new();
+        app.set_theme(preset);
+        app.set_catalog(crate::app::windowed_sample_catalog());
+        app.set_provider_settings(crate::app::ProviderSettings {
+            kind: codeloom_core::config::ProviderKind::OpenAiCompat,
+            model: model.into(),
+            base_url: "https://acme.example/v1".into(),
+            api_key_env: "ACME_KEY".into(),
+            effort: None,
+        });
+        app.apply(codeloom_core::event::LiveEvent::Usage {
+            input_tokens: 142_000,
+            output_tokens: 1,
+        });
+        app
+    }
+
+    #[test]
+    fn footer_shows_the_meter_when_wide_enough() {
+        use batten::widgets::ThemePreset;
+        // Pie clásico (Batten) y pie plano (Crush): los dos reservan el medidor.
+        for preset in [ThemePreset::Batten, ThemePreset::Crush] {
+            let mut app = footer_app(preset, "windowed");
+            let row = last_row_of(&mut app, 80, 24);
+            assert!(row.contains("━━━━━━━━━━"), "medidor en {preset:?}: {row}");
+            assert!(row.contains("142k/200k"), "fracción en {preset:?}: {row}");
+            assert!(row.contains("71 %"), "porcentaje en {preset:?}: {row}");
+        }
+    }
+
+    #[test]
+    fn footer_hides_the_meter_when_narrow() {
+        use batten::widgets::ThemePreset;
+        for preset in [ThemePreset::Batten, ThemePreset::Crush] {
+            let mut app = footer_app(preset, "windowed");
+            let row = last_row_of(&mut app, 79, 24);
+            assert!(!row.contains("━"), "sin medidor en {preset:?}: {row}");
+            assert!(
+                !row.contains("142k/200k"),
+                "sin fracción en {preset:?}: {row}"
+            );
+        }
+    }
+
+    #[test]
+    fn footer_shows_the_count_when_window_unknown() {
+        use batten::widgets::ThemePreset;
+        let mut app = footer_app(ThemePreset::Batten, "bare");
+        let row = last_row_of(&mut app, 80, 24);
+        assert!(row.contains("ctx 142k (sin ventana)"), "{row}");
+        assert!(!row.contains("━"), "sin barra sin ventana: {row}");
     }
 
     #[test]

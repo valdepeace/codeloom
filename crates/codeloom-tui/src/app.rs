@@ -13,6 +13,7 @@ use codeloom_core::question::{Answer, Question};
 use codeloom_core::session::{SessionId, SessionInfo, UsageRecord};
 use codeloom_core::task::{TaskState, TaskStatus};
 use ratatui::layout::Rect;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -127,6 +128,21 @@ const PRICED_SAMPLE_JSON: &str = r#"{
 #[cfg(test)]
 pub(crate) fn priced_sample_catalog() -> Arc<Catalog> {
     Arc::new(Catalog::from_json(PRICED_SAMPLE_JSON).expect("el JSON de muestra es válido"))
+}
+
+/// Catálogo de muestra con ventana publicada (200 000 tokens) para el modelo `windowed`, y un
+/// modelo `bare` sin ventana. Ambos cuelgan de `https://acme.example/v1`.
+#[cfg(test)]
+pub(crate) fn windowed_sample_catalog() -> Arc<Catalog> {
+    const WINDOWED_SAMPLE_JSON: &str = r#"{
+    "acme": {"id": "acme", "name": "Acme", "npm": "@ai-sdk/openai-compatible",
+        "api": "https://acme.example/v1/", "env": ["ACME_KEY"],
+        "models": {
+            "windowed": {"id": "windowed", "name": "Windowed", "tool_call": true,
+                "limit": {"context": 200000, "output": 8192}},
+            "bare": {"id": "bare", "name": "Bare", "tool_call": true}}}
+}"#;
+    Arc::new(Catalog::from_json(WINDOWED_SAMPLE_JSON).expect("el JSON de muestra es válido"))
 }
 
 /// Posición del campo «Effort» en `/settings`. Solo existe si el modelo admite niveles;
@@ -449,6 +465,20 @@ impl AgentRow {
     }
 }
 
+/// Ventana de contexto ya buscada en el catálogo, con las entradas que la determinan. Mientras
+/// no cambie ninguna, el pie reutiliza el valor en vez de recorrer el catálogo en cada fotograma.
+struct ContextWindowCache {
+    catalog: Arc<Catalog>,
+    base_url: String,
+    model: String,
+    window: Option<u64>,
+}
+
+/// Estimación de tokens de un texto de `bytes` bytes: cuatro bytes por token, redondeo hacia arriba.
+fn estimate_tokens(bytes: usize) -> u64 {
+    bytes.div_ceil(4) as u64
+}
+
 pub struct App {
     /// Transcript persistente: se actualiza con los eventos, no por frame.
     pub transcript: batten::state::Transcript,
@@ -527,6 +557,12 @@ pub struct App {
     pub output_tokens: u64,
     pub turn_input_tokens: u64,
     pub turn_output_tokens: u64,
+    /// Tokens de entrada de la última petición de la sesión mostrada: el tamaño real del contexto
+    /// enviado. Alimenta el medidor del pie. Un uso con entrada 0 no lo pisa.
+    pub context_tokens: u64,
+    /// Tokens estimados del resumen vigente (la memoria del medidor); 0 si no hay resumen.
+    pub context_memory: u64,
+    context_window_cache: RefCell<Option<ContextWindowCache>>,
     pub current_step: usize,
     pub max_steps: usize,
     pub changes: batten::state::FileChanges,
@@ -772,6 +808,9 @@ impl App {
             output_tokens: 0,
             turn_input_tokens: 0,
             turn_output_tokens: 0,
+            context_tokens: 0,
+            context_memory: 0,
+            context_window_cache: RefCell::new(None),
             current_step: 0,
             max_steps: 0,
             changes: batten::state::FileChanges::new(),
@@ -1452,6 +1491,8 @@ impl App {
         self.output_tokens = 0;
         self.turn_input_tokens = 0;
         self.turn_output_tokens = 0;
+        self.context_tokens = 0;
+        self.context_memory = 0;
         for message in messages {
             if let Some(usage) = message.usage.as_ref() {
                 self.input_tokens = self
@@ -1460,10 +1501,18 @@ impl App {
                 self.output_tokens = self
                     .output_tokens
                     .saturating_add(u64::from(usage.output_tokens));
+                // Como en vivo, la última petición con entrada conocida fija el tamaño del contexto.
+                if message.role == Role::Assistant && usage.input_tokens > 0 {
+                    self.context_tokens = u64::from(usage.input_tokens);
+                }
             }
             match message.role {
                 Role::User => {
                     let text = message.text();
+                    // El último resumen reconocido fija la memoria del medidor.
+                    if let Some((_, cuerpo)) = parse_summary_text(&text) {
+                        self.context_memory = estimate_tokens(cuerpo.len());
+                    }
                     // Los avisos (resúmenes incluidos, de hasta 16 000 bytes) no los escribió la
                     // persona usuaria: no entran en el historial del composer.
                     if parse_notice(&text).is_none() {
@@ -2117,6 +2166,42 @@ impl App {
             })
     }
 
+    /// Medidor del pie: uso de la última petición, ventana del modelo y memoria del resumen.
+    pub fn context_meter(&self) -> batten::widgets::context_meter::ContextMeter {
+        batten::widgets::context_meter::ContextMeter::new(
+            self.context_tokens,
+            self.context_window(),
+        )
+        .with_memory(self.context_memory)
+    }
+
+    /// Ventana de contexto del modelo actual según el catálogo, por el mismo camino que
+    /// `model_prices`. Se cachea y solo se recalcula si cambian el catálogo, la URL base o el
+    /// modelo: el pie se pinta en cada fotograma y no debe recorrer el catálogo entero cada vez.
+    fn context_window(&self) -> Option<u64> {
+        let base_url = self
+            .provider_settings
+            .as_ref()
+            .map_or("", |settings| settings.base_url.as_str());
+        let mut cache = self.context_window_cache.borrow_mut();
+        if let Some(entry) = cache.as_ref() {
+            if Arc::ptr_eq(&entry.catalog, &self.catalog)
+                && entry.base_url == base_url
+                && entry.model == self.model
+            {
+                return entry.window;
+            }
+        }
+        let window = self.catalog.context_window(base_url, &self.model);
+        *cache = Some(ContextWindowCache {
+            catalog: Arc::clone(&self.catalog),
+            base_url: base_url.to_string(),
+            model: self.model.clone(),
+            window,
+        });
+        window
+    }
+
     /// Precios `(entrada, salida)` por millón de tokens del modelo actual, buscados en el
     /// catálogo. `None` si falta el catálogo, el proveedor, el modelo o alguno de los dos precios.
     pub fn model_prices(&self) -> Option<(f64, f64)> {
@@ -2482,12 +2567,20 @@ impl App {
                 self.turn_output_tokens = self
                     .turn_output_tokens
                     .saturating_add(u64::from(output_tokens));
+                // Solo el uso de la sesión mostrada fija el medidor; el de los hijos llega por
+                // `ChildEvent` y no pasa por aquí.
+                if input_tokens > 0 {
+                    self.context_tokens = u64::from(input_tokens);
+                }
                 let session = self.session_id.unwrap_or(SessionId(0));
                 self.record_live_usage(session, input_tokens, output_tokens);
             }
             // El resumen ya llega como mensaje (`MessageAdded`), que `parse_notice` reconoce y
-            // pinta como aviso propio. Aquí no se añade una segunda línea.
-            LiveEvent::ContextCompacted { .. } => {}
+            // pinta como aviso propio. Aquí no se añade una segunda línea. Lo que sí cambia es la
+            // memoria del medidor: el resumen vigente pasa a contar como memoria.
+            LiveEvent::ContextCompacted { summary_bytes, .. } => {
+                self.context_memory = estimate_tokens(summary_bytes);
+            }
             // El aviso de presupuesto es de CodeLoom: se pinta como línea de sistema, igual que los
             // avisos de `parse_notice`, y nunca como mensaje de la persona usuaria ni como estado de
             // A2A. Corta la entrada del asistente para que lo que llegue después no se pegue encima.
@@ -6300,6 +6393,168 @@ linea 2",
             effort: None,
         });
         assert_eq!(app.model_prices(), None, "sin catálogo no hay precio");
+    }
+
+    /// App con el catálogo de ventanas y el proveedor de la URL de muestra, en el modelo indicado.
+    fn metered_app(model: &str) -> App {
+        let mut app = App::new();
+        app.set_catalog(windowed_sample_catalog());
+        app.set_provider_settings(ProviderSettings {
+            kind: codeloom_core::config::ProviderKind::OpenAiCompat,
+            model: model.into(),
+            base_url: "https://acme.example/v1".into(),
+            api_key_env: "ACME_KEY".into(),
+            effort: None,
+        });
+        app
+    }
+
+    #[test]
+    fn usage_event_sets_the_context_tokens() {
+        let mut app = App::new();
+        app.apply(LiveEvent::Usage {
+            input_tokens: 1_200,
+            output_tokens: 30,
+        });
+        assert_eq!(app.context_tokens, 1_200);
+        app.apply(LiveEvent::Usage {
+            input_tokens: 5_000,
+            output_tokens: 10,
+        });
+        assert_eq!(app.context_tokens, 5_000, "el último uso gana");
+        app.apply(LiveEvent::Usage {
+            input_tokens: 0,
+            output_tokens: 4,
+        });
+        assert_eq!(
+            app.context_tokens, 5_000,
+            "un uso sin entrada no pisa el tamaño"
+        );
+    }
+
+    #[test]
+    fn compacted_event_sets_the_memory_estimate() {
+        let mut app = App::new();
+        app.apply(LiveEvent::ContextCompacted {
+            replaced: 4,
+            tokens_before: 90_000,
+            summary_bytes: 100,
+        });
+        assert_eq!(app.context_memory, 25, "100 bytes son 25 tokens");
+        app.apply(LiveEvent::ContextCompacted {
+            replaced: 6,
+            tokens_before: 91_000,
+            summary_bytes: 101,
+        });
+        assert_eq!(app.context_memory, 26, "el redondeo sube");
+    }
+
+    #[test]
+    fn restore_messages_recovers_context_tokens_and_memory() {
+        let mut app = App::new();
+        let mut antes = Message::assistant(vec![ContentPart::Text {
+            text: "antes".into(),
+        }]);
+        antes.usage = Some(codeloom_core::message::Usage {
+            input_tokens: 80_000,
+            output_tokens: 5,
+        });
+        let mut ultimo = Message::assistant(vec![ContentPart::Text {
+            text: "ahora".into(),
+        }]);
+        ultimo.usage = Some(codeloom_core::message::Usage {
+            input_tokens: 120_000,
+            output_tokens: 9,
+        });
+        let resumen = codeloom_core::agent::compact::summary_message(3, &"x".repeat(400));
+        app.restore_messages(vec![resumen, Message::user("hola"), antes, ultimo]);
+        assert_eq!(
+            app.context_tokens, 120_000,
+            "gana el último asistente con uso"
+        );
+        assert_eq!(
+            app.context_memory, 100,
+            "400 bytes del cuerpo son 100 tokens"
+        );
+
+        app.restore_messages(vec![Message::user("sin nada")]);
+        assert_eq!((app.context_tokens, app.context_memory), (0, 0));
+    }
+
+    #[test]
+    fn child_usage_does_not_move_the_parent_meter() {
+        let mut app = App::new();
+        app.session_id = Some(SessionId(1));
+        app.apply(LiveEvent::Usage {
+            input_tokens: 2_000,
+            output_tokens: 1,
+        });
+        app.apply(LiveEvent::ChildEvent {
+            parent: SessionId(1),
+            child: SessionId(9),
+            event: Box::new(LiveEvent::Usage {
+                input_tokens: 90_000,
+                output_tokens: 7,
+            }),
+        });
+        app.apply(LiveEvent::ChildEvent {
+            parent: SessionId(1),
+            child: SessionId(9),
+            event: Box::new(LiveEvent::ContextCompacted {
+                replaced: 2,
+                tokens_before: 90_000,
+                summary_bytes: 400,
+            }),
+        });
+        assert_eq!(app.context_tokens, 2_000);
+        assert_eq!(app.context_memory, 0);
+    }
+
+    #[test]
+    fn unknown_window_shows_no_bar_but_the_count() {
+        use batten::widgets::context_meter::{meter_text, MeterStyle};
+        let mut app = metered_app("bare");
+        app.apply(LiveEvent::Usage {
+            input_tokens: 42_000,
+            output_tokens: 1,
+        });
+        let meter = app.context_meter();
+        assert_eq!(meter.window, None);
+        assert_eq!(
+            meter_text(&meter, MeterStyle::Segments),
+            "ctx 42k (sin ventana)"
+        );
+
+        let sin_catalogo = {
+            let mut app = App::new();
+            app.apply(LiveEvent::Usage {
+                input_tokens: 42_000,
+                output_tokens: 1,
+            });
+            app.context_meter()
+        };
+        assert_eq!(sin_catalogo.window, None);
+    }
+
+    #[test]
+    fn meter_window_follows_the_model_and_the_catalog() {
+        let mut app = metered_app("windowed");
+        app.apply(LiveEvent::Usage {
+            input_tokens: 142_000,
+            output_tokens: 1,
+        });
+        assert_eq!(app.context_meter().window, Some(200_000));
+        assert_eq!(app.context_meter().percent(), Some(71));
+
+        // Cambiar de modelo recalcula la ventana (la caché no se queda con la anterior).
+        app.model = "bare".into();
+        assert_eq!(app.context_meter().window, None);
+        app.model = "windowed".into();
+        assert_eq!(app.context_meter().window, Some(200_000));
+
+        // Un catálogo nuevo, aunque sea igual, también se vuelve a consultar.
+        app.set_catalog(windowed_sample_catalog());
+        assert_eq!(app.context_meter().window, Some(200_000));
     }
 
     #[test]
