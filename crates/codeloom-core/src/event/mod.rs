@@ -102,6 +102,13 @@ pub enum LiveEvent {
     },
     JobChanged(crate::job::JobSnapshot),
     SubagentChanged(crate::session::SubagentDescriptor),
+    /// Una tarea A2A entrante (servidor, A8b) ha cambiado de estado. Cuelga de la sesión padre del
+    /// servidor y no de la que muestra la interfaz, así que `SubagentChanged` no la haría visible.
+    A2aServed {
+        task: String,
+        agent: String,
+        state: String,
+    },
     /// Un hijo queda a la espera de una respuesta de su padre (`input-required`).
     SubagentInputRequested {
         parent: crate::session::SessionId,
@@ -174,6 +181,7 @@ impl LiveEvent {
             | LiveEvent::SessionMessageAdded { .. }
             | LiveEvent::JobChanged(_)
             | LiveEvent::SubagentChanged(_)
+            | LiveEvent::A2aServed { .. }
             | LiveEvent::SubagentInputRequested { .. }
             | LiveEvent::SubagentInputResolved { .. }
             | LiveEvent::TodosChanged { .. }

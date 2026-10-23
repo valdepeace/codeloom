@@ -186,6 +186,22 @@ async fn main() -> Result<()> {
     // La vigilancia dura lo que `main`: al soltar el `WatcherHandle` se detiene.
     let _vigilancia_agentes = registro_agentes.spawn_watcher(arranque.directorios, bus.clone());
     let fabrica_remotos = arrancar_remotos(&a2a, &registro_agentes, &bus)?;
+    // Servir A2A (A8b): solo con la interfaz; `-p` termina tras un turno y no deja nada escuchando.
+    if cli.print.is_none() {
+        if let Some(direccion) = arrancar_servidor(
+            &a2a,
+            &registro_agentes,
+            provider.clone(),
+            store.clone(),
+            &cfg,
+            &cwd,
+            &bus,
+        )
+        .await?
+        {
+            eprintln!("A2A: sirviendo en http://{direccion}/a2a");
+        }
+    }
     let (perm_tx, perm_rx) = tokio::sync::mpsc::channel(8);
     let (ask_tx, ask_rx) = tokio::sync::mpsc::channel(4);
     let permission = Arc::new(if cli.print.is_some() {
@@ -492,6 +508,42 @@ fn arrancar_remotos(
         let _ = codeloom_a2a::sync::refresh_remote_cards(&registro, &bus, &cliente, &config).await;
     });
     Ok(Some(Arc::new(fabrica)))
+}
+
+/// Pone en marcha el servidor A2A si `[a2a] role` lo pide (A8b). Con el rol apagado o solo de
+/// consumo no se abre ningún puerto. Si lo pide y falta algo (autenticación, su variable de
+/// entorno, un agente servido válido), el arranque falla con el motivo: nunca se sirve a medias.
+async fn arrancar_servidor(
+    a2a: &codeloom_a2a::config::A2aConfig,
+    registro: &Arc<AgentRegistry>,
+    provider: Arc<dyn Provider>,
+    store: Arc<SqliteStore>,
+    cfg: &CodeLoomConfig,
+    cwd: &Path,
+    bus: &EventBus,
+) -> Result<Option<std::net::SocketAddr>> {
+    use codeloom_a2a::config::A2aRole;
+    if !matches!(a2a.role, A2aRole::Serve | A2aRole::Both) {
+        return Ok(None);
+    }
+    let dependencias = codeloom_a2a::serve::launch::ServeDeps {
+        registry: registro.clone(),
+        provider,
+        store,
+        config: cfg.clone(),
+        cwd: cwd.to_path_buf(),
+        bus: bus.clone(),
+    };
+    // El servidor vive lo que el proceso: no hay quien lo apague antes.
+    let direccion = codeloom_a2a::serve::launch::start(
+        &a2a.serve,
+        dependencias,
+        &|nombre| std::env::var(nombre).ok(),
+        CancellationToken::new(),
+    )
+    .await
+    .context("A2A: no se pudo arrancar el servidor")?;
+    Ok(Some(direccion))
 }
 
 /// Resuelve una ruta de `[agents]`: un `~/` inicial va al directorio personal y una ruta

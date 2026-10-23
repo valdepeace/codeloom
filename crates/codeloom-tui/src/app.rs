@@ -2834,6 +2834,14 @@ impl App {
                     self.resync_tools();
                 }
             }
+            LiveEvent::A2aServed { task, agent, state } => {
+                // Un tercero está dictando trabajo a un modelo local: la persona usuaria ha de verlo.
+                self.transcript.push_entry(
+                    batten::state::LineKind::System,
+                    batten::state::Format::Plain,
+                    format!("A2A entrante: tarea {task} · agente {agent} · {state}"),
+                );
+            }
             LiveEvent::TodosChanged { session, items } => {
                 if self.session_id == Some(session) {
                     self.todos = items;
@@ -4290,6 +4298,24 @@ Cuerpo de front.
         assert!(!app.turn_in_flight);
         assert!(!app.thinking);
         assert_eq!(app.status, "error: provider unavailable");
+    }
+
+    #[test]
+    fn an_incoming_a2a_task_is_shown_as_a_system_line() {
+        let mut app = crush_app();
+        app.apply(LiveEvent::A2aServed {
+            task: "12".into(),
+            agent: "default".into(),
+            state: "TASK_STATE_SUBMITTED".into(),
+        });
+        assert_eq!(
+            texts(&app),
+            vec!["A2A entrante: tarea 12 · agente default · TASK_STATE_SUBMITTED".to_string()]
+        );
+        assert_eq!(
+            app.transcript.line(0).unwrap().kind,
+            batten::state::LineKind::System
+        );
     }
 
     #[test]

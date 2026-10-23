@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use codeloom_core::error::CoreError;
+use codeloom_core::event::{EventBus, LiveEvent};
 use codeloom_core::session::{SessionId, SessionStore, SubagentDescriptor};
 use codeloom_core::subagent::SubagentLauncher;
 use codeloom_core::tools::glob::GlobTool;
@@ -26,6 +27,8 @@ use crate::wire::WireTask;
 
 /// Cada cuánto se consulta el estado mientras se espera.
 const SONDEO: Duration = Duration::from_millis(50);
+/// Texto máximo que se devuelve por tarea (decálogo: nada sin cota llega al cliente).
+pub const MAX_RESULT_BYTES: usize = 32 * 1024;
 /// Etiqueta de las tareas entrantes en el almacén.
 const ETIQUETA: &str = "A2A entrante";
 
@@ -64,6 +67,7 @@ pub struct LauncherHost {
     parent: SessionId,
     agent: String,
     limits: HostLimits,
+    bus: Option<EventBus>,
     /// Serializa «contar tareas vivas y arrancar»: sin esto dos envíos simultáneos pasarían el tope.
     arranque: tokio::sync::Mutex<()>,
 }
@@ -83,8 +87,16 @@ impl LauncherHost {
             parent,
             agent,
             limits,
+            bus: None,
             arranque: tokio::sync::Mutex::new(()),
         })
+    }
+
+    /// Publica en el bus cada cambio de estado de una tarea entrante, para que la persona usuaria
+    /// la vea en la conversación.
+    pub fn with_bus(mut self, bus: EventBus) -> Self {
+        self.bus = Some(bus);
+        self
     }
 
     /// Sesión padre bajo la que viven las tareas entrantes.
@@ -177,22 +189,41 @@ impl TaskHost for LauncherHost {
 
         // Una tarea no puede durar más que el máximo: pasado el tiempo, se cancela.
         let (lanzador, padre, maximo) = (self.launcher.clone(), self.parent, self.limits.max_task);
+        let (bus, agente) = (self.bus.clone(), self.agent.clone());
+        let aviso = move |d: &SubagentDescriptor| {
+            if let Some(bus) = &bus {
+                bus.publish(LiveEvent::A2aServed {
+                    task: d.child.0.to_string(),
+                    agent: agente.clone(),
+                    state: d.status.state.proto_name().to_string(),
+                });
+            }
+        };
         tokio::spawn(async move {
             let limite = Instant::now() + maximo;
+            let mut ultimo = None;
             loop {
                 tokio::time::sleep(SONDEO.max(Duration::from_millis(100))).await;
-                let terminada = lanzador
+                let actual = lanzador
                     .list(padre)
                     .await
                     .ok()
-                    .and_then(|lista| lista.into_iter().find(|d| d.child == hijo))
-                    .is_none_or(|d| d.status.state.is_terminal());
-                if terminada {
+                    .and_then(|lista| lista.into_iter().find(|d| d.child == hijo));
+                if let Some(descriptor) = &actual {
+                    // Solo se avisa cuando el estado cambia: la conversación no es un registro de sondeos.
+                    if ultimo != Some(descriptor.status.state) {
+                        ultimo = Some(descriptor.status.state);
+                        aviso(descriptor);
+                    }
+                }
+                if actual.is_none_or(|d| d.status.state.is_terminal()) {
                     return;
                 }
                 if Instant::now() >= limite {
                     // Si ya terminó entre medias, `cancel` falla con `TaskNotCancelable`: es lo esperado.
-                    let _ = lanzador.cancel(padre, hijo).await;
+                    if let Ok(cancelada) = lanzador.cancel(padre, hijo).await {
+                        aviso(&cancelada);
+                    }
                     return;
                 }
             }
@@ -297,6 +328,7 @@ mod tests {
         host: LauncherHost,
         launcher: Arc<InProcessSubagentLauncher>,
         otro_padre: SessionId,
+        bus: EventBus,
         _dir: tempfile::TempDir,
     }
 
@@ -318,6 +350,7 @@ mod tests {
             effort: None,
         };
         let registro = Arc::new(AgentRegistry::new(vec![Box::new(BuiltInSource)]));
+        let bus = EventBus::new(64);
         let launcher = Arc::new(
             InProcessSubagentLauncher::new(
                 Arc::new(RwLock::new(provider)),
@@ -327,7 +360,7 @@ mod tests {
                 Arc::new(RwLock::new(config)),
                 dir.path().to_path_buf(),
                 Arc::new(LocalJobRegistry::default()),
-                EventBus::new(64),
+                bus.clone(),
             )
             .with_registry(registro),
         );
@@ -339,12 +372,14 @@ mod tests {
             limites,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .with_bus(bus.clone());
         let otro_padre = store.create_session("/otro").await.unwrap();
         Montaje {
             host,
             launcher,
             otro_padre,
+            bus,
             _dir: dir,
         }
     }
@@ -389,6 +424,45 @@ mod tests {
         assert_eq!(
             fin.json["artifacts"][0]["parts"][0]["text"],
             "hola desde el servidor"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_state_change_of_an_incoming_task_is_announced_on_the_bus() {
+        let montaje = montar(Arc::new(ConTexto("ok".into())), limites()).await;
+        let mut eventos = montaje.bus.subscribe();
+
+        let inicial = montaje.host.start("saluda".into()).await.unwrap();
+        let id = id_de(&inicial);
+
+        let mut estados = Vec::new();
+        let limite = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < limite {
+            let Ok(Ok(evento)) =
+                tokio::time::timeout(Duration::from_millis(500), eventos.recv()).await
+            else {
+                continue;
+            };
+            if let LiveEvent::A2aServed { task, agent, state } = evento {
+                assert_eq!(task, id);
+                assert_eq!(agent, "default");
+                let terminal = state == "TASK_STATE_COMPLETED";
+                estados.push(state);
+                if terminal {
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(
+            estados.last().map(String::as_str),
+            Some("TASK_STATE_COMPLETED")
+        );
+        let mut sin_repetir = estados.clone();
+        sin_repetir.dedup();
+        assert_eq!(
+            estados, sin_repetir,
+            "no debe avisar dos veces del mismo estado seguido"
         );
     }
 
