@@ -126,4 +126,22 @@ auth = { scheme = "bearer", env = "CODELOOM_A2A_TOKEN" }
 
 ## Estado
 
-Sin implementar.
+Implementada el 2026-10-23 (`af11149`, `6d80e07`, `4b01b7f`, `520324d`). Cabe señalar lo que sí se
+ha comprobado y lo que no:
+
+- **Comprobado con pruebas automáticas:** configuración, autenticación en tiempo constante, tarjeta
+  servida, enrutador JSON-RPC, confinamiento de la lectura (con mutación a mano), anfitrión (tope de
+  tareas, tiempo máximo, texto acotado, aislamiento entre sesiones), arranque que se niega sin
+  autenticación, sin su secreto, en dirección no local o con un agente inexistente, y un
+  ida y vuelta real por bucle local con el cliente de A8a.
+- **Comprobado a mano contra un tercero:** el cliente del SDK oficial `a2a-sdk` 1.2.3 resuelve la
+  tarjeta, envía `SendMessage` con `Bearer` y recupera la tarea con `GetTask`, que acaba en
+  `TASK_STATE_COMPLETED` con el texto devuelto; con un token erróneo recibe 401. El proveedor del
+  modelo era de prueba (prueba viva `serve_for_an_external_client`, con `--ignored`).
+- **No comprobado:** un modelo real detrás del servidor; la línea «A2A entrante» en una terminal
+  real (solo la cubre una prueba unitaria de la TUI); TLS (lo pone el proxy, no CodeLoom); carga
+  con muchos clientes.
+- **Límites declarados:** sin streaming (`SendStreamingMessage`, `SubscribeToTask`, `ListTasks` y `GetExtendedAgentCard` responden −32004),
+  sin notificaciones push, sin tarjeta extendida, un único principal, solo partes de texto, y el
+  agente servido es de solo lectura. La tarjeta anuncia `url` de la dirección de escucha o de
+  `public_url`; con puerto 0 (solo pruebas) no es utilizable.

@@ -125,6 +125,13 @@ después el transporte (A7, A8).
     del SDK oficial. Sin soporte: OAuth2, OpenID Connect, mTLS y firmas de la tarjeta. Spec
     `2026-10-23-codeloom-a2a-remote-auth-design.md`, plan `2026-10-23-codeloom-a2a-remote-auth.md`.
     La autenticación para *servir* se hace con A8b.
+  - **A8b (servir) hecha el 2026-10-23** (`af11149`, `6d80e07`, `4b01b7f`, `520324d`): con
+    `[a2a] role = "serve"` (o `both`) y `[a2a.serve]`, CodeLoom escucha solo en bucle local, exige
+    autenticación (`Bearer` o clave de API en cabecera, secreto en una variable de entorno) y atiende
+    `SendMessage`, `GetTask` y `CancelTask` con un agente de solo lectura (`view` confinado al
+    proyecto, `glob`, `grep`). Cada tarea entrante aparece en la conversación. Verificada con el cliente
+    del SDK oficial y con el de A8a. Sin streaming, sin TLS propio, un solo principal. Spec
+    `2026-10-23-codeloom-a2a-serve-design.md`, plan `2026-10-23-codeloom-a2a-serve.md`.
   - Firmas e icono de la tarjeta (`signatures`, `icon_url`) siguen sin modelarse; ver la spec de la
     tarjeta, sección «Estado».
 - [x] **A9. Flujo de eventos** `TaskStatusUpdateEvent` y de artefactos sobre el bus de

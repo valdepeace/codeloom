@@ -353,3 +353,32 @@ async fn the_server_refuses_a_public_address_and_an_unknown_served_agent() {
     .unwrap_err();
     assert!(error.to_string().contains("no-existe"), "{error}");
 }
+
+/// Prueba viva: deja el servidor escuchando en 127.0.0.1:9997 para que un cliente de un tercero
+/// (el SDK oficial `a2a-sdk`) lo ejercite desde fuera. `LOOM_SERVE_SECS` fija cuánto (60 por defecto).
+/// Se ejecuta a mano: `cargo test -p codeloom-a2a --test serve_round_trip -- --ignored --nocapture`.
+#[tokio::test]
+#[ignore = "prueba viva: necesita un cliente externo"]
+async fn serve_for_an_external_client() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = ServeConfig {
+        listen: "127.0.0.1:9997".into(),
+        ..config_servidor()
+    };
+    let apagado = CancellationToken::new();
+    let addr = start(
+        &config,
+        deps(Arc::new(ConTexto("respuesta de CodeLoom")), &dir).await,
+        &entorno,
+        apagado.clone(),
+    )
+    .await
+    .unwrap();
+    println!("LISTO {addr}");
+    let segundos = std::env::var("LOOM_SERVE_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60);
+    tokio::time::sleep(Duration::from_secs(segundos)).await;
+    apagado.cancel();
+}

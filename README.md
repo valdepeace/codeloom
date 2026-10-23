@@ -35,8 +35,8 @@ Ciertamente, falta mucho (véase «Lo que aún no está»), pero ya no es solo d
 - Control de contexto y coste: toda salida de herramienta, sección del prompt y bucle
   lleva una cota (véase el decálogo, más abajo).
 
-**Lo que aún no está:** servir CodeLoom como agente A2A (A8b), OAuth2/OpenID Connect/mTLS
-contra remotos (el resto de A8d), flujo SSE (A8c), MCP, LSP, skills y memoria (m4), y el plugin completo de
+**Lo que aún no está:** OAuth2/OpenID Connect/mTLS contra remotos (el resto de A8d), flujo
+SSE y streaming al servir (A8c), TLS propio al servir, MCP, LSP, skills y memoria (m4), y el plugin completo de
 herdr (m3; hoy solo se detecta el entorno y se le reporta el estado).
 
 ## Puesta en marcha
@@ -101,6 +101,26 @@ a2a:
 Si falta la variable, o el remoto solo ofrece OAuth2, OpenID Connect o mTLS (aún sin
 soporte), la fila del agente en `/agents` dice por qué no se puede usar y no se le envía
 nada.
+
+**Servir CodeLoom como agente A2A.** Con `role = "serve"` (o `"both"`) otros clientes A2A
+pueden pedirle trabajo. Como quien llama es un tercero y no hay nadie para aprobar permisos,
+el servidor es deliberadamente estrecho: no arranca sin autenticación ni sin su secreto,
+escucha solo en bucle local (si quieres exponerlo, ponle delante un proxy TLS y declara
+`public_url`), y el agente servido solo puede leer (`view` confinado al proyecto, `glob`,
+`grep`). Cada tarea entrante se anuncia en la conversación.
+
+```toml
+[a2a]
+role = "serve"
+
+[a2a.serve]
+listen = "127.0.0.1:7077"
+agent = "default"
+auth = { scheme = "bearer", env = "CODELOOM_A2A_TOKEN" }   # el secreto vive en el entorno
+```
+
+Los clientes encuentran la tarjeta en `/.well-known/agent-card.json` y llaman a
+`POST /a2a` (JSON-RPC: `SendMessage`, `GetTask`, `CancelTask`).
 
 ## Nomenclatura
 
