@@ -1130,7 +1130,7 @@ fn draw_agents_overlay(frame: &mut Frame, area: Rect, app: &App) {
             fila.execution
         );
         let estilo = if indice == app.agents_selected {
-            app.theme.styles.border
+            app.theme.styles.heading.add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
@@ -1952,6 +1952,41 @@ Cuerpo de front.
         assert!(content.contains("Prompt of `front`"), "{content}");
         assert!(content.contains("Cuerpo de front."), "{content}");
         assert!(content.contains("a approve"), "{content}");
+    }
+
+    /// Estilo de la primera celda del texto `aguja` en la pantalla pintada.
+    fn style_of_text(app: &mut App, w: u16, h: u16, aguja: &str) -> Style {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| render(f, app)).unwrap();
+        let buffer = term.backend().buffer();
+        for y in 0..h {
+            let fila: String = (0..w)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect();
+            if let Some(columna) = fila.find(aguja) {
+                let x = fila[..columna].chars().count() as u16;
+                return buffer[(x, y)].style();
+            }
+        }
+        panic!("no aparece `{aguja}`");
+    }
+
+    #[test]
+    fn agents_overlay_marks_the_selected_row_like_the_other_pickers() {
+        let registro = codeloom_core::registry::AgentRegistry::new(vec![Box::new(
+            codeloom_core::registry::BuiltInSource,
+        )]);
+        let mut app = App::new();
+        app.set_agent_registry(std::sync::Arc::new(registro));
+        app.show_agents();
+        let seleccionado = style_of_text(&mut app, 100, 30, "default [usable]");
+        let realce = app.theme.styles.heading.add_modifier(Modifier::BOLD);
+
+        // La fila con el foco se realza como en sesiones, ajustes y selectores: más viva que el
+        // texto normal, nunca más apagada (el gris del borde se leía como «sin foco»).
+        assert_eq!(seleccionado.fg, realce.fg);
+        assert!(seleccionado.add_modifier.contains(Modifier::BOLD));
+        assert_ne!(seleccionado.fg, app.theme.styles.border.fg);
     }
 
     #[test]
