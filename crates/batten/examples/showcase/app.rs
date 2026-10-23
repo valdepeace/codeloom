@@ -2,6 +2,7 @@
 
 use crate::demo::Demo;
 use crate::demos::{self, CatalogItem};
+use crate::matrix::{self, Cell, Matrix};
 use batten::widgets::{Anim, ThemePreset};
 use ratatui::crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use std::collections::BTreeSet;
@@ -10,6 +11,7 @@ use std::collections::BTreeSet;
 pub enum Focus {
     Index,
     Demo,
+    Matrix,
     ProviderFilter,
     TextFilter,
 }
@@ -28,18 +30,29 @@ pub struct Showcase {
     theme_preset: ThemePreset,
     provider_filter: Option<&'static str>,
     query: String,
+    /// Matriz de componentes por tema, derivada una vez del catálogo.
+    matrix: Matrix,
+    /// Celda bajo el cursor de la matriz: (fila, columna), siempre dentro de los límites.
+    matrix_cursor: (usize, usize),
+    /// `true` si el demo activo se abrió desde la matriz; `Esc` vuelve entonces a ella.
+    matrix_return: bool,
 }
 
 impl Showcase {
     pub fn new() -> Self {
+        let demos = demos::catalog();
+        let matrix = matrix::build(&demos);
         Self {
-            demos: demos::catalog(),
+            demos,
             selected: 0,
             focus: Focus::Index,
             quit: false,
             theme_preset: ThemePreset::Batten,
             provider_filter: None,
             query: String::new(),
+            matrix,
+            matrix_cursor: (0, 0),
+            matrix_return: false,
         }
     }
 
@@ -220,6 +233,7 @@ impl Showcase {
             self.selected = *first;
         }
         self.focus = Focus::Index;
+        self.matrix_return = false;
     }
 
     /// Mueve la selección una posición arriba (con tope) y vuelve el foco al índice.
@@ -231,6 +245,7 @@ impl Showcase {
             self.selected = *first;
         }
         self.focus = Focus::Index;
+        self.matrix_return = false;
     }
 
     pub fn toggle_focus(&mut self) {
@@ -238,10 +253,86 @@ impl Showcase {
             Focus::Index => Focus::Demo,
             _ => Focus::Index,
         };
+        // Cualquier salida de Focus::Demo por Tab deja el demo sin procedencia de la matriz.
+        self.matrix_return = false;
     }
 
     pub fn set_focus(&mut self, focus: Focus) {
         self.focus = focus;
+        if focus != Focus::Demo {
+            self.matrix_return = false;
+        }
+    }
+
+    /// Abre la matriz desde el índice.
+    pub fn open_matrix(&mut self) {
+        self.focus = Focus::Matrix;
+    }
+
+    /// Sale del demo con `Esc`: vuelve a la matriz si el demo se abrió desde ella, si no al índice.
+    pub fn leave_demo(&mut self) {
+        self.focus = if self.matrix_return {
+            Focus::Matrix
+        } else {
+            Focus::Index
+        };
+        self.matrix_return = false;
+    }
+
+    /// Matriz de componentes por tema.
+    // Lo leerá el dibujo de la matriz (Tarea 3); hasta entonces solo lo ejercitan los tests.
+    #[allow(dead_code)]
+    pub fn matrix(&self) -> &Matrix {
+        &self.matrix
+    }
+
+    /// Posición (fila, columna) del cursor de la matriz.
+    // Lo leerá el dibujo de la matriz (Tarea 3); hasta entonces solo lo ejercitan los tests.
+    #[allow(dead_code)]
+    pub fn matrix_cursor(&self) -> (usize, usize) {
+        self.matrix_cursor
+    }
+
+    /// Celda bajo el cursor de la matriz, o `None` si la matriz no tiene filas.
+    // Lo leerá el dibujo de la matriz (Tarea 3); hasta entonces solo lo ejercitan los tests.
+    #[allow(dead_code)]
+    pub fn matrix_cell(&self) -> Option<Cell> {
+        let (row, column) = self.matrix_cursor;
+        self.matrix
+            .rows
+            .get(row)
+            .and_then(|row| row.cells.get(column))
+            .copied()
+    }
+
+    /// Desplaza el cursor de la matriz con tope en los bordes; no hace nada sin filas.
+    pub fn matrix_move(&mut self, down: isize, right: isize) {
+        let rows = self.matrix.rows.len();
+        if rows == 0 {
+            return;
+        }
+        let (row, column) = self.matrix_cursor;
+        self.matrix_cursor = (
+            step(row, down, rows),
+            step(column, right, matrix::COLUMNS.len()),
+        );
+    }
+
+    /// Abre el demo de la celda bajo el cursor con el tema de su columna. Las celdas
+    /// `Missing` no hacen nada; la columna CodeLoom no cambia el tema activo.
+    pub fn open_matrix_cell(&mut self) {
+        let (row, column) = self.matrix_cursor;
+        let Some(component) = self.matrix.rows.get(row).map(|row| row.component) else {
+            return;
+        };
+        let Some(index) = matrix::target(&self.demos, component, column) else {
+            return;
+        };
+        self.select(index, true);
+        self.matrix_return = true;
+        if let Some((_, Some(preset))) = matrix::COLUMNS.get(column) {
+            self.theme_preset = *preset;
+        }
     }
 
     pub fn current(&mut self) -> Option<&mut Box<dyn Demo>> {
@@ -264,24 +355,34 @@ impl Showcase {
 
     #[cfg(test)]
     pub(crate) fn with_demos(demos: Vec<Box<dyn Demo>>) -> Self {
+        let demos: Vec<CatalogItem> = demos
+            .into_iter()
+            .map(|demo| CatalogItem {
+                component: "Tests",
+                variant: "Test",
+                provider: "Test",
+                demo,
+            })
+            .collect();
+        let matrix = matrix::build(&demos);
         Self {
-            demos: demos
-                .into_iter()
-                .map(|demo| CatalogItem {
-                    component: "Tests",
-                    variant: "Test",
-                    provider: "Test",
-                    demo,
-                })
-                .collect(),
+            demos,
             selected: 0,
             focus: Focus::Index,
             quit: false,
             theme_preset: ThemePreset::Batten,
             provider_filter: None,
             query: String::new(),
+            matrix,
+            matrix_cursor: (0, 0),
+            matrix_return: false,
         }
     }
+}
+
+/// Avanza una posición dentro de `0..len` sin dar la vuelta.
+fn step(position: usize, delta: isize, len: usize) -> usize {
+    (position as isize + delta).clamp(0, len as isize - 1) as usize
 }
 
 /// Resuelve una tecla. Las globales primero; el resto, al demo si tiene el foco.
@@ -317,6 +418,10 @@ pub fn route(show: &mut Showcase, kind: KeyEventKind, code: KeyCode, mods: KeyMo
             }
             KeyCode::Char('p') => {
                 show.focus = Focus::ProviderFilter;
+                Action::None
+            }
+            KeyCode::Char('m') => {
+                show.open_matrix();
                 Action::None
             }
             KeyCode::Char('q') => {
@@ -373,9 +478,36 @@ pub fn route(show: &mut Showcase, kind: KeyEventKind, code: KeyCode, mods: KeyMo
             }
             _ => Action::None,
         },
+        Focus::Matrix => match code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                show.matrix_move(-1, 0);
+                Action::None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                show.matrix_move(1, 0);
+                Action::None
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                show.matrix_move(0, -1);
+                Action::None
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                show.matrix_move(0, 1);
+                Action::None
+            }
+            KeyCode::Enter => {
+                show.open_matrix_cell();
+                Action::None
+            }
+            KeyCode::Esc | KeyCode::Char('m') => {
+                show.set_focus(Focus::Index);
+                Action::None
+            }
+            _ => Action::None,
+        },
         Focus::Demo => match code {
             KeyCode::Esc => {
-                show.focus = Focus::Index;
+                show.leave_demo();
                 Action::None
             }
             KeyCode::Tab => {
@@ -578,5 +710,178 @@ mod tests {
             KeyModifiers::CONTROL,
         );
         assert_eq!(seen.get(), Some(KeyModifiers::CONTROL));
+    }
+
+    fn press(show: &mut Showcase, code: KeyCode) {
+        route(show, KeyEventKind::Press, code, KeyModifiers::NONE);
+    }
+
+    /// Índice de columna de la matriz por nombre.
+    fn column_index(name: &str) -> usize {
+        matrix::COLUMNS
+            .iter()
+            .position(|(column, _)| *column == name)
+            .unwrap()
+    }
+
+    /// Coloca el cursor de la matriz en la celda (componente, columna), buscando por nombre.
+    fn place(show: &mut Showcase, component: &str, column: &str) {
+        let row = show
+            .matrix()
+            .rows
+            .iter()
+            .position(|row| row.component == component)
+            .unwrap_or_else(|| panic!("sin fila para {component}"));
+        show.matrix_cursor = (row, column_index(column));
+    }
+
+    /// Primer demo del catálogo con ese componente y esa variante (por prefijo de proveedor).
+    fn first_demo(show: &Showcase, component: &str, provider_prefix: &str) -> usize {
+        show.demos
+            .iter()
+            .position(|item| {
+                item.component == component && item.variant.starts_with(provider_prefix)
+            })
+            .unwrap()
+    }
+
+    /// Componente de la primera fila cuya celda en esa columna cumple `pred`.
+    fn component_where(
+        show: &Showcase,
+        column: usize,
+        pred: impl Fn(Cell) -> bool,
+    ) -> &'static str {
+        show.matrix()
+            .rows
+            .iter()
+            .find(|row| pred(row.cells[column]))
+            .map(|row| row.component)
+            .expect("ninguna fila cumple la condición en el catálogo real")
+    }
+
+    #[test]
+    fn m_opens_the_matrix_and_esc_closes_it() {
+        let mut show = Showcase::new();
+        press(&mut show, KeyCode::Char('m'));
+        assert_eq!(show.focus(), Focus::Matrix);
+        press(&mut show, KeyCode::Esc);
+        assert_eq!(show.focus(), Focus::Index);
+        press(&mut show, KeyCode::Char('m'));
+        press(&mut show, KeyCode::Char('m'));
+        assert_eq!(show.focus(), Focus::Index);
+    }
+
+    #[test]
+    fn m_is_a_character_in_the_text_filter() {
+        let mut show = Showcase::new();
+        press(&mut show, KeyCode::Char('/'));
+        press(&mut show, KeyCode::Char('m'));
+        assert_eq!(show.focus(), Focus::TextFilter);
+        assert_eq!(show.query(), "m");
+    }
+
+    #[test]
+    fn cursor_stops_at_the_edges() {
+        let mut show = Showcase::new();
+        press(&mut show, KeyCode::Char('m'));
+        for _ in 0..100 {
+            press(&mut show, KeyCode::Up);
+            press(&mut show, KeyCode::Left);
+        }
+        assert_eq!(show.matrix_cursor(), (0, 0));
+        for _ in 0..1000 {
+            press(&mut show, KeyCode::Char('j'));
+            press(&mut show, KeyCode::Char('l'));
+        }
+        let last_row = show.matrix().rows.len() - 1;
+        assert_eq!(show.matrix_cursor(), (last_row, matrix::COLUMNS.len() - 1));
+        assert_eq!(show.focus(), Focus::Matrix);
+    }
+
+    #[test]
+    fn enter_on_own_opens_the_demo_with_that_theme() {
+        let mut show = Showcase::new();
+        press(&mut show, KeyCode::Char('m'));
+        place(&mut show, "Composer", "Crush");
+        press(&mut show, KeyCode::Enter);
+        assert_eq!(show.focus(), Focus::Demo);
+        assert_eq!(show.selected(), first_demo(&show, "Composer", "Crush"));
+        assert_eq!(show.theme_preset(), ThemePreset::Crush);
+    }
+
+    #[test]
+    fn enter_on_generic_opens_the_batten_demo_with_the_column_theme() {
+        let mut show = Showcase::new();
+        press(&mut show, KeyCode::Char('m'));
+        place(&mut show, "Composer", "Pawan");
+        press(&mut show, KeyCode::Enter);
+        assert_eq!(show.focus(), Focus::Demo);
+        assert_eq!(show.selected(), first_demo(&show, "Composer", "Batten"));
+        assert_eq!(show.theme_preset(), ThemePreset::Pawan);
+    }
+
+    #[test]
+    fn enter_on_missing_does_nothing() {
+        let mut show = Showcase::new();
+        press(&mut show, KeyCode::Char('m'));
+        let pawan = column_index("Pawan");
+        let component = component_where(&show, pawan, |cell| cell == Cell::Missing);
+        place(&mut show, component, "Pawan");
+        let before = (show.selected(), show.theme_preset());
+        press(&mut show, KeyCode::Enter);
+        assert_eq!(show.focus(), Focus::Matrix);
+        assert_eq!((show.selected(), show.theme_preset()), before);
+        assert!(!show.matrix_return);
+    }
+
+    #[test]
+    fn enter_on_codeloom_keeps_the_active_theme() {
+        let mut show = Showcase::new();
+        show.theme_preset = ThemePreset::Pawan;
+        press(&mut show, KeyCode::Char('m'));
+        let codeloom = column_index("CodeLoom");
+        let component = component_where(&show, codeloom, |cell| matches!(cell, Cell::Own(_)));
+        place(&mut show, component, "CodeLoom");
+        press(&mut show, KeyCode::Enter);
+        assert_eq!(show.focus(), Focus::Demo);
+        assert_eq!(show.selected(), first_demo(&show, component, "CodeLoom"));
+        assert_eq!(show.theme_preset(), ThemePreset::Pawan);
+    }
+
+    #[test]
+    fn esc_from_a_demo_opened_from_the_matrix_returns_to_it() {
+        let mut show = Showcase::new();
+        press(&mut show, KeyCode::Char('m'));
+        place(&mut show, "Composer", "Crush");
+        press(&mut show, KeyCode::Enter);
+        press(&mut show, KeyCode::Esc);
+        assert_eq!(show.focus(), Focus::Matrix);
+        assert!(!show.matrix_return);
+    }
+
+    #[test]
+    fn esc_from_a_normal_demo_still_returns_to_the_index() {
+        let mut show = Showcase::new();
+        press(&mut show, KeyCode::Tab);
+        assert_eq!(show.focus(), Focus::Demo);
+        press(&mut show, KeyCode::Esc);
+        assert_eq!(show.focus(), Focus::Index);
+    }
+
+    #[test]
+    fn matrix_return_does_not_stick_after_leaving_the_demo_by_other_keys() {
+        let mut show = Showcase::new();
+        press(&mut show, KeyCode::Char('m'));
+        place(&mut show, "Composer", "Crush");
+        press(&mut show, KeyCode::Enter);
+        assert!(show.matrix_return);
+        // Tab saca del demo al índice: la marca se limpia.
+        press(&mut show, KeyCode::Tab);
+        assert_eq!(show.focus(), Focus::Index);
+        assert!(!show.matrix_return);
+        // Un demo abierto de forma normal no vuelve a la matriz con Esc.
+        press(&mut show, KeyCode::Tab);
+        press(&mut show, KeyCode::Esc);
+        assert_eq!(show.focus(), Focus::Index);
     }
 }

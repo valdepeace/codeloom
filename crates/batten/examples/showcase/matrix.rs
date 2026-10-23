@@ -8,8 +8,6 @@ use crate::demos::{strict_provider, CatalogItem};
 use batten::widgets::ThemePreset;
 
 /// Estado de una celda de la matriz.
-// Puntos de entrada del modo matriz (Tarea 2); hasta que se usen, solo los tests los ejercitan.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cell {
     /// Hay `n` demos (n ≥ 1) del proveedor de la columna.
@@ -21,8 +19,6 @@ pub enum Cell {
 }
 
 /// Columnas de la matriz, en este orden, y su preset (None = sin preset propio).
-// Lo usará el modo matriz (Tarea 2); hasta entonces solo lo ejercitan los tests.
-#[allow(dead_code)]
 pub const COLUMNS: [(&str, Option<ThemePreset>); 7] = [
     ("Batten", Some(ThemePreset::Batten)),
     ("Martty", Some(ThemePreset::Martty)),
@@ -36,28 +32,26 @@ pub const COLUMNS: [(&str, Option<ThemePreset>); 7] = [
 /// Proveedor de la columna Batten, usado como respaldo para las celdas `Generic`.
 const BATTEN: &str = "Batten";
 
-// Lo usará el modo matriz (Tarea 2); hasta entonces solo lo ejercitan los tests.
-#[allow(dead_code)]
 pub struct Matrix {
     /// Componentes con al menos un demo de un proveedor de columna, en el orden de primera
     /// aparición en el catálogo.
     pub rows: Vec<MatrixRow>,
     /// (componente, variante) cuyo proveedor no se reconoce; no cuentan en ninguna celda.
+    // Lo leerá el pie de la matriz (Tarea 3); hasta entonces solo lo ejercitan los tests.
+    #[allow(dead_code)]
     pub left_out: Vec<(&'static str, &'static str)>,
     /// Componentes cuyos demos son solo de dotmax (librería, no tema), sin repetir.
+    // Lo leerá el pie de la matriz (Tarea 3); hasta entonces solo lo ejercitan los tests.
+    #[allow(dead_code)]
     pub library: Vec<&'static str>,
 }
 
-// Lo usará el modo matriz (Tarea 2); hasta entonces solo lo ejercitan los tests.
-#[allow(dead_code)]
 pub struct MatrixRow {
     pub component: &'static str,
     pub cells: [Cell; 7],
 }
 
 /// Deriva la matriz a partir del catálogo.
-// Lo usará el modo matriz (Tarea 2); hasta entonces solo lo ejercitan los tests.
-#[allow(dead_code)]
 pub fn build(items: &[CatalogItem]) -> Matrix {
     let mut components: Vec<&'static str> = Vec::new();
     for item in items {
@@ -100,8 +94,6 @@ pub fn build(items: &[CatalogItem]) -> Matrix {
 
 /// Índice del primer demo del catálogo para esa celda: el del proveedor de la columna si es
 /// `Own`, el de Batten si es `Generic`, `None` si es `Missing`.
-// Lo usará el modo matriz (Tarea 2); hasta entonces solo lo ejercitan los tests.
-#[allow(dead_code)]
 pub fn target(items: &[CatalogItem], component: &str, column: usize) -> Option<usize> {
     let own = provider_of_column(column)?;
     let first = |provider: &str| {

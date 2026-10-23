@@ -271,6 +271,7 @@ fn draw_header(f: &mut Frame, area: Rect, show: &Showcase, theme: &Theme) {
             match show.focus() {
                 Focus::Index => "↑/↓: variante · Tab: abrir · F7: paleta · q: salir",
                 Focus::Demo => "F7: paleta · Tab/Esc: volver al índice",
+                Focus::Matrix => "←/→/↑/↓: celda · Enter: abrir · Esc: índice · F7: paleta",
                 Focus::ProviderFilter => "←/→: proveedor · Tab/Enter: buscar · Esc: índice",
                 Focus::TextFilter => "Escribe para filtrar · Enter: índice · Esc: limpiar",
             },
