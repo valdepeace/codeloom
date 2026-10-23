@@ -27,9 +27,9 @@
 
 ### Tarea 0: reconciliar la fuente normativa
 
-- [ ] Localizar la copia local de la spec (`spec.md`) y de `a2a.proto` citada en la spec del perfil
-  y, con ella, contrastar lo ya anotado (métodos PascalCase, códigos de error, `ErrorInfo`, cabecera
-  de versión) y cerrar lo abierto (`raw`, campos de los eventos). Guardar **fixtures literales**
+- [ ] El proto ya está en los fixtures (A9, tarea 0). Falta localizar o descargar `spec.md` y,
+  con ella, contrastar lo ya anotado (métodos PascalCase, códigos de error, `ErrorInfo`, cabecera
+  de versión). Guardar **fixtures literales**
   (tarjeta, `SendMessage`, `GetTask`, `CancelTask`, errores) en
   `crates/codeloom-a2a/tests/fixtures/`. Corregir la spec y `wire.rs` si algo no coincide.
   Commitear solo documentos y fixtures.

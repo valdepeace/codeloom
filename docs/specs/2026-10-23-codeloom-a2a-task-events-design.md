@@ -13,6 +13,20 @@ eventos de estado y de artefacto dentro de un `StreamResponse`. El núcleo ya pu
 
 ## Lo que consta en A2A v1.0
 
+**Literal del proto** (`package lf.a2a.v1`, servido en `a2a-protocol.org/latest/spec/a2a.proto`,
+copiado como fixture en `crates/codeloom-a2a/tests/fixtures/a2a.proto`):
+
+- `TaskStatusUpdateEvent { task_id = 1, context_id = 2, status = 3, metadata = 4 }`. **No tiene
+  indicador `final`** (la v0.3 sí lo tenía).
+- `TaskArtifactUpdateEvent { task_id = 1, context_id = 2, artifact = 3, append = 4, last_chunk = 5,
+  metadata = 6 }`; `append`: «the content of this artifact should be appended to a previously sent
+  artifact with the same ID»; `last_chunk`: «this is the final chunk of the artifact».
+- `StreamResponse` con `oneof payload { task = 1; message = 2; status_update = 3;
+  artifact_update = 4 }`.
+- `SubscribeToTask`: «Subscribes to task updates for tasks not in a terminal state. Returns
+  `UnsupportedOperationError` if the task is already in a terminal state (completed, failed,
+  canceled, rejected).»
+
 - **Literal:** `StreamResponse` lleva «exactly one of» `task`, `message`, `statusUpdate`,
   `artifactUpdate`.
 - **Resumen** (spec leída en la tarea A4): el orden de los eventos está garantizado y rige para
@@ -20,12 +34,10 @@ eventos de estado y de artefacto dentro de un `StreamResponse`. El núcleo ya pu
 
 ## Lo que NO consta (y por tanto decidimos)
 
-- **Los campos exactos** de `TaskStatusUpdateEvent` y `TaskArtifactUpdateEvent` en la v1.0 (no se
-  leyó `a2a.proto`). De la v0.3 se recuerda un indicador `final` y, en el de artefactos, `append` y
-  `lastChunk`; **no se sabe si la v1.0 los conserva**. Se modelan solo `task_id`, `context_id` y la
-  carga (estado o artefacto); lo demás se decide al contrastar el proto (tarea 0 del plan).
+- **Qué emite primero un flujo recién abierto**: el proto no lo dice (véase abajo).
 - **Qué emite primero un flujo recién abierto.** Decisión nuestra: una instantánea `task` con el
-  estado actual, para que el suscriptor no se pierda lo ya ocurrido.
+  estado actual, para que el suscriptor no se pierda lo ya ocurrido (`StreamResponse` admite `task`
+  como primer elemento).
 - **Cuándo se cierra el flujo.** Duda abierta ya registrada (§3.1.2 frente a §11.7). Decisión
   nuestra: se cierra tras el estado terminal; en `input-required` y `auth-required` sigue abierto.
 - **Cómo se reanuda tras una pérdida.** No consta. Decisión nuestra: si el suscriptor se atrasa
@@ -33,9 +45,11 @@ eventos de estado y de artefacto dentro de un `StreamResponse`. El núcleo ya pu
 
 ## Decisiones (nuestras salvo indicación)
 
-- **D1. Tipos en el núcleo** (`a2a.rs`): `TaskStatusUpdateEvent`, `TaskArtifactUpdateEvent` y
-  `StreamResponse { Task, Message, StatusUpdate, ArtifactUpdate }`. Sin nombres del cable: los
-  pone el adaptador (A4).
+- **D1. Tipos en el núcleo** (`a2a.rs`), con los campos del proto: `TaskStatusUpdateEvent
+  { task_id, context_id, status, metadata }`, `TaskArtifactUpdateEvent { task_id, context_id,
+  artifact, append, last_chunk, metadata }` y `StreamResponse { Task, Message, StatusUpdate,
+  ArtifactUpdate }`. Sin nombres del cable: los pone el adaptador (A4). Un artefacto nuestro llega
+  entero: `append = false`, `last_chunk = true`.
 - **D2. La fuente es el bus.** Una función pura `eventos_de_cambio(anterior, nuevo)` convierte un
   par de descriptores en cero o más eventos: uno de estado si cambió `status.state`, uno de
   artefacto por cada artefacto nuevo. No se inventan transiciones.
@@ -44,7 +58,10 @@ eventos de estado y de artefacto dentro de un `StreamResponse`. El núcleo ya pu
   independientes.
 - **D4. Orden:** el de publicación en el bus, que es por emisor. Se prueba que dos cambios
   sucesivos llegan en orden.
-- **D5. Una tarea ya terminal** produce la instantánea y el cierre inmediato, sin esperar.
+- **D5. Suscribirse a una tarea ya terminal es un error `UnsupportedOperation`**, como exige el
+  proto (corrige el primer borrador, que proponía instantánea y cierre). Se añade
+  `CoreError::UnsupportedOperation(String)`, cuyo código de cable (−32004) lo asigna A8. Una tarea
+  inexistente o ajena sigue siendo `TaskNotFound`.
 - **D6. Cota:** el búfer del bus ya está acotado (`EventBus::new(n)`); un suscriptor lento pierde
   eventos y recibe una instantánea, nunca se acumulan sin límite.
 
@@ -58,6 +75,5 @@ eventos de estado y de artefacto dentro de un `StreamResponse`. El núcleo ya pu
 
 ## Preguntas abiertas
 
-- Los campos reales del proto (tarea 0).
 - Si `ChildEvent` (texto y herramientas del hijo) debe reflejarse como `message` del flujo; hoy
   no se hace.

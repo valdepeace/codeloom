@@ -48,8 +48,9 @@ Sigue abierto o sin contrastar:
 - **Cuerpo de error de REST:** los ejemplos de §6 muestran `application/problem+json`, mientras
   §11.6 exige `ErrorInfo`. Lectura nuestra: prevalece la norma (MUST). Solo importa si se sirve REST.
 - **Nombres de los eventos de flujo y sus campos** (A9, tarea 0).
-- **Codificación de `raw`:** en ProtoJSON los `bytes` van en base64; es la regla general del
-  formato, **no** una frase de la spec leída. La copia local del proto no se ha localizado.
+- **Alfabeto y relleno del base64 de `raw`:** el proto dice que va en base64 pero no cuál;
+  decisión nuestra, estándar con relleno. El proto está guardado como fixture
+  (`crates/codeloom-a2a/tests/fixtures/a2a.proto`, descargado el 2026-10-23).
 - **Cómo se autentica un cliente ante un remoto concreto:** lo dice su tarjeta, dato de un tercero.
 
 ## Decisiones (nuestras salvo indicación)
