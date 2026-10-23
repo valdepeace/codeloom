@@ -220,6 +220,23 @@ fn tree_gutter(width: u16) -> u16 {
     }
 }
 
+/// Glifo de la cabecera de un bloque según el rol de su primera línea. Las herramientas, los
+/// subagentes y la actividad no llevan: su texto ya abre con un icono propio del color de su estado.
+fn tree_glyph(kind: batten::state::LineKind) -> Option<char> {
+    use batten::state::LineKind;
+    match kind {
+        LineKind::User => Some('›'),
+        LineKind::Assistant => Some('◆'),
+        LineKind::Thinking => Some('…'),
+        LineKind::System => Some('•'),
+        LineKind::Error => Some('×'),
+        LineKind::Todo => Some('☐'),
+        LineKind::Plan => Some('◇'),
+        LineKind::Banner => Some('◈'),
+        _ => None,
+    }
+}
+
 /// Estilo de la guía de un bloque según el rol de su primera línea: el acento para quien
 /// escribe y un gris tenue para el resto, de modo que los turnos se vean de un vistazo.
 fn tree_style(kind: batten::state::LineKind, app: &App) -> Style {
@@ -263,6 +280,7 @@ fn draw_tree_gutter(frame: &mut Frame, texto: Rect, app: &App) {
             continue;
         };
         let grueso = activo == Some(entry);
+        let glifo = tree_glyph(kind);
         let style = if grueso {
             active_marker_style(kind, app)
         } else {
@@ -272,15 +290,18 @@ fn draw_tree_gutter(frame: &mut Frame, texto: Rect, app: &App) {
             let Ok(dy) = u16::try_from(row - top) else {
                 break;
             };
+            // La cabecera lleva el glifo del rol en la segunda columna, en lugar del trazo.
+            let cabecera = glifo.unwrap_or(if grueso { '━' } else { '─' });
+            let cabecera = |esquina: char| format!("{esquina}{cabecera}");
             let guia = match (row == start, row + 1 == end, grueso) {
-                (true, true, false) => "──",
-                (true, true, true) => "━━",
-                (true, false, false) => "╭─",
-                (true, false, true) => "┏━",
-                (false, true, false) => "╰─",
-                (false, true, true) => "┗━",
-                (false, false, false) => "│",
-                (false, false, true) => "┃",
+                (true, true, false) => cabecera('─'),
+                (true, true, true) => cabecera('━'),
+                (true, false, false) => cabecera('╭'),
+                (true, false, true) => cabecera('┏'),
+                (false, true, false) => "╰─".to_string(),
+                (false, true, true) => "┗━".to_string(),
+                (false, false, false) => "│".to_string(),
+                (false, false, true) => "┃".to_string(),
             };
             for (i, simbolo) in guia.chars().enumerate() {
                 if let Some(cell) = buf.cell_mut((x0 + i as u16, texto.y + dy)) {
@@ -2012,11 +2033,12 @@ dos",
         let term = terminal_of(&mut app, 100, 30);
         let area = app.transcript_area.expect("el transcript fija su área");
 
-        // Cada bloque abre y cierra su propia línea; ninguno cuelga de otro.
+        // Cada bloque abre y cierra su propia línea, con el glifo de su rol; ninguno cuelga de otro.
+        let glifos = ['›', '◆', '›'];
         for (entrada, filas) in [(0, 2), (1, 3), (2, 2)] {
             assert_eq!(
                 gutter_at(&term, area, screen_row(&app, area, entrada, 0)),
-                "╭─ "
+                format!("╭{} ", glifos[entrada])
             );
             for dentro in 1..filas - 1 {
                 assert_eq!(
@@ -2032,7 +2054,7 @@ dos",
     }
 
     #[test]
-    fn a_block_of_a_single_row_is_a_bare_dash() {
+    fn a_block_of_a_single_row_is_a_dash_with_its_glyph() {
         let mut app = App::new();
         app.push_user("hola");
         app.transcript.push_entry(
@@ -2043,7 +2065,7 @@ dos",
         let term = terminal_of(&mut app, 100, 30);
         let area = app.transcript_area.expect("el transcript fija su área");
 
-        assert_eq!(gutter_at(&term, area, screen_row(&app, area, 1, 0)), "── ");
+        assert_eq!(gutter_at(&term, area, screen_row(&app, area, 1, 0)), "─• ");
     }
 
     #[test]
@@ -2078,7 +2100,7 @@ dos",
         for y in area.y..area.bottom() {
             let guia = gutter_at(&term, area, y);
             assert!(
-                ["╭─ ", "│  ", "╰─ ", "── "].contains(&guia.as_str()),
+                ["╭› ", "│  ", "╰─ ", "─› "].contains(&guia.as_str()),
                 "fila {y}: «{guia}»"
             );
         }
@@ -2105,7 +2127,7 @@ tres",
         for row in start..end {
             let y = area.y + (row - app.viewport.top()) as u16;
             let esperado = if row == start {
-                "┏━ "
+                "┏◆ "
             } else if row + 1 == end {
                 "┗━ "
             } else {
@@ -2119,7 +2141,7 @@ tres",
         }
         // Los demás bloques siguen con el trazo fino.
         let y = area.y + (block_rows(&app, 0).0 - app.viewport.top()) as u16;
-        assert_eq!(gutter_at(&term, area, y), "╭─ ");
+        assert_eq!(gutter_at(&term, area, y), "╭› ");
     }
 
     #[test]
@@ -2146,13 +2168,13 @@ tres",
         let y = screen_row(&app, area, 0, 0);
         assert_eq!(
             gutter_at(&sin_foco, area, y),
-            "╭─ ",
+            "╭› ",
             "sin foco no hay trazo grueso"
         );
 
         app.focus = Focus::Transcript;
         let con_foco = terminal_of(&mut app, 100, 30);
-        assert_eq!(gutter_at(&con_foco, area, y), "┏━ ");
+        assert_eq!(gutter_at(&con_foco, area, y), "┏› ");
         assert_eq!(
             con_foco.backend().buffer()[(area.x - TREE_GUTTER, y)].fg,
             app.theme.styles.accent.fg.unwrap()
