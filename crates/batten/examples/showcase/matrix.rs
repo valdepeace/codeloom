@@ -4,8 +4,15 @@
 //! (`Own`), si solo existe el widget genérico de Batten pintado con su paleta (`Generic`) o si no
 //! existe (`Missing`). No depende de la terminal: se prueba directamente sobre el catálogo.
 
+use crate::app::Showcase;
 use crate::demos::{strict_provider, CatalogItem};
-use batten::widgets::ThemePreset;
+use batten::state::StyleToken;
+use batten::widgets::{Theme, ThemePreset};
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::Modifier;
+use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
+use ratatui::Frame;
 
 /// Estado de una celda de la matriz.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,12 +44,8 @@ pub struct Matrix {
     /// aparición en el catálogo.
     pub rows: Vec<MatrixRow>,
     /// (componente, variante) cuyo proveedor no se reconoce; no cuentan en ninguna celda.
-    // Lo leerá el pie de la matriz (Tarea 3); hasta entonces solo lo ejercitan los tests.
-    #[allow(dead_code)]
     pub left_out: Vec<(&'static str, &'static str)>,
     /// Componentes cuyos demos son solo de dotmax (librería, no tema), sin repetir.
-    // Lo leerá el pie de la matriz (Tarea 3); hasta entonces solo lo ejercitan los tests.
-    #[allow(dead_code)]
     pub library: Vec<&'static str>,
 }
 
@@ -136,6 +139,193 @@ fn provider_of_column(column: usize) -> Option<&'static str> {
 /// Indica si un proveedor corresponde a una de las columnas de la matriz.
 fn is_column(provider: &str) -> bool {
     COLUMNS.iter().any(|(name, _)| *name == provider)
+}
+
+/// Ancho mínimo, en columnas, para dibujar la matriz; por debajo solo se muestra un aviso.
+const MIN_WIDTH: u16 = 30;
+/// Alto mínimo, en filas, para dibujar la matriz; por debajo solo se muestra un aviso.
+const MIN_HEIGHT: u16 = 3;
+/// Espacio entre el texto de una columna y la siguiente.
+const GAP: usize = 1;
+
+/// Dibuja la matriz de componentes por tema dentro de `area`: cabecera de columnas, una fila por
+/// componente con su símbolo en cada tema, leyenda, texto de la celda del cursor y, si hay sitio,
+/// nota sobre dotmax y los demos sin proveedor.
+pub fn draw_matrix(f: &mut Frame, area: Rect, show: &Showcase, theme: &Theme) {
+    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+        let message = Paragraph::new("Terminal pequeña").style(theme.style(StyleToken::Muted));
+        f.render_widget(message, area);
+        return;
+    }
+    let matrix = show.matrix();
+    let (cursor_row, cursor_col) = show.matrix_cursor();
+    // La nota solo cabe si, además de cabecera, una fila, leyenda y celda, queda una línea.
+    let note = note_text(matrix).filter(|_| area.height >= 5);
+    let [header, table, legend, cell, note_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(u16::from(note.is_some())),
+    ])
+    .areas(area);
+
+    let widths: Vec<usize> = COLUMNS
+        .iter()
+        .map(|(name, _)| name.chars().count() + GAP)
+        .collect();
+    let name_width = usize::from(area.width).saturating_sub(widths.iter().sum());
+    let muted = theme.style(StyleToken::Muted);
+
+    let mut head = vec![Span::raw(" ".repeat(name_width))];
+    for (column, (name, _)) in COLUMNS.iter().enumerate() {
+        let style = if column == cursor_col {
+            theme.style(StyleToken::Accent).add_modifier(Modifier::BOLD)
+        } else {
+            muted
+        };
+        head.push(Span::styled(
+            format!("{name:<w$}", w = widths[column]),
+            style,
+        ));
+    }
+    f.render_widget(Paragraph::new(Line::from(head)), header);
+
+    let rows: Vec<Line> = if matrix.rows.is_empty() {
+        vec![Line::styled("Sin componentes", muted)]
+    } else {
+        // Desplazamiento mínimo que deja visible la fila del cursor.
+        let height = usize::from(table.height);
+        let offset = (cursor_row + 1).saturating_sub(height);
+        matrix
+            .rows
+            .iter()
+            .enumerate()
+            .skip(offset)
+            .take(height)
+            .map(|(row_index, row)| {
+                let on_cursor_row = row_index == cursor_row;
+                row_line(row, on_cursor_row, cursor_col, &widths, name_width, theme)
+            })
+            .collect()
+    };
+    f.render_widget(Paragraph::new(rows), table);
+
+    let legend_line = Line::from(vec![
+        Span::styled("●", theme.style(StyleToken::Success)),
+        Span::styled(" propio  ", muted),
+        Span::styled("◐", theme.style(StyleToken::Warning)),
+        Span::styled(" genérico  ", muted),
+        Span::styled("·", muted),
+        Span::styled(" no existe", muted),
+    ]);
+    f.render_widget(Paragraph::new(legend_line), legend);
+
+    let width = usize::from(area.width);
+    let cell_line = Line::styled(
+        fit(&cell_text(show), width),
+        theme.style(StyleToken::Default),
+    );
+    f.render_widget(Paragraph::new(cell_line), cell);
+
+    if let Some(text) = note {
+        f.render_widget(
+            Paragraph::new(Line::styled(fit(&text, width), muted)),
+            note_area,
+        );
+    }
+}
+
+/// Línea de una fila: el nombre recortado a su ancho y, en cada columna, su símbolo. La celda
+/// del cursor va invertida.
+fn row_line(
+    row: &MatrixRow,
+    on_cursor_row: bool,
+    cursor_col: usize,
+    widths: &[usize],
+    name_width: usize,
+    theme: &Theme,
+) -> Line<'static> {
+    let name_style = if on_cursor_row {
+        theme
+            .style(StyleToken::Heading)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        theme.style(StyleToken::Default)
+    };
+    let name = fit(row.component, name_width.saturating_sub(GAP));
+    let mut spans = vec![Span::styled(
+        format!("{name:<w$}", w = name_width),
+        name_style,
+    )];
+    for (column, cell) in row.cells.iter().enumerate() {
+        let (symbol, style) = match cell {
+            Cell::Own(_) => ("●", theme.style(StyleToken::Success)),
+            Cell::Generic => ("◐", theme.style(StyleToken::Warning)),
+            Cell::Missing => ("·", theme.style(StyleToken::Muted)),
+        };
+        let slot = format!("{symbol:<w$}", w = widths[column]);
+        if on_cursor_row && column == cursor_col {
+            spans.push(Span::styled(slot, style.add_modifier(Modifier::REVERSED)));
+        } else {
+            spans.push(Span::styled(slot, style));
+        }
+    }
+    Line::from(spans)
+}
+
+/// Texto de la celda bajo el cursor: componente, columna y estado. Vacío si no hay filas.
+fn cell_text(show: &Showcase) -> String {
+    let (row_index, column) = show.matrix_cursor();
+    let (Some(row), Some((name, preset))) =
+        (show.matrix().rows.get(row_index), COLUMNS.get(column))
+    else {
+        return String::new();
+    };
+    let head = format!("{} · {name}", row.component);
+    let state = match show.matrix_cell() {
+        Some(Cell::Own(1)) => format!("{head}: 1 demo propio"),
+        Some(Cell::Own(n)) => format!("{head}: {n} demos propios"),
+        Some(Cell::Generic) => format!("{head}: sin demo propio, se usa el de Batten"),
+        Some(Cell::Missing) | None => format!("{head}: no existe"),
+    };
+    if preset.is_none() {
+        format!("{state} (sin paleta propia: se usa el tema activo)")
+    } else {
+        state
+    }
+}
+
+/// Nota al pie: componentes de dotmax (librería, no tema) y demos sin proveedor reconocido.
+fn note_text(matrix: &Matrix) -> Option<String> {
+    let mut parts = Vec::new();
+    // El recuento va primero: es corto, y al recortar la línea se pierde antes la lista.
+    if !matrix.left_out.is_empty() {
+        parts.push(format!(
+            "{} demos sin proveedor reconocido",
+            matrix.left_out.len()
+        ));
+    }
+    if !matrix.library.is_empty() {
+        parts.push(format!(
+            "dotmax es una librería, no un tema: {}",
+            matrix.library.join(", ")
+        ));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+/// Recorta `text` a `width` caracteres (no bytes), terminando en `…` si hay que cortar.
+fn fit(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut out: String = text.chars().take(width - 1).collect();
+    out.push('…');
+    out
 }
 
 #[cfg(test)]

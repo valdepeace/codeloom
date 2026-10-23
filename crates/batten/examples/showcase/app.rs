@@ -280,22 +280,16 @@ impl Showcase {
     }
 
     /// Matriz de componentes por tema.
-    // Lo leerá el dibujo de la matriz (Tarea 3); hasta entonces solo lo ejercitan los tests.
-    #[allow(dead_code)]
     pub fn matrix(&self) -> &Matrix {
         &self.matrix
     }
 
     /// Posición (fila, columna) del cursor de la matriz.
-    // Lo leerá el dibujo de la matriz (Tarea 3); hasta entonces solo lo ejercitan los tests.
-    #[allow(dead_code)]
     pub fn matrix_cursor(&self) -> (usize, usize) {
         self.matrix_cursor
     }
 
     /// Celda bajo el cursor de la matriz, o `None` si la matriz no tiene filas.
-    // Lo leerá el dibujo de la matriz (Tarea 3); hasta entonces solo lo ejercitan los tests.
-    #[allow(dead_code)]
     pub fn matrix_cell(&self) -> Option<Cell> {
         let (row, column) = self.matrix_cursor;
         self.matrix

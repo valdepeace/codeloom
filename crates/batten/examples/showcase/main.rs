@@ -9,6 +9,7 @@ mod prompt_keys;
 
 use app::{route, Action, Focus, Showcase};
 use batten::widgets::{Anim, Theme, ThemePreset, FRAME_INTERVAL};
+use matrix::draw_matrix;
 use ratatui::crossterm::event::{self, Event, MouseButton, MouseEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Modifier;
@@ -91,18 +92,24 @@ fn draw(f: &mut Frame, show: &mut Showcase, _anim: &Anim, theme: &Theme) {
     let parts = Layout::vertical([Constraint::Length(header_h), Constraint::Min(1)]).split(panel);
     let (header, content) = (parts[0], parts[1]);
 
+    // En la matriz no se consulta `fullscreen()`: el panel de contenido es siempre la matriz.
+    let matrix_mode = show.focus() == Focus::Matrix;
+    let fullscreen = !matrix_mode && show.current().is_some_and(|demo| demo.fullscreen());
+
     if let Some(ia) = index {
         draw_index(f, ia, show, theme);
-        if !show.current().is_some_and(|demo| demo.fullscreen()) {
+        if !fullscreen {
             draw_header(f, header, show, theme);
         }
     } else {
-        if !show.current().is_some_and(|demo| demo.fullscreen()) {
+        if !fullscreen {
             draw_collapsed(f, header, show, theme);
         }
     }
 
-    if let Some(demo) = show.current() {
+    if matrix_mode {
+        draw_matrix(f, content, show, theme);
+    } else if let Some(demo) = show.current() {
         demo.render(f, if demo.fullscreen() { panel } else { content }, theme);
     }
     draw_footer(f, footer, show.theme_preset(), theme);
@@ -316,6 +323,8 @@ fn draw_footer(f: &mut Frame, area: Rect, preset: ThemePreset, theme: &Theme) {
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
     use ratatui::Terminal;
 
     #[test]
@@ -328,5 +337,160 @@ mod tests {
             let mut term = Terminal::new(backend).unwrap();
             term.draw(|f| draw(f, &mut show, &anim, &theme)).unwrap();
         }
+    }
+
+    /// Cabecera de columnas de la matriz tal como se dibuja (sin el hueco del nombre).
+    const HEADER: &str = "Batten Martty Mindfork Pawan Crush MastraCode CodeLoom";
+
+    fn press(show: &mut Showcase, code: KeyCode) {
+        route(show, KeyEventKind::Press, code, KeyModifiers::NONE);
+    }
+
+    /// Dibuja el showcase completo en un buffer de `w`×`h`.
+    fn render(show: &mut Showcase, w: u16, h: u16) -> Buffer {
+        let anim = Anim::new();
+        let theme = Theme::preset(show.theme_preset());
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw(f, show, &anim, &theme)).unwrap();
+        term.backend().buffer().clone()
+    }
+
+    /// Líneas de texto del buffer desde la columna `x0`.
+    fn lines(buffer: &Buffer, x0: u16) -> Vec<String> {
+        (0..buffer.area.height)
+            .map(|y| {
+                (x0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Filas de la matriz: las que hay entre la cabecera de columnas y la leyenda.
+    fn matrix_table(lines: &[String]) -> &[String] {
+        let head = lines
+            .iter()
+            .position(|line| line.contains(HEADER))
+            .expect("cabecera de columnas");
+        let legend = lines
+            .iter()
+            .position(|line| line.contains("genérico"))
+            .expect("leyenda");
+        &lines[head + 1..legend]
+    }
+
+    /// Mueve el cursor de la matriz a la celda (componente, columna), buscándolas por nombre.
+    fn place(show: &mut Showcase, component: &str, column: &str) {
+        let row = show
+            .matrix()
+            .rows
+            .iter()
+            .position(|row| row.component == component)
+            .expect("fila del componente");
+        let column = matrix::COLUMNS
+            .iter()
+            .position(|(name, _)| *name == column)
+            .expect("columna");
+        for _ in 0..1000 {
+            press(show, KeyCode::Up);
+            press(show, KeyCode::Left);
+        }
+        for _ in 0..row {
+            press(show, KeyCode::Down);
+        }
+        for _ in 0..column {
+            press(show, KeyCode::Right);
+        }
+    }
+
+    #[test]
+    fn matrix_shows_the_three_symbols_and_all_columns() {
+        let mut show = Showcase::new();
+        press(&mut show, KeyCode::Char('m'));
+        let buffer = render(&mut show, 100, 40);
+        let lines = lines(&buffer, INDEX_WIDTH);
+        assert!(
+            lines.iter().any(|line| line.contains(HEADER)),
+            "faltan los siete nombres de columna"
+        );
+        let table = matrix_table(&lines).join("\n");
+        for symbol in ["●", "◐", "·"] {
+            assert!(table.contains(symbol), "falta {symbol} en la matriz");
+        }
+    }
+
+    #[test]
+    fn matrix_marks_the_cursor_column() {
+        let mut show = Showcase::new();
+        press(&mut show, KeyCode::Char('m'));
+        place(&mut show, "Composer", "Crush");
+        let buffer = render(&mut show, 100, 40);
+        let reversed: Vec<(u16, u16)> = (INDEX_WIDTH..buffer.area.width)
+            .flat_map(|x| (0..buffer.area.height).map(move |y| (x, y)))
+            .filter(|&(x, y)| buffer[(x, y)].modifier.contains(Modifier::REVERSED))
+            .collect();
+        assert!(!reversed.is_empty(), "ninguna celda invertida");
+        let y = reversed[0].1;
+        assert!(reversed.iter().all(|&(_, row)| row == y));
+        // La celda invertida es la de Composer en Crush: un demo propio, «●».
+        assert_eq!(buffer[(reversed[0].0, y)].symbol(), "●");
+
+        // El encabezado de Crush va resaltado en negrita.
+        let header_y = lines(&buffer, INDEX_WIDTH)
+            .iter()
+            .position(|line| line.contains(HEADER))
+            .expect("cabecera de columnas") as u16;
+        let header = lines(&buffer, INDEX_WIDTH).swap_remove(usize::from(header_y));
+        let crush_x = INDEX_WIDTH + header.find("Crush").expect("Crush en la cabecera") as u16;
+        assert!(buffer[(crush_x, header_y)]
+            .modifier
+            .contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn matrix_scrolls_to_keep_the_cursor_visible() {
+        let mut show = Showcase::new();
+        press(&mut show, KeyCode::Char('m'));
+        let rows = show.matrix().rows.len();
+        let first = show.matrix().rows[0].component;
+        let last = show.matrix().rows[rows - 1].component;
+        for _ in 0..rows {
+            press(&mut show, KeyCode::Char('j'));
+        }
+        let buffer = render(&mut show, 100, 40);
+        let table = matrix_table(&lines(&buffer, INDEX_WIDTH)).to_vec();
+        // Los nombres se recortan al ancho de la columna de nombre: se compara el prefijo.
+        let prefix = |name: &str| name.chars().take(6).collect::<String>();
+        assert!(
+            table.iter().any(|line| line.starts_with(&prefix(last))),
+            "la última fila ({last}) debe verse con el cursor al final"
+        );
+        assert!(
+            table.iter().all(|line| !line.starts_with(&prefix(first))),
+            "la primera fila ({first}) debe haber salido del área"
+        );
+    }
+
+    #[test]
+    fn matrix_fits_in_a_narrow_terminal_without_panic() {
+        let mut show = Showcase::new();
+        press(&mut show, KeyCode::Char('m'));
+        let buffer = render(&mut show, 60, 20);
+        assert!(lines(&buffer, 0).iter().any(|line| line.contains(HEADER)));
+        render(&mut show, 20, 5);
+    }
+
+    #[test]
+    fn footer_names_the_cell_under_the_cursor() {
+        let mut show = Showcase::new();
+        press(&mut show, KeyCode::Char('m'));
+        place(&mut show, "Composer", "Pawan");
+        let buffer = render(&mut show, 100, 40);
+        assert!(
+            lines(&buffer, INDEX_WIDTH)
+                .iter()
+                .any(|line| line.contains("Composer · Pawan: sin demo propio")),
+            "el pie debe nombrar la celda bajo el cursor"
+        );
     }
 }
