@@ -32,6 +32,7 @@ fn prefix(kind: LineKind) -> &'static str {
         LineKind::ToolBody | LineKind::ToolDiff(_) => "│ ",
         LineKind::ToolMore => "  ",
         LineKind::NodeHead(_) | LineKind::NodeBody => "",
+        LineKind::Fold => "",
     }
 }
 
@@ -58,6 +59,7 @@ fn kind_token(kind: LineKind) -> StyleToken {
         LineKind::ToolMore => StyleToken::Dim,
         LineKind::NodeHead(status) => status_token(status),
         LineKind::NodeBody => StyleToken::Muted,
+        LineKind::Fold => StyleToken::Dim,
     }
 }
 

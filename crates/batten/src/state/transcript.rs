@@ -30,6 +30,8 @@ pub enum LineKind {
     NodeHead(ToolStatus),
     /// Hijo de un nodo de subagente desplegado. El guion de árbol va en el texto.
     NodeBody,
+    /// Aviso de que un bloque largo tiene líneas plegadas.
+    Fold,
 }
 
 /// Token semantico de estilo. La capa `state` no conoce colores: los widgets
@@ -142,11 +144,36 @@ struct Entry {
     source: String,
     lines: Vec<Line>,
     rev: u64,
+    /// Se deriva de un texto de usuario o de asistente: es la única clase de entrada que se pliega.
+    foldable: bool,
+    /// Ya no recibe texto. Mientras llega (streaming) se ve entera, aunque sea larga.
+    sealed: bool,
+    /// La persona usuaria la ha desplegado.
+    expanded: bool,
+    /// Líneas que tendría desplegada.
+    total: usize,
 }
 
 impl Entry {
-    fn derive(&mut self) {
-        self.lines = match self.format {
+    fn new(kind: LineKind, format: Format, source: String, sealed: bool) -> Self {
+        Self {
+            kind,
+            format,
+            source,
+            lines: Vec::new(),
+            rev: 0,
+            foldable: matches!(kind, LineKind::User | LineKind::Assistant),
+            sealed,
+            expanded: false,
+            total: 0,
+        }
+    }
+
+    /// Líneas visibles a partir del texto. Con `limit`, una entrada sellada y sin desplegar que
+    /// pase de `limit` líneas muestra las primeras y un aviso con las que oculta. No se pliega
+    /// si solo sobraría una línea: el aviso ocuparía lo mismo que ella.
+    fn derive(&mut self, limit: Option<usize>) {
+        let mut lines = match self.format {
             Format::Plain => self
                 .source
                 .lines()
@@ -154,6 +181,18 @@ impl Entry {
                 .collect(),
             Format::Markdown => super::markdown::parse(&self.source, self.kind),
         };
+        self.total = lines.len();
+        if let Some(limit) = limit {
+            if self.foldable && self.sealed && !self.expanded && lines.len() > limit + 1 {
+                let hidden = lines.len() - limit;
+                lines.truncate(limit);
+                lines.push(Line::new(
+                    LineKind::Fold,
+                    format!("… ({hidden} lines hidden) [click or space to expand]"),
+                ));
+            }
+        }
+        self.lines = lines;
     }
 }
 
@@ -167,6 +206,8 @@ pub struct Transcript {
     starts: Vec<usize>,
     total_lines: usize,
     next_rev: u64,
+    /// Líneas a partir de las cuales se pliega un bloque largo. `None`: nunca.
+    fold_limit: Option<usize>,
 }
 
 impl Transcript {
@@ -187,22 +228,90 @@ impl Transcript {
         EntryId(self.entries.len() - 1)
     }
 
-    /// Nueva entrada a partir de su texto.
+    /// Nueva entrada a partir de su texto, ya completa (puede plegarse).
     pub fn push_entry(
         &mut self,
         kind: LineKind,
         format: Format,
         text: impl Into<String>,
     ) -> EntryId {
-        let mut entry = Entry {
-            kind,
-            format,
-            source: text.into(),
-            lines: Vec::new(),
-            rev: 0,
-        };
-        entry.derive();
+        let mut entry = Entry::new(kind, format, text.into(), true);
+        entry.derive(self.fold_limit);
         self.push_built(entry)
+    }
+
+    /// Nueva entrada que seguirá recibiendo texto con `append`: no se pliega hasta `settle`.
+    pub fn push_streaming(
+        &mut self,
+        kind: LineKind,
+        format: Format,
+        text: impl Into<String>,
+    ) -> EntryId {
+        let mut entry = Entry::new(kind, format, text.into(), false);
+        entry.derive(self.fold_limit);
+        self.push_built(entry)
+    }
+
+    /// Fija a partir de cuántas líneas se pliega un bloque largo (`None`: nunca) y recalcula.
+    pub fn set_fold_limit(&mut self, limit: Option<usize>) {
+        self.fold_limit = limit;
+        self.rederive_all();
+    }
+
+    /// Da por terminado el texto de todas las entradas: las largas se pliegan.
+    pub fn settle(&mut self) {
+        for entry in &mut self.entries {
+            entry.sealed = true;
+        }
+        self.rederive_all();
+    }
+
+    /// Re-deriva las entradas cuyo aspecto cambia y reindexa. Las que no cambian conservan su
+    /// revisión, para no invalidar su medida.
+    fn rederive_all(&mut self) {
+        let limit = self.fold_limit;
+        let mut first_changed = None;
+        for i in 0..self.entries.len() {
+            let mut probe = self.entries[i].clone();
+            if probe.foldable {
+                probe.derive(limit);
+            }
+            if probe.lines != self.entries[i].lines {
+                probe.rev = self.bump();
+                self.entries[i] = probe;
+                first_changed.get_or_insert(i);
+            } else {
+                self.entries[i].total = probe.total;
+            }
+        }
+        if let Some(i) = first_changed {
+            self.reindex_from(i);
+        }
+    }
+
+    /// `true` si la entrada `i` tiene más líneas que el límite de pliegue (esté plegada o no).
+    pub fn is_foldable(&self, i: usize) -> bool {
+        let Some(limit) = self.fold_limit else {
+            return false;
+        };
+        self.entries
+            .get(i)
+            .is_some_and(|e| e.foldable && e.sealed && e.total > limit + 1)
+    }
+
+    /// Pliega o despliega la entrada `i`. `false` si no hay nada que plegar en ella.
+    pub fn toggle_fold(&mut self, i: usize) -> bool {
+        if !self.is_foldable(i) {
+            return false;
+        }
+        let limit = self.fold_limit;
+        let rev = self.bump();
+        let entry = &mut self.entries[i];
+        entry.expanded = !entry.expanded;
+        entry.derive(limit);
+        entry.rev = rev;
+        self.reindex_from(i);
+        true
     }
 
     /// Entrada con líneas ya construidas. Admite una lista vacía. Estas
@@ -236,35 +345,31 @@ impl Transcript {
             .map(|l| l.text.as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        Entry {
-            kind,
-            format: Format::Plain,
-            source,
-            lines,
-            rev: 0,
-        }
+        let mut entry = Entry::new(kind, Format::Plain, source, true);
+        entry.foldable = false;
+        entry.lines = lines;
+        entry
     }
 
     /// Una línea ya construida como entrada propia (no admite `append`).
     pub fn push(&mut self, line: Line) {
-        let entry = Entry {
-            kind: line.kind,
-            format: Format::Plain,
-            source: line.text.clone(),
-            lines: vec![line],
-            rev: 0,
-        };
+        let mut entry = Entry::new(line.kind, Format::Plain, line.text.clone(), true);
+        entry.foldable = false;
+        entry.lines = vec![line];
         self.push_built(entry);
     }
 
     /// Añade texto a una entrada y re-deriva solo sus líneas.
     pub fn append(&mut self, id: EntryId, delta: &str) {
+        let limit = self.fold_limit;
         let rev = self.bump();
         let Some(entry) = self.entries.get_mut(id.0) else {
             return;
         };
         entry.source.push_str(delta);
-        entry.derive();
+        // Vuelve a llegar texto: se ve entera hasta el próximo `settle`.
+        entry.sealed = false;
+        entry.derive(limit);
         entry.rev = rev;
         self.reindex_from(id.0);
     }
@@ -436,5 +541,116 @@ mod tests {
         t.replace(id, Vec::new());
         assert_eq!(t.len(), 2);
         assert_eq!(t.line(1).unwrap().plain(), "despues");
+    }
+
+    fn lines_of(n: usize) -> String {
+        (1..=n)
+            .map(|i| format!("l{i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_long_sealed_block_folds_to_the_limit_with_a_hint() {
+        let mut t = Transcript::new();
+        t.set_fold_limit(Some(10));
+        t.push_entry(LineKind::Assistant, Format::Plain, lines_of(20));
+        t.push_entry(LineKind::User, Format::Plain, "despues");
+
+        assert_eq!(t.entry_lines(0).len(), 11);
+        assert_eq!(t.entry_lines(0)[9].plain(), "l10");
+        let aviso = t.entry_lines(0).last().unwrap();
+        assert_eq!(aviso.kind, LineKind::Fold);
+        assert_eq!(
+            aviso.plain(),
+            "… (10 lines hidden) [click or space to expand]"
+        );
+        // Los índices globales cuentan las líneas visibles.
+        assert_eq!(t.entry_start(1), 11);
+        assert_eq!(t.len(), 12);
+    }
+
+    #[test]
+    fn a_block_that_would_hide_a_single_line_is_not_folded() {
+        let mut t = Transcript::new();
+        t.set_fold_limit(Some(10));
+        t.push_entry(LineKind::Assistant, Format::Plain, lines_of(11));
+        t.push_entry(LineKind::Assistant, Format::Plain, lines_of(12));
+
+        assert_eq!(t.entry_lines(0).len(), 11, "11 líneas caben");
+        assert!(t.entry_lines(0).iter().all(|l| l.kind != LineKind::Fold));
+        assert_eq!(t.entry_lines(1).len(), 11, "12 líneas sí se pliegan");
+        assert_eq!(t.entry_lines(1).last().unwrap().kind, LineKind::Fold);
+    }
+
+    #[test]
+    fn a_streaming_block_is_whole_until_it_settles() {
+        let mut t = Transcript::new();
+        t.set_fold_limit(Some(10));
+        let id = t.push_streaming(LineKind::Assistant, Format::Plain, lines_of(5));
+        t.append(id, "\nl6\nl7\nl8\nl9\nl10\nl11\nl12\nl13\nl14\nl15\nl16");
+        assert_eq!(t.entry_lines(0).len(), 16, "se ve entera mientras llega");
+
+        t.settle();
+        assert_eq!(t.entry_lines(0).len(), 11);
+
+        // Si vuelve a llegar texto, se despliega otra vez hasta el siguiente `settle`.
+        t.append(id, "\nmas");
+        assert_eq!(t.entry_lines(0).len(), 17);
+    }
+
+    #[test]
+    fn toggling_expands_and_collapses_and_reindexes_the_rest() {
+        let mut t = Transcript::new();
+        t.set_fold_limit(Some(10));
+        t.push_entry(LineKind::Assistant, Format::Plain, lines_of(20));
+        t.push_entry(LineKind::User, Format::Plain, "despues");
+        let rev = t.entry_rev(0);
+
+        assert!(t.is_foldable(0));
+        assert!(t.toggle_fold(0));
+        assert_eq!(t.entry_lines(0).len(), 20);
+        assert!(t.entry_lines(0).iter().all(|l| l.kind != LineKind::Fold));
+        assert_eq!(t.entry_start(1), 20);
+        assert!(t.entry_rev(0) > rev);
+        assert!(t.is_foldable(0), "desplegada sigue siendo plegable");
+
+        assert!(t.toggle_fold(0));
+        assert_eq!(t.entry_lines(0).len(), 11);
+        assert_eq!(t.entry_start(1), 11);
+    }
+
+    #[test]
+    fn only_user_and_assistant_text_folds_and_no_limit_means_never() {
+        let mut t = Transcript::new();
+        t.set_fold_limit(Some(10));
+        t.push_entry(LineKind::System, Format::Plain, lines_of(30));
+        t.push_lines(
+            (0..30)
+                .map(|i| Line::new(LineKind::Assistant, format!("x{i}")))
+                .collect(),
+        );
+        assert_eq!(t.entry_lines(0).len(), 30);
+        assert_eq!(t.entry_lines(1).len(), 30);
+        assert!(!t.toggle_fold(0));
+        assert!(!t.toggle_fold(1));
+
+        let mut libre = Transcript::new();
+        libre.push_entry(LineKind::Assistant, Format::Plain, lines_of(50));
+        assert_eq!(libre.entry_lines(0).len(), 50);
+        libre.set_fold_limit(Some(10));
+        assert_eq!(libre.entry_lines(0).len(), 11);
+        libre.set_fold_limit(None);
+        assert_eq!(libre.entry_lines(0).len(), 50);
+    }
+
+    #[test]
+    fn settling_leaves_untouched_entries_with_their_revision() {
+        let mut t = Transcript::new();
+        t.set_fold_limit(Some(10));
+        t.push_entry(LineKind::User, Format::Plain, "corto");
+        let rev = t.entry_rev(0);
+        t.settle();
+        assert_eq!(t.entry_rev(0), rev, "no se re-mide lo que no cambia");
     }
 }
