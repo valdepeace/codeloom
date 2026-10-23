@@ -542,9 +542,39 @@ impl AgentLoop {
                 max_tokens: 4096,
                 effort: config.effort.clone(),
             };
-            let mut stream = tokio::select! {
+            let abierto = tokio::select! {
                 _ = cancel.cancelled() => break,
-                result = provider.stream(req, cancel.clone()) => result?,
+                result = provider.stream(req, cancel.clone()) => result,
+            };
+            let mut stream = match abierto {
+                Ok(stream) => stream,
+                // Red de seguridad de la compactación: la estimación local pudo quedarse corta y el
+                // proveedor rechaza la petición por exceder la ventana. Se resume por fuerza y se
+                // reintenta, con el mismo tope de compactaciones por turno que la vía normal, de
+                // modo que el bucle no puede ser infinito. Si no hay corte posible, o el resumen
+                // falla, se devuelve el error original.
+                Err(error)
+                    if compact::is_context_overflow(&error)
+                        && compactions < compact::MAX_COMPACTIONS_PER_TURN
+                        && !compaction_failed
+                        && compact::choose_cut(&history).is_some() =>
+                {
+                    tracing::warn!(error = %error, "el proveedor rechazó el contexto por exceso; se compacta y se reintenta");
+                    let tokens_before =
+                        compact::estimate_context_tokens(&history, system.len()) as u64;
+                    match self
+                        .compact_or_activate(session, &history, tokens_before, &cancel)
+                        .await
+                    {
+                        Ok(true) => {
+                            compactions += 1;
+                            continue;
+                        }
+                        Ok(false) if cancel.is_cancelled() => break,
+                        Ok(false) | Err(_) => return Err(error),
+                    }
+                }
+                Err(error) => return Err(error),
             };
             let mut text_buf = String::new();
             let mut tool_calls: Vec<(String, String, serde_json::Value)> = Vec::new();
@@ -2740,6 +2770,8 @@ Cuerpo.
         falla_resumen: bool,
         normales: Mutex<VecDeque<Vec<StreamChunk>>>,
         seen: Mutex<Vec<ProviderRequest>>,
+        /// Cuántas peticiones normales (no de resumen) se rechazan aún por exceso de contexto.
+        desbordes: Mutex<usize>,
     }
 
     #[async_trait]
@@ -2766,6 +2798,16 @@ Cuerpo.
                     StreamChunk::TextDelta(self.resumen.clone()),
                     StreamChunk::Done(FinishReason::Stop),
                 ])));
+            }
+            {
+                let mut desbordes = self.desbordes.lock().unwrap();
+                if *desbordes > 0 {
+                    *desbordes -= 1;
+                    return Err(crate::error::CoreError::Provider(
+                        "http 400 Bad Request: This model's maximum context length is 8192 tokens"
+                            .into(),
+                    ));
+                }
             }
             let guion = self
                 .normales
@@ -2898,7 +2940,75 @@ Cuerpo.
             falla_resumen,
             normales: Mutex::new(VecDeque::from(normales)),
             seen: Mutex::new(Vec::new()),
+            desbordes: Mutex::new(0),
         }
+    }
+
+    /// Como `proveedor_de`, pero las primeras `n` peticiones normales las rechaza por exceso de
+    /// contexto.
+    fn proveedor_que_desborda(resumen: &str, n: usize) -> PlanProvider {
+        let proveedor = proveedor_de(resumen, false, vec![]);
+        *proveedor.desbordes.lock().unwrap() = n;
+        proveedor
+    }
+
+    #[tokio::test]
+    async fn a_context_overflow_rejection_compacts_and_retries_the_request() {
+        // Ventana enorme: la compactación preventiva no actúa; sólo el rechazo del proveedor.
+        let historial = historial_grande(100);
+        let e = entorno_de_turno(
+            proveedor_que_desborda("resumen", 1),
+            catalogo_de_ventana(10_000_000),
+            &historial,
+            ToolRegistry::new(),
+        )
+        .await;
+
+        e.agente
+            .run(e.sid, "hi".into(), CancellationToken::new())
+            .await
+            .expect("el turno se recupera del rechazo");
+
+        let vistas = e.proveedor.seen.lock().unwrap();
+        let normales: Vec<_> = vistas
+            .iter()
+            .filter(|r| !es_peticion_de_resumen(r))
+            .collect();
+        assert_eq!(normales.len(), 2, "la petición rechazada y su reintento");
+        assert_eq!(vistas.len(), 3, "más una de resumen");
+        assert!(
+            normales[1].messages.len() < normales[0].messages.len(),
+            "el reintento lleva el historial resumido"
+        );
+        assert!(compact::parse_summary(&normales[1].messages[0]).is_some());
+    }
+
+    #[tokio::test]
+    async fn a_context_overflow_that_persists_stops_after_the_compaction_limit() {
+        let historial = historial_grande(100);
+        let e = entorno_de_turno(
+            proveedor_que_desborda("resumen", usize::MAX),
+            catalogo_de_ventana(10_000_000),
+            &historial,
+            ToolRegistry::new(),
+        )
+        .await;
+
+        let Err(error) = e
+            .agente
+            .run(e.sid, "hi".into(), CancellationToken::new())
+            .await
+        else {
+            panic!("sin remedio, el error debe llegar");
+        };
+        assert!(compact::is_context_overflow(&error), "{error}");
+
+        let vistas = e.proveedor.seen.lock().unwrap();
+        let resumenes = vistas.iter().filter(|r| es_peticion_de_resumen(r)).count();
+        assert!(
+            resumenes <= compact::MAX_COMPACTIONS_PER_TURN,
+            "{resumenes} resúmenes"
+        );
     }
 
     /// Historial alternado: los pares son llamadas del asistente y los impares sus resultados. Cada

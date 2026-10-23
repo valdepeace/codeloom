@@ -73,8 +73,9 @@ que no tiene cota acabará, tarde o temprano, desbordándose.**
    compactación o resumen de lo antiguo. *Estado: **hecho en lo esencial**. Limpieza de
    resultados antiguos de herramientas (`2026-10-22-codeloom-context-compaction-design.md`) y,
    desde el 2026-10-23, resumen del historial con el modelo al alcanzar el 80 % de la ventana
-   (`2026-10-23-codeloom-context-summary-design.md`). Faltan `/compact` manual y el reintento
-   reactivo ante un rechazo por contexto excedido; sin ventana conocida no se compacta. Desde el
+   (`2026-10-23-codeloom-context-summary-design.md`). Falta `/compact` manual. Ante un
+   rechazo `400`/`413` por contexto excedido se compacta y se reintenta (fórmulas de error sin
+   contrastar con los proveedores); sin ventana conocida no se compacta por umbral. Desde el
    mismo día existe, **opt-in** (`[compaction] background = true`), la preparación del resumen en
    segundo plano al 60 % para activarlo al 80 % sin detener el turno
    (`2026-10-23-codeloom-background-compaction-design.md`); su coste real está sin medir. Véase

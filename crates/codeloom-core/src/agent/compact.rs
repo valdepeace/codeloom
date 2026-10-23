@@ -238,6 +238,30 @@ pub fn should_compact(history: &[Message], system_bytes: usize, window: u64) -> 
     estimate_context_tokens(history, system_bytes) as f64 >= window as f64 * COMPACT_RATIO
 }
 
+/// `true` si el error es el rechazo del proveedor por exceder la ventana de contexto: un `400` o
+/// `413` cuyo cuerpo menciona alguna de las fórmulas habituales («maximum context length»,
+/// «prompt is too long»…). Las fórmulas son las que se recuerdan de los proveedores, sin
+/// contrastarlas contra su documentación; un proveedor con otra redacción no se reconoce y el
+/// error se propaga como siempre. Sólo se examina el texto de `CoreError::Provider`, cuyo formato
+/// es `http {estado}: {cuerpo}`.
+pub fn is_context_overflow(error: &CoreError) -> bool {
+    const FORMULAS: [&str; 7] = [
+        "maximum context length",
+        "context_length_exceeded",
+        "context length",
+        "context window",
+        "prompt is too long",
+        "too many tokens",
+        "exceeds the context",
+    ];
+    let CoreError::Provider(mensaje) = error else {
+        return false;
+    };
+    let mensaje = mensaje.to_lowercase();
+    (mensaje.starts_with("http 400") || mensaje.starts_with("http 413"))
+        && FORMULAS.iter().any(|f| mensaje.contains(f))
+}
+
 /// Posición cruda `N` desde la que se conserva la cola, u `None` si no hay nada que resumir.
 ///
 /// La cola se forma desde el final hasta alcanzar `KEEP_TAIL_TOKENS`. Después se legaliza el
@@ -287,6 +311,29 @@ pub fn choose_cut(history: &[Message]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_overflow_is_recognised_only_for_a_400_or_413_with_a_known_wording() {
+        let p = |t: &str| CoreError::Provider(t.to_string());
+        assert!(is_context_overflow(&p(
+            "http 400 Bad Request: {\"error\":{\"message\":\"This model's maximum context length is 8192 tokens\"}}"
+        )));
+        assert!(is_context_overflow(&p(
+            "http 400 Bad Request: prompt is too long: 250000 tokens > 200000 maximum"
+        )));
+        assert!(is_context_overflow(&p(
+            "http 413 Payload Too Large: context window exceeded"
+        )));
+        // Otro estado con la misma redacción: no es un rechazo de este tipo.
+        assert!(!is_context_overflow(&p(
+            "http 500 Internal: maximum context length"
+        )));
+        // Un 400 que no habla de contexto (clave inválida, esquema roto…) no se reintenta.
+        assert!(!is_context_overflow(&p(
+            "http 400 Bad Request: invalid tool schema"
+        )));
+        assert!(!is_context_overflow(&CoreError::Cancelled));
+    }
     use crate::message::Usage;
 
     #[test]

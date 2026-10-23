@@ -94,8 +94,11 @@ anterior más lo que vino después.
 - **`/compact` manual:** la TUI no tiene ninguna infraestructura de comandos con barra; es otra
   tarea de producto.
 - **Reintento reactivo** al recibir del proveedor un rechazo por contexto excedido (lo hacen
-  deepseek-harness, opencode y qwen-code): requiere reconocer el texto del error por proveedor,
-  que no tenemos contrastado. Pendiente.
+  deepseek-harness, opencode y qwen-code): **hecho el 2026-10-23** (`is_context_overflow` en
+  `compact.rs`, rama en `run_turn`). Se reconoce un `400`/`413` cuyo cuerpo contiene alguna de
+  siete fórmulas («maximum context length», «prompt is too long»…), que son **las que se recuerdan
+  de los proveedores, sin contrastar con su documentación**: un proveedor con otra redacción no se
+  reconoce y su error se propaga como antes. Comparte el tope `MAX_COMPACTIONS_PER_TURN`.
 - **Restaurar ficheros** tras compactar (qwen-code restaura hasta 5): no se hace.
 - **Presupuesto de tokens de gasto:** decisión de producto sin tomar; es otra cosa que la ventana.
 
@@ -140,7 +143,8 @@ propio en la TUI) y `cd04d13` (apunte del consumo de la llamada de resumen).
   tokens cacheados y la estimación se quedaría corta; habría que sumar los campos de caché.
 - **Sin ventana conocida no se compacta** (modelo ausente del catálogo, catálogo sin descargar o
   sin red). La limpieza de resultados antiguos sigue activa.
-- **`/compact` manual** y **reintento reactivo** ante un rechazo por contexto excedido: sin hacer.
+- **`/compact` manual**: sin hacer. El **reintento reactivo** ante un rechazo por contexto
+  excedido está hecho (véase arriba), con fórmulas de error sin contrastar.
 - **Presupuesto de tokens de gasto:** decisión de producto sin tomar.
 - **Subagentes:** heredan el mecanismo porque usan el mismo bucle y el catálogo compartido, pero
   no hay un test específico de un hijo que compacte.
