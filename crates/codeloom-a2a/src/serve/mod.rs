@@ -8,4 +8,6 @@
 pub mod auth;
 pub mod card;
 pub mod config;
+pub mod confine;
+pub mod host;
 pub mod rpc;

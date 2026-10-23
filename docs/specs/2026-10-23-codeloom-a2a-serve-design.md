@@ -51,6 +51,15 @@ cite el protocolo es decisión nuestra.
   más: ni `edit`, ni `bash`, ni jobs, ni subagentes, ni `ask_user`, ni `todo`. Motivo: nadie aprobaría
   un permiso, y la regla del proyecto es no delegar escritura en quien no está presente. Ampliarlo
   exigiría su propia spec (lista blanca por herramienta y por ruta).
+- **D4b. Lectura confinada al directorio de trabajo** (hallazgo de implementación, a revisar). `view`
+  resuelve con `cwd.join(ruta)`, de modo que una ruta absoluta o con `..` salía del proyecto y dejaba
+  al alcance de un tercero, por ejemplo, el `.env` con la clave del proveedor. El servidor envuelve
+  `view` (`ConfinedView`): ruta relativa sin `..`, forma canónica (tras resolver enlaces) dentro del
+  directorio, fichero de a lo sumo 2 MiB, y se vedan por nombre directorios (`.git`, `.ssh`, `.gnupg`,
+  `.aws`, `.azure`, `.kube`) y ficheros (`.env*`, claves `id_*`, `*.pem`, `*.key`, `*.p12`, `*.pfx`,
+  `credentials`, `.netrc`, `.npmrc`, `.pypirc`, `.pgpass`). Los nombres vedados son un primer filtro,
+  **no una garantía**: lo que protege es el confinamiento y la autenticación. `glob` y `grep` ya
+  omiten ficheros ocultos y respetan `.gitignore`.
 - **D5. Dónde escucha:** solo en bucle local (`127.0.0.1` o `::1`), puerto configurable. Una dirección
   no local es un error de configuración: el proceso no habla TLS (§13.4 exige cifrado en
   producción), así que quien quiera exponerlo ha de ponerle delante un proxy TLS que sí lo haga y

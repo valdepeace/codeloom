@@ -14,6 +14,8 @@ sha2 = "0.10"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 toml = "0.8"
 futures.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
 async-trait.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
@@ -23,4 +25,3 @@ tokio = { workspace = true, features = ["test-util"] }
 wiremock = "0.6"
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
-tokio-util.workspace = true
