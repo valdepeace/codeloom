@@ -32,8 +32,8 @@ y el trait `AgentTransport` con `send_message(&self, SendRequest, CancellationTo
 Result<SubagentDescriptor>`, `get_task(parent, SessionId)`, `list_tasks(parent)`,
 `cancel_task(parent, SessionId)` y `agent_card(Option<&str>) -> Result<AgentCard>`.
 
-- [ ] Prueba de compilación con un transporte de juguete que implemente el trait.
-- [ ] Escribir el trait con la documentación de cada operación; commitear.
+- [x] Prueba de compilación con un transporte de juguete que implemente el trait.
+- [x] Escribir el trait con la documentación de cada operación; commitear.
 
 ### Tarea 2: enviar un mensaje nuevo, consultar y listar
 
@@ -41,26 +41,26 @@ Result<SubagentDescriptor>`, `get_task(parent, SessionId)`, `list_tasks(parent)`
 
 **Interfaces:** consume la tarea 1. Produce `InProcessTransport::new(launcher, registry)`.
 
-- [ ] Pruebas: `a_new_message_starts_a_task`, `a_message_with_references_starts_a_follow_up`,
+- [x] Pruebas: `a_new_message_starts_a_task`, `a_message_with_references_starts_a_follow_up`,
   `get_task_of_another_parent_is_not_found`, `list_tasks_returns_only_the_parents_children`.
-- [ ] Implementar sobre `start`, `start_follow_up` y `list`; commitear.
+- [x] Implementar sobre `start`, `start_follow_up` y `list`; commitear.
 
 ### Tarea 3: reanudar, cancelar y tarjeta
 
 **Ficheros:** `crates/codeloom-core/src/transport.rs`.
 
-- [ ] Pruebas: `a_message_resumes_a_task_waiting_for_input`,
+- [x] Pruebas: `a_message_resumes_a_task_waiting_for_input`,
   `a_message_to_a_task_not_waiting_is_refused_and_delivers_nothing`,
   `a_resume_with_the_wrong_number_of_answers_is_refused`,
   `a_resume_with_a_non_text_part_is_refused`, `cancel_task_returns_the_canceled_task`,
   `agent_card_of_default_and_of_unknown`.
-- [ ] Implementar sobre `answer`, `cancel` y el registro; commitear.
+- [x] Implementar sobre `answer`, `cancel` y el registro; commitear.
 
 ### Tarea 4: suite de contrato y documentos
 
 **Ficheros:** `crates/codeloom-core/src/transport.rs` (módulo de pruebas) y las specs.
 
-- [ ] `pub async fn transport_contract(t: &impl AgentTransport, ...)` (bajo `#[cfg(test)]`, reutilizable
+- [x] `pub async fn transport_contract(t: &impl AgentTransport, ...)` (bajo `#[cfg(test)]`, reutilizable
   por A8 mediante una característica de prueba) que ejercite envío, consulta, listado, cancelación
   y errores; ejecutarla contra `InProcess`.
-- [ ] Sección «Estado» de la spec y roadmap (A7 [x]); commitear.
+- [x] Sección «Estado» de la spec y roadmap (A7 [x]); commitear.

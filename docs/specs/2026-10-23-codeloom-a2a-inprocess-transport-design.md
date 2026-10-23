@@ -1,7 +1,7 @@
 # Transporte `InProcess` de A2A detrás de `AgentTransport` (A7)
 
-Estado: propuesta del 2026-10-23, pendiente de aprobación (tarea A7 de
-`docs/plans/2026-10-22-codeloom-a2a-roadmap.md`). No implementar todavía.
+Estado: implementada el 2026-10-23 (véase «Estado» al final; tarea A7 de
+`docs/plans/2026-10-22-codeloom-a2a-roadmap.md`).
 
 ## Propósito
 
@@ -64,3 +64,36 @@ implementación en memoria. No toca el cable ni abre nada.
 - Si `SubagentTool` debe acabar hablando con `AgentTransport` en lugar de con el lanzador, o si el
   transporte queda solo como fachada para lo remoto y los tests.
 - Si el broker debe aceptar menos respuestas que preguntas pendientes.
+
+## Estado
+
+Implementada el 2026-10-23, **sin verla en una terminal real**: probada con proveedores simulados.
+Commits: `f87c66b` (esta spec y su plan), `3101452` (contrato y transporte en memoria) y `1106c3c`
+(suite de contrato).
+
+### Lo hecho
+
+- `crates/codeloom-core/src/transport.rs`: `SendRequest`, el trait `AgentTransport`
+  (`send_message`, `get_task`, `list_tasks`, `cancel_task`, `agent_card`) y `InProcessTransport`
+  sobre el lanzador y el registro. Sin tipos del cable ni red.
+- Un mensaje sin `task_id` crea una tarea; con una referencia, un seguimiento (A11); con `task_id`,
+  reanuda una tarea en `input-required` y cada `Part` de texto es una respuesta, en orden.
+- Característica `test-support` de `codeloom-core`, que expone `transport::contract` a otros crates.
+
+### Cómo se comprobó
+
+Once pruebas del transporte, entre ellas las de rechazo (tarea que no espera entrada, número de
+respuestas que no cuadra, partes que no son de texto, reanudar y referenciar a la vez, dos
+referencias) y la suite de contrato ejecutada contra `InProcess`. A mano se quitó la comprobación de
+`input-required` y la prueba correspondiente falló.
+
+### Lo que no consta o queda pendiente
+
+- **Decisión añadida al implementar:** el transporte en memoria rechaza cualquier `Part` que no sea
+  de texto, también al crear una tarea nueva (no solo al reanudar).
+- **Sin `SubscribeToTask`** (A9) y sin que `SubagentTool` use el transporte; sigue con el lanzador.
+- **La suite de contrato es corta a propósito:** solo lo independiente del transporte. El ciclo
+  completo de una tarea depende de cada agente y se prueba en las pruebas de cada transporte.
+- **Un solo `task_id` por tarea y una sola referencia**, como en A11.
+- **El error de «no espera entrada»** es un error de herramienta; su código de cable
+  (`UnsupportedOperationError`, −32004) lo asigna A8.

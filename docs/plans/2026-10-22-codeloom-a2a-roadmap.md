@@ -105,9 +105,10 @@ después el transporte (A7, A8).
     `docs/specs/2026-10-22-codeloom-a2a-agent-card-design.md`, sección «Estado». Plan:
     `docs/plans/2026-10-22-codeloom-a2a-agent-card.md`.
   - **Fuera de A6:** seguridad, firmas e icono de la tarjeta, que quedan para A8.
-- [ ] **A7. Transporte `InProcess`** detrás de `AgentTransport`: mensajes en memoria,
-  sin socket, para los tests. Spec y plan preparados el 2026-10-23
-  (`2026-10-23-codeloom-a2a-inprocess-transport-*`), pendientes de aprobación.
+- [x] **A7. Transporte `InProcess`** detrás de `AgentTransport`: mensajes en memoria,
+  sin socket, para los tests. **Hecho el 2026-10-23** (`3101452`, `1106c3c`): contrato
+  `AgentTransport`, `InProcessTransport` y suite de contrato. Spec y plan
+  `2026-10-23-codeloom-a2a-inprocess-transport-*`.
 - [ ] **A8. Transporte `A2aRemote`** (HTTP JSON-RPC y SSE; gRPC opcional) con roles
   `serve | consume | both`, por defecto desactivados, en el crate opcional
   `codeloom-a2a`. Aquí cobra sentido `auth-required`. Spec y plan preparados el 2026-10-23
