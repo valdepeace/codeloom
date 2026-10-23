@@ -313,6 +313,24 @@ fn draw_tree_gutter(frame: &mut Frame, texto: Rect, app: &App) {
     }
 }
 
+/// Herramienta que ocupa la tarjeta fija sobre el composer (look `Pinned`). La tarjeta cuenta qué
+/// hace el agente ahora: se muestra mientras dura el turno, o mientras la herramienta siga viva
+/// (pendiente, en curso o esperando permiso), y desaparece al acabar, cuando ya solo repetiría lo
+/// que la conversación tiene escrito. Quitarla una vez por turno, y no en cada herramienta, evita
+/// que el composer salte de sitio a cada llamada.
+fn pinned_tool(app: &App) -> Option<&batten::state::ToolItem> {
+    use batten::state::ToolStatus;
+    if app.theme.look.tool != batten::widgets::ToolStyle::Pinned {
+        return None;
+    }
+    let tool = app.tools.back()?;
+    let viva = matches!(
+        tool.status(),
+        ToolStatus::Pending | ToolStatus::Running | ToolStatus::AwaitingPermission
+    );
+    (app.turn_in_flight || app.wake_in_flight || viva).then_some(tool)
+}
+
 fn draw_transcript(frame: &mut Frame, area: Rect, app: &mut App, panes: &mut Vec<(Focus, Rect)>) {
     panes.push((Focus::Transcript, area));
     app.transcript_area = None;
@@ -346,10 +364,9 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &mut App, panes: &mut Vec
     }
     // Con el look `Pinned` la última herramienta ocupa una tarjeta fija; con
     // `Inline` aparece dentro del transcript y no reserva filas aquí.
-    let pinned = app.theme.look.tool == batten::widgets::ToolStyle::Pinned;
     let thinking_rows = u16::from(app.thinking);
     let max_tool_rows = inner.height.saturating_sub(4 + thinking_rows);
-    let tool_rows = app.tools.back().filter(|_| pinned).map_or(0, |tool| {
+    let tool_rows = pinned_tool(app).map_or(0, |tool| {
         let args = usize::from(tool.summary.as_deref().is_some_and(|s| !s.is_empty()));
         let output_lines = tool
             .output
@@ -437,7 +454,7 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &mut App, panes: &mut Vec
         let line = app.reasoning.lines().last().unwrap_or("Thinking…");
         batten::widgets::thinking::render(frame, rows[2], line, &app.animation, &app.theme);
     }
-    if let Some(tool) = app.tools.back().filter(|_| pinned) {
+    if let Some(tool) = pinned_tool(app) {
         batten::widgets::tool_item::render_crush(frame, rows[3], tool, &app.theme);
     }
     batten::widgets::composer::render_for_look(
@@ -2217,6 +2234,63 @@ tres",
         assert_eq!(tree_glyph(LineKind::ToolDiff(DiffKind::Insert)), None);
     }
 
+    fn finished_tool() -> batten::state::ToolItem {
+        let mut tool = batten::state::ToolItem::new("call-1", "view");
+        tool.set_summary(r#"{"path":"src/main.rs"}"#);
+        tool.set_result(false);
+        tool.set_output("fn main() {}");
+        tool
+    }
+
+    #[test]
+    fn the_pinned_tool_card_goes_away_once_the_turn_is_over() {
+        let mut app = App::new();
+        app.tools.push_back(finished_tool());
+
+        // Sin turno en curso y con la herramienta terminada, la tarjeta solo repetiría la
+        // conversación: no se pinta ni reserva filas.
+        let content = buffer_of(&mut app, 90, 20);
+        assert!(!content.contains("OUT"), "{content}");
+        assert!(!content.contains("DONE"), "{content}");
+
+        // Mientras dura el turno, sigue mostrando la última herramienta aunque haya acabado.
+        app.turn_in_flight = true;
+        let content = buffer_of(&mut app, 90, 20);
+        assert!(
+            content.contains("OUT") && content.contains("DONE"),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn a_live_tool_keeps_its_card_even_without_a_turn() {
+        let mut tool = batten::state::ToolItem::new("call-2", "bash");
+        tool.start();
+        let mut app = App::new();
+        app.tools.push_back(tool);
+
+        let content = buffer_of(&mut app, 90, 20);
+
+        assert!(content.contains("RUNNING"), "{content}");
+    }
+
+    #[test]
+    fn the_composer_stays_put_when_the_tool_card_goes_away() {
+        let mut app = App::new();
+        app.turn_in_flight = true;
+        app.tools.push_back(finished_tool());
+        let _ = buffer_of(&mut app, 90, 24);
+        let con_tarjeta = app.composer_area;
+        let transcript_con = app.transcript_area.unwrap().height;
+
+        app.turn_in_flight = false;
+        let _ = buffer_of(&mut app, 90, 24);
+
+        // El composer va anclado abajo: la tarjeta libera su sitio a la conversación.
+        assert_eq!(app.composer_area, con_tarjeta);
+        assert!(app.transcript_area.unwrap().height > transcript_con);
+    }
+
     #[test]
     fn help_overlay_lists_subagent_navigation() {
         let mut app = App::new();
@@ -2327,6 +2401,7 @@ tres",
         );
         tool.expanded = true;
         let mut app = App::new();
+        app.turn_in_flight = true;
         app.tools.push_back(tool);
         let content = buffer_of(&mut app, 120, 40);
         assert!(content.contains("line-19"));
@@ -2339,6 +2414,7 @@ tres",
         tool.set_result(false);
         tool.set_output("fn main() {}");
         let mut app = App::new();
+        app.turn_in_flight = true;
         app.tools.push_back(tool);
         let content = buffer_of(&mut app, 90, 20);
         assert!(content.contains("DONE"));
