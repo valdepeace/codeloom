@@ -121,6 +121,8 @@ pub struct RemoteFetched {
     /// Por qué el cliente no puede autenticarse con él (esquema no soportado, falta una variable
     /// de entorno…), ya redactado para mostrarlo. `None` si puede, o si no hace falta.
     pub auth_problem: Option<String>,
+    /// La tarjeta declara `capabilities.streaming = true`: la tarea se puede seguir por flujo (A8c).
+    pub streaming: bool,
 }
 
 /// Puntero a un agente remoto, tal como lo declara un perfil.

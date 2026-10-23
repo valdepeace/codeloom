@@ -85,6 +85,7 @@ pub async fn refresh_remote_cards_with_env(
                     env,
                 )
                 .err();
+                let streaming = remota.card.capabilities.streaming == Some(true);
                 Ok((
                     remota.card,
                     RemoteFetched {
@@ -94,6 +95,7 @@ pub async fn refresh_remote_cards_with_env(
                         requires_auth: remota.requires_auth,
                         security: remota.security,
                         auth_problem,
+                        streaming,
                     },
                 ))
             }

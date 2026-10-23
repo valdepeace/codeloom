@@ -44,6 +44,7 @@ async fn remoto() -> (A2aConfig, RemoteSpec) {
             requires_auth: tarjeta.requires_auth,
             security: tarjeta.security,
             auth_problem: None,
+            streaming: false,
         }),
         credentials: [("token".to_string(), "A2A_LIVE_TOKEN".to_string())].into(),
     };

@@ -154,6 +154,8 @@ const REMOTE_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 /// Lo máximo que se sigue una tarea remota antes de darla por perdida (decálogo: todo bucle tiene cota).
 const REMOTE_MAX_FOLLOW: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
+/// Cuánto se espera a que el remoto abra el flujo de la tarea (A8c) antes de sondear.
+const REMOTE_WATCH_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// Lo máximo que se espera a que un remoto conteste a `CancelTask`; menor que `CANCEL_WAIT`.
 const REMOTE_CANCEL_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
 
@@ -892,6 +894,51 @@ async fn seguir_remoto(
     let inicio = tokio::time::Instant::now();
     let mut ultimo = TaskState::Working;
     let mut fallos = 0u32;
+    // A8c: si el remoto declara streaming se sigue el flujo en lugar de sondear. Cualquier fallo al
+    // abrirlo, un error a mitad, un cierre antes del estado terminal o una tarea ajena devuelven el
+    // seguimiento al sondeo de siempre: el flujo es una mejora, nunca la única vía.
+    if !tarea.status.state.is_terminal() {
+        let apertura = tokio::select! {
+            apertura = tokio::time::timeout(REMOTE_WATCH_OPEN_TIMEOUT, cliente.watch(&id)) => apertura,
+            _ = job_cancel.cancelled() => return espejo.cancelar(Some(&id)).await,
+            _ = parent_cancel.cancelled() => {
+                job_cancel.cancel();
+                return espejo.cancelar(Some(&id)).await;
+            }
+        };
+        if let Ok(Ok(mut flujo)) = apertura {
+            let limite = inicio + max_follow;
+            loop {
+                tokio::select! {
+                    siguiente = futures::StreamExt::next(&mut flujo) => match siguiente {
+                        Some(Ok(nueva)) if nueva.id == id => {
+                            let estado = nueva.status.state;
+                            tarea = nueva;
+                            if estado.is_terminal() {
+                                return espejo.terminar(tarea, &handle).await;
+                            }
+                            if estado != ultimo {
+                                espejo
+                                    .transicion(estado_con_mensaje(
+                                        estado,
+                                        tarea.status.message.clone(),
+                                    ))
+                                    .await;
+                                ultimo = estado;
+                            }
+                        }
+                        _ => break,
+                    },
+                    _ = tokio::time::sleep_until(limite) => break,
+                    _ = job_cancel.cancelled() => return espejo.cancelar(Some(&id)).await,
+                    _ = parent_cancel.cancelled() => {
+                        job_cancel.cancel();
+                        return espejo.cancelar(Some(&id)).await;
+                    }
+                }
+            }
+        }
+    }
     loop {
         let estado = tarea.status.state;
         if estado.is_terminal() {
@@ -3968,8 +4015,22 @@ mod tests {
     use crate::registry::RemoteFetched;
     use std::collections::VecDeque;
 
+    /// Cómo responde `watch` el cliente guionizado.
+    enum GuionFlujo {
+        /// Un flujo que entrega estos elementos y se cierra.
+        Elementos(Vec<std::result::Result<RemoteTask, RemoteTaskError>>),
+        /// No se puede abrir.
+        Falla(RemoteTaskError),
+        /// Un flujo que se abre y no dice nunca nada.
+        Pendiente,
+    }
+
     /// Cliente remoto guionizado: contesta lo que se le diga y anota lo que recibe.
     struct ClienteGuionizado {
+        /// `None`: el remoto no ofrece flujo (`watch` falla con «no soportado»).
+        flujo: std::sync::Mutex<Option<GuionFlujo>>,
+        /// Veces que se ha sondeado con `get`.
+        sondeos: std::sync::Mutex<usize>,
         envio: std::sync::Mutex<Option<std::result::Result<RemoteReply, RemoteTaskError>>>,
         consultas: std::sync::Mutex<VecDeque<std::result::Result<RemoteTask, RemoteTaskError>>>,
         /// Respuesta cuando la cola de consultas se agota.
@@ -4000,6 +4061,8 @@ mod tests {
             consultas: Vec<std::result::Result<RemoteTask, RemoteTaskError>>,
         ) -> Arc<Self> {
             Arc::new(ClienteGuionizado {
+                flujo: std::sync::Mutex::new(None),
+                sondeos: std::sync::Mutex::new(0),
                 envio: std::sync::Mutex::new(Some(envio)),
                 consultas: std::sync::Mutex::new(consultas.into()),
                 consulta_final: std::sync::Mutex::new(Ok(tarea(
@@ -4036,7 +4099,28 @@ mod tests {
             self.enviados.lock().unwrap().push(message);
             self.envio.lock().unwrap().take().expect("un solo envío")
         }
+        async fn watch(
+            &self,
+            _id: &str,
+        ) -> std::result::Result<
+            futures::stream::BoxStream<'static, std::result::Result<RemoteTask, RemoteTaskError>>,
+            RemoteTaskError,
+        > {
+            use futures::StreamExt;
+            match self.flujo.lock().unwrap().take() {
+                None => Err(RemoteTaskError::Unsupported("sin flujo".into())),
+                Some(GuionFlujo::Falla(error)) => Err(error),
+                Some(GuionFlujo::Elementos(elementos)) => {
+                    Ok(futures::stream::iter(elementos).boxed())
+                }
+                Some(GuionFlujo::Pendiente) => Ok(futures::stream::pending::<
+                    std::result::Result<RemoteTask, RemoteTaskError>,
+                >()
+                .boxed()),
+            }
+        }
         async fn get(&self, _id: &str) -> std::result::Result<RemoteTask, RemoteTaskError> {
+            *self.sondeos.lock().unwrap() += 1;
             match self.consultas.lock().unwrap().pop_front() {
                 Some(respuesta) => respuesta,
                 None => self.consulta_final.lock().unwrap().clone(),
@@ -4113,6 +4197,7 @@ mod tests {
                     requires_auth,
                     security: None,
                     auth_problem: None,
+                    streaming: false,
                 },
             )),
         );
@@ -4515,6 +4600,178 @@ mod tests {
             *entorno.cliente.canceladas.lock().unwrap(),
             vec!["r1".to_string()]
         );
+    }
+
+    fn con_flujo(cliente: &Arc<ClienteGuionizado>, guion: GuionFlujo) {
+        *cliente.flujo.lock().unwrap() = Some(guion);
+    }
+
+    #[tokio::test]
+    async fn a_streaming_remote_is_followed_by_the_stream_without_polling() {
+        let cliente = ClienteGuionizado::trabajando();
+        con_flujo(
+            &cliente,
+            GuionFlujo::Elementos(vec![
+                Ok(tarea("r1", TaskState::Working, None, &[])),
+                Ok(tarea("r1", TaskState::InputRequired, Some("¿color?"), &[])),
+                Ok(tarea("r1", TaskState::Working, None, &[])),
+                Ok(tarea("r1", TaskState::Completed, None, &["por el flujo"])),
+            ]),
+        );
+        let entorno = entorno_remoto(cliente, true, false, Duration::from_secs(60)).await;
+        let mut rx = entorno.bus.subscribe();
+
+        let hijo = entorno.lanzar().await;
+
+        assert_eq!(
+            entorno.estado_del_aviso(&mut rx).await,
+            TaskState::Completed
+        );
+        let descriptor = entorno.descriptor(hijo).await;
+        assert_eq!(descriptor.artifacts[0].text(), "por el flujo");
+        assert_eq!(
+            *entorno.cliente.sondeos.lock().unwrap(),
+            0,
+            "no debía sondear"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stream_cut_before_the_terminal_state_falls_back_to_polling() {
+        let cliente = ClienteGuionizado::nuevo(
+            Ok(RemoteReply::Task(tarea(
+                "r1",
+                TaskState::Working,
+                None,
+                &[],
+            ))),
+            vec![Ok(tarea("r1", TaskState::Completed, None, &["por sondeo"]))],
+        );
+        con_flujo(
+            &cliente,
+            GuionFlujo::Elementos(vec![Ok(tarea("r1", TaskState::Working, None, &[]))]),
+        );
+        let entorno = entorno_remoto(cliente, true, false, Duration::from_secs(60)).await;
+        let mut rx = entorno.bus.subscribe();
+
+        let hijo = entorno.lanzar().await;
+
+        assert_eq!(
+            entorno.estado_del_aviso(&mut rx).await,
+            TaskState::Completed
+        );
+        assert_eq!(
+            entorno.descriptor(hijo).await.artifacts[0].text(),
+            "por sondeo"
+        );
+        assert!(*entorno.cliente.sondeos.lock().unwrap() >= 1);
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_fails_to_open_or_midway_falls_back_to_polling() {
+        for guion in [
+            GuionFlujo::Falla(RemoteTaskError::Other("no abre".into())),
+            GuionFlujo::Falla(RemoteTaskError::AuthFailed("HTTP 401".into())),
+            GuionFlujo::Elementos(vec![
+                Ok(tarea("r1", TaskState::Working, None, &[])),
+                Err(RemoteTaskError::Other("se cortó".into())),
+            ]),
+        ] {
+            let cliente = ClienteGuionizado::nuevo(
+                Ok(RemoteReply::Task(tarea(
+                    "r1",
+                    TaskState::Working,
+                    None,
+                    &[],
+                ))),
+                vec![Ok(tarea("r1", TaskState::Completed, None, &["a salvo"]))],
+            );
+            con_flujo(&cliente, guion);
+            let entorno = entorno_remoto(cliente, true, false, Duration::from_secs(60)).await;
+            let mut rx = entorno.bus.subscribe();
+
+            let hijo = entorno.lanzar().await;
+
+            assert_eq!(
+                entorno.estado_del_aviso(&mut rx).await,
+                TaskState::Completed
+            );
+            assert_eq!(
+                entorno.descriptor(hijo).await.artifacts[0].text(),
+                "a salvo"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stream_about_another_task_is_dropped_and_polling_takes_over() {
+        let cliente = ClienteGuionizado::nuevo(
+            Ok(RemoteReply::Task(tarea(
+                "r1",
+                TaskState::Working,
+                None,
+                &[],
+            ))),
+            vec![Ok(tarea("r1", TaskState::Failed, Some("de verdad"), &[]))],
+        );
+        // Un flujo que dice que «otra» tarea se completó no puede dar por buena la nuestra.
+        con_flujo(
+            &cliente,
+            GuionFlujo::Elementos(vec![Ok(tarea(
+                "otra",
+                TaskState::Completed,
+                None,
+                &["falso"],
+            ))]),
+        );
+        let entorno = entorno_remoto(cliente, true, false, Duration::from_secs(60)).await;
+        let mut rx = entorno.bus.subscribe();
+
+        let hijo = entorno.lanzar().await;
+
+        assert_eq!(entorno.estado_del_aviso(&mut rx).await, TaskState::Failed);
+        assert!(entorno.descriptor(hijo).await.artifacts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelling_the_parent_while_following_the_stream_cancels_the_remote_task() {
+        let cliente = ClienteGuionizado::trabajando();
+        con_flujo(&cliente, GuionFlujo::Pendiente);
+        let entorno = entorno_remoto(cliente, true, false, Duration::from_secs(60)).await;
+        let cancel_padre = CancellationToken::new();
+        let (hijo, _) = entorno
+            .lanzador
+            .start(
+                entorno.parent,
+                "lejano".into(),
+                "haz lo tuyo".into(),
+                Some("remoto".into()),
+                cancel_padre.clone(),
+            )
+            .await
+            .unwrap();
+        espera_estado_del_hijo(&entorno.store, entorno.parent, hijo, TaskState::Working).await;
+
+        cancel_padre.cancel();
+
+        espera_estado_del_hijo(&entorno.store, entorno.parent, hijo, TaskState::Canceled).await;
+        assert_eq!(
+            *entorno.cliente.canceladas.lock().unwrap(),
+            vec!["r1".to_string()]
+        );
+        assert_eq!(*entorno.cliente.sondeos.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_silent_stream_is_given_up_at_the_follow_limit_and_polling_gives_up_too() {
+        let cliente = ClienteGuionizado::trabajando();
+        con_flujo(&cliente, GuionFlujo::Pendiente);
+        let entorno = entorno_remoto(cliente, true, false, Duration::from_millis(200)).await;
+        let mut rx = entorno.bus.subscribe();
+
+        entorno.lanzar().await;
+
+        assert_eq!(entorno.estado_del_aviso(&mut rx).await, TaskState::Failed);
     }
 
     #[tokio::test]

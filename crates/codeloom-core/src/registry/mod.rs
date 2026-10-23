@@ -1285,6 +1285,7 @@ mod tests {
             requires_auth: false,
             security: None,
             auth_problem: None,
+            streaming: false,
         }
     }
 

@@ -224,6 +224,30 @@ async fn our_own_client_runs_a_task_on_our_own_server_end_to_end() {
 }
 
 #[tokio::test]
+async fn our_own_client_follows_a_task_of_our_own_server_by_stream() {
+    use futures::StreamExt;
+    let servidor = arrancar(Arc::new(ConTexto("hola por el flujo")), config_servidor()).await;
+    let cliente = cliente(&servidor, TOKEN).await.with_streaming(true);
+
+    let inicial = tarea(cliente.send(Message::user_text("saluda")).await.unwrap());
+    let flujo = cliente.watch(&inicial.id).await;
+
+    // La tarea puede haber terminado antes de suscribirse: entonces el servidor la rechaza y el
+    // llamante sondea. Si se abre, el último elemento ha de ser el estado terminal.
+    match flujo {
+        Ok(flujo) => {
+            let tareas: Vec<_> = flujo.collect().await;
+            let ultima = tareas.last().expect("el flujo debía traer algo");
+            assert!(ultima.as_ref().unwrap().status.state.is_terminal());
+        }
+        Err(error) => assert!(
+            matches!(error, RemoteTaskError::Unsupported(_)),
+            "{error:?}"
+        ),
+    }
+}
+
+#[tokio::test]
 async fn the_served_card_is_public_but_the_rpc_endpoint_is_not() {
     let servidor = arrancar(Arc::new(ConTexto("x")), config_servidor()).await;
     let http = reqwest::Client::new();

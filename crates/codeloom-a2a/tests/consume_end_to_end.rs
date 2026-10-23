@@ -84,6 +84,13 @@ impl Respond for RemotoSimulado {
             "CancelTask" => {
                 json!({"id": "t-remota", "status": {"state": "TASK_STATE_CANCELED"}})
             }
+            // La tarjeta de ejemplo declara streaming, pero este remoto simulado no lo ofrece: el
+            // cliente debe caer al sondeo (A8c).
+            "SubscribeToTask" => {
+                return ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "error": {"code": -32004, "message": "streaming no soportado"}}));
+            }
             otro => panic!("método inesperado: {otro}"),
         };
         ResponseTemplate::new(200)
@@ -336,7 +343,8 @@ async fn a_remote_agent_is_pending_then_approved_then_runs_to_completion() {
     assert_eq!(descriptor.agent.as_deref(), Some("lejano"));
     let metodos = metodos_recibidos(&montaje.servidor).await;
     assert_eq!(metodos[0], "SendMessage");
-    assert!(metodos[1..].iter().all(|m| m == "GetTask"), "{metodos:?}");
+    assert_eq!(metodos[1], "SubscribeToTask", "{metodos:?}");
+    assert!(metodos[2..].iter().all(|m| m == "GetTask"), "{metodos:?}");
     drop(montaje.bus);
 }
 

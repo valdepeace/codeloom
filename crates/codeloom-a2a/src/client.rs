@@ -4,8 +4,10 @@
 //! `A2A-Version: 1.0`, acota el cuerpo de cada respuesta y no afirma nada que el remoto no diga:
 //! un error de A2A se traduce a su equivalente y cualquier otra cosa es un error visible.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use codeloom_core::a2a::{Artifact, Message};
@@ -14,6 +16,8 @@ use codeloom_core::remote_task::{
     RemoteClientFactory, RemoteReply, RemoteTask, RemoteTaskClient, RemoteTaskError,
 };
 use codeloom_core::task::TaskStatus;
+use futures::stream::BoxStream;
+use futures::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -22,7 +26,10 @@ use crate::card::VERSION_SOPORTADA;
 use crate::config::A2aConfig;
 use crate::remote::{http_client, leer_acotado, mapear, RemoteError};
 use crate::security::AuthPlan;
-use crate::wire::{state_from_wire, timestamp_from_wire, WireMessage, WireTask};
+use crate::sse::SseDecoder;
+use crate::wire::{
+    state_from_wire, timestamp_from_wire, WireMessage, WireStreamResponse, WireTask,
+};
 
 /// Cota de los textos de error de un tercero que se copian a un mensaje nuestro.
 const MAX_TEXTO_ERROR: usize = 300;
@@ -66,6 +73,8 @@ pub struct JsonRpcClient {
     max_result_bytes: usize,
     siguiente_id: AtomicU64,
     auth: AuthPlan,
+    /// La tarjeta declara streaming: solo entonces se intenta `SubscribeToTask` (A8c).
+    streaming: bool,
 }
 
 impl JsonRpcClient {
@@ -84,7 +93,14 @@ impl JsonRpcClient {
             max_result_bytes,
             siguiente_id: AtomicU64::new(1),
             auth: AuthPlan::open(),
+            streaming: false,
         }
+    }
+
+    /// Indica que la tarjeta del remoto declara `capabilities.streaming = true`.
+    pub fn with_streaming(mut self, streaming: bool) -> Self {
+        self.streaming = streaming;
+        self
     }
 
     /// Autentica cada petición con `auth`. Sin esto el cliente habla a un remoto abierto.
@@ -212,7 +228,8 @@ impl RemoteClientFactory for A2aClientFactory {
                 descargada.tenant.clone(),
                 self.max_result_bytes,
             )
-            .with_auth(plan),
+            .with_auth(plan)
+            .with_streaming(descargada.streaming),
         ))
     }
 
@@ -281,6 +298,103 @@ fn tarea_desde_wire(wire: WireTask) -> Result<RemoteTask, RemoteTaskError> {
     })
 }
 
+/// Tiempo máximo de una conexión de flujo. Quien sigue la tarea la suelta antes (`max_follow`); esto
+/// solo evita que el tope de petición del cliente (pensado para llamadas cortas) corte un flujo legítimo.
+const MAX_CONEXION_FLUJO: Duration = Duration::from_secs(6 * 3600);
+/// Artefactos que se acumulan como máximo al seguir un flujo.
+const MAX_ARTEFACTOS_FLUJO: usize = 64;
+
+/// Estado de la lectura de un flujo de tarea.
+struct LecturaFlujo {
+    cuerpo: BoxStream<'static, Result<bytes::Bytes, reqwest::Error>>,
+    decodificador: SseDecoder,
+    pendientes: VecDeque<String>,
+    actual: Option<RemoteTask>,
+    tarea: String,
+    rpc_id: u64,
+    max_bytes: usize,
+    terminado: bool,
+}
+
+/// Aplica un evento (`data:`) del flujo a la tarea que se sigue. Todo lo que no cuadra corta el flujo:
+/// es dato de un tercero y no se interpreta a medias.
+fn aplicar_evento(lectura: &mut LecturaFlujo, datos: &str) -> Result<RemoteTask, RemoteTaskError> {
+    let rpc: RespuestaRpc = serde_json::from_str(datos).map_err(invalida)?;
+    if rpc.id != json!(lectura.rpc_id) {
+        return Err(RemoteTaskError::Other(
+            "stream event id does not match the request".into(),
+        ));
+    }
+    let resultado = match (rpc.result, rpc.error) {
+        (Some(resultado), None) => resultado,
+        (None, Some(error)) => return Err(traducir_error_rpc(error)),
+        _ => {
+            return Err(RemoteTaskError::Other(
+                "stream event must carry exactly one of result and error".into(),
+            ))
+        }
+    };
+    let evento: WireStreamResponse = serde_json::from_value(resultado).map_err(invalida)?;
+    evento.validate().map_err(invalida)?;
+    let propia = |id: &str| -> Result<(), RemoteTaskError> {
+        if id == lectura.tarea {
+            Ok(())
+        } else {
+            Err(RemoteTaskError::Other(
+                "the stream carries events of a different task".into(),
+            ))
+        }
+    };
+    if let Some(tarea) = evento.task {
+        propia(&tarea.id)?;
+        lectura.actual = Some(tarea_desde_wire(tarea)?);
+    } else if let Some(cambio) = evento.status_update {
+        propia(&cambio.task_id)?;
+        let actual = lectura
+            .actual
+            .as_mut()
+            .ok_or_else(|| RemoteTaskError::Other("the stream must start with the task".into()))?;
+        let temporal = WireTask {
+            id: cambio.task_id,
+            context_id: None,
+            status: cambio.status,
+            artifacts: Vec::new(),
+        };
+        actual.status = tarea_desde_wire(temporal)?.status;
+    } else if let Some(cambio) = evento.artifact_update {
+        propia(&cambio.task_id)?;
+        let actual = lectura
+            .actual
+            .as_mut()
+            .ok_or_else(|| RemoteTaskError::Other("the stream must start with the task".into()))?;
+        let artefacto = Artifact::try_from(cambio.artifact).map_err(invalida)?;
+        match actual
+            .artifacts
+            .iter_mut()
+            .find(|existente| existente.artifact_id == artefacto.artifact_id)
+        {
+            Some(existente) if cambio.append => existente.parts.extend(artefacto.parts),
+            Some(existente) => *existente = artefacto,
+            None => actual.artifacts.push(artefacto),
+        }
+        if actual.artifacts.len() > MAX_ARTEFACTOS_FLUJO
+            || codeloom_core::a2a::artifacts_text(&actual.artifacts).len() > lectura.max_bytes
+        {
+            return Err(RemoteTaskError::Other(
+                "the stream result is larger than allowed".into(),
+            ));
+        }
+    } else {
+        return Err(RemoteTaskError::Other(
+            "unexpected message in a task stream".into(),
+        ));
+    }
+    lectura
+        .actual
+        .clone()
+        .ok_or_else(|| RemoteTaskError::Other("the stream must start with the task".into()))
+}
+
 fn tarea_de_resultado(resultado: Value) -> Result<RemoteTask, RemoteTaskError> {
     let wire: WireTask = serde_json::from_value(resultado).map_err(invalida)?;
     tarea_desde_wire(wire)
@@ -316,6 +430,101 @@ impl RemoteTaskClient for JsonRpcClient {
     async fn cancel(&self, id: &str) -> Result<RemoteTask, RemoteTaskError> {
         let params = self.con_tenant(json!({ "id": id }));
         tarea_de_resultado(self.llamar("CancelTask", params).await?)
+    }
+
+    async fn watch(
+        &self,
+        id: &str,
+    ) -> Result<BoxStream<'static, Result<RemoteTask, RemoteTaskError>>, RemoteTaskError> {
+        // Se comprueba la tarjeta antes de intentarlo (§3.3.4): sin streaming declarado, ni se pregunta.
+        if !self.streaming {
+            return Err(RemoteTaskError::Unsupported(
+                "the remote card does not declare streaming".into(),
+            ));
+        }
+        let rpc_id = self.siguiente_id.fetch_add(1, Ordering::Relaxed);
+        let params = self.con_tenant(json!({ "id": id }));
+        let cuerpo = json!({ "jsonrpc": "2.0", "id": rpc_id, "method": "SubscribeToTask", "params": params });
+        let peticion = self
+            .http
+            .post(&self.url)
+            .header("A2A-Version", VERSION_SOPORTADA)
+            .header(reqwest::header::ACCEPT, "text/event-stream")
+            .timeout(MAX_CONEXION_FLUJO)
+            .json(&cuerpo);
+        let respuesta = self
+            .auth
+            .apply(peticion)
+            .send()
+            .await
+            .map_err(|e| traducir_fallo(mapear(e)))?;
+        let estado = respuesta.status();
+        if estado == reqwest::StatusCode::UNAUTHORIZED || estado == reqwest::StatusCode::FORBIDDEN {
+            return Err(RemoteTaskError::AuthFailed(format!(
+                "HTTP {}; revisa la credencial declarada en `a2a.credentials`",
+                estado.as_u16()
+            )));
+        }
+        let es_flujo = respuesta
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|valor| valor.to_str().ok())
+            .is_some_and(|valor| valor.starts_with("text/event-stream"));
+        if !es_flujo {
+            // Un error previo al flujo viaja como JSON-RPC normal (§9.4.6).
+            let bytes = leer_acotado(respuesta, self.max_result_bytes)
+                .await
+                .map_err(traducir_fallo)?;
+            return match serde_json::from_slice::<RespuestaRpc>(&bytes) {
+                Ok(RespuestaRpc {
+                    error: Some(error), ..
+                }) => Err(traducir_error_rpc(error)),
+                _ => Err(RemoteTaskError::Other(
+                    "the remote did not answer with an event stream".into(),
+                )),
+            };
+        }
+        let lectura = LecturaFlujo {
+            cuerpo: respuesta.bytes_stream().boxed(),
+            decodificador: SseDecoder::new(),
+            pendientes: VecDeque::new(),
+            actual: None,
+            tarea: id.to_string(),
+            rpc_id,
+            max_bytes: self.max_result_bytes,
+            terminado: false,
+        };
+        Ok(futures::stream::unfold(lectura, |mut lectura| async move {
+            loop {
+                if lectura.terminado {
+                    return None;
+                }
+                if let Some(datos) = lectura.pendientes.pop_front() {
+                    return match aplicar_evento(&mut lectura, &datos) {
+                        Ok(tarea) => Some((Ok(tarea), lectura)),
+                        Err(error) => {
+                            lectura.terminado = true;
+                            Some((Err(error), lectura))
+                        }
+                    };
+                }
+                match lectura.cuerpo.next().await {
+                    Some(Ok(trozo)) => match lectura.decodificador.push(&trozo) {
+                        Ok(eventos) => lectura.pendientes.extend(eventos),
+                        Err(error) => {
+                            lectura.terminado = true;
+                            return Some((Err(invalida(error)), lectura));
+                        }
+                    },
+                    Some(Err(error)) => {
+                        lectura.terminado = true;
+                        return Some((Err(traducir_fallo(mapear(error))), lectura));
+                    }
+                    None => return None,
+                }
+            }
+        })
+        .boxed())
     }
 }
 
@@ -370,6 +579,223 @@ mod tests {
             .respond_with(respuesta)
             .mount(servidor)
             .await;
+    }
+
+    // ---- A8c: seguimiento por flujo ----
+
+    fn sobre(evento: Value) -> String {
+        format!(
+            "data: {}\n\n",
+            json!({ "jsonrpc": "2.0", "id": 1, "result": evento })
+        )
+    }
+
+    fn flujo_sse(cuerpo: impl Into<String>) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_raw(cuerpo.into().into_bytes(), "text/event-stream")
+    }
+
+    fn tarea_wire(estado: &str) -> Value {
+        json!({ "task": { "id": "t-1", "contextId": "c-1", "status": { "state": estado } } })
+    }
+
+    fn estado_wire(estado: &str) -> Value {
+        json!({ "statusUpdate": { "taskId": "t-1", "contextId": "c-1",
+                                  "status": { "state": estado } } })
+    }
+
+    fn artefacto_wire(id: &str, texto: &str, append: bool) -> Value {
+        json!({ "artifactUpdate": { "taskId": "t-1", "contextId": "c-1", "append": append,
+                "artifact": { "artifactId": id, "parts": [{ "text": texto }] } } })
+    }
+
+    async fn recoger(
+        cliente: &JsonRpcClient,
+    ) -> Vec<Result<codeloom_core::remote_task::RemoteTask, RemoteTaskError>> {
+        use futures::StreamExt;
+        cliente.watch("t-1").await.unwrap().collect().await
+    }
+
+    #[tokio::test]
+    async fn watch_yields_the_whole_task_after_each_event_and_applies_updates() {
+        let servidor = MockServer::start().await;
+        let cuerpo = [
+            sobre(tarea_wire("TASK_STATE_WORKING")),
+            ": latido\n\n".to_string(),
+            sobre(artefacto_wire("a1", "hola ", false)),
+            sobre(artefacto_wire("a1", "mundo", true)),
+            sobre(estado_wire("TASK_STATE_COMPLETED")),
+        ]
+        .concat();
+        montar(&servidor, "SubscribeToTask", flujo_sse(cuerpo)).await;
+
+        let tareas = recoger(&cliente(&servidor, Some("t")).with_streaming(true)).await;
+
+        let tareas: Vec<_> = tareas.into_iter().map(|t| t.unwrap()).collect();
+        assert_eq!(tareas.len(), 4);
+        assert_eq!(tareas[0].status.state, TaskState::Working);
+        assert_eq!(tareas[1].artifacts[0].text(), "hola ");
+        // `append` añade una parte al artefacto; `text()` une las partes con salto de línea.
+        assert_eq!(tareas[2].artifacts[0].parts.len(), 2);
+        assert_eq!(
+            tareas[2].artifacts[0].text(),
+            "hola 
+mundo"
+        );
+        assert_eq!(tareas[3].status.state, TaskState::Completed);
+        assert_eq!(tareas[3].artifacts.len(), 1);
+        let recibidas = servidor.received_requests().await.unwrap();
+        let cuerpo: Value = serde_json::from_slice(&recibidas[0].body).unwrap();
+        assert_eq!(cuerpo["params"]["id"], "t-1");
+        assert_eq!(cuerpo["params"]["tenant"], "t");
+        assert_eq!(recibidas[0].headers["accept"], "text/event-stream");
+    }
+
+    #[tokio::test]
+    async fn without_declared_streaming_watch_does_not_even_touch_the_network() {
+        let servidor = MockServer::start().await;
+
+        let error = cliente(&servidor, None).watch("t-1").await.err().unwrap();
+
+        assert!(
+            matches!(error, RemoteTaskError::Unsupported(_)),
+            "{error:?}"
+        );
+        assert!(servidor.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn errors_before_the_stream_keep_their_meaning_and_a_401_is_an_auth_failure() {
+        let servidor = MockServer::start().await;
+        let no_encontrada: Value = serde_json::from_str(NO_ENCONTRADA).unwrap();
+        montar(
+            &servidor,
+            "SubscribeToTask",
+            ResponseTemplate::new(200).set_body_json(con_id_1(no_encontrada)),
+        )
+        .await;
+        let error = cliente(&servidor, None)
+            .with_streaming(true)
+            .watch("t-1")
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error, RemoteTaskError::NotFound);
+
+        let cerrado = MockServer::start().await;
+        montar(
+            &cerrado,
+            "SubscribeToTask",
+            ResponseTemplate::new(401).set_body_string("token-secreto-eco"),
+        )
+        .await;
+        let error = cliente(&cerrado, None)
+            .with_streaming(true)
+            .watch("t-1")
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(error, RemoteTaskError::AuthFailed(_)), "{error:?}");
+        assert!(!error.to_string().contains("token-secreto-eco"));
+    }
+
+    #[tokio::test]
+    async fn a_non_stream_answer_is_refused() {
+        let servidor = MockServer::start().await;
+        montar(
+            &servidor,
+            "SubscribeToTask",
+            ResponseTemplate::new(200).set_body_string("hola"),
+        )
+        .await;
+
+        let error = cliente(&servidor, None)
+            .with_streaming(true)
+            .watch("t-1")
+            .await
+            .err()
+            .unwrap();
+
+        assert!(matches!(error, RemoteTaskError::Other(_)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn events_of_another_task_out_of_order_or_with_a_wrong_id_cut_the_stream() {
+        let ajena =
+            json!({ "task": { "id": "otra", "status": { "state": "TASK_STATE_COMPLETED" } } });
+        let casos = [
+            // La tarea de otro: nunca se da por buena.
+            sobre(ajena),
+            // Un estado antes de que llegue la tarea.
+            sobre(estado_wire("TASK_STATE_COMPLETED")),
+            // Un mensaje en un flujo de tarea.
+            sobre(json!({ "message": { "messageId": "m", "role": "ROLE_AGENT",
+                                       "parts": [{ "text": "x" }] } })),
+            // Una respuesta a otra petición.
+            format!(
+                "data: {}\n\n",
+                json!({ "jsonrpc": "2.0", "id": 99, "result": tarea_wire("TASK_STATE_WORKING") })
+            ),
+            // Una carga vacía y un estado desconocido.
+            sobre(json!({})),
+            sobre(tarea_wire("TASK_STATE_INVENTADO")),
+            // JSON roto.
+            "data: {no es json\n\n".to_string(),
+        ];
+        for cuerpo in casos {
+            let servidor = MockServer::start().await;
+            montar(&servidor, "SubscribeToTask", flujo_sse(cuerpo.clone())).await;
+
+            let tareas = recoger(&cliente(&servidor, None).with_streaming(true)).await;
+
+            assert_eq!(tareas.len(), 1, "{cuerpo}");
+            assert!(tareas[0].is_err(), "{cuerpo}: {:?}", tareas[0]);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_error_event_in_the_stream_is_translated_and_ends_it() {
+        let servidor = MockServer::start().await;
+        let cuerpo = [
+            sobre(tarea_wire("TASK_STATE_WORKING")),
+            format!(
+                "data: {}\n\n",
+                json!({ "jsonrpc": "2.0", "id": 1,
+                        "error": { "code": -32001, "message": "task not found" } })
+            ),
+            sobre(estado_wire("TASK_STATE_COMPLETED")),
+        ]
+        .concat();
+        montar(&servidor, "SubscribeToTask", flujo_sse(cuerpo)).await;
+
+        let tareas = recoger(&cliente(&servidor, None).with_streaming(true)).await;
+
+        assert_eq!(tareas.len(), 2);
+        assert!(tareas[0].is_ok());
+        assert_eq!(tareas[1], Err(RemoteTaskError::NotFound));
+    }
+
+    #[tokio::test]
+    async fn an_oversized_line_or_result_cuts_the_stream() {
+        let servidor = MockServer::start().await;
+        let gigante = format!("data: {}\n\n", "x".repeat(crate::sse::MAX_LINEA + 10));
+        montar(&servidor, "SubscribeToTask", flujo_sse(gigante)).await;
+        let tareas = recoger(&cliente(&servidor, None).with_streaming(true)).await;
+        assert_eq!(tareas.len(), 1);
+        assert!(tareas[0].is_err());
+
+        // El resultado acumulado no pasa del tope de resultado del cliente (64 KiB en las pruebas).
+        let servidor = MockServer::start().await;
+        let cuerpo = [
+            sobre(tarea_wire("TASK_STATE_WORKING")),
+            sobre(artefacto_wire("a1", &"y".repeat(40_000), false)),
+            sobre(artefacto_wire("a2", &"y".repeat(40_000), false)),
+        ]
+        .concat();
+        montar(&servidor, "SubscribeToTask", flujo_sse(cuerpo)).await;
+        let tareas = recoger(&cliente(&servidor, None).with_streaming(true)).await;
+        assert_eq!(tareas.len(), 3);
+        assert!(tareas[1].is_ok());
+        assert!(tareas[2].is_err());
     }
 
     #[tokio::test]
@@ -790,6 +1216,7 @@ mod tests {
                 requires_auth: true,
                 security: seguridad.to_json(),
                 auth_problem: None,
+                streaming: false,
             }),
             credentials: BTreeMap::from([("claveApi".to_string(), "AGENTE_KEY".to_string())]),
         }

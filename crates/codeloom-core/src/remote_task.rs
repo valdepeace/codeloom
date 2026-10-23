@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::stream::BoxStream;
 
 use crate::a2a::{Artifact, Message};
 use crate::registry::RemoteSpec;
@@ -73,4 +74,17 @@ pub trait RemoteTaskClient: Send + Sync {
     /// Pide cancelar la tarea `id`. Devuelve lo que el remoto dice que ha pasado: quien llama no
     /// debe dar por cancelada una tarea cuyo estado devuelto no lo sea.
     async fn cancel(&self, id: &str) -> Result<RemoteTask, RemoteTaskError>;
+
+    /// Sigue la tarea `id` por flujo (A8c). Cada elemento es la tarea completa tras aplicar un evento
+    /// del remoto; el flujo empieza por la tarea actual y se cierra al estado terminal. Un error en el
+    /// flujo es el último elemento. Quien llama debe volver al sondeo (`get`) ante `Err` al abrir, un
+    /// error en el flujo o un cierre antes de un estado terminal: el seguimiento nunca se pierde.
+    async fn watch(
+        &self,
+        _id: &str,
+    ) -> Result<BoxStream<'static, Result<RemoteTask, RemoteTaskError>>, RemoteTaskError> {
+        Err(RemoteTaskError::Unsupported(
+            "task streaming is not available".into(),
+        ))
+    }
 }
