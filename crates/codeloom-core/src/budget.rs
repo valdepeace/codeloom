@@ -84,10 +84,10 @@ pub struct BudgetWarning {
 
 /// Avisos de los umbrales que cruza el acumulado de la sesión al añadir `added`.
 ///
-/// `before` son los apuntes previos; solo cuentan los de la sesión de `added`. El almacén
-/// devuelve también el consumo de los subagentes, pero el presupuesto es por sesión y no lo
-/// hereda: si contara, un hijo podría rebasar un umbral entre dos respuestas del padre y el aviso
-/// no saltaría nunca, porque el acumulado «anterior» ya lo habría superado.
+/// `before` son los apuntes previos de la **familia**: la sesión raíz y sus subagentes, tal como
+/// los devuelve `SessionStore::session_usage`. Todos cuentan, sea cual sea su sesión, de modo que
+/// el gasto de un hijo suma al mismo total que el del padre y un nivel se comunica una sola vez
+/// aunque lo cruce un hijo. Quien llama debe pasar la familia entera y sólo ella.
 /// Un umbral avisa si `antes < umbral <= despues`,
 /// de modo que cada nivel se comunica una sola vez por sesión sin guardar estado. Los avisos salen
 /// en orden de métrica (tokens y luego coste) y de nivel ascendente.
@@ -97,10 +97,6 @@ pub fn budget_crossings(
     added: &UsageRecord,
 ) -> Vec<BudgetWarning> {
     let mut avisos = Vec::new();
-    let before: Vec<&UsageRecord> = before
-        .iter()
-        .filter(|r| r.session == added.session)
-        .collect();
 
     if let Some(limite) = config.session_tokens {
         let antes: f64 = before
@@ -121,7 +117,7 @@ pub fn budget_crossings(
     if let Some(limite) = config.session_cost_usd {
         let mut antes = 0.0;
         let mut partial = false;
-        for registro in &before {
+        for registro in before {
             match registro.cost() {
                 Some(coste) => antes += coste,
                 None => partial = true,
@@ -331,22 +327,37 @@ mod tests {
     }
 
     #[test]
-    fn records_of_other_sessions_do_not_count() {
-        // Un hijo gastó 900 de 1000 en otra sesión; el padre gasta 100. El acumulado del padre es
-        // 100, así que no cruza el 80 %. Si el gasto del hijo contara, «antes» ya superaría el
-        // umbral y tampoco avisaría: por eso se prueba también el caso inverso.
-        let mut hijo = registro(900, 0, None);
+    fn the_spending_of_the_children_adds_to_the_family_total() {
+        let mut hijo = registro(700, 0, None);
         hijo.session = SessionId(2);
-        let padre = registro(100, 0, None);
-        assert!(budget_crossings(&solo_tokens(1000), &[hijo.clone()], &padre).is_empty());
-
-        // El padre lleva 700 propios; el hijo 900 aparte. El apunte de 150 del padre lleva su
-        // acumulado a 850 y debe avisar del 80 %, aunque el total con el hijo ya estuviera pasado.
-        let previo = registro(700, 0, None);
-        let aviso = budget_crossings(&solo_tokens(1000), &[hijo, previo], &registro(150, 0, None));
+        let padre = registro(50, 0, None);
+        // El hijo lleva 700 y el padre 50: el apunte de 100 del padre lleva la familia de 750 a
+        // 850 y cruza el 80 %, que con la cuenta solo del padre (150) no se habría avisado.
+        let aviso = budget_crossings(
+            &solo_tokens(1000),
+            &[hijo.clone(), padre],
+            &registro(100, 0, None),
+        );
         assert_eq!(aviso.len(), 1);
         assert_eq!(aviso[0].level_percent, 80);
         assert_eq!(aviso[0].used, 850.0);
+
+        // Un apunte del propio hijo también cruza el umbral de la familia.
+        let mut apunte_hijo = registro(150, 0, None);
+        apunte_hijo.session = SessionId(2);
+        let aviso = budget_crossings(&solo_tokens(1000), &[registro(700, 0, None)], &apunte_hijo);
+        assert_eq!(aviso.len(), 1);
+        assert_eq!(aviso[0].used, 850.0);
+
+        // Y el nivel ya cruzado por un hijo no se repite cuando después gasta el padre.
+        let ya_cruzado = [registro(700, 0, None), {
+            let mut r = registro(150, 0, None);
+            r.session = SessionId(2);
+            r
+        }];
+        assert!(
+            budget_crossings(&solo_tokens(1000), &ya_cruzado, &registro(10, 0, None)).is_empty()
+        );
     }
 
     #[test]

@@ -2763,6 +2763,26 @@ impl App {
                 event,
             } => {
                 if Some(parent) == self.session_id {
+                    // El presupuesto es de la familia: el aviso que cruza un hijo es el mismo del
+                    // padre y se pinta igual, no como métrica del hijo.
+                    if let LiveEvent::BudgetWarning {
+                        metric,
+                        level_percent,
+                        used,
+                        limit,
+                        partial,
+                    } = event.as_ref()
+                    {
+                        let linea =
+                            budget_warning_line(*metric, *level_percent, *used, *limit, *partial);
+                        self.transcript.push_entry(
+                            batten::state::LineKind::System,
+                            batten::state::Format::Plain,
+                            linea,
+                        );
+                        self.assistant = None;
+                        return;
+                    }
                     // El consumo de un hijo se atribuye al modelo actual de la interfaz, pero
                     // con la sesión del hijo para que su coste se pueda separar.
                     if let LiveEvent::Usage {
@@ -3537,7 +3557,7 @@ fn budget_warning_line(
         BudgetMetric::CostUsd => ("USD", format!("{used:.2}"), format!("{limit:.2}")),
     };
     let mut linea = format!(
-        "aviso de presupuesto: {level_percent} % de {limite} {unidad} de la sesión ({usado} usados)"
+        "aviso de presupuesto: {level_percent} % de {limite} {unidad} de la sesión y sus subagentes ({usado} usados)"
     );
     if partial {
         linea.push_str(" (según los precios conocidos)");
@@ -4174,7 +4194,7 @@ Cuerpo de front.
         assert_eq!(
             texts(&app),
             vec![
-                "aviso de presupuesto: 80 % de 500k tokens de la sesión (400k usados)".to_string()
+                "aviso de presupuesto: 80 % de 500k tokens de la sesión y sus subagentes (400k usados)".to_string()
             ]
         );
         assert_eq!(
@@ -4182,6 +4202,42 @@ Cuerpo de front.
             batten::state::LineKind::System
         );
         assert!(!has_user_line(&app));
+    }
+
+    #[test]
+    fn a_budget_warning_crossed_by_a_child_is_shown_once_as_a_system_line() {
+        let mut app = crush_app();
+        app.session_id = Some(SessionId(1));
+        let aviso = LiveEvent::BudgetWarning {
+            metric: BudgetMetric::Tokens,
+            level_percent: 80,
+            used: 400_123.0,
+            limit: 500_000.0,
+            partial: false,
+        };
+        app.apply(LiveEvent::ChildEvent {
+            parent: SessionId(1),
+            child: SessionId(9),
+            event: Box::new(aviso.clone()),
+        });
+        assert_eq!(
+            texts(&app),
+            vec![
+                "aviso de presupuesto: 80 % de 500k tokens de la sesión y sus subagentes (400k usados)"
+                    .to_string()
+            ]
+        );
+        assert_eq!(
+            app.transcript.line(0).unwrap().kind,
+            batten::state::LineKind::System
+        );
+        // Un aviso de otro padre no es de esta sesión y no se pinta.
+        app.apply(LiveEvent::ChildEvent {
+            parent: SessionId(2),
+            child: SessionId(9),
+            event: Box::new(aviso),
+        });
+        assert_eq!(texts(&app).len(), 1);
     }
 
     #[test]
@@ -4200,7 +4256,7 @@ Cuerpo de front.
         assert!(lineas[0].contains("según los precios conocidos"));
         assert_eq!(
             lineas[0],
-            "aviso de presupuesto: 80 % de 10.00 USD de la sesión (8.00 usados) (según los precios conocidos)"
+            "aviso de presupuesto: 80 % de 10.00 USD de la sesión y sus subagentes (8.00 usados) (según los precios conocidos)"
         );
 
         let mut completo = crush_app();
@@ -4214,7 +4270,7 @@ Cuerpo de front.
         let sin_parcial = texts(&completo);
         assert_eq!(
             sin_parcial[0],
-            "aviso de presupuesto: 80 % de 10.00 USD de la sesión (8.00 usados)"
+            "aviso de presupuesto: 80 % de 10.00 USD de la sesión y sus subagentes (8.00 usados)"
         );
         assert!(!sin_parcial[0].contains("según los precios conocidos"));
     }

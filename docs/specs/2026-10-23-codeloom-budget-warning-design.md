@@ -56,8 +56,8 @@ el aviso lo dice («según los precios conocidos») en lugar de afirmar un total
 
 ## Fuera de alcance, declarado
 
-- **Subagentes:** cada hijo tiene su propia sesión y **no** hereda el presupuesto; el gasto de los
-  hijos no suma al del padre. Es la fuga más probable y queda pendiente de decisión.
+- **Subagentes:** inicialmente fuera de alcance; resuelto el 2026-10-23 por decisión de la persona
+  usuaria (véase «Estado»): el presupuesto es de la **familia** (sesión raíz y sus hijos).
 - **Presupuesto por turno** (qwen-code lo ofrece por directiva) y **por día**: no.
 - **Aviso al modelo** (codex): descartado por la decisión de producto.
 - **Recarga en caliente** de `[budget]`: se lee al arrancar.
@@ -76,12 +76,32 @@ Implementado el 2026-10-23, **sin verlo aún en una terminal real**. Commits: `2
 - **Un `[budget]` mal escrito impide arrancar**, igual que `[agents]`. Un aviso por la salida de
   errores se perdería tras la pantalla alternativa de la interfaz.
 
+### Los subagentes suman al total (2026-10-23)
+
+La persona usuaria eligió el **total compartido**. Sustituye a la desviación anterior («solo
+cuentan los apuntes de la propia sesión»), que ya no rige.
+
+- `budget_crossings` cuenta **todos** los apuntes que recibe, sean de la sesión que sean. Quien la
+  llama pasa la familia entera: el agente raíz lee `session_usage(su sesión)` y un hijo lee
+  `session_usage(sesión del padre)` (`with_budget_family`), que devuelve la raíz y sus hijos.
+- El lanzador de subagentes recibe el presupuesto (`InProcessSubagentLauncher::with_budget`) y lo
+  pasa a cada hijo. Con ello el problema que motivó la desviación anterior (un hijo rebasa un
+  umbral y el padre ya no avisa) desaparece: el aviso lo da quien cruza el umbral, una vez por
+  nivel para toda la familia.
+- El aviso que cruza un hijo llega al bus del padre como `ChildEvent` y la interfaz lo pinta
+  como la misma línea de sistema, con el texto «de la sesión y sus subagentes». Hasta este
+  cambio la interfaz descartaba en silencio cualquier `BudgetWarning` de un hijo.
+- Los contadores de consumo de la interfaz y el presupuesto miden ya lo mismo (la familia).
+
 ### Lo que no consta o queda pendiente
 
-- **Incoherencia visible:** los contadores de consumo de la interfaz pueden sumar los hijos
-  (vienen de la misma consulta del almacén), mientras que el presupuesto no. Una persona puede
-  ver un total mayor que el que mide el aviso. No se ha comprobado en pantalla.
-- **Los hijos no heredan el presupuesto** y su gasto no suma al del padre: es la fuga más probable.
+- **No atómico:** leer el acumulado y apuntar el consumo son dos pasos. Dos respuestas
+  simultáneas (padre e hijo, o dos hijos) que cruzan el mismo nivel pueden publicar el aviso dos
+  veces. No se ha medido con qué frecuencia ocurre.
+- **Un solo nivel de familia:** los hijos no reciben la herramienta `subagent`, así que no hay
+  nietos; si algún día los hubiera, un nieto contaría su familia desde el padre, no desde la raíz.
+- **Sin tope duro** (por decisión): el hijo sigue sin detenerse al llegar al 100 %.
+- Sin verlo en una terminal real; probado con un lanzador real y un proveedor simulado.
 - Los tokens se muestran con `format_tokens` (400 123 sale como «400k»): la precisión del aviso es
   la de ese formato.
 - Con dólares, el límite lleva «USD» y lo usado solo la cifra («8.00 usados»).

@@ -1,5 +1,6 @@
 use crate::a2a::Artifact;
 use crate::agent::AgentLoop;
+use crate::budget::BudgetConfig;
 use crate::catalog::Catalog;
 use crate::config::CodeLoomConfig;
 use crate::error::{CoreError, Result};
@@ -79,6 +80,8 @@ pub struct InProcessSubagentLauncher {
     registry: Option<Arc<AgentRegistry>>,
     /// Volcado de salidas recortadas que reciben los hijos; `None` como en el agente padre.
     spill: Option<ToolSpill>,
+    /// Presupuesto del padre: cada hijo lo recibe y suma su consumo al total de la familia.
+    budget: BudgetConfig,
 }
 
 /// Descarta la pregunta pendiente del hijo al terminar su trabajo, sea cual sea la
@@ -181,7 +184,14 @@ impl InProcessSubagentLauncher {
             catalog: Arc::new(RwLock::new(Catalog::default())),
             registry: None,
             spill: None,
+            budget: BudgetConfig::default(),
         }
+    }
+
+    /// Comparte el presupuesto de gasto con los hijos que lance: avisan con el total de la familia.
+    pub fn with_budget(mut self, budget: BudgetConfig) -> Self {
+        self.budget = budget;
+        self
     }
 
     /// Comparte el volcado a disco con los hijos que lance, como `with_catalog`.
@@ -375,6 +385,7 @@ impl SubagentLauncher for InProcessSubagentLauncher {
         let child_jobs = self.jobs.clone();
         let child_catalog = self.catalog.clone();
         let child_spill = self.spill.clone();
+        let child_budget = self.budget.clone();
         let descriptor_label = label.clone();
         // El bus del hijo se crea y se suscribe antes de lanzarlo, para no perder ningún
         // evento de su arranque. Su canal se cierra cuando se sueltan todos sus emisores.
@@ -416,7 +427,9 @@ impl SubagentLauncher for InProcessSubagentLauncher {
                     )
                     .with_jobs(child_jobs)
                     .with_catalog(child_catalog)
-                    .with_system_extra(child_system);
+                    .with_system_extra(child_system)
+                    .with_budget(child_budget)
+                    .with_budget_family(parent);
                     if let Some(spill) = child_spill {
                         child_agent = child_agent.with_spill(spill);
                     }
@@ -2034,6 +2047,94 @@ mod tests {
                 StreamChunk::Done(FinishReason::Stop),
             ])))
         }
+    }
+
+    /// Proveedor que responde `listo` declarando `entrada` tokens de consumo.
+    struct ProveedorConUso {
+        entrada: u32,
+    }
+
+    #[async_trait]
+    impl Provider for ProveedorConUso {
+        fn capabilities(&self) -> crate::provider::Capabilities {
+            crate::provider::Capabilities {
+                tool_use: false,
+                reasoning: false,
+                streaming: true,
+            }
+        }
+        async fn stream(
+            &self,
+            _req: crate::provider::ProviderRequest,
+            _cancel: CancellationToken,
+        ) -> Result<crate::provider::ProviderStream> {
+            Ok(Box::pin(futures::stream::iter(vec![
+                StreamChunk::TextDelta("listo".into()),
+                StreamChunk::Usage(crate::message::Usage {
+                    input_tokens: self.entrada,
+                    output_tokens: 0,
+                }),
+                StreamChunk::Done(FinishReason::Stop),
+            ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_child_inherits_the_budget_and_its_warning_reaches_the_parent_bus() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, parent) = tienda_de_prueba(dir.path(), "presupuesto.db").await;
+        let jobs = Arc::new(LocalJobRegistry::default());
+        let bus = EventBus::new(256);
+        let mut rx = bus.subscribe();
+        let provider: Arc<dyn Provider> = Arc::new(ProveedorConUso { entrada: 900 });
+        let runtime = InProcessSubagentLauncher::new(
+            Arc::new(RwLock::new(provider)),
+            store.clone(),
+            Arc::new(ToolRegistry::new()),
+            Arc::new(PermissionService::allow_all()),
+            Arc::new(RwLock::new(config_de_prueba())),
+            dir.path().to_path_buf(),
+            jobs.clone(),
+            bus,
+        )
+        .with_budget(BudgetConfig {
+            session_tokens: Some(1000),
+            session_cost_usd: None,
+        });
+
+        let (_, job) = runtime
+            .start(
+                parent,
+                "obrero".into(),
+                "tarea".into(),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        jobs.wait(parent, &job).await.unwrap();
+
+        let aviso = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await {
+                    Ok(LiveEvent::ChildEvent { event, .. }) => {
+                        if let LiveEvent::BudgetWarning {
+                            level_percent,
+                            used,
+                            ..
+                        } = *event
+                        {
+                            return (level_percent, used);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => panic!("el bus debería seguir abierto: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("el aviso del hijo debería llegar al bus del padre");
+        assert_eq!(aviso, (80, 900.0));
     }
 
     /// Configuración del padre de las pruebas: modelo `test` y esfuerzo `low`.

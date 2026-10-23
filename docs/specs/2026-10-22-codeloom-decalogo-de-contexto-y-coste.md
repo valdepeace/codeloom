@@ -93,8 +93,11 @@ que no tiene cota acabará, tarde o temprano, desbordándose.**
    al 80 % y al 100 %, por decisión de producto **solo avisa**: no detiene el turno, no
    pregunta y no informa al modelo (`2026-10-23-codeloom-budget-warning-design.md`). El sondeo
    (`job_output` en bucle) es un bucle disfrazado: se evita en el prompt, pero no se garantiza.
-   *Estado: **parcial**: sin tope duro por decisión, y el gasto de los subagentes no suma al
-   presupuesto del padre.*
+   *Estado: **parcial**: sin tope duro por decisión. Desde el 2026-10-23 el gasto de los
+   subagentes **suma al mismo total** que el del padre (la familia: sesión raíz y sus hijos): el
+   hijo hereda el presupuesto y el aviso lo cruza quien gaste, una sola vez por nivel. Dos
+   gastos simultáneos pueden duplicar un aviso, porque leer y apuntar no es atómico; con
+   subagentes sin anidar la familia es de un nivel.*
 8. **Lo que cruza de un agente a otro también se acota.** El resultado de un subagente vuelve al
    padre y lo paga cada paso siguiente. *Estado: hecho: el aviso de finalización del hijo se recorta a 8 000 bytes.*
 9. **La memoria de la interfaz tiene cota.** Registros por hijo (200 elementos), cachés de
@@ -119,7 +122,7 @@ que no tiene cota acabará, tarde o temprano, desbordándose.**
 - ¿Qué tope tiene sentido por herramienta? 20 000 bytes (≈ 5 000 tokens) es una cota general
   prudente, muy por debajo de los 25 000 tokens de Claude Code, y no una medida afinada. Conviene
   medir con sesiones reales.
-- Presupuesto de tokens: resuelto como aviso por sesión (regla 7). Quedan abiertos el presupuesto
-  por turno y que el gasto de los hijos sume al del padre.
+- Presupuesto de tokens: resuelto como aviso por sesión y familia (regla 7). Queda abierto el
+  presupuesto por turno.
 - ¿Compactación a petición (`/compact`)? La automática ya existe; falta el mando manual, que
   exige una infraestructura de comandos con barra que la TUI no tiene.

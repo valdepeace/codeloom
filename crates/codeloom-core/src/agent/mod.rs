@@ -64,6 +64,8 @@ struct UsageRecorder {
     config: Arc<RwLock<CodeLoomConfig>>,
     catalog: Arc<RwLock<Catalog>>,
     budget: BudgetConfig,
+    /// Sesión raíz cuya familia (ella y sus hijos) suma al presupuesto; `None` si es la propia.
+    family: Option<SessionId>,
     bus: EventBus,
 }
 
@@ -94,7 +96,11 @@ impl UsageRecorder {
         let anteriores = if self.budget.is_empty() {
             None
         } else {
-            match self.store.session_usage(session).await {
+            match self
+                .store
+                .session_usage(self.family.unwrap_or(session))
+                .await
+            {
                 Ok(registros) => Some(registros),
                 Err(error) => {
                     tracing::warn!(error = %error, "no se pudo leer el consumo previo del presupuesto");
@@ -142,9 +148,12 @@ pub struct AgentLoop {
     delegation_confirm: ConfirmDelegation,
     /// Volcado a disco de las salidas recortadas; `None` no guarda nada y no añade ruta.
     spill: Option<ToolSpill>,
-    /// Presupuesto de gasto de la sesión; vacío no avisa ni lee el consumo acumulado. No se
-    /// propaga a los subagentes.
+    /// Presupuesto de gasto de la sesión; vacío no avisa ni lee el consumo acumulado. Los
+    /// subagentes lo reciben y suman al mismo total (véase `budget_family`).
     budget: BudgetConfig,
+    /// Sesión raíz del presupuesto compartido. En un hijo, la del padre: su consumo y el de sus
+    /// hermanos suman al mismo acumulado. `None` en el agente raíz, que cuenta con su propia sesión.
+    budget_family: Option<SessionId>,
     /// Configuración de la compactación (`[compaction]`). Por defecto, sin segundo plano. Solo
     /// afecta a este agente: el lanzador de subagentes no lo hereda.
     compaction: compact::CompactionConfig,
@@ -223,6 +232,7 @@ impl AgentLoop {
             delegation_confirm: ConfirmDelegation::default(),
             spill: None,
             budget: BudgetConfig::default(),
+            budget_family: None,
             compaction: compact::CompactionConfig::default(),
             background: background::BackgroundSlots::default(),
             cwd,
@@ -285,9 +295,20 @@ impl AgentLoop {
     }
 
     /// Fija el presupuesto de gasto de la sesión (`[budget]`). Sin él, o vacío, no hay avisos.
-    /// Solo afecta a este agente: el lanzador de subagentes no lo hereda.
+    /// Los subagentes que lance heredan el mismo presupuesto y suman al total de la familia.
     pub fn with_budget(mut self, budget: BudgetConfig) -> Self {
         self.budget = budget;
+        // Igual que `with_catalog`: el lanzador guarda su copia y, si ya existía, se reconstruye.
+        if self.subagents.is_some() {
+            self.subagents = Some(self.subagent_launcher());
+        }
+        self
+    }
+
+    /// Hace que el consumo de este agente cuente en el acumulado de la familia de `root`: es lo que
+    /// usa el lanzador para que un hijo y sus hermanos sumen al presupuesto del padre.
+    pub fn with_budget_family(mut self, root: SessionId) -> Self {
+        self.budget_family = Some(root);
         self
     }
 
@@ -310,7 +331,8 @@ impl AgentLoop {
             self.jobs.clone(),
             self.bus.clone(),
         )
-        .with_catalog(self.catalog.clone());
+        .with_catalog(self.catalog.clone())
+        .with_budget(self.budget.clone());
         let lanzador = match &self.registry {
             Some(registro) => lanzador.with_registry(registro.clone()),
             None => lanzador,
@@ -330,6 +352,7 @@ impl AgentLoop {
             config: self.config.clone(),
             catalog: self.catalog.clone(),
             budget: self.budget.clone(),
+            family: self.budget_family,
             bus: self.bus.clone(),
         }
     }
@@ -3402,6 +3425,66 @@ Cuerpo.
 
         // 800 tokens sobre un límite de 1000: se cruza el 80 % y no el 100 %.
         assert_eq!(avisos_del_bus(&mut rx), vec![(80, 800.0)]);
+    }
+
+    /// Registra `child` como hijo de `parent` en el almacén, como hace el lanzador.
+    async fn registrar_hijo(store: &SqliteStore, parent: SessionId) -> SessionId {
+        let child = store.create_session("/p").await.unwrap();
+        store
+            .save_subagent(&crate::session::SubagentDescriptor {
+                parent,
+                child,
+                job_id: "subagent-1".into(),
+                label: "hijo".into(),
+                status: crate::task::TaskStatus::new(crate::task::TaskState::Working),
+                artifacts: Vec::new(),
+                notice_delivered: false,
+                agent: None,
+                agent_origin: None,
+            })
+            .await
+            .unwrap();
+        child
+    }
+
+    #[tokio::test]
+    async fn a_child_spending_crosses_the_family_budget_once() {
+        let proveedor = proveedor_de("", false, vec![respuesta_con_consumo("hijo", 100, 50)]);
+        let mut e = entorno_de_turno(
+            proveedor,
+            catalogo_de_ventana(100_000),
+            &[],
+            ToolRegistry::new(),
+        )
+        .await;
+        let hijo = registrar_hijo(&e.store, e.sid).await;
+        // El padre ya lleva 700 de 1000. El hijo gasta 150: la familia llega a 850 y cruza el 80 %.
+        e.store
+            .record_usage(
+                e.sid,
+                &UsageRecord {
+                    session: e.sid,
+                    model: "m".into(),
+                    input_tokens: 700,
+                    output_tokens: 0,
+                    input_price: None,
+                    output_price: None,
+                    created_at_ms: 0,
+                },
+            )
+            .await
+            .unwrap();
+        e.agente = e
+            .agente
+            .with_budget(presupuesto_de_tokens(1000))
+            .with_budget_family(e.sid);
+        let mut rx = e.agente.bus.subscribe();
+
+        e.agente
+            .run(hijo, "tarea".into(), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(avisos_del_bus(&mut rx), vec![(80, 850.0)]);
     }
 
     #[tokio::test]
