@@ -1,7 +1,8 @@
 # Elección automática de agente: regla y clasificador (A12b)
 
-Estado: propuesta del 2026-10-23, pendiente de aprobación (tarea A12b de
-`docs/plans/2026-10-22-codeloom-a2a-roadmap.md`). No implementar todavía. Independiente de A7–A9.
+Estado: la persona usuaria ordenó continuar con A12b el 2026-10-23 («continua con a8c y a12b»); la
+regla (D1–D3, D6–D8) está implementada y el clasificador (D4–D5) sigue pendiente; véase «Estado» al
+final. Tarea A12b de `docs/plans/2026-10-22-codeloom-a2a-roadmap.md`. Independiente de A7–A9.
 
 ## Propósito
 
@@ -67,3 +68,24 @@ un turno ni una pregunta, y que **siempre quede visible qué agente se eligió y
 - Umbral y ventaja de la regla (D3): se fijan con casos reales de la persona usuaria.
 - Si el idioma de la tarea (español, inglés) exige normalizar acentos y plurales en la regla.
 - Si el clasificador debe usar el mismo proveedor que el padre o uno más barato configurable.
+
+## Estado
+
+Hecho el 2026-10-23 (`4cdb793`, `5094579` y el commit de la integración): el contrato `AgentRouter`,
+la regla `RuleRouter`, `[agents] routing` y `routing_model`, la integración en la herramienta
+`subagent` y la visibilidad. Decisiones tomadas al implementar, rotuladas como nuestras:
+
+- **El enrutador cuelga del lanzador** (`SubagentLauncher::route`, con `None` por defecto), no de la
+  herramienta: es quien tiene el registro. Un nombre que el enrutador devuelva y no esté entre los
+  candidatos aprobados se descarta, y un error del enrutador nunca impide delegar.
+- **`always` no se enruta** (D7 simplificada): la persona usuaria aprueba cada asignación, así que el
+  enrutador no decide por ella. La *sugerencia* dentro de la pregunta queda sin hacer.
+- **La regla puntúa nombre, etiquetas y ejemplos; nunca la descripción** (D3 afinada): 3 puntos por
+  coincidencia de etiqueta o nombre, 1 por palabra de ejemplo con tope de 3; elige con al menos 3
+  puntos y 2 de ventaja sobre el segundo. Sin acentos ni plurales simples. Son umbrales sin medir.
+- **`default` no puntúa por nombre** (es genérico) y con un solo candidato no hay decisión.
+- La decisión sale como `LiveEvent::AgentRouted` (línea de sistema en la conversación) y el resultado de
+  la herramienta añade `agent`, `routed_by` y `routing_reason` solo cuando eligió el enrutador.
+
+**Pendiente:** el clasificador (`ClassifierRouter`, D4–D5): hoy `routing = "classifier"` equivale a
+`rule`. Sin medir el ahorro real ni los umbrales con tareas reales. No visto en una terminal real.

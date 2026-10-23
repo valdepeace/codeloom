@@ -77,6 +77,24 @@ impl Tool for SubagentTool {
                 )),
             },
         };
+        // Solo se enruta una delegación nueva sin agente nombrado: un `agent` explícito siempre manda,
+        // y un seguimiento hereda la tarea que continúa.
+        let elegido = match (&agent, follow_up_of) {
+            (None, None) => launcher.route(ctx.session, &label, &prompt).await?,
+            _ => None,
+        };
+        let agent = match &elegido {
+            Some(decision) => {
+                ctx.bus.publish(crate::event::LiveEvent::AgentRouted {
+                    parent: ctx.session,
+                    agent: decision.agent.clone(),
+                    reason: decision.reason.clone(),
+                    source: decision.source.as_str().to_string(),
+                });
+                Some(decision.agent.clone())
+            }
+            None => agent,
+        };
         let (child, job) = match follow_up_of {
             Some(anterior) => {
                 launcher
@@ -100,13 +118,25 @@ impl Tool for SubagentTool {
         }
         super::job_start::track_job(&ctx, &job)?;
         Ok(ToolOutput::ok(
-            serde_json::json!({
-                "child_id": child.0,
-                "job_id": job.0,
-            })
-            .to_string(),
+            resultado_json(child, job, elegido.as_ref()).to_string(),
         ))
     }
+}
+
+/// Resultado que ve el modelo. Si el agente lo eligió el enrutador, lo dice y da el motivo: así la
+/// elección no es silenciosa para nadie.
+fn resultado_json(
+    child: SessionId,
+    job: crate::job::JobId,
+    elegido: Option<&crate::registry::router::RouteDecision>,
+) -> serde_json::Value {
+    let mut resultado = serde_json::json!({ "child_id": child.0, "job_id": job.0 });
+    if let Some(decision) = elegido {
+        resultado["agent"] = serde_json::json!(decision.agent);
+        resultado["routed_by"] = serde_json::json!(decision.source.as_str());
+        resultado["routing_reason"] = serde_json::json!(decision.reason);
+    }
+    resultado
 }
 
 #[cfg(test)]
@@ -124,6 +154,8 @@ mod tests {
     #[derive(Default)]
     struct LanzadorEspia {
         agentes: Mutex<Vec<Option<String>>>,
+        /// Lo que `route` contesta; `None` es «no sé».
+        decision: Option<crate::registry::router::RouteDecision>,
         /// Tareas referidas que llegaron a `start_follow_up`.
         seguimientos: Mutex<Vec<SessionId>>,
     }
@@ -163,6 +195,15 @@ mod tests {
             _message: Option<String>,
         ) -> Result<()> {
             Err(CoreError::Tool("not used".into()))
+        }
+
+        async fn route(
+            &self,
+            _parent: SessionId,
+            _label: &str,
+            _prompt: &str,
+        ) -> Result<Option<crate::registry::router::RouteDecision>> {
+            Ok(self.decision.clone())
         }
 
         async fn list(&self, _parent: SessionId) -> Result<Vec<SubagentDescriptor>> {
@@ -227,6 +268,115 @@ mod tests {
             .await;
 
         assert_eq!(*espia.agentes.lock().unwrap(), vec![None]);
+    }
+
+    fn espia_que_elige(agente: &str) -> Arc<LanzadorEspia> {
+        Arc::new(LanzadorEspia {
+            decision: Some(crate::registry::router::RouteDecision {
+                agent: agente.into(),
+                reason: "regla: coincide con «review»".into(),
+                source: crate::registry::router::RouteSource::Rule,
+            }),
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn a_router_decision_picks_the_agent_and_emits_the_event() {
+        let espia = espia_que_elige("revisor");
+        let ctx = contexto_con(espia.clone());
+        let mut eventos = ctx.bus.subscribe();
+
+        let _ = SubagentTool
+            .run(
+                ctx,
+                serde_json::json!({"prompt": "haz una review"}),
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert_eq!(
+            *espia.agentes.lock().unwrap(),
+            vec![Some("revisor".to_string())]
+        );
+        match eventos.try_recv() {
+            Ok(crate::event::LiveEvent::AgentRouted {
+                parent,
+                agent,
+                reason,
+                source,
+            }) => {
+                assert_eq!(parent, SessionId(1));
+                assert_eq!(agent, "revisor");
+                assert!(reason.contains("review"));
+                assert_eq!(source, "rule");
+            }
+            otro => panic!("se esperaba AgentRouted y llegó {otro:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_explicit_agent_wins_over_the_router() {
+        let espia = espia_que_elige("otro");
+        let ctx = contexto_con(espia.clone());
+        let mut eventos = ctx.bus.subscribe();
+
+        let _ = SubagentTool
+            .run(
+                ctx,
+                serde_json::json!({"prompt": "haz una review", "agent": "revisor"}),
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert_eq!(
+            *espia.agentes.lock().unwrap(),
+            vec![Some("revisor".to_string())]
+        );
+        assert!(eventos.try_recv().is_err(), "no debe anunciar una elección");
+    }
+
+    #[tokio::test]
+    async fn a_follow_up_is_never_routed() {
+        let espia = espia_que_elige("revisor");
+        let ctx = contexto_con(espia.clone());
+        let mut eventos = ctx.bus.subscribe();
+
+        let _ = SubagentTool
+            .run(
+                ctx,
+                serde_json::json!({"prompt": "sigue", "follow_up_of": 3}),
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(espia.agentes.lock().unwrap().is_empty());
+        assert_eq!(*espia.seguimientos.lock().unwrap(), vec![SessionId(3)]);
+        assert!(eventos.try_recv().is_err());
+    }
+
+    #[test]
+    fn the_tool_result_names_the_agent_and_the_reason_only_when_routed() {
+        let decision = crate::registry::router::RouteDecision {
+            agent: "revisor".into(),
+            reason: "regla: coincide con «review»".into(),
+            source: crate::registry::router::RouteSource::Rule,
+        };
+
+        let elegido = resultado_json(
+            SessionId(4),
+            crate::job::JobId("j1".into()),
+            Some(&decision),
+        );
+        let normal = resultado_json(SessionId(4), crate::job::JobId("j1".into()), None);
+
+        assert_eq!(elegido["agent"], "revisor");
+        assert_eq!(elegido["routed_by"], "rule");
+        assert!(elegido["routing_reason"]
+            .as_str()
+            .unwrap()
+            .contains("review"));
+        assert_eq!(normal, serde_json::json!({"child_id": 4, "job_id": "j1"}));
     }
 
     #[test]

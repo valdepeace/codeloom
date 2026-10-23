@@ -2,12 +2,13 @@ use crate::a2a::{Artifact, Message};
 use crate::agent::AgentLoop;
 use crate::budget::BudgetConfig;
 use crate::catalog::Catalog;
-use crate::config::CodeLoomConfig;
+use crate::config::{CodeLoomConfig, ConfirmDelegation};
 use crate::error::{CoreError, Result};
 use crate::event::{EventBus, LiveEvent};
 use crate::job::{JobBody, JobHandle, JobId, JobRegistry, JobResult, JobSpec};
 use crate::permission::PermissionService;
 use crate::provider::Provider;
+use crate::registry::router::{AgentRouter, RouteDecision, RouteRequest};
 use crate::registry::{AgentEntry, AgentRegistry, Approval, Execution, AGENTE_POR_DEFECTO};
 use crate::remote_task::{
     RemoteClientFactory, RemoteReply, RemoteTask, RemoteTaskClient, RemoteTaskError,
@@ -41,6 +42,17 @@ pub trait SubagentLauncher: Send + Sync {
         action: &str,
         message: Option<String>,
     ) -> Result<()>;
+
+    /// Elige agente para una tarea sin agente explícito (A12b). `None` significa «no sé» o «no hay
+    /// enrutador»: se delega en el agente por defecto, como siempre.
+    async fn route(
+        &self,
+        _parent: SessionId,
+        _label: &str,
+        _prompt: &str,
+    ) -> Result<Option<RouteDecision>> {
+        Ok(None)
+    }
 
     /// Arranca un hijo como seguimiento de otro ya terminado (A11): una tarea nueva en el mismo
     /// contexto, con el resultado de la anterior en su prompt y el enlace guardado como
@@ -115,6 +127,9 @@ pub struct InProcessSubagentLauncher {
     /// Cada cuánto se consulta una tarea remota, y cuánto se la sigue como máximo.
     remote_poll: std::time::Duration,
     remote_max_follow: std::time::Duration,
+    /// Enrutador de agentes (A12b) y el modo de confirmación con el que convive. Sin él no se elige
+    /// agente automáticamente.
+    router: Option<(Arc<dyn AgentRouter>, ConfirmDelegation)>,
 }
 
 /// Descarta la pregunta pendiente del hijo al terminar su trabajo, sea cual sea la
@@ -254,6 +269,7 @@ impl InProcessSubagentLauncher {
             remote_clients: None,
             remote_poll: REMOTE_POLL,
             remote_max_follow: REMOTE_MAX_FOLLOW,
+            router: None,
         }
     }
 
@@ -297,6 +313,13 @@ impl InProcessSubagentLauncher {
     /// Comparte el registro de agentes: `start` resuelve ahí el agente pedido.
     pub fn with_registry(mut self, registry: Arc<AgentRegistry>) -> Self {
         self.registry = Some(registry);
+        self
+    }
+
+    /// Activa la elección automática de agente (A12b) cuando la herramienta no nombra ninguno.
+    /// Con `confirm = always` no actúa: ahí la persona usuaria aprueba cada asignación.
+    pub fn with_router(mut self, router: Arc<dyn AgentRouter>, confirm: ConfirmDelegation) -> Self {
+        self.router = Some((router, confirm));
         self
     }
 
@@ -999,6 +1022,38 @@ impl SubagentLauncher for InProcessSubagentLauncher {
         validar_peticion(&label, &prompt)?;
         self.arrancar(parent, label, prompt, agent, Vec::new(), parent_cancel)
             .await
+    }
+
+    async fn route(
+        &self,
+        _parent: SessionId,
+        label: &str,
+        prompt: &str,
+    ) -> Result<Option<RouteDecision>> {
+        let Some((router, confirm)) = &self.router else {
+            return Ok(None);
+        };
+        // `always`: cada asignación la aprueba la persona usuaria, no se decide por ella.
+        if *confirm == ConfirmDelegation::Always {
+            return Ok(None);
+        }
+        let Some(registro) = &self.registry else {
+            return Ok(None);
+        };
+        let candidatos = registro.snapshot().route_candidates();
+        let peticion = RouteRequest {
+            prompt: prompt.to_string(),
+            label: label.to_string(),
+        };
+        // Un fallo del enrutador nunca impide delegar: se vuelve al comportamiento de siempre.
+        let Ok(Some(decision)) = router.route(&peticion, &candidatos).await else {
+            return Ok(None);
+        };
+        // La respuesta se valida contra los candidatos aprobados: un nombre inventado no vale.
+        Ok(candidatos
+            .iter()
+            .any(|c| c.name == decision.agent)
+            .then_some(decision))
     }
 
     async fn start_follow_up(
@@ -2712,6 +2767,128 @@ mod tests {
             Some(registro) => lanzador.with_registry(registro),
             None => lanzador,
         }
+    }
+
+    /// Enrutador de prueba: contesta lo que se le diga.
+    struct EnrutadorFijo(Result<Option<RouteDecision>>);
+
+    #[async_trait]
+    impl crate::registry::router::AgentRouter for EnrutadorFijo {
+        async fn route(
+            &self,
+            _request: &RouteRequest,
+            _candidates: &[crate::registry::router::RouteCandidate],
+        ) -> Result<Option<RouteDecision>> {
+            match &self.0 {
+                Ok(decision) => Ok(decision.clone()),
+                Err(_) => Err(CoreError::Tool("el enrutador falló".into())),
+            }
+        }
+    }
+
+    fn decision_para(agente: &str) -> RouteDecision {
+        RouteDecision {
+            agent: agente.into(),
+            reason: "prueba".into(),
+            source: crate::registry::router::RouteSource::Rule,
+        }
+    }
+
+    /// Lanzador con registro (integrado + `revisor` global) y el enrutador dado.
+    fn lanzador_con_enrutador(
+        dir: &std::path::Path,
+        store: Arc<SqliteStore>,
+        enrutador: Option<(Result<Option<RouteDecision>>, ConfirmDelegation)>,
+    ) -> InProcessSubagentLauncher {
+        let global = dir.join("global");
+        std::fs::create_dir_all(&global).unwrap();
+        escribir_perfil(
+            &global,
+            "revisor",
+            "---\nname: revisor\ndescription: Revisa\n---\n\nCuerpo.\n",
+        );
+        let proveedor = ProveedorGrabador {
+            peticiones: Arc::new(std::sync::Mutex::new(Vec::new())),
+            puerta: None,
+        };
+        let lanzador = lanzador_grabador(
+            dir,
+            store,
+            Arc::new(LocalJobRegistry::default()),
+            proveedor,
+            Some(registro_global(&global)),
+            None,
+        );
+        match enrutador {
+            Some((respuesta, modo)) => {
+                lanzador.with_router(Arc::new(EnrutadorFijo(respuesta)), modo)
+            }
+            None => lanzador,
+        }
+    }
+
+    #[tokio::test]
+    async fn route_without_a_router_abstains() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, parent) = tienda_de_prueba(dir.path(), "r1.db").await;
+        let lanzador = lanzador_con_enrutador(dir.path(), store, None);
+
+        assert_eq!(lanzador.route(parent, "t", "revisa").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn route_returns_the_routers_decision_for_an_approved_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, parent) = tienda_de_prueba(dir.path(), "r2.db").await;
+        for modo in [ConfirmDelegation::Doubt, ConfirmDelegation::Never] {
+            let lanzador = lanzador_con_enrutador(
+                dir.path(),
+                store.clone(),
+                Some((Ok(Some(decision_para("revisor"))), modo)),
+            );
+
+            let decision = lanzador.route(parent, "t", "revisa").await.unwrap();
+
+            assert_eq!(decision.map(|d| d.agent), Some("revisor".to_string()));
+        }
+    }
+
+    #[tokio::test]
+    async fn always_mode_still_asks_so_the_router_does_not_decide() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, parent) = tienda_de_prueba(dir.path(), "r3.db").await;
+        let lanzador = lanzador_con_enrutador(
+            dir.path(),
+            store,
+            Some((
+                Ok(Some(decision_para("revisor"))),
+                ConfirmDelegation::Always,
+            )),
+        );
+
+        assert_eq!(lanzador.route(parent, "t", "revisa").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn an_invented_agent_name_or_a_failing_router_never_blocks_delegation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, parent) = tienda_de_prueba(dir.path(), "r4.db").await;
+        let inventado = lanzador_con_enrutador(
+            dir.path(),
+            store.clone(),
+            Some((
+                Ok(Some(decision_para("no-existe"))),
+                ConfirmDelegation::Doubt,
+            )),
+        );
+        let roto = lanzador_con_enrutador(
+            dir.path(),
+            store,
+            Some((Err(CoreError::Tool("x".into())), ConfirmDelegation::Doubt)),
+        );
+
+        assert_eq!(inventado.route(parent, "t", "revisa").await.unwrap(), None);
+        assert_eq!(roto.route(parent, "t", "revisa").await.unwrap(), None);
     }
 
     async fn tienda_de_prueba(

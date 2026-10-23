@@ -2834,6 +2834,21 @@ impl App {
                     self.resync_tools();
                 }
             }
+            LiveEvent::AgentRouted {
+                parent,
+                agent,
+                reason,
+                source,
+            } => {
+                // La elección automática nunca es silenciosa: qué agente, quién decidió y por qué.
+                if Some(parent) == self.session_id {
+                    self.transcript.push_entry(
+                        batten::state::LineKind::System,
+                        batten::state::Format::Plain,
+                        format!("agente elegido automáticamente: {agent} ({source}) · {reason}"),
+                    );
+                }
+            }
             LiveEvent::A2aServed { task, agent, state } => {
                 // Un tercero está dictando trabajo a un modelo local: la persona usuaria ha de verlo.
                 self.transcript.push_entry(
@@ -4298,6 +4313,30 @@ Cuerpo de front.
         assert!(!app.turn_in_flight);
         assert!(!app.thinking);
         assert_eq!(app.status, "error: provider unavailable");
+    }
+
+    #[test]
+    fn an_automatic_agent_choice_is_shown_with_who_decided_and_why() {
+        let mut app = idle_parent_app();
+        let padre = app.session_id.unwrap();
+        app.apply(LiveEvent::AgentRouted {
+            parent: padre,
+            agent: "revisor".into(),
+            reason: "regla: coincide con «review»".into(),
+            source: "rule".into(),
+        });
+        // La de otra sesión no se pinta aquí.
+        app.apply(LiveEvent::AgentRouted {
+            parent: SessionId(padre.0 + 100),
+            agent: "otro".into(),
+            reason: "x".into(),
+            source: "rule".into(),
+        });
+
+        let lineas = system_lines(&app);
+        assert_eq!(lineas.len(), 1, "{lineas:?}");
+        assert!(lineas[0].contains("revisor") && lineas[0].contains("rule"));
+        assert!(lineas[0].contains("review"));
     }
 
     #[test]

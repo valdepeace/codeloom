@@ -238,6 +238,10 @@ async fn main() -> Result<()> {
         Some(fabrica) => agent.with_remote_clients(fabrica),
         None => agent,
     };
+    let agent = match enrutador_de(&agents_cfg) {
+        Some(enrutador) => agent.with_router(enrutador),
+        None => agent,
+    };
     let agent = Arc::new(agent);
 
     if let Some(prompt) = cli.print {
@@ -510,6 +514,20 @@ fn arrancar_remotos(
     Ok(Some(Arc::new(fabrica)))
 }
 
+/// Enrutador de agentes que pide `[agents] routing` (A12b). Apagado por defecto. El clasificador
+/// aún no existe: `classifier` usa solo la regla determinista, que ya es su primer nivel.
+fn enrutador_de(
+    agents: &AgentsConfig,
+) -> Option<Arc<dyn codeloom_core::registry::router::AgentRouter>> {
+    use codeloom_core::config::RoutingMode;
+    match agents.routing {
+        RoutingMode::Off => None,
+        RoutingMode::Rule | RoutingMode::Classifier => {
+            Some(Arc::new(codeloom_core::registry::router::RuleRouter))
+        }
+    }
+}
+
 /// Pone en marcha el servidor A2A si `[a2a] role` lo pide (A8b). Con el rol apagado o solo de
 /// consumo no se abre ningún puerto. Si lo pide y falta algo (autenticación, su variable de
 /// entorno, un agente servido válido), el arranque falla con el motivo: nunca se sirve a medias.
@@ -713,6 +731,19 @@ a2a:
             )),
         ]));
         (registro, dir)
+    }
+
+    #[test]
+    fn routing_is_off_by_default_and_on_with_rule_or_classifier() {
+        use codeloom_core::config::RoutingMode;
+        assert!(enrutador_de(&AgentsConfig::default()).is_none());
+        for modo in [RoutingMode::Rule, RoutingMode::Classifier] {
+            let cfg = AgentsConfig {
+                routing: modo,
+                ..AgentsConfig::default()
+            };
+            assert!(enrutador_de(&cfg).is_some(), "{modo:?}");
+        }
     }
 
     #[tokio::test]

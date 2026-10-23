@@ -146,6 +146,8 @@ pub struct AgentLoop {
     registry: Option<Arc<crate::registry::AgentRegistry>>,
     /// Modo de confirmación al delegar; viaja a `RegistrySnapshot::prompt_section` en cada turno.
     delegation_confirm: ConfirmDelegation,
+    /// Enrutador de agentes (A12b); sin él no se elige agente automáticamente.
+    router: Option<Arc<dyn crate::registry::router::AgentRouter>>,
     /// Volcado a disco de las salidas recortadas; `None` no guarda nada y no añade ruta.
     spill: Option<ToolSpill>,
     remote_clients: Option<Arc<dyn crate::remote_task::RemoteClientFactory>>,
@@ -231,6 +233,7 @@ impl AgentLoop {
             system_extra: None,
             registry: None,
             delegation_confirm: ConfirmDelegation::default(),
+            router: None,
             spill: None,
             remote_clients: None,
             budget: BudgetConfig::default(),
@@ -275,6 +278,12 @@ impl AgentLoop {
         if self.subagents.is_some() {
             self.subagents = Some(self.subagent_launcher());
         }
+        self
+    }
+
+    /// Activa la elección automática de agente al delegar (`[agents] routing`, A12b).
+    pub fn with_router(mut self, router: Arc<dyn crate::registry::router::AgentRouter>) -> Self {
+        self.router = Some(router);
         self
     }
 
@@ -419,6 +428,10 @@ impl AgentLoop {
         .with_budget(self.budget.clone());
         let lanzador = match &self.registry {
             Some(registro) => lanzador.with_registry(registro.clone()),
+            None => lanzador,
+        };
+        let lanzador = match &self.router {
+            Some(router) => lanzador.with_router(router.clone(), self.delegation_confirm),
             None => lanzador,
         };
         let lanzador = match &self.spill {

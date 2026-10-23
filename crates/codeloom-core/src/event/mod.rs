@@ -102,6 +102,14 @@ pub enum LiveEvent {
     },
     JobChanged(crate::job::JobSnapshot),
     SubagentChanged(crate::session::SubagentDescriptor),
+    /// El enrutador (A12b) eligió el agente de una delegación que no nombraba ninguno. Queda a la
+    /// vista de la persona usuaria: qué agente, por qué y quién decidió (`rule` o `classifier`).
+    AgentRouted {
+        parent: crate::session::SessionId,
+        agent: String,
+        reason: String,
+        source: String,
+    },
     /// Una tarea A2A entrante (servidor, A8b) ha cambiado de estado. Cuelga de la sesión padre del
     /// servidor y no de la que muestra la interfaz, así que `SubagentChanged` no la haría visible.
     A2aServed {
@@ -182,6 +190,7 @@ impl LiveEvent {
             | LiveEvent::JobChanged(_)
             | LiveEvent::SubagentChanged(_)
             | LiveEvent::A2aServed { .. }
+            | LiveEvent::AgentRouted { .. }
             | LiveEvent::SubagentInputRequested { .. }
             | LiveEvent::SubagentInputResolved { .. }
             | LiveEvent::TodosChanged { .. }
