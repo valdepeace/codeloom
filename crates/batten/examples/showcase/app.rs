@@ -21,6 +21,20 @@ pub enum Action {
     None,
 }
 
+/// Fila del índice lateral. El texto no lleva el símbolo del componente: el dibujo lo pinta
+/// aparte, con su estilo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexRow {
+    /// Índice del catálogo del ejemplo; `None` en las cabeceras y en el aviso «Sin resultados».
+    pub catalog_index: Option<usize>,
+    /// Texto de la fila. Las filas hijas van ya sangradas con dos espacios.
+    pub text: String,
+    /// `true` si la fila es de un componente (cabecera o fila única) y lleva símbolo.
+    pub marked: bool,
+    /// Solo con `marked`: `true` si el símbolo es el del genérico (`◐`), `false` si es propio (`●`).
+    pub generic: bool,
+}
+
 pub struct Showcase {
     demos: Vec<CatalogItem>,
     /// Índice del catálogo del demo seleccionado (el de un ejemplo, nunca el de una cabecera).
@@ -73,8 +87,6 @@ impl Showcase {
     }
 
     /// Vista del tema activo: componentes y ejemplos que el índice muestra.
-    // Sin lectura en el binario hasta la Tarea 3 (pestañas y pie); lo usan los tests.
-    #[allow(dead_code)]
     pub fn view(&self) -> &ThemeView {
         &self.view
     }
@@ -111,39 +123,54 @@ impl Showcase {
             .collect()
     }
 
-    /// Filas del índice como `(índice del catálogo, texto)`.
+    /// Filas del índice.
     ///
     /// Un componente con un único ejemplo visible es una sola fila seleccionable. Con varios, una
-    /// cabecera sin índice (no seleccionable) y una fila hija por ejemplo, con su etiqueta. El
-    /// marcador (`◐` genérico, `●` propio) va delante del texto de cada cabecera o fila
-    /// seleccionable; las filas hijas no llevan marcador.
-    pub fn index_rows(&self) -> Vec<(Option<usize>, String)> {
+    /// cabecera sin índice (no seleccionable, con `─`) y una fila hija por ejemplo, sangrada con su
+    /// etiqueta. Las cabeceras y las filas únicas van marcadas (`marked`) con el símbolo de su tipo.
+    pub fn index_rows(&self) -> Vec<IndexRow> {
         let mut rows = Vec::new();
         for (entry, examples) in self.visible() {
-            let marker = if entry.generic { "◐ " } else { "● " };
             if let [example] = examples.as_slice() {
-                rows.push((
-                    Some(example.catalog_index),
-                    format!("{marker}{}", entry.component),
-                ));
+                rows.push(IndexRow {
+                    catalog_index: Some(example.catalog_index),
+                    text: entry.component.to_string(),
+                    marked: true,
+                    generic: entry.generic,
+                });
             } else {
-                rows.push((None, format!("{marker}{} ─", entry.component)));
+                rows.push(IndexRow {
+                    catalog_index: None,
+                    text: format!("{} ─", entry.component),
+                    marked: true,
+                    generic: entry.generic,
+                });
                 for example in examples {
-                    rows.push((Some(example.catalog_index), format!("  {}", example.label)));
+                    rows.push(IndexRow {
+                        catalog_index: Some(example.catalog_index),
+                        text: format!("  {}", example.label),
+                        marked: false,
+                        generic: false,
+                    });
                 }
             }
         }
         if rows.is_empty() {
-            rows.push((None, "Sin resultados".to_string()));
+            rows.push(IndexRow {
+                catalog_index: None,
+                text: "Sin resultados".to_string(),
+                marked: false,
+                generic: false,
+            });
         }
         rows
     }
 
-    pub fn visible_index_rows(&self, height: u16) -> (usize, Vec<(Option<usize>, String)>) {
+    pub fn visible_index_rows(&self, height: u16) -> (usize, Vec<IndexRow>) {
         let rows = self.index_rows();
         let selected_row = rows
             .iter()
-            .position(|(index, _)| *index == Some(self.selected))
+            .position(|row| row.catalog_index == Some(self.selected))
             .unwrap_or(0);
         let height = usize::from(height);
         let start = selected_row
@@ -998,20 +1025,25 @@ mod tests {
         let mut show = Showcase::new();
         show.set_theme_column(column_index("Crush"));
         let rows = show.index_rows();
+        // ADAPTADO: el símbolo ya no forma parte del texto; la cabecera se identifica por `marked`.
         let header = rows
             .iter()
-            .position(|(index, label)| index.is_none() && label.starts_with("● Assistant message"))
+            .position(|row| {
+                row.catalog_index.is_none() && row.text.starts_with("Assistant message")
+            })
             .expect("cabecera de Assistant message");
-        assert_eq!(rows[header].1, "● Assistant message ─");
+        assert_eq!(rows[header].text, "Assistant message ─");
+        assert!(rows[header].marked && !rows[header].generic);
         let children: Vec<&str> = rows[header + 1..]
             .iter()
-            // Las filas hijas van sangradas; las de componentes con un ejemplo no.
-            .take_while(|(index, label)| index.is_some() && label.starts_with("  "))
-            .map(|(_, label)| label.as_str())
+            // Las filas hijas van sangradas y sin símbolo; las de componentes con un ejemplo no.
+            .take_while(|row| row.catalog_index.is_some() && row.text.starts_with("  "))
+            .map(|row| row.text.as_str())
             .collect();
         assert_eq!(children, ["  pending", "  refusal", "  summary"]);
-        for (index, _) in rows[header + 1..].iter().take(children.len()) {
-            let index = index.expect("fila hija seleccionable");
+        for row in rows[header + 1..].iter().take(children.len()) {
+            assert!(!row.marked);
+            let index = row.catalog_index.expect("fila hija seleccionable");
             assert_eq!(show.component_at(index), Some("Assistant message"));
         }
     }
@@ -1022,10 +1054,11 @@ mod tests {
         show.set_theme_column(column_index("Crush"));
         let rows = show.index_rows();
         let plan = first_demo(&show, "Plan card", "Crush");
-        assert!(rows.contains(&(Some(plan), "● Plan card".to_string())));
+        // ADAPTADO: la fila única guarda el nombre sin símbolo y con `marked` para el dibujo.
         assert!(rows
             .iter()
-            .all(|(_, label)| !label.ends_with("Plan card ─")));
+            .any(|row| row.catalog_index == Some(plan) && row.text == "Plan card" && row.marked));
+        assert!(rows.iter().all(|row| !row.text.ends_with("Plan card ─")));
     }
 
     #[test]
@@ -1041,10 +1074,11 @@ mod tests {
         );
         // El filtro es del tema: en Batten no hay «Plan card».
         show.set_theme_column(column_index("Batten"));
-        assert_eq!(
-            show.index_rows(),
-            vec![(None, "Sin resultados".to_string())]
-        );
+        // ADAPTADO: `index_rows` devuelve `IndexRow`, no tuplas.
+        let rows = show.index_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].catalog_index, None);
+        assert_eq!(rows[0].text, "Sin resultados");
         // El filtro también casa con la etiqueta del ejemplo.
         show.clear_query();
         show.set_theme_column(column_index("Crush"));

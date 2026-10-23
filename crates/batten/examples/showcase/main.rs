@@ -8,9 +8,9 @@ mod matrix;
 mod prompt_keys;
 mod theme_view;
 
-use app::{route, Action, Focus, Showcase};
+use app::{route, Action, Focus, IndexRow, Showcase};
 use batten::widgets::{Anim, Theme, FRAME_INTERVAL};
-use matrix::draw_matrix;
+use matrix::{draw_matrix, Cell};
 use ratatui::crossterm::event::{self, Event, MouseButton, MouseEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Modifier;
@@ -21,6 +21,8 @@ use std::time::{Duration, Instant};
 
 const INDEX_WIDTH: u16 = 34;
 const WIDE_MIN: u16 = 70;
+/// Columnas entre dos pestañas de tema.
+const TAB_GAP: u16 = 1;
 
 fn main() -> std::io::Result<()> {
     let mut show = Showcase::new();
@@ -72,10 +74,11 @@ fn draw(f: &mut Frame, show: &mut Showcase, _anim: &Anim, theme: &Theme) {
         Block::default().style(theme.style(batten::state::StyleToken::Default)),
         area,
     );
+    let footer_lines = footer_texts(show, area.width);
     let [filters, body, footer] = Layout::vertical([
         Constraint::Length(2),
         Constraint::Min(1),
-        Constraint::Length(1),
+        Constraint::Length(footer_lines.len() as u16),
     ])
     .areas(area);
     draw_filters(f, filters, show, theme);
@@ -113,31 +116,44 @@ fn draw(f: &mut Frame, show: &mut Showcase, _anim: &Anim, theme: &Theme) {
     } else if let Some(demo) = show.current() {
         demo.render(f, if demo.fullscreen() { panel } else { content }, theme);
     }
-    draw_footer(f, footer, show, theme);
+    draw_footer(f, footer, &footer_lines, theme);
+}
+
+/// Ancho de una pestaña de tema: el nombre con un espacio a cada lado.
+fn tab_width(name: &str) -> u16 {
+    name.chars().count() as u16 + 2
+}
+
+/// Posición de cada pestaña de tema visible en la fila de pestañas de un área de `width`
+/// columnas: índice en `matrix::COLUMNS`, x de inicio y ancho.
+///
+/// Las pestañas van separadas por `TAB_GAP`. Una que no cabe entera se recorta a lo que queda, y
+/// las siguientes no aparecen. El dibujo y el ratón usan esta misma función, así que no pueden
+/// divergir.
+pub(crate) fn tab_spans_layout(width: u16) -> Vec<(usize, u16, u16)> {
+    let mut spans = Vec::new();
+    let mut x = 0u16;
+    for (column, (name, _)) in matrix::COLUMNS.iter().enumerate() {
+        if x >= width {
+            break;
+        }
+        let full = tab_width(name);
+        let shown = full.min(width - x);
+        spans.push((column, x, shown));
+        if shown < full {
+            break;
+        }
+        x = x.saturating_add(full).saturating_add(TAB_GAP);
+    }
+    spans
 }
 
 fn draw_filters(f: &mut Frame, area: Rect, show: &Showcase, theme: &Theme) {
-    let [theme_area, query_area] =
+    let [tabs_area, query_area] =
         Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
-    let muted = theme.style(batten::state::StyleToken::Muted);
-    // Provisional hasta la Tarea 3 (pestañas de tema): los siete temas en texto, el activo entre
-    // corchetes.
-    let names: Vec<String> = matrix::COLUMNS
-        .iter()
-        .enumerate()
-        .map(|(column, (name, _))| {
-            if column == show.theme_column() {
-                format!("[{name}]")
-            } else {
-                name.to_string()
-            }
-        })
-        .collect();
-    f.render_widget(
-        Paragraph::new(Line::styled(names.join("  "), muted)),
-        theme_area,
-    );
+    draw_tabs(f, tabs_area, show, theme);
 
+    let muted = theme.style(batten::state::StyleToken::Muted);
     let cursor = if show.focus() == Focus::TextFilter {
         "▏"
     } else {
@@ -161,6 +177,34 @@ fn draw_filters(f: &mut Frame, area: Rect, show: &Showcase, theme: &Theme) {
         ])),
         query_area,
     );
+}
+
+/// Fila de pestañas: los temas de `matrix::COLUMNS`, la activa en negrita y en vídeo inverso.
+fn draw_tabs(f: &mut Frame, area: Rect, show: &Showcase, theme: &Theme) {
+    let active = show.theme_column();
+    let muted = theme.style(batten::state::StyleToken::Muted);
+    let active_style = theme
+        .style(batten::state::StyleToken::Accent)
+        .add_modifier(Modifier::BOLD | Modifier::REVERSED);
+    let mut spans = Vec::new();
+    let mut x = 0u16;
+    for (column, x0, width) in tab_spans_layout(area.width) {
+        if x0 > x {
+            spans.push(Span::raw(" ".repeat(usize::from(x0 - x))));
+        }
+        let Some((name, _)) = matrix::COLUMNS.get(column) else {
+            break;
+        };
+        let style = if column == active {
+            active_style
+        } else {
+            muted
+        };
+        let text = matrix::fit(&format!(" {name} "), usize::from(width));
+        spans.push(Span::styled(text, style));
+        x = x0 + width;
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn handle_mouse(show: &mut Showcase, column: u16, row: u16, screen: Rect) {
@@ -193,7 +237,11 @@ fn handle_mouse(show: &mut Showcase, column: u16, row: u16, screen: Rect) {
         {
             return;
         }
-        if let Some((Some(index), _)) = visible.get(usize::from(relative_row)) {
+        if let Some(IndexRow {
+            catalog_index: Some(index),
+            ..
+        }) = visible.get(usize::from(relative_row))
+        {
             show.select(*index, true);
         }
     } else if screen.width < WIDE_MIN || column >= screen.x.saturating_add(INDEX_WIDTH) {
@@ -204,43 +252,59 @@ fn handle_mouse(show: &mut Showcase, column: u16, row: u16, screen: Rect) {
 fn draw_index(f: &mut Frame, area: Rect, show: &Showcase, theme: &Theme) {
     let (start, rows) = show.visible_index_rows(area.height);
     let all_rows = show.index_rows();
+    let muted = theme.style(batten::state::StyleToken::Muted);
     let mut lines = Vec::with_capacity(rows.len());
-    for (offset, (index, label)) in rows.iter().enumerate() {
+    for (offset, row) in rows.iter().enumerate() {
         if offset == 0 && start > 0 {
-            lines.push(Line::styled(
-                "  ↑ más resultados",
-                theme.style(batten::state::StyleToken::Muted),
-            ));
+            lines.push(Line::styled("  ↑ más resultados", muted));
             continue;
         }
         if start + offset + 1 == all_rows.len() && start + rows.len() < all_rows.len() {
-            lines.push(Line::styled(
-                "  ↓ más resultados",
-                theme.style(batten::state::StyleToken::Muted),
-            ));
+            lines.push(Line::styled("  ↓ más resultados", muted));
             continue;
         }
-        let Some(i) = index else {
-            lines.push(Line::styled(
-                format!("  {label}"),
-                theme.style(batten::state::StyleToken::Muted),
-            ));
-            continue;
+        let mut spans = Vec::new();
+        // El símbolo del componente va aparte, con su estilo de `draw_matrix`.
+        let symbol = |row: &IndexRow| {
+            let cell = if row.generic {
+                Cell::Generic
+            } else {
+                Cell::Own(1)
+            };
+            let (glyph, style) = matrix::glyph(cell, theme);
+            Span::styled(format!("{glyph} "), style)
         };
-        let selected = *i == show.selected();
-        let focused = selected && show.focus() == Focus::Index;
-        let marker = if focused {
-            "▸ "
-        } else if selected {
-            "• "
-        } else {
-            "  "
-        };
-        let mut style = theme.style(batten::state::StyleToken::Default);
-        if focused {
-            style = style.add_modifier(Modifier::BOLD);
+        match row.catalog_index {
+            Some(i) => {
+                let selected = i == show.selected();
+                let focused = selected && show.focus() == Focus::Index;
+                let marker = if focused {
+                    "▸ "
+                } else if selected {
+                    "• "
+                } else {
+                    "  "
+                };
+                let mut style = theme.style(batten::state::StyleToken::Default);
+                if focused {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                spans.push(Span::styled(format!("  {marker}"), style));
+                if row.marked {
+                    spans.push(symbol(row));
+                }
+                spans.push(Span::styled(row.text.clone(), style));
+            }
+            None => {
+                // Cabecera de componente con varios ejemplos, o el aviso «Sin resultados».
+                spans.push(Span::styled("  ", muted));
+                if row.marked {
+                    spans.push(symbol(row));
+                }
+                spans.push(Span::styled(row.text.clone(), muted));
+            }
         }
-        lines.push(Line::styled(format!("  {marker}{label}"), style));
+        lines.push(Line::from(spans));
     }
     f.render_widget(Paragraph::new(lines), area);
 }
@@ -261,16 +325,21 @@ fn draw_header(f: &mut Frame, area: Rect, show: &Showcase, theme: &Theme) {
             theme.style(batten::state::StyleToken::Muted),
         ),
         Line::styled(
-            match show.focus() {
-                Focus::Index => "↑/↓: variante · ←/→: tema · Tab: abrir · q: salir",
-                Focus::Demo => "F7/Shift+F7: tema · Tab/Esc: volver al índice",
-                Focus::Matrix => "←/→/↑/↓: celda · Enter: abrir · Esc: índice · F7: paleta",
-                Focus::TextFilter => "Escribe para filtrar · Enter: índice · Esc: limpiar",
-            },
+            help(show.focus()),
             theme.style(batten::state::StyleToken::Muted),
         ),
     ];
     f.render_widget(Paragraph::new(lines), area);
+}
+
+/// Ayuda de teclas de una línea para cada foco; la usan la cabecera y la versión estrecha.
+fn help(focus: Focus) -> &'static str {
+    match focus {
+        Focus::Index => "↑/↓: ejemplo · ←/→: tema · Tab: abrir · /: filtrar · m: matriz · q: salir",
+        Focus::Demo => "F7: tema · Tab/Esc: volver",
+        Focus::Matrix => "←/→/↑/↓: celda · Enter: abrir · Esc: índice · F7: paleta",
+        Focus::TextFilter => "Escribe para filtrar · Enter: índice · Esc: limpiar",
+    }
 }
 
 fn draw_collapsed(f: &mut Frame, area: Rect, show: &Showcase, theme: &Theme) {
@@ -286,28 +355,57 @@ fn draw_collapsed(f: &mut Frame, area: Rect, show: &Showcase, theme: &Theme) {
             theme.style(batten::state::StyleToken::Muted),
         ),
         Line::styled(
-            if show.focus() == Focus::Demo {
-                "F7/Shift+F7: tema · Tab/Esc: volver al índice"
-            } else {
-                "↑/↓: variante · ←/→: tema · Tab: abrir · q: salir"
-            },
+            help(show.focus()),
             theme.style(batten::state::StyleToken::Muted),
         ),
     ];
     f.render_widget(Paragraph::new(lines), area);
 }
 
-/// Pie de una línea con el tema activo. El detalle del componente (tira y nota) vuelve en la
-/// Tarea 3.
-fn draw_footer(f: &mut Frame, area: Rect, show: &Showcase, theme: &Theme) {
-    f.render_widget(
-        Paragraph::new(format!(
-            "batten showcase · F7/Shift+F7 tema: {}",
-            show.theme_preset().name()
-        ))
-        .style(theme.style(batten::state::StyleToken::Muted)),
-        area,
+/// Textos del pie, una línea cada uno, para un área de `width` columnas.
+///
+/// La línea 1 da el tema, el recuento de sus componentes (propios `●`, genéricos `◐`) y cuántos
+/// faltan. La línea 2 existe solo si el componente seleccionado es genérico: explica el estado.
+/// El sufijo de F7 se añade solo si la línea 1 cabe entera con él.
+fn footer_texts(show: &Showcase, width: u16) -> Vec<String> {
+    let view = show.view();
+    let generic = view.entries.iter().filter(|entry| entry.generic).count();
+    let own = view.entries.len() - generic;
+    let (name, _) = matrix::COLUMNS[show.theme_column()];
+    let base = format!(
+        "Tema: {name} · {} componentes: {own} ● · {generic} ◐ · faltan {} (m: matriz)",
+        view.entries.len(),
+        view.missing
     );
+    let with_keys = format!("{base} · F7/Shift+F7 tema");
+    let line = if with_keys.chars().count() <= usize::from(width) {
+        with_keys
+    } else {
+        base
+    };
+    let mut lines = vec![matrix::fit(&line, usize::from(width))];
+    if let Some(component) = show.component_at(show.selected()) {
+        let generic_entry = view
+            .entries
+            .iter()
+            .find(|entry| entry.component == component)
+            .is_some_and(|entry| entry.generic);
+        if generic_entry {
+            let note = matrix::status_note(component, show.theme_column(), Cell::Generic);
+            lines.push(matrix::fit(&note, usize::from(width)));
+        }
+    }
+    lines
+}
+
+/// Dibuja las líneas del pie, una por fila del área.
+fn draw_footer(f: &mut Frame, area: Rect, lines: &[String], theme: &Theme) {
+    let muted = theme.style(batten::state::StyleToken::Muted);
+    let rows: Vec<Line> = lines
+        .iter()
+        .map(|line| Line::styled(line.as_str(), muted))
+        .collect();
+    f.render_widget(Paragraph::new(rows), area);
 }
 
 #[cfg(test)]
@@ -504,11 +602,193 @@ mod tests {
         );
         let buffer = render(&mut show, 100, 30);
         let lines = lines(&buffer, 0);
+        // ADAPTADO: el pie nuevo empieza por el tema; sin fila en la matriz no hay línea de nota.
         assert!(
-            lines[29].starts_with("batten showcase · F7/Shift+F7 tema:"),
+            lines[29].starts_with("Tema: Batten · "),
             "pie de una línea: {}",
             lines[29]
         );
+        assert!(lines.iter().all(|line| !line.contains("parcialmente")));
         assert!(lines.iter().all(|line| !line.contains(" · Martty ●")));
+    }
+
+    /// Índice de columna de `matrix::COLUMNS` por nombre.
+    fn theme_index(name: &str) -> usize {
+        matrix::COLUMNS
+            .iter()
+            .position(|(column, _)| *column == name)
+            .expect("columna")
+    }
+
+    /// Texto de la columna del índice (las primeras `INDEX_WIDTH` columnas) de cada fila.
+    fn index_text(buffer: &Buffer) -> Vec<String> {
+        lines(buffer, 0)
+            .into_iter()
+            .map(|line| line.chars().take(usize::from(INDEX_WIDTH)).collect())
+            .collect()
+    }
+
+    /// Primer demo del catálogo con ese componente y un proveedor dado como prefijo de variante.
+    fn demo_of(show: &Showcase, component: &str, provider: &str) -> usize {
+        (0..show.len())
+            .find(|&i| {
+                show.component_at(i) == Some(component)
+                    && show.variant_at(i).is_some_and(|v| v.starts_with(provider))
+            })
+            .expect("demo en el catálogo")
+    }
+
+    #[test]
+    fn tabs_show_the_seven_themes_and_mark_the_active() {
+        let mut show = Showcase::new();
+        let buffer = render(&mut show, 100, 30);
+        let row = lines(&buffer, 0).swap_remove(0);
+        for (name, _) in matrix::COLUMNS {
+            assert!(row.contains(name), "falta la pestaña {name}: {row}");
+        }
+        let bold = |buffer: &Buffer, line: &str, name: &str| {
+            let x = line.find(name).expect("pestaña") as u16;
+            buffer[(x, 0)].modifier.contains(Modifier::BOLD)
+        };
+        assert!(bold(&buffer, &row, "Batten"));
+        assert!(!bold(&buffer, &row, "Crush"));
+
+        show.set_theme_column(theme_index("Crush"));
+        let buffer = render(&mut show, 100, 30);
+        let row = lines(&buffer, 0).swap_remove(0);
+        assert!(bold(&buffer, &row, "Crush"));
+        assert!(!bold(&buffer, &row, "Batten"));
+    }
+
+    #[test]
+    fn index_marks_generic_components() {
+        // Pawan: Composer es genérico (◐) y Transcript tiene demo propio (●).
+        let mut show = Showcase::new();
+        show.set_theme_column(theme_index("Pawan"));
+        let buffer = render(&mut show, 100, 60);
+        let index = index_text(&buffer);
+        let composer = index
+            .iter()
+            .find(|l| l.contains("Composer"))
+            .expect("Composer");
+        assert!(composer.contains('◐'), "Composer sin ◐: {composer}");
+        let transcript = index
+            .iter()
+            .find(|l| l.contains("Transcript"))
+            .expect("Transcript");
+        assert!(transcript.contains('●'), "Transcript sin ●: {transcript}");
+    }
+
+    #[test]
+    fn index_indents_child_examples() {
+        // Crush: Assistant message tiene varios ejemplos, con filas hijas sangradas bajo la cabecera.
+        let mut show = Showcase::new();
+        show.set_theme_column(theme_index("Crush"));
+        let buffer = render(&mut show, 100, 60);
+        let index = index_text(&buffer);
+        let header = index
+            .iter()
+            .find(|l| l.contains("Assistant message ─"))
+            .expect("cabecera de Assistant message");
+        assert!(header.contains('●'), "cabecera sin ●: {header}");
+        // Columna en caracteres (no en bytes: «●» ocupa tres bytes) donde empieza un texto.
+        let column_of =
+            |line: &str, needle: &str| line.find(needle).map(|byte| line[..byte].chars().count());
+        let name_x = column_of(header, "Assistant").expect("nombre");
+        for child in ["pending", "refusal", "summary"] {
+            let line = index
+                .iter()
+                .find(|l| l.contains(child))
+                .unwrap_or_else(|| panic!("falta la fila hija {child}"));
+            // Dos columnas más que el nombre de la cabecera: la hija va sangrada.
+            assert_eq!(
+                column_of(line, child),
+                Some(name_x + 2),
+                "sangría de {child}: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn footer_counts_components_and_missing() {
+        let mut show = Showcase::new();
+        show.set_theme_column(theme_index("Pawan"));
+        let buffer = render(&mut show, 100, 30);
+        let all = lines(&buffer, 0);
+        assert!(
+            all.iter()
+                .any(|l| l.contains("26 componentes: 9 ● · 17 ◐ · faltan 31")),
+            "recuento de Pawan: {all:?}"
+        );
+    }
+
+    #[test]
+    fn footer_notes_partial_implementation_for_generic() {
+        let mut show = Showcase::new();
+        show.set_theme_column(theme_index("Pawan"));
+        show.select(demo_of(&show, "Composer", "Batten"), false);
+        let buffer = render(&mut show, 100, 30);
+        let all = lines(&buffer, 0);
+        // La línea 2 del pie es la última de la pantalla.
+        assert!(
+            all[29].contains("parcialmente implementado"),
+            "línea 2 del pie: {}",
+            all[29]
+        );
+        assert!(
+            all[28].contains("componentes:"),
+            "línea 1 del pie: {}",
+            all[28]
+        );
+    }
+
+    #[test]
+    fn footer_is_one_line_for_an_own_component() {
+        let mut show = Showcase::new();
+        show.set_theme_column(theme_index("Crush"));
+        show.select(demo_of(&show, "Composer", "Crush"), false);
+        let buffer = render(&mut show, 100, 30);
+        let all = lines(&buffer, 0);
+        assert!(all[29].contains("componentes:"), "pie: {}", all[29]);
+        assert!(all.iter().all(|l| !l.contains("parcialmente")));
+    }
+
+    #[test]
+    fn narrow_terminal_does_not_panic() {
+        for (name, component, variant) in [
+            ("Pawan", "Composer", "Batten"),
+            ("Crush", "Composer", "Crush"),
+        ] {
+            let mut show = Showcase::new();
+            show.set_theme_column(theme_index(name));
+            show.select(demo_of(&show, component, variant), false);
+            for (w, h) in [(60u16, 20u16), (30, 8), (20, 5)] {
+                render(&mut show, w, h);
+            }
+        }
+    }
+
+    #[test]
+    fn tab_layout_positions_match_what_is_drawn() {
+        let mut show = Showcase::new();
+        for width in [100u16, 60] {
+            let buffer = render(&mut show, width, 30);
+            let layout = tab_spans_layout(width);
+            assert!(!layout.is_empty());
+            for (column, x, shown) in layout {
+                let (name, _) = matrix::COLUMNS[column];
+                let drawn: String = (x..x + shown).map(|cx| buffer[(cx, 0)].symbol()).collect();
+                assert_eq!(
+                    drawn,
+                    matrix::fit(&format!(" {name} "), usize::from(shown)),
+                    "pestaña {name} a {width} columnas"
+                );
+            }
+        }
+        // A 60 columnas la última pestaña no cabe entera: aparece recortada.
+        let layout = tab_spans_layout(60);
+        let (column, _, shown) = *layout.last().expect("pestañas");
+        let (name, _) = matrix::COLUMNS[column];
+        assert!(shown < tab_width(name), "{name} debería recortarse");
     }
 }

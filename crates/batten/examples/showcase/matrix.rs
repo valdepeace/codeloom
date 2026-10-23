@@ -151,8 +151,6 @@ pub fn glyph(cell: Cell, theme: &Theme) -> (&'static str, Style) {
 }
 
 /// Nota de estado de una celda (componente, columna), para el pie de la vista entre temas.
-// Sin uso fuera de los tests hasta la Tarea 3 (nota del pie); el `allow` se retira entonces.
-#[allow(dead_code)]
 pub fn status_note(component: &str, column: usize, cell: Cell) -> String {
     let Some((name, _)) = COLUMNS.get(column) else {
         return String::new();
@@ -166,18 +164,6 @@ pub fn status_note(component: &str, column: usize, cell: Cell) -> String {
         ),
         Cell::Missing => format!("· {component} · {name}: no existe"),
     }
-}
-
-/// Tira de una fila: para cada columna, su nombre, su celda y si es la columna `current`.
-// Sin uso fuera de los tests hasta la Tarea 3 (tira del pie); el `allow` se retira entonces.
-#[allow(dead_code)]
-pub fn strip(row: &MatrixRow, current: Option<usize>) -> Vec<(String, Cell, bool)> {
-    COLUMNS
-        .iter()
-        .zip(row.cells)
-        .enumerate()
-        .map(|(index, ((name, _), cell))| (name.to_string(), cell, current == Some(index)))
-        .collect()
 }
 
 /// Ancho mínimo, en columnas, para dibujar la matriz; por debajo solo se muestra un aviso.
@@ -556,21 +542,6 @@ mod tests {
             assert!(!status_note("Chip", col("CodeLoom"), cell).contains("sin paleta"));
         }
         assert!(!status_note("Chip", col("Crush"), Cell::Own(1)).contains("sin paleta"));
-    }
-
-    #[test]
-    fn strip_marks_the_current_column() {
-        let items = vec![item("Chip", "Batten"), item("Chip", "Crush")];
-        let matrix = build(&items);
-        let entries = strip(row(&matrix, "Chip"), Some(col("Crush")));
-        assert_eq!(entries.len(), COLUMNS.len());
-        assert_eq!(entries.iter().filter(|(_, _, current)| *current).count(), 1);
-        let (name, cell, current) = &entries[col("Crush")];
-        assert_eq!(
-            (name.as_str(), *cell, *current),
-            ("Crush", Cell::Own(1), true)
-        );
-        assert_eq!(entries[col("Pawan")].1, Cell::Generic);
     }
 
     #[test]

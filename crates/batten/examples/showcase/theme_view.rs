@@ -30,8 +30,6 @@ pub struct ThemeView {
     /// Componentes con demo propio o genérico en el tema, en el orden de las filas de la matriz.
     pub entries: Vec<ThemeEntry>,
     /// Componentes que no existen en el tema; no se listan, pero se cuentan.
-    // Sin lectura en el binario hasta la Tarea 3 (pie con el recuento); lo leen los tests.
-    #[allow(dead_code)]
     pub missing: usize,
 }
 
