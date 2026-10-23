@@ -86,3 +86,38 @@ propio ancho para que el pie reparta el espacio.
   los widgets.
 - El apunte de la llamada de resumen publica su propio `Usage` y puede mover un instante la barra
   al tamaño de esa petición hasta la siguiente respuesta.
+
+## Estado
+
+Implementado el 2026-10-23, **sin verlo aún en una terminal real**: solo hay pruebas con
+`TestBackend`, de modo que el aspecto, los colores y la ausencia de parpadeo del pie están sin
+comprobar a ojo. Commits: `36f5162` (widget con dos estilos), `81d04b8` (memoria y mensajes),
+`7d9e38e` (demo del showcase) y `b8d0120` (pie de la app).
+
+### Cómo verlo
+
+- Demo: `cargo run -p batten --example showcase` y elegir «Context meter».
+- App: `cargo run -p codeloom-cli --bin loom`; el medidor aparece en el pie con 80 columnas o más
+  en cuanto llega la primera respuesta del proveedor.
+
+### Decisiones tomadas durante la implementación
+
+- **El nivel de aviso usa aritmética entera exacta**, no el porcentaje redondeado: 79,6 % se
+  muestra como «80 %» pero no es aviso hasta alcanzarlo, igual que la compactación.
+- **La memoria se pinta con el estilo de acento del tema**, no atenuada como en mastra: el estilo
+  atenuado era casi idéntico al de las celdas libres y no se distinguían.
+- **La ventana se cachea** (comparando `Arc` del catálogo, URL base y modelo) para que el pie no
+  recorra el catálogo en cada fotograma.
+- **El uso de un subagente no mueve el medidor del padre** (llega por `ChildEvent`).
+
+### Lo que no consta o queda pendiente
+
+- **El `Usage` de la propia llamada de resumen** mueve la barra al tamaño de esa petición hasta
+  la siguiente respuesta normal.
+- **Tras compactar**, la barra mantiene el uso anterior hasta que llega la siguiente respuesta; la
+  memoria nueva se acota a ese uso.
+- **Con menos de dos celdas ocupadas** todas son de mensajes (difiere de mastra en ese caso).
+- **Solo se mide el padre**; el gasto de contexto de un hijo que se esté viendo se atribuye a la
+  sesión mostrada.
+- La velocidad de la animación del demo es a ojo.
+- Quedan 5 lints de `clippy --examples` preexistentes en otros demos del showcase, ajenos a esto.
