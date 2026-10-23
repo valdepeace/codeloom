@@ -87,5 +87,15 @@ la regla `RuleRouter`, `[agents] routing` y `routing_model`, la integración en 
 - La decisión sale como `LiveEvent::AgentRouted` (línea de sistema en la conversación) y el resultado de
   la herramienta añade `agent`, `routed_by` y `routing_reason` solo cuando eligió el enrutador.
 
-**Pendiente:** el clasificador (`ClassifierRouter`, D4–D5): hoy `routing = "classifier"` equivale a
-`rule`. Sin medir el ahorro real ni los umbrales con tareas reales. No visto en una terminal real.
+**Clasificador hecho el 2026-10-24** (`be231b4`): `ClassifierRouter` encadena primero la regla y solo
+consulta al modelo (`routing_model`, o el de la sesión si no se indica) cuando ella se abstiene y hay
+al menos dos candidatos. Decisiones nuestras, rotuladas: tiempo máximo de 8 s; entrada acotada
+(tarea 2 000 bytes, 20 candidatos, 200 bytes de descripción) y 150 tokens de salida; la respuesta
+ha de ser un objeto JSON con un `agent` que sea exactamente un candidato aprobado (se tolera
+prosa o vallas alrededor); cualquier anomalía (JSON roto, nombre ajeno, corte por longitud o error,
+flujo sin cierre, error del proveedor, tiempo agotado) es abstención. Las descripciones y la tarea se
+presentan al modelo como dato, no como instrucciones, y aun así un nombre inventado jamás se acepta.
+
+**Sin medir / sin ver:** los umbrales de la regla con tareas reales; el coste y el ahorro real del
+clasificador frente a que el padre elija; el clasificador contra un modelo real (solo proveedor de
+prueba); la sugerencia dentro de la pregunta en modo `always`; la línea de elección en una terminal real.

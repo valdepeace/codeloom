@@ -173,12 +173,12 @@ después el transporte (A7, A8).
       `ask_user` cuando duda entre varios; la interfaz muestra siempre el agente de cada
       hijo. Commits `871576e` (spec), `9631385` (plan), `7cd4aab`, `1c12360` y `c71f53e`.
       Spec: `docs/specs/2026-10-22-codeloom-a2a-delegation-choice-design.md`, sección «Estado».
-    - **A12b, regla hecha el 2026-10-23; clasificador pendiente** (idea del usuario). Con
+    - **A12b hecha el 2026-10-24: regla (2026-10-23) y clasificador** (idea del usuario). Con
       `[agents] routing = "rule"` (apagado por defecto) la herramienta `subagent` elige agente por
       etiquetas, nombre y ejemplos de las tarjetas aprobadas cuando no se nombra ninguno, y lo anuncia en
       la conversación con su motivo. Spec y plan `2026-10-23-codeloom-a2a-agent-router-*`; el
-      clasificador (`routing = "classifier"`, hoy equivale a `rule`) y la medida del ahorro siguen sin
-      hacer.
+      clasificador (`routing = "classifier"`) consulta a `routing_model` solo si la regla se abstiene y
+      se abstiene él ante cualquier anomalía. La medida del ahorro y de los umbrales sigue sin hacer.
 - [x] **Árbol de subagentes (2026-10-22).** El subagente es un nodo plegable de la conversación,
   con el icono del estado A2A y su nombre exacto; desplegado, muestra su texto y sus herramientas
   y las consultas del padre sobre él. Commits `a059b49`, `1bf6ec6`, `3d4ee31`, `7cdce9b`,
