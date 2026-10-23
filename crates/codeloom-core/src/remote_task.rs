@@ -4,9 +4,12 @@
 //! (enviar un mensaje, consultar una tarea, cancelarla) y el crate de A2A lo implementa. Las
 //! tareas remotas se identifican por el texto que el remoto asigna, no por una `SessionId`.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 
 use crate::a2a::{Artifact, Message};
+use crate::registry::RemoteSpec;
 use crate::task::TaskStatus;
 
 /// Tarea tal como la describe el remoto.
@@ -38,6 +41,13 @@ pub enum RemoteTaskError {
     Timeout,
     #[error("remote error: {0}")]
     Other(String),
+}
+
+/// Construye el cliente de un agente remoto del registro. Lo implementa el crate de A2A; sin
+/// fábrica configurada, el lanzador no ejecuta remotos.
+pub trait RemoteClientFactory: Send + Sync {
+    /// Cliente del remoto `name`, o `None` si no se puede construir (p. ej. sin tarjeta descargada).
+    fn client_for(&self, name: &str, spec: &RemoteSpec) -> Option<Arc<dyn RemoteTaskClient>>;
 }
 
 /// Cliente de un agente remoto concreto (un punto de entrada y una interfaz ya elegida).

@@ -1,14 +1,17 @@
-use crate::a2a::Artifact;
+use crate::a2a::{Artifact, Message};
 use crate::agent::AgentLoop;
 use crate::budget::BudgetConfig;
 use crate::catalog::Catalog;
 use crate::config::CodeLoomConfig;
 use crate::error::{CoreError, Result};
 use crate::event::{EventBus, LiveEvent};
-use crate::job::{JobId, JobRegistry, JobResult, JobSpec};
+use crate::job::{JobBody, JobHandle, JobId, JobRegistry, JobResult, JobSpec};
 use crate::permission::PermissionService;
 use crate::provider::Provider;
 use crate::registry::{AgentEntry, AgentRegistry, Approval, Execution, AGENTE_POR_DEFECTO};
+use crate::remote_task::{
+    RemoteClientFactory, RemoteReply, RemoteTask, RemoteTaskClient, RemoteTaskError,
+};
 use crate::session::{SessionId, SessionStore, SubagentDescriptor};
 use crate::subagent_input::{ChildResponder, InputBroker, PendingInput};
 use crate::task::{TaskState, TaskStatus};
@@ -17,7 +20,7 @@ use crate::tools::ToolRegistry;
 use async_trait::async_trait;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 #[async_trait]
@@ -107,6 +110,11 @@ pub struct InProcessSubagentLauncher {
     budget: BudgetConfig,
     /// Lo máximo que `cancel` espera a que el hijo se asiente; `CANCEL_WAIT` salvo en las pruebas.
     cancel_wait: std::time::Duration,
+    /// Fábrica de clientes de agentes remotos (A8a). Sin ella, un remoto no se ejecuta.
+    remote_clients: Option<Arc<dyn RemoteClientFactory>>,
+    /// Cada cuánto se consulta una tarea remota, y cuánto se la sigue como máximo.
+    remote_poll: std::time::Duration,
+    remote_max_follow: std::time::Duration,
 }
 
 /// Descarta la pregunta pendiente del hijo al terminar su trabajo, sea cual sea la
@@ -124,6 +132,18 @@ impl Drop for DiscardOnExit {
 
 /// Lo máximo que `cancel` espera a que el hijo se asiente tras la orden de parar.
 const CANCEL_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Cada cuánto se consulta una tarea remota.
+const REMOTE_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Lo máximo que se sigue una tarea remota antes de darla por perdida (decálogo: todo bucle tiene cota).
+const REMOTE_MAX_FOLLOW: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Lo máximo que se espera a que un remoto conteste a `CancelTask`; menor que `CANCEL_WAIT`.
+const REMOTE_CANCEL_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Consultas fallidas seguidas tras las que se da por perdido el contacto con el remoto.
+const REMOTE_MAX_FALLOS_SEGUIDOS: u32 = 3;
 
 /// Cada cuánto `cancel` relee el estado del hijo mientras espera.
 const CANCEL_POLL: std::time::Duration = std::time::Duration::from_millis(10);
@@ -231,7 +251,27 @@ impl InProcessSubagentLauncher {
             spill: None,
             budget: BudgetConfig::default(),
             cancel_wait: CANCEL_WAIT,
+            remote_clients: None,
+            remote_poll: REMOTE_POLL,
+            remote_max_follow: REMOTE_MAX_FOLLOW,
         }
+    }
+
+    /// Permite ejecutar agentes remotos: `fabrica` construye el cliente de cada uno.
+    pub fn with_remote_clients(mut self, fabrica: Arc<dyn RemoteClientFactory>) -> Self {
+        self.remote_clients = Some(fabrica);
+        self
+    }
+
+    /// Cambia cada cuánto se consulta una tarea remota y cuánto se la sigue como máximo.
+    pub fn with_remote_timing(
+        mut self,
+        poll: std::time::Duration,
+        max_follow: std::time::Duration,
+    ) -> Self {
+        self.remote_poll = poll;
+        self.remote_max_follow = max_follow;
+        self
     }
 
     /// Cambia cuánto espera `cancel` a que el hijo se asiente. Existe para las pruebas, que no
@@ -316,8 +356,8 @@ impl InProcessSubagentLauncher {
         let entrada = instantanea.get(nombre).ok_or_else(|| {
             CoreError::Tool(format!("agente «{nombre}» inexistente en el registro"))
         })?;
-        // Se comprueba antes que la aprobación: un remoto figura como pendiente y el motivo real es otro.
-        if matches!(entrada.execution, Execution::Remote(_)) {
+        // Sin fábrica de clientes no hay forma de ejecutar un remoto: se dice antes que lo demás.
+        if matches!(entrada.execution, Execution::Remote(_)) && self.remote_clients.is_none() {
             return Err(CoreError::Tool(format!(
                 "agente remoto no disponible: «{nombre}»"
             )));
@@ -326,6 +366,13 @@ impl InProcessSubagentLauncher {
             return Err(CoreError::Tool(format!(
                 "agente «{nombre}» pendiente de aprobación: apruébalo antes de usarlo"
             )));
+        }
+        if let Execution::Remote(spec) = &entrada.execution {
+            if spec.fetched.as_ref().is_some_and(|d| d.requires_auth) {
+                return Err(CoreError::Tool(format!(
+                    "el agente remoto «{nombre}» exige autenticación, que aún no está soportada"
+                )));
+            }
         }
         if let Execution::Local(spec) = &entrada.execution {
             if let Some(modelo) = &spec.model {
@@ -342,6 +389,27 @@ impl InProcessSubagentLauncher {
         Ok(Some(entrada.clone()))
     }
 
+    /// Cliente del agente remoto elegido; `None` si el agente es local. Un remoto sin cliente
+    /// construible (p. ej. sin tarjeta descargada) es un error: no se crea tarea.
+    fn cliente_remoto(
+        &self,
+        perfil: Option<&AgentEntry>,
+    ) -> Result<Option<Arc<dyn RemoteTaskClient>>> {
+        let Some(AgentEntry {
+            name,
+            execution: Execution::Remote(spec),
+            ..
+        }) = perfil
+        else {
+            return Ok(None);
+        };
+        self.remote_clients
+            .as_ref()
+            .and_then(|fabrica| fabrica.client_for(name, spec))
+            .map(Some)
+            .ok_or_else(|| CoreError::Tool(format!("agente remoto no disponible: «{name}»")))
+    }
+
     /// Arranque común de `start` y `start_follow_up`. La petición ya viene validada.
     async fn arrancar(
         &self,
@@ -354,6 +422,7 @@ impl InProcessSubagentLauncher {
     ) -> Result<(SessionId, JobId)> {
         // El agente se valida antes de reservar puesto o crear tarea: un rechazo no deja rastro.
         let perfil = self.resolver_agente(agent.as_deref())?;
+        let cliente_remoto = self.cliente_remoto(perfil.as_ref())?;
         let (agente, origen) = match &perfil {
             Some(entrada) => (Some(entrada.name.clone()), Some(entrada.origin.as_text())),
             None => (None, None),
@@ -426,12 +495,21 @@ impl InProcessSubagentLauncher {
         // La compuerta retiene al hijo hasta que su tarea `submitted` está guardada.
         let (abrir_puerta, puerta) = tokio::sync::oneshot::channel::<()>();
         let cuerpo_tracker = tracker.clone();
-        let job = self.jobs.start(JobSpec {
-            kind: "subagent".into(),
-            label,
-            owner: parent,
-            output_limit: 64 * 1024,
-            run: Box::new(move |handle, job_cancel| {
+        let run: JobBody = match cliente_remoto {
+            Some(cliente) => cuerpo_remoto(EjecucionRemota {
+                cliente,
+                parent,
+                child,
+                prompt,
+                tracker: cuerpo_tracker,
+                store: self.store.clone(),
+                permit,
+                puerta,
+                parent_cancel,
+                poll: self.remote_poll,
+                max_follow: self.remote_max_follow,
+            }),
+            None => Box::new(move |handle, job_cancel| {
                 Box::pin(async move {
                     let _permit = permit;
                     let _discard = DiscardOnExit {
@@ -494,6 +572,13 @@ impl InProcessSubagentLauncher {
                     Ok(Some(JobResult { content: text }))
                 })
             }),
+        };
+        let job = self.jobs.start(JobSpec {
+            kind: "subagent".into(),
+            label,
+            owner: parent,
+            output_limit: 64 * 1024,
+            run,
         })?;
         // Reenvío filtrado: solo los eventos relevantes del hijo llegan al padre,
         // etiquetados con su identidad. La tarea termina cuando el bus del hijo se cierra.
@@ -548,26 +633,33 @@ impl InProcessSubagentLauncher {
                     let asentado = match store.list_subagents(parent).await {
                         Ok(hijos) => hijos
                             .iter()
-                            .any(|hijo| hijo.child == child && hijo.status.state.is_terminal()),
+                            .find(|hijo| hijo.child == child && hijo.status.state.is_terminal())
+                            .map(|hijo| hijo.status.state),
                         Err(error) => {
                             tracing::warn!("read subagent status: {error}");
-                            false
+                            None
                         }
                     };
-                    if !asentado {
-                        if let Err(error) = tracker
-                            .transition(parent, child, TaskStatus::new(state))
-                            .await
-                        {
-                            tracing::warn!("persist subagent status: {error}");
+                    // Manda el estado ya persistido: un espejo remoto fija el suyo (p. ej. `rejected`)
+                    // antes de que el trabajo acabe, y el aviso no debe contradecirlo.
+                    let estado_final = match asentado {
+                        Some(persistido) => persistido,
+                        None => {
+                            if let Err(error) = tracker
+                                .transition(parent, child, TaskStatus::new(state))
+                                .await
+                            {
+                                tracing::warn!("persist subagent status: {error}");
+                            }
+                            state
                         }
-                    }
+                    };
                     // Se publica tras el intento de persistir, también si falló: así el
                     // padre nunca lee el aviso antes del estado final.
                     settle_bus.publish(LiveEvent::SubagentSettled {
                         parent,
                         child,
-                        status: state,
+                        status: estado_final,
                     });
                     break;
                 }
@@ -577,6 +669,266 @@ impl InProcessSubagentLauncher {
             }
         });
         Ok((child, job.id().clone()))
+    }
+}
+
+/// Todo lo que el trabajo espejo de un agente remoto necesita para seguir su tarea.
+struct EjecucionRemota {
+    cliente: Arc<dyn RemoteTaskClient>,
+    parent: SessionId,
+    child: SessionId,
+    prompt: String,
+    tracker: Arc<TaskTracker>,
+    store: Arc<dyn SessionStore>,
+    permit: OwnedSemaphorePermit,
+    puerta: tokio::sync::oneshot::Receiver<()>,
+    parent_cancel: CancellationToken,
+    poll: std::time::Duration,
+    max_follow: std::time::Duration,
+}
+
+fn cuerpo_remoto(ejecucion: EjecucionRemota) -> JobBody {
+    Box::new(move |handle, job_cancel| Box::pin(seguir_remoto(ejecucion, handle, job_cancel)))
+}
+
+/// Estado local con el mensaje que explica la razón, con la marca de tiempo de este proceso
+/// (la del remoto no es de fiar: es de un tercero).
+fn estado_con_mensaje(state: TaskState, mensaje: Option<Message>) -> TaskStatus {
+    TaskStatus {
+        message: mensaje,
+        ..TaskStatus::new(state)
+    }
+}
+
+/// Los pasos del espejo que cambian la tarea local.
+struct Espejo {
+    cliente: Arc<dyn RemoteTaskClient>,
+    parent: SessionId,
+    child: SessionId,
+    tracker: Arc<TaskTracker>,
+    store: Arc<dyn SessionStore>,
+}
+
+impl Espejo {
+    async fn transicion(&self, status: TaskStatus) {
+        if let Err(error) = self
+            .tracker
+            .transition(self.parent, self.child, status)
+            .await
+        {
+            tracing::warn!("persist subagent status: {error}");
+        }
+    }
+
+    /// Cierra la tarea como fallida con la razón en su mensaje y devuelve el error del trabajo.
+    async fn fallar(&self, razon: String) -> Result<Option<JobResult>> {
+        self.transicion(estado_con_mensaje(
+            TaskState::Failed,
+            Some(Message::agent_text(razon.as_str())),
+        ))
+        .await;
+        Err(CoreError::Tool(razon))
+    }
+
+    /// Pide al remoto cancelar y deja la tarea local `canceled` con lo que el remoto haya dicho:
+    /// sin su confirmación no se afirma que quedó cancelada allí.
+    async fn cancelar(&self, id: Option<&str>) -> Result<Option<JobResult>> {
+        let nota = match id {
+            None => "cancelled before the remote assigned a task id".to_string(),
+            Some(id) => {
+                match tokio::time::timeout(REMOTE_CANCEL_TIMEOUT, self.cliente.cancel(id)).await {
+                    Ok(Ok(tarea)) if tarea.status.state == TaskState::Canceled => {
+                        "cancellation confirmed by the remote".to_string()
+                    }
+                    Ok(Ok(tarea)) => format!(
+                        "cancellation requested; the remote reports {}",
+                        tarea.status.state.proto_name()
+                    ),
+                    Ok(Err(RemoteTaskError::NotCancelable)) => {
+                        "cancellation requested; the remote says the task is not cancelable"
+                            .to_string()
+                    }
+                    Ok(Err(error)) => {
+                        format!("cancellation requested; the remote did not confirm it: {error}")
+                    }
+                    Err(_) => {
+                        "cancellation requested; the remote did not answer in time".to_string()
+                    }
+                }
+            }
+        };
+        self.transicion(estado_con_mensaje(
+            TaskState::Canceled,
+            Some(Message::agent_text(nota.as_str())),
+        ))
+        .await;
+        Ok(None)
+    }
+
+    /// Cierra la tarea con lo que el remoto dice que acabó (estado terminal).
+    async fn terminar(&self, tarea: RemoteTask, handle: &JobHandle) -> Result<Option<JobResult>> {
+        if tarea.status.state != TaskState::Completed {
+            let razon = tarea
+                .status
+                .message
+                .as_ref()
+                .map(Message::text)
+                .filter(|texto| !texto.trim().is_empty())
+                .unwrap_or_else(|| format!("remote task {}", tarea.status.state.proto_name()));
+            self.transicion(estado_con_mensaje(
+                tarea.status.state,
+                tarea.status.message.clone(),
+            ))
+            .await;
+            return Err(CoreError::Tool(razon));
+        }
+        let mut artifacts = tarea.artifacts;
+        if artifacts.is_empty() {
+            if let Some(texto) = tarea
+                .status
+                .message
+                .as_ref()
+                .map(Message::text)
+                .filter(|texto| !texto.trim().is_empty())
+            {
+                artifacts.push(Artifact::text_artifact(texto));
+            }
+        }
+        self.store
+            .complete_subagent(self.parent, self.child, &artifacts)
+            .await?;
+        if let Err(error) = self.tracker.publish(self.parent, self.child).await {
+            tracing::warn!("publish subagent status: {error}");
+        }
+        let texto = crate::a2a::artifacts_text(&artifacts);
+        handle.append(&texto);
+        Ok(Some(JobResult { content: texto }))
+    }
+}
+
+/// Espejo de una tarea remota: envía el mensaje, la sigue por sondeo y copia su estado y sus
+/// artefactos al descriptor local, de modo que el árbol, la cancelación y el presupuesto de tareas
+/// la tratan como a cualquier subagente.
+async fn seguir_remoto(
+    e: EjecucionRemota,
+    handle: JobHandle,
+    job_cancel: CancellationToken,
+) -> Result<Option<JobResult>> {
+    let EjecucionRemota {
+        cliente,
+        parent,
+        child,
+        prompt,
+        tracker,
+        store,
+        permit,
+        puerta,
+        parent_cancel,
+        poll,
+        max_follow,
+    } = e;
+    let _permit = permit;
+    // La compuerta retiene el trabajo hasta que la tarea `submitted` está guardada.
+    if puerta.await.is_err() || job_cancel.is_cancelled() {
+        return Ok(None);
+    }
+    let espejo = Espejo {
+        cliente: cliente.clone(),
+        parent,
+        child,
+        tracker,
+        store,
+    };
+    espejo.transicion(TaskStatus::new(TaskState::Working)).await;
+
+    let enviado = tokio::select! {
+        respuesta = cliente.send(Message::user_text(prompt)) => respuesta,
+        _ = job_cancel.cancelled() => return espejo.cancelar(None).await,
+        _ = parent_cancel.cancelled() => {
+            job_cancel.cancel();
+            return espejo.cancelar(None).await;
+        }
+    };
+    let mut tarea = match enviado {
+        Ok(RemoteReply::Task(tarea)) => tarea,
+        Ok(RemoteReply::Message(mensaje)) => {
+            // El remoto contestó sin crear tarea: su mensaje es el resultado.
+            let tarea = RemoteTask {
+                id: String::new(),
+                context_id: None,
+                status: TaskStatus::new(TaskState::Completed),
+                artifacts: vec![Artifact::text_artifact(mensaje.text())],
+            };
+            return espejo.terminar(tarea, &handle).await;
+        }
+        Err(error) => return espejo.fallar(format!("remote send failed: {error}")).await,
+    };
+
+    let id = tarea.id.clone();
+    let inicio = tokio::time::Instant::now();
+    let mut ultimo = TaskState::Working;
+    let mut fallos = 0u32;
+    loop {
+        let estado = tarea.status.state;
+        if estado.is_terminal() {
+            return espejo.terminar(tarea, &handle).await;
+        }
+        if estado != ultimo {
+            espejo
+                .transicion(estado_con_mensaje(estado, tarea.status.message.clone()))
+                .await;
+            ultimo = estado;
+        }
+        if inicio.elapsed() >= max_follow {
+            // Se avisa al remoto de que ya no interesa, sin esperar su confirmación.
+            let _ = tokio::time::timeout(REMOTE_CANCEL_TIMEOUT, cliente.cancel(&id)).await;
+            return espejo
+                .fallar(format!(
+                    "gave up following the remote task after {} s",
+                    max_follow.as_secs()
+                ))
+                .await;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(poll) => {}
+            _ = job_cancel.cancelled() => return espejo.cancelar(Some(&id)).await,
+            _ = parent_cancel.cancelled() => {
+                job_cancel.cancel();
+                return espejo.cancelar(Some(&id)).await;
+            }
+        }
+        let consulta = tokio::select! {
+            respuesta = cliente.get(&id) => respuesta,
+            _ = job_cancel.cancelled() => return espejo.cancelar(Some(&id)).await,
+            _ = parent_cancel.cancelled() => {
+                job_cancel.cancel();
+                return espejo.cancelar(Some(&id)).await;
+            }
+        };
+        match consulta {
+            Ok(nueva) if nueva.id == id => {
+                fallos = 0;
+                tarea = nueva;
+            }
+            Ok(_) => {
+                return espejo
+                    .fallar("the remote answered about a different task".into())
+                    .await
+            }
+            Err(RemoteTaskError::NotFound) => {
+                return espejo
+                    .fallar("the remote no longer knows the task".into())
+                    .await
+            }
+            Err(error) => {
+                fallos += 1;
+                if fallos >= REMOTE_MAX_FALLOS_SEGUIDOS {
+                    return espejo
+                        .fallar(format!("lost contact with the remote: {error}"))
+                        .await;
+                }
+            }
+        }
     }
 }
 
@@ -3430,5 +3782,610 @@ mod tests {
             primero.contains("Previous result:\n(no result)"),
             "{primero}"
         );
+    }
+
+    // ---------------------------------------------------------------- espejo de remotos (A8a, T5a)
+
+    use crate::registry::RemoteFetched;
+    use std::collections::VecDeque;
+
+    /// Cliente remoto guionizado: contesta lo que se le diga y anota lo que recibe.
+    struct ClienteGuionizado {
+        envio: std::sync::Mutex<Option<std::result::Result<RemoteReply, RemoteTaskError>>>,
+        consultas: std::sync::Mutex<VecDeque<std::result::Result<RemoteTask, RemoteTaskError>>>,
+        /// Respuesta cuando la cola de consultas se agota.
+        consulta_final: std::sync::Mutex<std::result::Result<RemoteTask, RemoteTaskError>>,
+        cancelacion: std::sync::Mutex<std::result::Result<RemoteTask, RemoteTaskError>>,
+        enviados: std::sync::Mutex<Vec<Message>>,
+        canceladas: std::sync::Mutex<Vec<String>>,
+    }
+
+    fn tarea(id: &str, estado: TaskState, mensaje: Option<&str>, resultado: &[&str]) -> RemoteTask {
+        RemoteTask {
+            id: id.to_string(),
+            context_id: None,
+            status: TaskStatus {
+                message: mensaje.map(Message::agent_text),
+                ..TaskStatus::new(estado)
+            },
+            artifacts: resultado
+                .iter()
+                .map(|t| Artifact::text_artifact(*t))
+                .collect(),
+        }
+    }
+
+    impl ClienteGuionizado {
+        fn nuevo(
+            envio: std::result::Result<RemoteReply, RemoteTaskError>,
+            consultas: Vec<std::result::Result<RemoteTask, RemoteTaskError>>,
+        ) -> Arc<Self> {
+            Arc::new(ClienteGuionizado {
+                envio: std::sync::Mutex::new(Some(envio)),
+                consultas: std::sync::Mutex::new(consultas.into()),
+                consulta_final: std::sync::Mutex::new(Ok(tarea(
+                    "r1",
+                    TaskState::Working,
+                    None,
+                    &[],
+                ))),
+                cancelacion: std::sync::Mutex::new(Ok(tarea("r1", TaskState::Canceled, None, &[]))),
+                enviados: std::sync::Mutex::new(Vec::new()),
+                canceladas: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn trabajando() -> Arc<Self> {
+            Self::nuevo(
+                Ok(RemoteReply::Task(tarea(
+                    "r1",
+                    TaskState::Working,
+                    None,
+                    &[],
+                ))),
+                vec![],
+            )
+        }
+    }
+
+    #[async_trait]
+    impl RemoteTaskClient for ClienteGuionizado {
+        async fn send(
+            &self,
+            message: Message,
+        ) -> std::result::Result<RemoteReply, RemoteTaskError> {
+            self.enviados.lock().unwrap().push(message);
+            self.envio.lock().unwrap().take().expect("un solo envío")
+        }
+        async fn get(&self, _id: &str) -> std::result::Result<RemoteTask, RemoteTaskError> {
+            match self.consultas.lock().unwrap().pop_front() {
+                Some(respuesta) => respuesta,
+                None => self.consulta_final.lock().unwrap().clone(),
+            }
+        }
+        async fn cancel(&self, id: &str) -> std::result::Result<RemoteTask, RemoteTaskError> {
+            self.canceladas.lock().unwrap().push(id.to_string());
+            self.cancelacion.lock().unwrap().clone()
+        }
+    }
+
+    struct FabricaFija(Arc<ClienteGuionizado>);
+
+    impl RemoteClientFactory for FabricaFija {
+        fn client_for(
+            &self,
+            _name: &str,
+            _spec: &crate::registry::RemoteSpec,
+        ) -> Option<Arc<dyn RemoteTaskClient>> {
+            Some(self.0.clone())
+        }
+    }
+
+    struct Entorno {
+        lanzador: InProcessSubagentLauncher,
+        store: Arc<SqliteStore>,
+        parent: SessionId,
+        bus: EventBus,
+        cliente: Arc<ClienteGuionizado>,
+        // Mantiene vivos los directorios temporales.
+        _dirs: (tempfile::TempDir, tempfile::TempDir),
+    }
+
+    async fn entorno_remoto(
+        cliente: Arc<ClienteGuionizado>,
+        aprobar: bool,
+        requires_auth: bool,
+        max_follow: Duration,
+    ) -> Entorno {
+        let dir = tempfile::tempdir().unwrap();
+        let datos = tempfile::tempdir().unwrap();
+        let (store, parent) = tienda_de_prueba(dir.path(), "remoto.db").await;
+        let registro = AgentRegistry::new(vec![
+            Box::new(BuiltInSource),
+            Box::new(FuenteRemotaDePrueba),
+        ])
+        .with_trust(
+            TrustStore::open(datos.path().to_path_buf()).unwrap(),
+            datos.path().to_path_buf(),
+            false,
+        );
+        // Igual que en producción: la tarjeta llega después de cargar el perfil, y solo entonces
+        // se puede aprobar.
+        registro.set_remote_card(
+            &EventBus::new(8),
+            "remoto",
+            "https://agente.example",
+            Ok((
+                crate::card::AgentCard::local("remoto", "Agente remoto", "1.0.0"),
+                RemoteFetched {
+                    card_hash: "abc".into(),
+                    jsonrpc_url: "https://agente.example/a2a/v1".into(),
+                    tenant: None,
+                    requires_auth,
+                },
+            )),
+        );
+        if aprobar {
+            registro.approve("remoto").unwrap();
+        }
+        let bus = EventBus::new(256);
+        let provider: Arc<dyn Provider> = Arc::new(ProveedorGrabador {
+            peticiones: Arc::new(std::sync::Mutex::new(Vec::new())),
+            puerta: None,
+        });
+        let lanzador = InProcessSubagentLauncher::new(
+            Arc::new(RwLock::new(provider)),
+            store.clone(),
+            Arc::new(ToolRegistry::new()),
+            Arc::new(PermissionService::allow_all()),
+            Arc::new(RwLock::new(config_de_prueba())),
+            dir.path().to_path_buf(),
+            Arc::new(LocalJobRegistry::default()),
+            bus.clone(),
+        )
+        .with_registry(Arc::new(registro))
+        .with_remote_clients(Arc::new(FabricaFija(cliente.clone())))
+        .with_remote_timing(Duration::from_millis(5), max_follow);
+        Entorno {
+            lanzador,
+            store,
+            parent,
+            bus,
+            cliente,
+            _dirs: (dir, datos),
+        }
+    }
+
+    impl Entorno {
+        async fn lanzar(&self) -> SessionId {
+            self.lanzador
+                .start(
+                    self.parent,
+                    "lejano".into(),
+                    "haz lo tuyo".into(),
+                    Some("remoto".into()),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap()
+                .0
+        }
+
+        async fn descriptor(&self, child: SessionId) -> SubagentDescriptor {
+            self.store
+                .list_subagents(self.parent)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|d| d.child == child)
+                .unwrap()
+        }
+
+        /// Espera a que el aviso de cierre llegue al bus y devuelve el estado que lleva.
+        async fn estado_del_aviso(
+            &self,
+            rx: &mut tokio::sync::broadcast::Receiver<LiveEvent>,
+        ) -> TaskState {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Ok(LiveEvent::SubagentSettled { status, .. }) = rx.recv().await {
+                        return status;
+                    }
+                }
+            })
+            .await
+            .expect("debería llegar el aviso de cierre")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_remote_agent_runs_to_completion_and_its_result_is_mirrored() {
+        let cliente = ClienteGuionizado::nuevo(
+            Ok(RemoteReply::Task(tarea(
+                "r1",
+                TaskState::Working,
+                None,
+                &[],
+            ))),
+            vec![
+                Ok(tarea("r1", TaskState::Working, None, &[])),
+                Ok(tarea(
+                    "r1",
+                    TaskState::Completed,
+                    None,
+                    &["resultado remoto"],
+                )),
+            ],
+        );
+        let entorno = entorno_remoto(cliente, true, false, Duration::from_secs(60)).await;
+        let mut rx = entorno.bus.subscribe();
+
+        let hijo = entorno.lanzar().await;
+
+        assert_eq!(
+            entorno.estado_del_aviso(&mut rx).await,
+            TaskState::Completed
+        );
+        let descriptor = entorno.descriptor(hijo).await;
+        assert_eq!(descriptor.status.state, TaskState::Completed);
+        assert_eq!(descriptor.artifacts[0].text(), "resultado remoto");
+        assert_eq!(descriptor.agent.as_deref(), Some("remoto"));
+        let enviados = entorno.cliente.enviados.lock().unwrap();
+        assert_eq!(enviados.len(), 1);
+        assert_eq!(enviados[0].text(), "haz lo tuyo");
+    }
+
+    #[tokio::test]
+    async fn the_mirrored_states_follow_the_remote_in_order() {
+        let cliente = ClienteGuionizado::nuevo(
+            Ok(RemoteReply::Task(tarea(
+                "r1",
+                TaskState::Working,
+                None,
+                &[],
+            ))),
+            vec![
+                Ok(tarea(
+                    "r1",
+                    TaskState::InputRequired,
+                    Some("¿qué color?"),
+                    &[],
+                )),
+                Ok(tarea("r1", TaskState::Working, None, &[])),
+                Ok(tarea("r1", TaskState::Completed, None, &["azul"])),
+            ],
+        );
+        let entorno = entorno_remoto(cliente, true, false, Duration::from_secs(60)).await;
+        let mut rx = entorno.bus.subscribe();
+
+        entorno.lanzar().await;
+
+        let mut vistos: Vec<(TaskState, String)> = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await {
+                    Ok(LiveEvent::SubagentChanged(d)) => {
+                        let texto = d
+                            .status
+                            .message
+                            .as_ref()
+                            .map(Message::text)
+                            .unwrap_or_default();
+                        if vistos.last().map(|(s, _)| *s) != Some(d.status.state) {
+                            vistos.push((d.status.state, texto));
+                        }
+                    }
+                    Ok(LiveEvent::SubagentSettled { .. }) => return,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("debería llegar el aviso de cierre");
+
+        let estados: Vec<TaskState> = vistos.iter().map(|(s, _)| *s).collect();
+        assert_eq!(
+            estados,
+            vec![
+                TaskState::Submitted,
+                TaskState::Working,
+                TaskState::InputRequired,
+                TaskState::Working,
+                TaskState::Completed
+            ],
+            "{vistos:?}"
+        );
+        assert_eq!(vistos[2].1, "¿qué color?");
+    }
+
+    #[tokio::test]
+    async fn a_failed_remote_task_fails_the_local_one_with_the_remote_message() {
+        let cliente = ClienteGuionizado::nuevo(
+            Ok(RemoteReply::Task(tarea(
+                "r1",
+                TaskState::Working,
+                None,
+                &[],
+            ))),
+            vec![Ok(tarea("r1", TaskState::Failed, Some("no pude"), &[]))],
+        );
+        let entorno = entorno_remoto(cliente, true, false, Duration::from_secs(60)).await;
+        let mut rx = entorno.bus.subscribe();
+
+        let hijo = entorno.lanzar().await;
+
+        assert_eq!(entorno.estado_del_aviso(&mut rx).await, TaskState::Failed);
+        let descriptor = entorno.descriptor(hijo).await;
+        assert_eq!(descriptor.status.state, TaskState::Failed);
+        assert_eq!(descriptor.status.message.unwrap().text(), "no pude");
+    }
+
+    #[tokio::test]
+    async fn a_rejected_or_canceled_remote_task_keeps_its_own_state_in_the_settled_notice() {
+        for estado in [TaskState::Rejected, TaskState::Canceled] {
+            let cliente = ClienteGuionizado::nuevo(
+                Ok(RemoteReply::Task(tarea(
+                    "r1",
+                    TaskState::Working,
+                    None,
+                    &[],
+                ))),
+                vec![Ok(tarea("r1", estado, Some("porque sí"), &[]))],
+            );
+            let entorno = entorno_remoto(cliente, true, false, Duration::from_secs(60)).await;
+            let mut rx = entorno.bus.subscribe();
+
+            let hijo = entorno.lanzar().await;
+
+            assert_eq!(entorno.estado_del_aviso(&mut rx).await, estado);
+            assert_eq!(entorno.descriptor(hijo).await.status.state, estado);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_direct_message_reply_completes_the_task_with_its_text() {
+        let cliente = ClienteGuionizado::nuevo(
+            Ok(RemoteReply::Message(Message::agent_text(
+                "respuesta directa",
+            ))),
+            vec![],
+        );
+        let entorno = entorno_remoto(cliente, true, false, Duration::from_secs(60)).await;
+        let mut rx = entorno.bus.subscribe();
+
+        let hijo = entorno.lanzar().await;
+
+        assert_eq!(
+            entorno.estado_del_aviso(&mut rx).await,
+            TaskState::Completed
+        );
+        assert_eq!(
+            entorno.descriptor(hijo).await.artifacts[0].text(),
+            "respuesta directa"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_send_fails_the_task_visibly() {
+        let cliente = ClienteGuionizado::nuevo(Err(RemoteTaskError::Other("boom".into())), vec![]);
+        let entorno = entorno_remoto(cliente, true, false, Duration::from_secs(60)).await;
+        let mut rx = entorno.bus.subscribe();
+
+        let hijo = entorno.lanzar().await;
+
+        assert_eq!(entorno.estado_del_aviso(&mut rx).await, TaskState::Failed);
+        let mensaje = entorno
+            .descriptor(hijo)
+            .await
+            .status
+            .message
+            .unwrap()
+            .text();
+        assert!(
+            mensaje.contains("remote send failed") && mensaje.contains("boom"),
+            "{mensaje}"
+        );
+    }
+
+    #[tokio::test]
+    async fn losing_contact_after_three_failed_polls_fails_the_task() {
+        let cliente = ClienteGuionizado::trabajando();
+        *cliente.consulta_final.lock().unwrap() = Err(RemoteTaskError::Timeout);
+        let entorno = entorno_remoto(cliente, true, false, Duration::from_secs(60)).await;
+        let mut rx = entorno.bus.subscribe();
+
+        let hijo = entorno.lanzar().await;
+
+        assert_eq!(entorno.estado_del_aviso(&mut rx).await, TaskState::Failed);
+        let mensaje = entorno
+            .descriptor(hijo)
+            .await
+            .status
+            .message
+            .unwrap()
+            .text();
+        assert!(mensaje.contains("lost contact"), "{mensaje}");
+    }
+
+    #[tokio::test]
+    async fn a_remote_task_that_never_finishes_is_given_up_and_the_remote_is_told() {
+        let cliente = ClienteGuionizado::trabajando();
+        let entorno = entorno_remoto(cliente, true, false, Duration::from_millis(60)).await;
+        let mut rx = entorno.bus.subscribe();
+
+        let hijo = entorno.lanzar().await;
+
+        assert_eq!(entorno.estado_del_aviso(&mut rx).await, TaskState::Failed);
+        let mensaje = entorno
+            .descriptor(hijo)
+            .await
+            .status
+            .message
+            .unwrap()
+            .text();
+        assert!(mensaje.contains("gave up following"), "{mensaje}");
+        assert_eq!(
+            *entorno.cliente.canceladas.lock().unwrap(),
+            vec!["r1".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_remote_forgetting_the_task_fails_it() {
+        let cliente = ClienteGuionizado::nuevo(
+            Ok(RemoteReply::Task(tarea(
+                "r1",
+                TaskState::Working,
+                None,
+                &[],
+            ))),
+            vec![Err(RemoteTaskError::NotFound)],
+        );
+        let entorno = entorno_remoto(cliente, true, false, Duration::from_secs(60)).await;
+        let mut rx = entorno.bus.subscribe();
+
+        let hijo = entorno.lanzar().await;
+
+        assert_eq!(entorno.estado_del_aviso(&mut rx).await, TaskState::Failed);
+        let mensaje = entorno
+            .descriptor(hijo)
+            .await
+            .status
+            .message
+            .unwrap()
+            .text();
+        assert!(mensaje.contains("no longer knows"), "{mensaje}");
+    }
+
+    #[tokio::test]
+    async fn cancel_asks_the_remote_to_cancel_and_says_only_what_it_answered() {
+        let casos: Vec<(std::result::Result<RemoteTask, RemoteTaskError>, &str)> = vec![
+            (
+                Ok(tarea("r1", TaskState::Canceled, None, &[])),
+                "cancellation confirmed by the remote",
+            ),
+            (
+                Ok(tarea("r1", TaskState::Working, None, &[])),
+                "the remote reports TASK_STATE_WORKING",
+            ),
+            (
+                Err(RemoteTaskError::NotCancelable),
+                "the remote says the task is not cancelable",
+            ),
+            (
+                Err(RemoteTaskError::Other("caído".into())),
+                "the remote did not confirm it",
+            ),
+        ];
+        for (respuesta, esperado) in casos {
+            let cliente = ClienteGuionizado::trabajando();
+            *cliente.cancelacion.lock().unwrap() = respuesta;
+            let entorno = entorno_remoto(cliente, true, false, Duration::from_secs(60)).await;
+            let hijo = entorno.lanzar().await;
+            espera_estado_del_hijo(&entorno.store, entorno.parent, hijo, TaskState::Working).await;
+
+            let devuelto = entorno.lanzador.cancel(entorno.parent, hijo).await.unwrap();
+
+            assert_eq!(devuelto.status.state, TaskState::Canceled);
+            let mensaje = devuelto.status.message.unwrap().text();
+            assert!(mensaje.contains(esperado), "{esperado}: {mensaje}");
+            assert_eq!(
+                *entorno.cliente.canceladas.lock().unwrap(),
+                vec!["r1".to_string()]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_the_parent_cancels_the_remote_task_too() {
+        let cliente = ClienteGuionizado::trabajando();
+        let entorno = entorno_remoto(cliente, true, false, Duration::from_secs(60)).await;
+        let cancel_padre = CancellationToken::new();
+        let (hijo, _) = entorno
+            .lanzador
+            .start(
+                entorno.parent,
+                "lejano".into(),
+                "haz lo tuyo".into(),
+                Some("remoto".into()),
+                cancel_padre.clone(),
+            )
+            .await
+            .unwrap();
+        espera_estado_del_hijo(&entorno.store, entorno.parent, hijo, TaskState::Working).await;
+
+        cancel_padre.cancel();
+
+        espera_estado_del_hijo(&entorno.store, entorno.parent, hijo, TaskState::Canceled).await;
+        assert_eq!(
+            *entorno.cliente.canceladas.lock().unwrap(),
+            vec!["r1".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unapproved_remote_creates_no_task() {
+        let entorno = entorno_remoto(
+            ClienteGuionizado::trabajando(),
+            false,
+            false,
+            Duration::from_secs(60),
+        )
+        .await;
+
+        let error = entorno
+            .lanzador
+            .start(
+                entorno.parent,
+                "lejano".into(),
+                "haz lo tuyo".into(),
+                Some("remoto".into()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("pendiente de aprobación"),
+            "{error}"
+        );
+        assert!(entorno
+            .store
+            .list_subagents(entorno.parent)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(entorno.cliente.enviados.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_remote_that_requires_authentication_is_refused_for_now() {
+        let entorno = entorno_remoto(
+            ClienteGuionizado::trabajando(),
+            true,
+            true,
+            Duration::from_secs(60),
+        )
+        .await;
+
+        let error = entorno
+            .lanzador
+            .start(
+                entorno.parent,
+                "lejano".into(),
+                "haz lo tuyo".into(),
+                Some("remoto".into()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("exige autenticación"), "{error}");
+        assert!(entorno
+            .store
+            .list_subagents(entorno.parent)
+            .await
+            .unwrap()
+            .is_empty());
     }
 }
