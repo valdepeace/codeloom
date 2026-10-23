@@ -6459,12 +6459,14 @@ linea 2",
             replaced: 4,
             tokens_before: 90_000,
             summary_bytes: 100,
+            activation: codeloom_core::event::Activation::Sync, // ADAPTADO: campo nuevo
         });
         assert_eq!(app.context_memory, 25, "100 bytes son 25 tokens");
         app.apply(LiveEvent::ContextCompacted {
             replaced: 6,
             tokens_before: 91_000,
             summary_bytes: 101,
+            activation: codeloom_core::event::Activation::Sync, // ADAPTADO: campo nuevo
         });
         assert_eq!(app.context_memory, 26, "el redondeo sube");
     }
@@ -6551,6 +6553,7 @@ linea 2",
                 replaced: 2,
                 tokens_before: 90_000,
                 summary_bytes: 400,
+                activation: codeloom_core::event::Activation::Sync, // ADAPTADO: campo nuevo
             }),
         });
         assert_eq!(app.context_tokens, 2_000);

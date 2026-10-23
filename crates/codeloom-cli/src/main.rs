@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
+use codeloom_core::agent::compact::CompactionConfig;
 use codeloom_core::agent::AgentLoop;
 use codeloom_core::budget::BudgetConfig;
 use codeloom_core::catalog::{
@@ -158,6 +159,8 @@ async fn main() -> Result<()> {
     // Como `[agents]`, un `[budget]` mal escrito impide arrancar con un error claro: un aviso
     // por stderr se perdería tras la pantalla alternativa de la interfaz.
     let presupuesto = BudgetConfig::load(&config_path)?;
+    // Igual que `[budget]`: una sección `[compaction]` mal escrita impide arrancar con un error claro.
+    let compactacion = CompactionConfig::load(&config_path)?;
     let cwd_label = cwd.display().to_string();
     let model_label = cfg.model.clone();
     let provider = build_provider(&cfg)?;
@@ -211,7 +214,8 @@ async fn main() -> Result<()> {
         .with_agent_registry(registro_agentes.clone())
         .with_delegation_confirm(agents_cfg.confirm_delegation)
         .with_spill(ToolSpill::new(data_dir.join("tool-output")))
-        .with_budget(presupuesto),
+        .with_budget(presupuesto)
+        .with_compaction(compactacion),
     );
 
     if let Some(prompt) = cli.print {

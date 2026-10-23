@@ -9,7 +9,7 @@ use crate::budget::{budget_crossings, BudgetConfig};
 use crate::catalog::Catalog;
 use crate::config::{CodeLoomConfig, ConfirmDelegation};
 use crate::error::Result;
-use crate::event::{EventBus, LiveEvent};
+use crate::event::{Activation, EventBus, LiveEvent};
 use crate::message::{ContentPart, FinishReason, Message, Role, Usage};
 use crate::permission::PermissionService;
 use crate::provider::{Provider, ProviderRequest, StreamChunk};
@@ -48,6 +48,71 @@ pub struct TurnOutcome {
     pub steps: usize,
 }
 
+/// Registrador del consumo de una respuesta. Lleva copias compartidas del almacén, la
+/// configuración, el catálogo y el bus, de modo que es `'static` y puede moverse a una tarea
+/// `tokio::spawn`. Su comportamiento es el del antiguo `AgentLoop::record_usage`.
+#[derive(Clone)]
+struct UsageRecorder {
+    store: Arc<dyn SessionStore>,
+    config: Arc<RwLock<CodeLoomConfig>>,
+    catalog: Arc<RwLock<Catalog>>,
+    budget: BudgetConfig,
+    bus: EventBus,
+}
+
+impl UsageRecorder {
+    /// Guarda el apunte de consumo de una respuesta, con el modelo y la URL de la configuración
+    /// vigente y los precios del catálogo en ese instante. Un fallo se registra y no corta el turno.
+    async fn record(&self, session: SessionId, usage: &crate::message::Usage) {
+        let (model, base_url) = {
+            let config = self.config.read().unwrap();
+            (config.model.clone(), config.provider.base_url.clone())
+        };
+        let prices = self
+            .catalog
+            .read()
+            .ok()
+            .and_then(|catalog| catalog.prices(&base_url, &model));
+        let record = UsageRecord {
+            session,
+            model,
+            input_tokens: u64::from(usage.input_tokens),
+            output_tokens: u64::from(usage.output_tokens),
+            input_price: prices.map(|(input, _)| input),
+            output_price: prices.map(|(_, output)| output),
+            created_at_ms: crate::message::now_ms(),
+        };
+        // Con presupuesto, el acumulado previo se lee antes de guardar el apunte para comparar
+        // antes y después. Sin presupuesto no se toca el almacén más allá del apunte.
+        let anteriores = if self.budget.is_empty() {
+            None
+        } else {
+            match self.store.session_usage(session).await {
+                Ok(registros) => Some(registros),
+                Err(error) => {
+                    tracing::warn!(error = %error, "no se pudo leer el consumo previo del presupuesto");
+                    None
+                }
+            }
+        };
+        if let Err(error) = self.store.record_usage(session, &record).await {
+            tracing::warn!(error = %error, "no se pudo guardar el apunte de consumo");
+            return;
+        }
+        if let Some(anteriores) = anteriores {
+            for aviso in budget_crossings(&self.budget, &anteriores, &record) {
+                self.bus.publish(LiveEvent::BudgetWarning {
+                    metric: aviso.metric,
+                    level_percent: aviso.level_percent,
+                    used: aviso.used,
+                    limit: aviso.limit,
+                    partial: aviso.partial,
+                });
+            }
+        }
+    }
+}
+
 pub struct AgentLoop {
     provider: Arc<RwLock<Arc<dyn Provider>>>,
     store: Arc<dyn SessionStore>,
@@ -73,6 +138,9 @@ pub struct AgentLoop {
     /// Presupuesto de gasto de la sesión; vacío no avisa ni lee el consumo acumulado. No se
     /// propaga a los subagentes.
     budget: BudgetConfig,
+    /// Configuración de la compactación (`[compaction]`). Por defecto, sin segundo plano. Solo
+    /// afecta a este agente: el lanzador de subagentes no lo hereda.
+    compaction: compact::CompactionConfig,
 }
 
 impl AgentLoop {
@@ -106,6 +174,7 @@ impl AgentLoop {
             delegation_confirm: ConfirmDelegation::default(),
             spill: None,
             budget: BudgetConfig::default(),
+            compaction: compact::CompactionConfig::default(),
             cwd,
         };
         if has_subagents {
@@ -172,6 +241,13 @@ impl AgentLoop {
         self
     }
 
+    /// Fija la configuración de la compactación (`[compaction]`). Solo afecta a este agente: el
+    /// lanzador de subagentes no lo hereda, así que un hijo usa siempre la vía síncrona.
+    pub fn with_compaction(mut self, compaction: compact::CompactionConfig) -> Self {
+        self.compaction = compaction;
+        self
+    }
+
     /// Lanzador de subagentes con el estado actual de este agente, catálogo y registro incluidos.
     fn subagent_launcher(&self) -> Arc<dyn crate::subagent::SubagentLauncher> {
         let lanzador = crate::subagent::InProcessSubagentLauncher::new(
@@ -196,55 +272,21 @@ impl AgentLoop {
         Arc::new(lanzador)
     }
 
-    /// Guarda el apunte de consumo de una respuesta, con el modelo y la URL de la configuración
-    /// vigente y los precios del catálogo en ese instante. Un fallo se registra y no corta el turno.
+    /// Registrador de consumo con el estado actual de este agente. Es clonable y no toma prestado
+    /// el agente, así que una tarea en segundo plano puede llevarlo consigo.
+    fn recorder(&self) -> UsageRecorder {
+        UsageRecorder {
+            store: self.store.clone(),
+            config: self.config.clone(),
+            catalog: self.catalog.clone(),
+            budget: self.budget.clone(),
+            bus: self.bus.clone(),
+        }
+    }
+
+    /// Guarda el apunte de consumo de una respuesta. Véase `UsageRecorder::record`.
     async fn record_usage(&self, session: SessionId, usage: &crate::message::Usage) {
-        let (model, base_url) = {
-            let config = self.config.read().unwrap();
-            (config.model.clone(), config.provider.base_url.clone())
-        };
-        let prices = self
-            .catalog
-            .read()
-            .ok()
-            .and_then(|catalog| catalog.prices(&base_url, &model));
-        let record = UsageRecord {
-            session,
-            model,
-            input_tokens: u64::from(usage.input_tokens),
-            output_tokens: u64::from(usage.output_tokens),
-            input_price: prices.map(|(input, _)| input),
-            output_price: prices.map(|(_, output)| output),
-            created_at_ms: crate::message::now_ms(),
-        };
-        // Con presupuesto, el acumulado previo se lee antes de guardar el apunte para comparar
-        // antes y después. Sin presupuesto no se toca el almacén más allá del apunte.
-        let anteriores = if self.budget.is_empty() {
-            None
-        } else {
-            match self.store.session_usage(session).await {
-                Ok(registros) => Some(registros),
-                Err(error) => {
-                    tracing::warn!(error = %error, "no se pudo leer el consumo previo del presupuesto");
-                    None
-                }
-            }
-        };
-        if let Err(error) = self.store.record_usage(session, &record).await {
-            tracing::warn!(error = %error, "no se pudo guardar el apunte de consumo");
-            return;
-        }
-        if let Some(anteriores) = anteriores {
-            for aviso in budget_crossings(&self.budget, &anteriores, &record) {
-                self.bus.publish(LiveEvent::BudgetWarning {
-                    metric: aviso.metric,
-                    level_percent: aviso.level_percent,
-                    used: aviso.used,
-                    limit: aviso.limit,
-                    partial: aviso.partial,
-                });
-            }
-        }
+        self.recorder().record(session, usage).await;
     }
 
     pub fn jobs(&self) -> Arc<dyn crate::job::JobRegistry> {
@@ -611,6 +653,20 @@ impl AgentLoop {
             return Ok(false);
         };
 
+        self.activate(session, &resumen, tokens_before, Activation::Sync)
+            .await?;
+        Ok(true)
+    }
+
+    /// Activa un resumen ya generado: lo persiste como mensaje de resumen y publica `MessageAdded`
+    /// y `ContextCompacted`. No hace llamadas al modelo. `activation` indica cómo entra en efecto.
+    async fn activate(
+        &self,
+        session: SessionId,
+        resumen: &GeneratedSummary,
+        tokens_before: u64,
+        activation: Activation,
+    ) -> Result<()> {
         let mensaje = compact::summary_message(resumen.covers, &resumen.text);
         self.store.append_message(session, &mensaje).await?;
         self.bus.publish(LiveEvent::MessageAdded(mensaje));
@@ -618,8 +674,9 @@ impl AgentLoop {
             replaced: resumen.covers,
             tokens_before,
             summary_bytes: resumen.text.len(),
+            activation,
         });
-        Ok(true)
+        Ok(())
     }
 
     /// Entrega los avisos pendientes de jobs y subagentes. Devuelve cuántos se
@@ -2379,10 +2436,65 @@ Cuerpo.
                 replaced,
                 tokens_before,
                 summary_bytes,
+                ..  // ADAPTADO: campo nuevo
             } => Some((*replaced, *tokens_before, *summary_bytes)),
             _ => None,
         });
         assert_eq!(compactado, Some((cut, 1234, "resumen".len())));
+        assert!(
+            eventos
+                .iter()
+                .any(|evento| matches!(evento, LiveEvent::MessageAdded(_))),
+            "el mensaje de resumen también se publica"
+        );
+    }
+
+    #[tokio::test]
+    async fn activate_persists_the_message_and_publishes_the_activation() {
+        let e = entorno_de_resumen("resumen", &historial_grande(100)).await;
+        let antes = e.store.messages(e.sid).await.unwrap();
+        let cut = compact::choose_cut(&antes).expect("hay historia que resumir");
+        let mut rx = e.bus.subscribe();
+        let resumen = GeneratedSummary {
+            text: "resumen".to_string(),
+            usage: None,
+            covers: cut,
+        };
+
+        e.agente
+            .activate(e.sid, &resumen, 777, Activation::Background)
+            .await
+            .unwrap();
+
+        let despues = e.store.messages(e.sid).await.unwrap();
+        assert_eq!(despues.len(), antes.len() + 1);
+        let (covers, texto) =
+            compact::parse_summary(despues.last().unwrap()).expect("el resumen va al final");
+        assert_eq!(covers, cut);
+        assert_eq!(texto, "resumen");
+
+        let mut eventos = Vec::new();
+        while let Ok(evento) = rx.try_recv() {
+            eventos.push(evento);
+        }
+        let activacion = eventos.iter().find_map(|evento| match evento {
+            LiveEvent::ContextCompacted {
+                replaced,
+                tokens_before,
+                summary_bytes,
+                activation,
+            } => Some((
+                *replaced,
+                *tokens_before,
+                *summary_bytes,
+                activation.clone(),
+            )),
+            _ => None,
+        });
+        assert_eq!(
+            activacion,
+            Some((cut, 777, "resumen".len(), Activation::Background))
+        );
         assert!(
             eventos
                 .iter()

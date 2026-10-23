@@ -1,6 +1,16 @@
 use crate::message::Message;
 use tokio::sync::broadcast;
 
+/// Cómo entró en efecto una compactación. `Sync` es la vía de siempre: el turno esperó al resumen.
+/// `Background` activó un resumen ya listo, sin llamada al modelo. `BackgroundAwaited` activó un
+/// resumen en curso tras esperarlo `waited_ms` milisegundos.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Activation {
+    Sync,
+    Background,
+    BackgroundAwaited { waited_ms: u64 },
+}
+
 #[derive(Debug, Clone)]
 pub enum LiveEvent {
     TurnStarted,
@@ -31,6 +41,8 @@ pub enum LiveEvent {
         replaced: usize,
         tokens_before: u64,
         summary_bytes: usize,
+        /// Cómo entró en efecto el resumen (`Sync` en la vía síncrona de siempre).
+        activation: Activation,
     },
     /// El gasto acumulado de la sesión cruza un umbral del presupuesto (`[budget]`). `used` y
     /// `limit` van en tokens o en dólares según `metric`; `partial` indica que el coste no suma

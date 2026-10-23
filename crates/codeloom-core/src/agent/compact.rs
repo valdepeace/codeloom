@@ -7,7 +7,10 @@
 //! Las cifras son decisiones propias de CodeLoom; véase
 //! `docs/specs/2026-10-23-codeloom-context-summary-design.md`.
 
+use crate::error::{CoreError, Result};
 use crate::message::{ContentPart, Message, Role};
+use serde::Deserialize;
+use std::path::Path;
 
 /// Fracción de la ventana del modelo a partir de la cual se compacta.
 pub const COMPACT_RATIO: f64 = 0.80;
@@ -23,6 +26,46 @@ pub const SUMMARY_MAX_TOKENS: u32 = 4096;
 
 /// Compactaciones permitidas dentro de un mismo turno.
 pub const MAX_COMPACTIONS_PER_TURN: usize = 3;
+
+/// Sección opcional `[compaction]` de `codeloom.toml`. Sin ella, o con `background` ausente, la
+/// compactación en segundo plano está desactivada y se usa la vía síncrona de siempre.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct CompactionConfig {
+    /// Si `true`, el resumen se genera en segundo plano al acercarse al umbral de compactación.
+    pub background: bool,
+}
+
+/// Forma del fichero a efectos de la sección `[compaction]`; el resto de claves se ignora.
+#[derive(Deserialize)]
+struct FicheroConCompaction {
+    #[serde(default)]
+    compaction: CompactionConfig,
+}
+
+impl CompactionConfig {
+    /// Lee la sección `[compaction]` de un texto TOML. Su ausencia da la configuración por defecto.
+    pub fn from_toml(text: &str) -> Result<CompactionConfig> {
+        let fichero: FicheroConCompaction =
+            toml::from_str(text).map_err(|e| CoreError::Config(e.to_string()))?;
+        Ok(fichero.compaction)
+    }
+
+    /// Lee la configuración de `path`. Un fichero inexistente da la configuración por defecto; un
+    /// fallo de lectura distinto de la ausencia, o una sección mal escrita, son errores.
+    pub fn load(path: &Path) -> Result<CompactionConfig> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => Self::from_toml(&text),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(CompactionConfig::default())
+            }
+            Err(error) => Err(CoreError::Config(format!(
+                "read {}: {error}",
+                path.display()
+            ))),
+        }
+    }
+}
 
 /// Inicio de la cabecera de un resumen; lo que sigue es el número de mensajes cubiertos.
 const SUMMARY_PREFIX: &str = "[Context summary: first ";
@@ -425,5 +468,42 @@ mod tests {
         history.push(summary_message(0, "r"));
         history.extend((0..5).map(|_| Message::user("y".repeat(4000))));
         assert_eq!(choose_cut(&history), Some(7));
+    }
+
+    #[test]
+    fn compaction_section_parses_and_rejects_garbage() {
+        // Sin fichero de configuración o sin sección, la compactación en segundo plano está apagada.
+        assert!(!CompactionConfig::from_toml("").unwrap().background);
+        assert!(
+            !CompactionConfig::from_toml("model = \"gpt-4o\"\n")
+                .unwrap()
+                .background
+        );
+
+        let activada = CompactionConfig::from_toml("[compaction]\nbackground = true\n").unwrap();
+        assert!(activada.background);
+
+        // Las demás secciones se ignoran, como hace `BudgetConfig`.
+        let con_otras = CompactionConfig::from_toml(
+            "[budget]\nsession_tokens = 1000\n[compaction]\nbackground = false\n",
+        )
+        .unwrap();
+        assert!(!con_otras.background);
+        // Una clave desconocida dentro de la sección también se ignora, igual que en `[budget]`.
+        let clave_rara = CompactionConfig::from_toml("[compaction]\nclave_rara = 1\n").unwrap();
+        assert!(!clave_rara.background);
+
+        // Una sección mal escrita, o un valor que no es booleano, es un error.
+        for texto in [
+            "[compaction]\nbackground = \"sí\"\n",
+            "[compaction]\nbackground = 1\n",
+            "compaction = 3\n",
+        ] {
+            let error = CompactionConfig::from_toml(texto).unwrap_err();
+            assert!(
+                matches!(error, CoreError::Config(_)),
+                "{texto:?} dio {error:?}"
+            );
+        }
     }
 }
