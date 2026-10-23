@@ -25,12 +25,14 @@
 - Con los roles apagados no se abre ni un socket ni se hace una petición.
 - Una tarjeta con texto que intenta dar órdenes se muestra como dato y no cambia el prompt del padre.
 
-### Tarea 0: la fuente normativa
+### Tarea 0: reconciliar la fuente normativa
 
-- [ ] Leer entera la especificación v1.0 (§9–§13) y `a2a.proto`; resolver las contradicciones de la
-  spec (métodos, cuerpo de error, códigos, `raw`) y guardar **fixtures literales** (tarjeta,
-  `SendMessage`, `GetTask`, `CancelTask`, errores) en `crates/codeloom-a2a/tests/fixtures/`.
-  Corregir la spec y `wire.rs` si algo no coincide. Commitear solo documentos y fixtures.
+- [ ] Localizar la copia local de la spec (`spec.md`) y de `a2a.proto` citada en la spec del perfil
+  y, con ella, contrastar lo ya anotado (métodos PascalCase, códigos de error, `ErrorInfo`, cabecera
+  de versión) y cerrar lo abierto (`raw`, campos de los eventos). Guardar **fixtures literales**
+  (tarjeta, `SendMessage`, `GetTask`, `CancelTask`, errores) en
+  `crates/codeloom-a2a/tests/fixtures/`. Corregir la spec y `wire.rs` si algo no coincide.
+  Commitear solo documentos y fixtures.
 
 ### Fase A8a: consumir
 
@@ -39,7 +41,7 @@
 - [ ] **T2. Tarjeta remota.** Descarga de `/.well-known/agent-card.json` con tiempo y tope, y
   conversión a `AgentCard`. Pruebas con cassettes: tarjeta válida, demasiado grande, JSON roto,
   redirección a otro anfitrión (rechazada), versión no soportada.
-- [ ] **T3. Fuente de agentes remotos** para el registro, con `Approval::Pending`. Pruebas: no
+- [ ] **T3. Fuente de agentes remotos** (perfiles `.md` con `transport: a2a-remote`) para el registro, con `Approval::Pending` atada al hash de la tarjeta: si cambia, vuelve a pendiente. Pruebas: no
   aparece como usable hasta aprobarse; su texto no entra al prompt del padre sin marcarse como dato.
 - [ ] **T4. Cliente `A2aRemoteTransport`** (`impl AgentTransport`): `send_message`, `get_task`,
   `list_tasks`, `cancel_task`. Se ejecuta `transport_contract` (A7) con cassettes.
@@ -50,8 +52,8 @@
 
 ### Fase A8b: servir (solo tras A8d-T1)
 
-- [ ] Enrutador en memoria con `SendMessage`, `GetTask`, `CancelTask` sobre `InProcessTransport`;
-  tarjeta publicada; escucha en `127.0.0.1`. Pruebas sin puerto.
+- [ ] Dependencia `axum` (solo en `codeloom-a2a`). Enrutador en memoria con `SendMessage`, `GetTask`, `CancelTask` sobre `InProcessTransport`;
+  tarjeta publicada; escucha en `127.0.0.1`. Pruebas sin puerto, con el enrutador llamado en memoria. Las del cliente (A8a) usan `wiremock`.
 
 ### Fase A8c: SSE (tras A9)
 

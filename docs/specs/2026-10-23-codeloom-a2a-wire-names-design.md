@@ -33,7 +33,8 @@ contrastarse palabra por palabra.
 ## Lo que NO consta (y por tanto decidimos o aplazamos)
 
 - **Cómo se codifican los bytes de `raw`.** El texto leído no lo dice; el ejemplo parece base64.
-  Decisión nuestra: base64 estándar (la convención de ProtoJSON). No se leyó `a2a.proto`.
+  Decisión nuestra: base64 estándar, que es la regla general de ProtoJSON para `bytes` (regla del
+  formato, no una frase de la spec). No se leyó `a2a.proto`.
 - **Si la v1.0 aún acepta los nombres de la v0.3** (`working`, `user`): no consta. Se aplaza a A8,
   junto con `A2A-Version`.
 - **Una regla general de omisión** para `Task` y `Message`: solo consta en los casos citados y
