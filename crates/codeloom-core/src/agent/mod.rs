@@ -1,3 +1,4 @@
+pub mod background;
 pub mod changes;
 mod clear;
 pub mod compact;
