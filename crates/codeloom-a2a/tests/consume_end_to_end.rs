@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use codeloom_a2a::client::A2aClientFactory;
 use codeloom_a2a::config::{A2aConfig, A2aRole};
 use codeloom_a2a::remote::http_client;
-use codeloom_a2a::sync::refresh_remote_cards;
+use codeloom_a2a::sync::refresh_remote_cards_with_env;
 use codeloom_core::config::{CodeLoomConfig, ProviderConfig, ProviderKind};
 use codeloom_core::error::Result as CoreResult;
 use codeloom_core::event::EventBus;
@@ -33,6 +33,9 @@ use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 const TARJETA: &str = include_str!("fixtures/agent-card.sample.json");
+
+/// Credencial de los remotos protegidos de estas pruebas.
+const SECRETO: &str = "s3cr3t0-de-prueba-muy-largo";
 
 /// El proveedor no se usa: el agente es remoto.
 struct ProveedorInerte;
@@ -88,32 +91,50 @@ impl Respond for RemotoSimulado {
     }
 }
 
-async fn servidor(completa_en: usize) -> MockServer {
+async fn servidor(completa_en: usize, protegido: bool) -> MockServer {
     let servidor = MockServer::start().await;
     let mut tarjeta: Value = serde_json::from_str(TARJETA).unwrap();
     for interfaz in tarjeta["supportedInterfaces"].as_array_mut().unwrap() {
         interfaz["url"] = json!(format!("{}/a2a/v1", servidor.uri()));
     }
-    // Esta tarjeta de ejemplo declara requisitos de seguridad; para consumir sin autenticación
-    // (lo único soportado hoy) se quitan.
-    tarjeta
-        .as_object_mut()
-        .unwrap()
-        .remove("securityRequirements");
+    // La tarjeta de ejemplo pide OpenID Connect, que no está soportado: o se quita la seguridad
+    // (remoto abierto) o se sustituye por un `Bearer`, que exige la cabecera en cada llamada.
+    let objeto = tarjeta.as_object_mut().unwrap();
+    objeto.remove("securityRequirements");
+    objeto.remove("securitySchemes");
+    if protegido {
+        objeto.insert(
+            "securitySchemes".into(),
+            json!({ "token": { "httpAuthSecurityScheme": { "scheme": "Bearer" } } }),
+        );
+        objeto.insert(
+            "securityRequirements".into(),
+            json!([{ "schemes": { "token": { "list": [] } } }]),
+        );
+    }
     Mock::given(method("GET"))
         .and(path("/.well-known/agent-card.json"))
         .respond_with(ResponseTemplate::new(200).set_body_json(tarjeta))
         .mount(&servidor)
         .await;
-    Mock::given(method("POST"))
+    let rpc = Mock::given(method("POST"))
         .and(path("/a2a/v1"))
-        .and(header("A2A-Version", "1.0"))
-        .respond_with(RemotoSimulado {
-            consultas: AtomicUsize::new(0),
-            completa_en,
-        })
-        .mount(&servidor)
-        .await;
+        .and(header("A2A-Version", "1.0"));
+    // Un remoto protegido no contesta a quien no lleve su credencial: ni siquiera con un 401.
+    let rpc = if protegido {
+        rpc.and(header(
+            "authorization",
+            format!("Bearer {SECRETO}").as_str(),
+        ))
+    } else {
+        rpc
+    };
+    rpc.respond_with(RemotoSimulado {
+        consultas: AtomicUsize::new(0),
+        completa_en,
+    })
+    .mount(&servidor)
+    .await;
     servidor
 }
 
@@ -128,17 +149,39 @@ struct Montaje {
 }
 
 async fn montar(completa_en: usize) -> Montaje {
-    let servidor = servidor(completa_en).await;
+    montar_con(completa_en, false, None).await
+}
+
+/// `protegido`: el remoto exige `Bearer`; el perfil declara la variable `AGENTE_KEY`, cuyo valor
+/// en el «entorno» de la prueba es `valor_env`.
+async fn montar_con(
+    completa_en: usize,
+    protegido: bool,
+    valor_env: Option<&'static str>,
+) -> Montaje {
+    let servidor = servidor(completa_en, protegido).await;
     let dir = tempfile::tempdir().unwrap();
     let datos = tempfile::tempdir().unwrap();
+    let credenciales = if protegido {
+        "  credentials:\n    token: AGENTE_KEY\n"
+    } else {
+        ""
+    };
     std::fs::write(
         dir.path().join("lejano.md"),
         format!(
-            "---\nname: lejano\ndescription: Alta manual\ntransport: a2a-remote\na2a:\n  endpoint: {}\n---\n",
+            "---\nname: lejano\ndescription: Alta manual\ntransport: a2a-remote\na2a:\n  endpoint: {}\n{credenciales}---\n",
             servidor.uri()
         ),
     )
     .unwrap();
+    let entorno = move |variable: &str| {
+        if variable == "AGENTE_KEY" {
+            valor_env.map(str::to_string)
+        } else {
+            None
+        }
+    };
     let registro = Arc::new(
         AgentRegistry::new(vec![
             Box::new(BuiltInSource),
@@ -160,7 +203,7 @@ async fn montar(completa_en: usize) -> Montaje {
     };
     let bus = EventBus::new(256);
     let cliente = http_client(&config_a2a).unwrap().unwrap();
-    refresh_remote_cards(&registro, &bus, &cliente, &config_a2a).await;
+    refresh_remote_cards_with_env(&registro, &bus, &cliente, &config_a2a, &entorno).await;
 
     let store = Arc::new(
         SqliteStore::open(dir.path().join("e2e.db").to_str().unwrap())
@@ -179,7 +222,10 @@ async fn montar(completa_en: usize) -> Montaje {
         max_steps: 5,
         effort: None,
     };
-    let fabrica = A2aClientFactory::from_config(&config_a2a).unwrap().unwrap();
+    let fabrica = A2aClientFactory::from_config(&config_a2a)
+        .unwrap()
+        .unwrap()
+        .with_env(entorno);
     let lanzador = InProcessSubagentLauncher::new(
         Arc::new(RwLock::new(provider)),
         store.clone(),
@@ -324,4 +370,92 @@ async fn with_the_role_off_there_is_no_client_factory() {
     assert!(A2aClientFactory::from_config(&A2aConfig::default())
         .unwrap()
         .is_none());
+}
+
+#[tokio::test]
+async fn a_protected_remote_is_delegated_to_with_its_bearer_token_and_the_secret_leaks_nowhere() {
+    let montaje = montar_con(2, true, Some(SECRETO)).await;
+    let mut eventos = montaje.bus.subscribe();
+    montaje.registro.approve("lejano").unwrap();
+
+    let (hijo, _) = montaje
+        .lanzador
+        .start(
+            montaje.parent,
+            "tarea".into(),
+            "hazlo".into(),
+            Some("lejano".into()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    espera(&montaje, hijo, TaskState::Completed).await;
+
+    // El remoto solo contesta con la credencial: que haya completado prueba que llegó.
+    let metodos = metodos_recibidos(&montaje.servidor).await;
+    assert_eq!(metodos[0], "SendMessage");
+    // El secreto no aparece en ningún evento ni en lo que quedó guardado de la tarea.
+    while let Ok(evento) = eventos.try_recv() {
+        assert!(!format!("{evento:?}").contains(SECRETO), "{evento:?}");
+    }
+    let descriptores = montaje.store.list_subagents(montaje.parent).await.unwrap();
+    assert!(!format!("{descriptores:?}").contains(SECRETO));
+}
+
+#[tokio::test]
+async fn without_the_env_var_a_protected_remote_is_refused_and_nothing_is_sent() {
+    let montaje = montar_con(2, true, None).await;
+    montaje.registro.approve("lejano").unwrap();
+
+    let error = montaje
+        .lanzador
+        .start(
+            montaje.parent,
+            "tarea".into(),
+            "hazlo".into(),
+            Some("lejano".into()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("AGENTE_KEY"), "{error}");
+    assert!(metodos_recibidos(&montaje.servidor).await.is_empty());
+    assert!(montaje
+        .store
+        .list_subagents(montaje.parent)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn a_remote_that_rejects_the_credential_fails_the_task_without_echoing_it() {
+    // El remoto contesta 401 al token equivocado: el espejo no debe repetirlo en ningún sitio.
+    let montaje = montar_con(2, true, Some("otro-token-incorrecto")).await;
+    montaje.registro.approve("lejano").unwrap();
+
+    let resultado = montaje
+        .lanzador
+        .start(
+            montaje.parent,
+            "tarea".into(),
+            "hazlo".into(),
+            Some("lejano".into()),
+            CancellationToken::new(),
+        )
+        .await;
+
+    // Con el token equivocado el servidor simulado no tiene ruta (404), así que el envío falla.
+    let texto = match resultado {
+        Ok((hijo, _)) => {
+            espera(&montaje, hijo, TaskState::Failed).await;
+            format!(
+                "{:?}",
+                montaje.store.list_subagents(montaje.parent).await.unwrap()
+            )
+        }
+        Err(error) => error.to_string(),
+    };
+    assert!(!texto.contains("otro-token-incorrecto"), "{texto}");
 }

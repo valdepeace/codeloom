@@ -445,23 +445,45 @@ pub struct AgentRow {
     pub body: String,
 }
 
+/// Texto de ejecución de una fila y prompt a revisar. De un remoto, además, el motivo por el que no
+/// se puede usar (falta una credencial, esquema no soportado…) para que la persona sepa qué hacer
+/// sin abrir un registro. Ese motivo se acota y se aplana: puede incluir nombres de un tercero.
+fn execution_label(execution: &codeloom_core::registry::Execution) -> (String, String) {
+    use codeloom_core::registry::Execution;
+    const MAX_MOTIVO: usize = 120;
+    match execution {
+        Execution::Local(local) => (
+            format!(
+                "model {} / effort {}",
+                local.model.as_deref().unwrap_or("inherits"),
+                local.effort.as_deref().unwrap_or("inherits")
+            ),
+            local.system_prompt(),
+        ),
+        Execution::Remote(spec) => {
+            let motivo = spec
+                .fetched
+                .as_ref()
+                .and_then(|descargada| descargada.auth_problem.as_deref())
+                .map(una_linea);
+            let texto = match motivo {
+                Some(motivo) => format!(
+                    "remote · auth: {}",
+                    motivo.chars().take(MAX_MOTIVO).collect::<String>()
+                ),
+                None => "remote".to_string(),
+            };
+            (texto, String::new())
+        }
+    }
+}
+
 impl AgentRow {
     fn from_entry(
         entrada: &codeloom_core::registry::AgentEntry,
         instantanea: &codeloom_core::registry::RegistrySnapshot,
     ) -> Self {
-        use codeloom_core::registry::Execution;
-        let (execution, body) = match &entrada.execution {
-            Execution::Local(local) => (
-                format!(
-                    "model {} / effort {}",
-                    local.model.as_deref().unwrap_or("inherits"),
-                    local.effort.as_deref().unwrap_or("inherits")
-                ),
-                local.system_prompt(),
-            ),
-            Execution::Remote(_) => ("remote".to_string(), String::new()),
-        };
+        let (execution, body) = execution_label(&entrada.execution);
         AgentRow {
             name: entrada.name.clone(),
             origin: entrada.origin.as_text(),
@@ -4791,6 +4813,61 @@ linea 2",
         hijo.agent = agent.map(str::to_owned);
         hijo.agent_origin = origin.map(str::to_owned);
         hijo
+    }
+
+    #[test]
+    fn a_remote_row_shows_why_it_cannot_be_used() {
+        use codeloom_core::registry::{Execution, RemoteFetched, RemoteSpec};
+        let remoto = |problema: Option<&str>| {
+            Execution::Remote(RemoteSpec {
+                endpoint: "https://ext.example".into(),
+                fetched: Some(RemoteFetched {
+                    card_hash: "h".into(),
+                    jsonrpc_url: "https://ext.example/a2a".into(),
+                    tenant: None,
+                    requires_auth: true,
+                    security: None,
+                    auth_problem: problema.map(str::to_string),
+                }),
+                credentials: Default::default(),
+            })
+        };
+
+        let (texto, _) = execution_label(&remoto(Some("falta la variable de entorno AGENTE_KEY")));
+        assert_eq!(
+            texto,
+            "remote · auth: falta la variable de entorno AGENTE_KEY"
+        );
+
+        let (texto, _) = execution_label(&remoto(None));
+        assert_eq!(texto, "remote");
+    }
+
+    #[test]
+    fn a_remote_reason_is_flattened_and_bounded() {
+        use codeloom_core::registry::{Execution, RemoteFetched, RemoteSpec};
+        let largo = format!(
+            "línea uno
+línea dos {}",
+            "x".repeat(500)
+        );
+        let remoto = Execution::Remote(RemoteSpec {
+            endpoint: "https://ext.example".into(),
+            fetched: Some(RemoteFetched {
+                card_hash: "h".into(),
+                jsonrpc_url: "https://ext.example/a2a".into(),
+                tenant: None,
+                requires_auth: true,
+                security: None,
+                auth_problem: Some(largo),
+            }),
+            credentials: Default::default(),
+        });
+
+        let (texto, _) = execution_label(&remoto);
+
+        assert!(!texto.contains(char::from(10)), "{texto}");
+        assert!(texto.chars().count() <= "remote · auth: ".chars().count() + 120);
     }
 
     #[test]
