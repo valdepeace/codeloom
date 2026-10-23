@@ -206,6 +206,80 @@ fn draw_flat_footer(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(line), area);
 }
 
+/// Columnas del carril de árbol a la izquierda del texto: guía, filete y un hueco.
+const TREE_GUTTER: u16 = 3;
+/// Ancho mínimo del transcript para reservar el carril; por debajo, el texto manda.
+const TREE_MIN_WIDTH: u16 = 40;
+
+/// Columnas que se reservan al carril de árbol en un transcript de `width` columnas.
+fn tree_gutter(width: u16) -> u16 {
+    if width >= TREE_MIN_WIDTH {
+        TREE_GUTTER
+    } else {
+        0
+    }
+}
+
+/// Estilo de la guía de un bloque según el rol de su primera línea: el acento para quien
+/// escribe y un gris tenue para el resto, de modo que los turnos se vean de un vistazo.
+fn tree_style(kind: batten::state::LineKind, app: &App) -> Style {
+    match kind {
+        batten::state::LineKind::User => app.theme.styles.accent,
+        _ => app.theme.styles.muted,
+    }
+}
+
+/// Pinta el transcript como un árbol: cada bloque (mensaje, herramienta, subagente) cuelga de la
+/// raíz con `├─` en su primera fila, `│` mientras dura su cuerpo y `└─` si es el último. Vive en
+/// las `TREE_GUTTER` columnas a la izquierda de `texto`, así que el ajuste de línea no lo afecta.
+/// Recorre solo las entradas visibles y parchea celdas: no re-renderiza nada.
+fn draw_tree_gutter(frame: &mut Frame, texto: Rect, app: &App) {
+    let Some(x0) = texto.x.checked_sub(TREE_GUTTER) else {
+        return;
+    };
+    let top = app.viewport.top();
+    let bottom = top + usize::from(texto.height);
+    let Some((line, _)) = app.layout.line_at_row(top) else {
+        return;
+    };
+    let Some((first, _)) = app.transcript.locate(line) else {
+        return;
+    };
+    let ultimo = app.transcript.entry_count().saturating_sub(1);
+    let buf = frame.buffer_mut();
+    for entry in first..app.transcript.entry_count() {
+        let first_line = app.transcript.entry_start(entry);
+        let start = app.layout.row_of(first_line);
+        if start >= bottom {
+            break;
+        }
+        let lines = app.transcript.entry_lines(entry);
+        let end = app.layout.row_of(first_line + lines.len());
+        let Some(kind) = lines.first().map(|line| line.kind) else {
+            continue;
+        };
+        let style = tree_style(kind, app);
+        for row in start.max(top)..end.min(bottom) {
+            let Ok(dy) = u16::try_from(row - top) else {
+                break;
+            };
+            let y = texto.y + dy;
+            let guia = match (row == start, entry == ultimo) {
+                (true, true) => "└─",
+                (true, false) => "├─",
+                (false, true) => continue,
+                (false, false) => "│",
+            };
+            for (i, simbolo) in guia.chars().enumerate() {
+                if let Some(cell) = buf.cell_mut((x0 + i as u16, y)) {
+                    cell.set_symbol(simbolo.encode_utf8(&mut [0; 4]))
+                        .set_style(style);
+                }
+            }
+        }
+    }
+}
+
 fn draw_transcript(frame: &mut Frame, area: Rect, app: &mut App, panes: &mut Vec<(Focus, Rect)>) {
     panes.push((Focus::Transcript, area));
     app.transcript_area = None;
@@ -289,10 +363,18 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &mut App, panes: &mut Vec
             rows[0],
         );
     }
-    app.transcript_area = Some(rows[1]);
+    // El carril de árbol ocupa el borde izquierdo; el texto (y su selección) va a su derecha.
+    let gutter = tree_gutter(rows[1].width);
+    let texto = Rect::new(
+        rows[1].x + gutter,
+        rows[1].y,
+        rows[1].width - gutter,
+        rows[1].height,
+    );
+    app.transcript_area = Some(texto);
     batten::widgets::transcript::render(
         frame,
-        rows[1],
+        texto,
         &app.transcript,
         &mut app.viewport,
         &mut app.layout,
@@ -310,13 +392,14 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &mut App, panes: &mut Vec
     if let Some(sel) = app.text_sel.as_ref() {
         batten::widgets::transcript::paint_text_selection(
             frame.buffer_mut(),
-            rows[1],
+            texto,
             &app.layout,
             &app.viewport,
             sel,
             app.theme.styles.selection,
         );
     }
+    draw_tree_gutter(frame, texto, app);
     if app.thinking {
         let line = app.reasoning.lines().last().unwrap_or("Thinking…");
         batten::widgets::thinking::render(frame, rows[2], line, &app.animation, &app.theme);
@@ -1248,16 +1331,6 @@ fn mark_focused_panes(frame: &mut Frame, panes: &[(Focus, Rect)], app: &App, fla
     }
 }
 
-/// Línea fina del margen para un bloque inactivo. Solo los mensajes de usuario la
-/// llevan; el resto de roles queda sin línea hasta que el bloque se activa.
-fn rail_style(kind: batten::state::LineKind, app: &App) -> Option<Style> {
-    use batten::state::LineKind;
-    match kind {
-        LineKind::User => Some(app.theme.styles.accent),
-        _ => None,
-    }
-}
-
 /// Color del marcador grueso del bloque activo, según el rol de su primera línea:
 /// el acento para el usuario y un verde suave (éxito) para el resto.
 fn active_marker_style(kind: batten::state::LineKind, app: &App) -> Style {
@@ -1266,51 +1339,6 @@ fn active_marker_style(kind: batten::state::LineKind, app: &App) -> Style {
         app.theme.styles.accent
     } else {
         app.theme.styles.success
-    }
-}
-
-/// Pinta una línea vertical fina en la columna de margen por cada bloque de
-/// usuario visible del transcript. Solo con el chrome `Flat`. Recorre únicamente
-/// las entradas que caen en la vista y parchea sus celdas: no re-renderiza nada.
-fn mark_block_rails(frame: &mut Frame, app: &App, flat: bool) {
-    if !flat {
-        return;
-    }
-    let Some(area) = app
-        .transcript_area
-        .filter(|area| !area.is_empty() && area.x > 0)
-    else {
-        return;
-    };
-    let margin = area.x - 1;
-    let top = app.viewport.top();
-    let bottom = top + usize::from(area.height);
-    let Some((line, _)) = app.layout.line_at_row(top) else {
-        return;
-    };
-    let Some((first, _)) = app.transcript.locate(line) else {
-        return;
-    };
-    let buf = frame.buffer_mut();
-    for entry in first..app.transcript.entry_count() {
-        let first_line = app.transcript.entry_start(entry);
-        let start = app.layout.row_of(first_line);
-        if start >= bottom {
-            break;
-        }
-        let lines = app.transcript.entry_lines(entry);
-        let end = app.layout.row_of(first_line + lines.len());
-        let Some(style) = lines.first().and_then(|line| rail_style(line.kind, app)) else {
-            continue;
-        };
-        for row in start.max(top)..end.min(bottom) {
-            let Ok(dy) = u16::try_from(row - top) else {
-                break;
-            };
-            if let Some(cell) = buf.cell_mut((margin, area.y + dy)) {
-                cell.set_symbol("│").set_style(style);
-            }
-        }
     }
 }
 
@@ -1421,7 +1449,6 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
     mark_focused_panes(frame, &panes, app, flat);
     // Una línea por bloque en el margen; después el bloque activo, que la sobreescribe.
-    mark_block_rails(frame, app, flat);
     mark_active_block(frame, app, flat);
     app.pane_rects = panes;
     if flat {
@@ -1987,6 +2014,81 @@ Cuerpo de front.
         assert_eq!(seleccionado.fg, realce.fg);
         assert!(seleccionado.add_modifier.contains(Modifier::BOLD));
         assert_ne!(seleccionado.fg, app.theme.styles.border.fg);
+    }
+
+    /// Guías del carril de árbol de la fila de pantalla `y`: las celdas a la izquierda del texto.
+    fn gutter_at(term: &Terminal<TestBackend>, area: Rect, y: u16) -> String {
+        (area.x - TREE_GUTTER..area.x)
+            .map(|x| term.backend().buffer()[(x, y)].symbol().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn the_transcript_draws_its_blocks_as_a_tree_in_the_gutter() {
+        let mut app = App::new();
+        app.push_user("hola");
+        app.push_assistant(
+            "uno
+dos",
+        );
+        app.push_user("fin");
+        let term = terminal_of(&mut app, 100, 30);
+        let area = app.transcript_area.expect("el transcript fija su área");
+        let fila = |entrada: usize, dentro: usize| {
+            let linea = app.transcript.entry_start(entrada);
+            area.y + (app.layout.row_of(linea) + dentro - app.viewport.top()) as u16
+        };
+
+        // Cada bloque cuelga de la raíz: su primera fila lleva `├─`, el resto del cuerpo `│`.
+        assert_eq!(gutter_at(&term, area, fila(0, 0)), "├─ ");
+        assert_eq!(gutter_at(&term, area, fila(0, 1)), "│  ");
+        assert_eq!(gutter_at(&term, area, fila(1, 0)), "├─ ");
+        assert_eq!(gutter_at(&term, area, fila(1, 2)), "│  ");
+        // El último bloque cierra el árbol con `└─` y su cuerpo ya no lleva guía.
+        assert_eq!(gutter_at(&term, area, fila(2, 0)), "└─ ");
+        assert_eq!(gutter_at(&term, area, fila(2, 1)), "   ");
+    }
+
+    #[test]
+    fn the_tree_gutter_is_dropped_when_there_is_no_room_for_it() {
+        assert_eq!(tree_gutter(TREE_MIN_WIDTH - 1), 0);
+        assert_eq!(tree_gutter(TREE_MIN_WIDTH), TREE_GUTTER);
+    }
+
+    #[test]
+    fn the_tree_guide_spans_every_wrapped_row_of_a_block() {
+        let mut app = App::new();
+        app.push_assistant(&"palabra ".repeat(60));
+        app.push_user("fin");
+        let term = terminal_of(&mut app, 60, 30);
+        let area = app.transcript_area.expect("el transcript fija su área");
+        let (start, end) = block_rows(&app, 0);
+
+        assert!(end - start > 3, "el bloque debería ocupar varias filas");
+        for row in start + 1..end {
+            let y = area.y + (row - app.viewport.top()) as u16;
+            assert_eq!(gutter_at(&term, area, y), "│  ", "fila {row}");
+        }
+    }
+
+    #[test]
+    fn the_tree_follows_the_viewport_scroll() {
+        let mut app = App::new();
+        for i in 0..30 {
+            app.push_user(&format!("pregunta {i}"));
+        }
+        let _ = terminal_of(&mut app, 100, 12);
+        app.viewport.scroll_up(5);
+        let term = terminal_of(&mut app, 100, 12);
+        let area = app.transcript_area.expect("el transcript fija su área");
+
+        for y in area.y..area.bottom() {
+            let guia = gutter_at(&term, area, y);
+            assert!(
+                guia == "├─ " || guia == "│  " || guia == "└─ ",
+                "fila {y}: «{guia}»"
+            );
+        }
     }
 
     #[test]
@@ -2791,8 +2893,8 @@ Cuerpo de front.
         let term = terminal_of(&mut app, 120, 40);
         let area = app.transcript_area.expect("el transcript fija su área");
         let margin = area.x - 1;
-        // La fila 0 es el bloque: lleva su línea por rol, no el filete de foco.
-        assert_eq!(term.backend().buffer()[(margin, area.y)].symbol(), "│");
+        // La fila 0 es el bloque: su guía está en el carril de árbol, no en el hueco del margen.
+        assert_eq!(term.backend().buffer()[(margin, area.y)].symbol(), " ");
         // Una fila por debajo del contenido no pertenece a ningún bloque: sin filete.
         let below = area.y + area.height - 1;
         assert_eq!(term.backend().buffer()[(margin, below)].symbol(), " ");
@@ -2836,8 +2938,8 @@ Cuerpo de front.
         }
         assert_eq!(
             term.backend().buffer()[(margin, area.y)].symbol(),
-            "│",
-            "fuera del bloque sigue su línea por rol, sin filete de foco"
+            " ",
+            "fuera del bloque, el hueco del carril queda libre de filete de foco"
         );
     }
 
@@ -2885,74 +2987,6 @@ Cuerpo de front.
     }
 
     #[test]
-    fn only_user_blocks_have_a_thin_rail_when_inactive() {
-        use batten::state::{Format, LineKind};
-        let mut app = crush_ctx();
-        app.push_user("pregunta");
-        app.push_assistant("respuesta");
-        app.transcript
-            .push_entry(LineKind::Thinking, Format::Plain, "pensando");
-        app.transcript
-            .push_entry(LineKind::Plan, Format::Plain, "plan");
-        app.transcript
-            .push_entry(LineKind::ToolCall, Format::Plain, "herramienta");
-        app.transcript
-            .push_entry(LineKind::Error, Format::Plain, "fallo");
-        app.push_user("otra pregunta");
-        let term = terminal_of(&mut app, 120, 40);
-        assert_eq!(app.transcript.entry_count(), 7);
-        let accent = app.theme.styles.accent.fg.expect("acento con color");
-        for entry in [0, 6] {
-            let (start, end) = block_rows(&app, entry);
-            assert!(end > start, "el bloque {entry} ocupa filas");
-            for row in start..end {
-                let cell = margin_cell(&term, &app, row);
-                assert_eq!(cell.symbol(), "│", "el usuario {entry} lleva línea fina");
-                assert_eq!(cell.fg, accent);
-            }
-        }
-        for entry in 1..6 {
-            let (start, end) = block_rows(&app, entry);
-            assert!(end > start, "el bloque {entry} ocupa filas");
-            for row in start..end {
-                assert_eq!(
-                    margin_cell(&term, &app, row).symbol(),
-                    " ",
-                    "el bloque {entry} inactivo no lleva línea"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn blocks_without_role_have_no_rail() {
-        let mut app = crush_ctx();
-        app.transcript.push_entry(
-            batten::state::LineKind::Banner,
-            batten::state::Format::Plain,
-            "banner",
-        );
-        app.push_user("hola");
-        app.transcript.push_entry(
-            batten::state::LineKind::System,
-            batten::state::Format::Plain,
-            "sistema",
-        );
-        let term = terminal_of(&mut app, 120, 40);
-        for entry in [0, 2] {
-            let (start, end) = block_rows(&app, entry);
-            for row in start..end {
-                assert_eq!(margin_cell(&term, &app, row).symbol(), " ");
-            }
-        }
-        let (start, end) = block_rows(&app, 1);
-        assert!(end > start);
-        for row in start..end {
-            assert_eq!(margin_cell(&term, &app, row).symbol(), "│");
-        }
-    }
-
-    #[test]
     fn active_assistant_block_gets_thick_rail_with_soft_success_style() {
         use batten::state::{Format, LineKind};
         let mut app = crush_ctx();
@@ -2993,87 +3027,13 @@ Cuerpo de front.
             assert_eq!(cell.symbol(), "▌", "la fila {row} del activo es gruesa");
             assert_eq!(cell.fg, accent, "la fila {row} del activo es de acento");
         }
-        // El usuario inactivo conserva su línea fina; el asistente, nada.
-        let (start, end) = block_rows(&app, 2);
-        for row in start..end {
-            assert_eq!(margin_cell(&term, &app, row).symbol(), "│");
-        }
-        let (start, end) = block_rows(&app, 1);
-        for row in start..end {
-            assert_eq!(margin_cell(&term, &app, row).symbol(), " ");
-        }
-    }
-
-    #[test]
-    fn rail_spans_every_row_of_a_wrapped_block() {
-        let mut app = crush_ctx();
-        app.push_user(&"palabra ".repeat(60));
-        app.push_user("corto");
-        let term = terminal_of(&mut app, 60, 30);
-        let (start, end) = block_rows(&app, 0);
-        assert!(end - start > 1, "el bloque ocupa varias filas");
-        for row in start..end {
-            assert_eq!(margin_cell(&term, &app, row).symbol(), "│");
-        }
-    }
-
-    #[test]
-    fn no_rails_in_classic_chrome() {
-        let mut app = App::new();
-        app.push_user("primera");
-        app.push_assistant("segunda");
-        let term = terminal_of(&mut app, 100, 30);
-        assert_ne!(app.theme.look.chrome, ChromeStyle::Flat);
-        let border = app.theme.styles.border.fg.expect("el borde tiene color");
-        for entry in 0..2 {
+        // Los bloques inactivos no marcan el hueco: su guía vive en el carril de árbol.
+        for entry in [1, 2] {
             let (start, end) = block_rows(&app, entry);
             for row in start..end {
-                let cell = margin_cell(&term, &app, row);
-                assert_eq!(cell.fg, border, "el margen clásico es el borde del panel");
+                assert_eq!(margin_cell(&term, &app, row).symbol(), " ");
             }
         }
-    }
-
-    #[test]
-    fn rails_follow_the_viewport_scroll() {
-        let mut app = crush_ctx();
-        for i in 0..20 {
-            if i % 2 == 0 {
-                app.push_user(&format!("pregunta {i}"));
-            } else {
-                app.transcript.push_entry(
-                    batten::state::LineKind::Assistant,
-                    batten::state::Format::Plain,
-                    &format!("respuesta {i}"),
-                );
-            }
-        }
-        let term = terminal_of(&mut app, 60, 15);
-        let user = app.theme.styles.accent.fg.expect("acento con color");
-        let (last, _) = block_rows(&app, 19);
-        assert_eq!(
-            margin_cell(&term, &app, last).symbol(),
-            " ",
-            "al final se ve el último bloque, asistente, sin línea"
-        );
-        // Cada bloque de usuario visible lleva su línea en todas sus filas.
-        let top = app.viewport.top();
-        let bottom = top + 15;
-        for entry in (0..20).step_by(2) {
-            let (start, end) = block_rows(&app, entry);
-            for row in start.max(top)..end.min(bottom) {
-                assert_eq!(margin_cell(&term, &app, row).symbol(), "│");
-            }
-        }
-        app.viewport.to_top();
-        let term = terminal_of(&mut app, 60, 15);
-        assert_eq!(app.viewport.top(), 0);
-        let (first, _) = block_rows(&app, 0);
-        assert_eq!(
-            margin_cell(&term, &app, first).fg,
-            user,
-            "tras subir, el primer bloque es del usuario"
-        );
     }
 
     #[test]
