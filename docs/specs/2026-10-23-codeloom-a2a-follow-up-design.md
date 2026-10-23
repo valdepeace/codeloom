@@ -1,7 +1,7 @@
 # Tareas enlazadas: un seguimiento es una tarea nueva (A11)
 
-Estado: propuesta del 2026-10-23 (tarea A11 de `docs/plans/2026-10-22-codeloom-a2a-roadmap.md`,
-Fase C de `2026-10-21-codeloom-agent-autonomy-design.md`).
+Estado: implementada el 2026-10-23 (véase «Estado» al final; tarea A11 de
+`docs/plans/2026-10-22-codeloom-a2a-roadmap.md`, Fase C de `2026-10-21-codeloom-agent-autonomy-design.md`).
 
 ## Propósito
 
@@ -24,7 +24,7 @@ diseño de autonomía ya lo anticipó con un `follow_up_of`. Esta tarea lo cierr
   referenciarlas): que su resultado pase al prompt de la nueva es **decisión nuestra**.
 - Si se puede referir a una tarea que no es terminal.
 
-## Estado actual
+## Estado antes de esta tarea
 
 `Message.reference_task_ids` existe en `a2a.rs`, pero nada lo escribe. `contextId` ya se deriva
 (`SubagentDescriptor::context_id`) de la sesión del padre, así que todos los hijos de un padre lo
@@ -74,3 +74,41 @@ comparten. No hay forma de enlazar dos tareas.
 - Si el resultado referido debe ir como mensaje aparte en el historial del hijo en lugar de
   prefijar el prompt. Se prefija porque es lo más simple y no depende de cómo el bucle relee el
   historial; es decisión nuestra y reversible.
+
+## Estado
+
+Implementada el 2026-10-23, **sin verla en una terminal real**: probada con proveedores y trabajos
+simulados. Commits: `95bf005` (esta spec y su plan), `881b374` (el descriptor guarda
+`reference_task_ids`), `282f252` (`SubagentLauncher::start_follow_up`) y `5b001af` (parámetro
+`follow_up_of` de la herramienta `subagent`).
+
+### Lo hecho
+
+- `SubagentDescriptor.reference_task_ids: Vec<SessionId>`, persistido como JSON en la columna
+  `subagents.reference_task_ids` (migración idempotente). Una fila anterior, o un valor ilegible,
+  se lee como lista vacía.
+- `SubagentLauncher::start_follow_up(parent, label, prompt, agent, follow_up_of, cancel)`: falla
+  con `TaskNotFound` si la tarea no existe o es de otro padre, y con error de herramienta si sigue
+  viva; antepone al prompt el resultado de la anterior (D4, acotado a `MAX_NOTICE_BYTES`) y guarda
+  el enlace. El arranque común quedó en `arrancar`; `start` no cambia de comportamiento.
+- La herramienta `subagent` acepta `follow_up_of` (entero ≥ 1); cualquier otro valor es un error de
+  herramienta y no lanza nada.
+
+### Cómo se comprobó
+
+Cinco pruebas del lanzador (prompt con el resultado, `contextId` compartido, tarea viva rechazada,
+tarea ajena o inexistente, tope del resultado), una sexta para el hijo sin resultado, tres de la
+herramienta y dos de almacenamiento. A mano se quitó el tope del resultado y la comprobación de
+estado terminal (cada prueba afectada falló) y se aflojó el mínimo de `follow_up_of` a 0.
+
+### Lo que no consta o queda pendiente
+
+- **Que el resultado vaya prefijado al prompt es decisión nuestra**: no consta qué debe hacer el
+  servidor con las tareas referidas. No se ha comprobado cómo lo aprovecha un modelo real.
+- **El enlace no se pinta en la interfaz**: el nodo del árbol de subagentes no muestra de quién es
+  seguimiento un hijo.
+- **Una sola referencia desde la herramienta**; el almacén admite varias.
+- **Un resultado de más de 8 000 bytes entra recortado** (cabeza y cola); el seguimiento no ve el
+  resto. No hay herramienta para leer artefactos enteros (Fase B de la autonomía).
+- **`send_message` sigue sin restringirse** a responder preguntas (segunda viñeta de la Fase C).
+- **El cable** (`referenceTaskIds` en JSON) queda para A4.

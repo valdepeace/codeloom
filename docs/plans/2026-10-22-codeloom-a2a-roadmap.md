@@ -73,7 +73,7 @@ después el transporte (A7, A8).
   by itself, as authorization».
   - **Resuelto en A5 (2026-10-22):** `result` y el mensaje de estado ya son `Artifact` y
     `Message`, según la spec de tipos. Historial: hasta A5 eran texto (divergencia temporal
-    declarada). Sigue abierto: no hay `contextId` compartido ni `reference_task_ids` (A11).
+    declarada). Sigue abierto: no hay `contextId` compartido; `reference_task_ids` lo cerró A11.
   - **Abierto (no consta en A2A):** qué pasa con `input-required` o `auth-required` si el
     usuario cancela al hijo (hoy pasa a `canceled`; ver A10).
 - [x] **A3. Leer lo que falta de la especificación** (completa el 2026-10-22: ya se ha
@@ -93,8 +93,8 @@ después el transporte (A7, A8).
     sección «Estado». Plan: `docs/plans/2026-10-22-codeloom-a2a-protocol-types.md`.
   - **Abierto:** no existe un tipo `Task` en el núcleo, así que `history` y `metadata` no se
     modelan. `contextId` solo se deriva en lectura (id de la sesión del padre), sin
-    `contextId` compartido entre tareas. `reference_task_ids` existe, pero nada lo escribe
-    hasta A11. La serialización JSON es interna y la del cable queda para A4. La validación
+    `contextId` compartido entre tareas. `reference_task_ids` lo escribe el descriptor del
+    subagente desde A11 (2026-10-23). La serialización JSON es interna y la del cable queda para A4. La validación
     visual en terminal real está pendiente.
 - [x] **A6. Tarjeta del agente (`AgentCard`)** y capacidades declaradas.
   - **Hecho el 2026-10-22** en el commit `77b8de1` (`feat(core): los tipos de la tarjeta de agente de A2A`),
@@ -120,7 +120,11 @@ después el transporte (A7, A8).
   `Task` actualizada; no consta a qué estado pasa (la inferencia `canceled` ha de
   rotularse) ni si `input-required` es cancelable. Reanudar tras `input-required` con
   un mensaje con el mismo `taskId` y `contextId` (consta literal).
-- [ ] **A11. Tareas enlazadas** (`follow_up_of`, Fase C de la autonomía). Según la
+- [x] **A11. Tareas enlazadas** (`follow_up_of`, Fase C de la autonomía). Hecho el
+  2026-10-23: la herramienta `subagent` acepta `follow_up_of`, el hijo nuevo recibe el resultado
+  de la tarea terminal referida (acotado) y el enlace queda en `reference_task_ids`. Sin pintar
+  en la interfaz ni cable. Spec `2026-10-23-codeloom-a2a-follow-up-design.md`. Texto original:
+  Según la
   spec, una tarea terminal no se reinicia: el seguimiento es una **tarea nueva** en el
   mismo `contextId`, con `reference_task_ids`. El nombre `follow_up_of` es nuestro;
   valorar si debe alinearse con `reference_task_ids`. Los ids los genera el servidor.

@@ -55,7 +55,7 @@ adoptan los tipos del proto tal cual en `codeloom-core` y se retiran las cadenas
 
 - `Task.history`, `Task.metadata` y envío de `Message` entre agentes (A7, A9).
 - `reference_task_ids` en uso: el campo existe porque lo trae el proto, pero nada lo escribe
-  hasta A11.
+  hasta A11 (hecho el 2026-10-23: lo escribe el descriptor del subagente, no `Message`).
 - Nombres del cable, transporte, tarjeta del agente (A4, A6, A8).
 - `JobResult` de los trabajos (`bash` y similares): no son tareas A2A.
 
@@ -120,12 +120,13 @@ tipos). La tarea 3 es esta documentación.
 ### Limitaciones reales
 
 - No existe un tipo `Task` en el núcleo: `Task.history` y `Task.metadata` no se modelan.
-- `reference_task_ids` existe en `Message`, pero nada lo escribe hasta A11.
+- `reference_task_ids` existe en `Message`, pero nada lo escribe en `Message`. Desde A11
+  (2026-10-23) lo guarda `SubagentDescriptor`.
 - La serialización JSON es un formato interno de almacenamiento, no el del cable. Los nombres
   JSON del cable son la tarea A4.
 - `message_text()` no tiene consumidor en código de producción: solo lo usan tests. La TUI
   lee el resultado con `result_text()`.
 - `contextId` solo se deriva en lectura (id de la sesión del padre). No hay un `contextId`
-  compartido entre tareas; queda abierto junto con `reference_task_ids` (A11).
+  compartido entre tareas; queda abierto. `reference_task_ids` lo cerró A11 en el descriptor.
 - La validación visual en una terminal real está pendiente. Las pruebas son puras y no
   sustituyen una comprobación en pantalla.

@@ -111,6 +111,9 @@ transcript, solo en el pie; validación en terminal real pendiente.
 
 - `subagent` gana `follow_up_of: child_id` opcional. El hijo nuevo recibe, en
   su prompt, la lista de artefactos de la tarea referida y puede leerlos.
+  Nota (2026-10-23, tras A11): hecho con otra decisión: el prompt lleva el resultado de la
+  tarea referida, acotado, y no la lista de artefactos; el enlace se guarda como
+  `reference_task_ids`. Véase `2026-10-23-codeloom-a2a-follow-up-design.md`.
 - La acción `send_message` de `subagent_control` se restringe a lo que A2A
   permite: responder a una tarea en `input-required`. Enviar texto a un hijo
   en marcha sin pregunta pendiente deja de ser válido (hoy es ambiguo: se

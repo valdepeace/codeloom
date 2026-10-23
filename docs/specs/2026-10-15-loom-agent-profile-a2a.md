@@ -257,6 +257,9 @@ resultado son `Artifact`s (`docs/specs/2026-10-22-codeloom-a2a-protocol-types-de
 sección «Estado»). Quedan abiertos el `contextId` compartido entre tareas y
 `reference_task_ids` (A11). El resto de esta sección no cambia.
 
+Nota (2026-10-23, tras A11): `reference_task_ids` ya se escribe, en el descriptor del subagente
+(`docs/specs/2026-10-23-codeloom-a2a-follow-up-design.md`).
+
 ### Fuente normativa de los estados (2026-10-22)
 
 Fuente: `https://a2a-protocol.org/latest/definitions/`, proto `lf.a2a.v1`, que la
