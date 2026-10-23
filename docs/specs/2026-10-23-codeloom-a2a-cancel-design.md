@@ -1,6 +1,6 @@
 # Cancelar un subagente según A2A (A10)
 
-Estado: propuesta del 2026-10-23 (tarea A10 de `docs/plans/2026-10-22-codeloom-a2a-roadmap.md`).
+Estado: implementada el 2026-10-23 (véase «Estado» al final; tarea A10 de `docs/plans/2026-10-22-codeloom-a2a-roadmap.md`).
 Cierra las dudas 2, 3 y 4 de la sección «Dudas que siguen abiertas» de
 `2026-10-15-loom-agent-profile-a2a.md`, **como decisiones nuestras, rotuladas como tales**: la
 especificación de A2A no las resuelve.
@@ -69,3 +69,40 @@ tarea; el `taskId` es la sesión del hijo y el `contextId` se deriva de la sesi�
 
 - Si cancelar en `auth-required` debe conservar algún rastro de que no se concedió la
   autorización. El protocolo no lo dice; hoy ningún hijo llega a ese estado por sí solo.
+
+## Estado
+
+Implementada el 2026-10-23, **sin verla en una terminal real**: probada con proveedores y trabajos
+simulados. Commits: `c7e2518` (esta spec y su plan) y el de la implementación (errores tipados,
+`SubagentLauncher::cancel` y la herramienta).
+
+### Lo hecho
+
+- `CoreError::TaskNotFound(i64)` y `CoreError::TaskNotCancelable { child, state }`.
+- `SubagentLauncher::cancel(parent, child)`: localiza al hijo del padre, falla si es terminal,
+  ordena parar solo a un trabajo en marcha y espera hasta `cancel_wait` (2 s) a que se asiente.
+  `control(.., "interrupt", ..)` delega en él.
+- `subagent_control` con `interrupt` responde `Subagent N: canceled.` o
+  `Subagent N: cancel requested; still stopping (state: TASK_STATE_WORKING).`.
+
+### Cómo se comprobó
+
+Seis pruebas del lanzador (cancelar en `input-required`, hijo terminado, hijo ajeno o inexistente,
+hijo que no se detiene, cancelación repetida) y dos de la herramienta. Se desactivó a mano la
+comprobación de estado terminal y dos de ellas fallaron.
+
+### Lo que no consta o queda pendiente
+
+- **El plazo de 2 s es decisión nuestra**, sin medir. Un hijo cuyo trabajo tarde más en parar se
+  informa como «still stopping» aunque acabe cancelándose un instante después.
+- **`cancel_wait` solo se puede cambiar en las pruebas**: no es configurable por la persona
+  usuaria.
+- **Un hijo con trabajo que ignora la orden de parar** no se puede forzar: hoy no existe tal caso,
+  porque el trabajo de un hijo se corta con `select!` al cancelarse. Se probó con un trabajo
+  artificial que nunca termina.
+- **Cancelar sin un trabajo registrado** (el descriptor existe, pero el trabajo ya no figura en el
+  registro) no mata nada y solo espera: es el caso de un hijo huérfano tras reiniciar la
+  aplicación; su estado ya lo corrige el arranque (`Unfinished` → `Failed`).
+- **No hay mando en la interfaz** para cancelar un hijo concreto, y `Esc` sigue cancelando el
+  turno del padre y, con él, a los hijos.
+- **La reanudación tras `input-required`** (D7 de la lectura) no se ha tocado: `answer` ya la hace.

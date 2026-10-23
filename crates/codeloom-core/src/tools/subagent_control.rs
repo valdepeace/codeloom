@@ -1,6 +1,7 @@
 use super::{ExecutionMode, Tool, ToolCtx, ToolOutput};
 use crate::error::{CoreError, Result};
 use crate::session::SessionId;
+use crate::task::TaskState;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
@@ -83,6 +84,18 @@ impl Tool for SubagentControlTool {
                 .await?;
             return Ok(ToolOutput::ok(format!("Subagent {child}: answer sent.")));
         }
+        if action == "interrupt" {
+            // `CancelTask` de A2A: la respuesta dice en qué estado quedó la tarea. El éxito no
+            // está garantizado, así que sólo se afirma «canceled» si el hijo se asentó.
+            let tarea = launcher.cancel(ctx.session, SessionId(child)).await?;
+            return Ok(ToolOutput::ok(match tarea.status.state {
+                TaskState::Canceled => format!("Subagent {child}: canceled."),
+                otro => format!(
+                    "Subagent {child}: cancel requested; still stopping (state: {}).",
+                    otro.proto_name()
+                ),
+            }));
+        }
         launcher
             .control(
                 ctx.session,
@@ -107,10 +120,12 @@ mod tests {
     use crate::subagent::SubagentLauncher;
     use std::sync::{Arc, Mutex};
 
-    /// Lanzador de prueba: registra las respuestas recibidas por `answer`.
+    /// Lanzador de prueba: registra las respuestas recibidas por `answer` y, si se le da un
+    /// estado, lo devuelve como resultado de `cancel`.
     #[derive(Default)]
     struct RecordingLauncher {
         answers: Mutex<Vec<(SessionId, SessionId, Vec<String>)>>,
+        cancel_state: Mutex<Option<TaskState>>,
     }
 
     #[async_trait]
@@ -134,6 +149,25 @@ mod tests {
             _message: Option<String>,
         ) -> Result<()> {
             Err(CoreError::Tool("not used".into()))
+        }
+
+        async fn cancel(&self, parent: SessionId, child: SessionId) -> Result<SubagentDescriptor> {
+            let state = self
+                .cancel_state
+                .lock()
+                .unwrap()
+                .ok_or(CoreError::TaskNotFound(child.0))?;
+            Ok(SubagentDescriptor {
+                parent,
+                child,
+                job_id: "subagent-1".into(),
+                label: "hijo".into(),
+                status: crate::task::TaskStatus::new(state),
+                artifacts: Vec::new(),
+                notice_delivered: false,
+                agent: None,
+                agent_origin: None,
+            })
         }
 
         async fn list(&self, _parent: SessionId) -> Result<Vec<SubagentDescriptor>> {
@@ -190,6 +224,48 @@ mod tests {
             );
         }
         assert!(launcher.answers.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn interrupt_reports_the_state_it_ended_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = SubagentControlTool;
+        let casos = [
+            (TaskState::Canceled, "Subagent 2: canceled."),
+            (
+                TaskState::Working,
+                "Subagent 2: cancel requested; still stopping (state: TASK_STATE_WORKING).",
+            ),
+        ];
+        for (estado, esperado) in casos {
+            let launcher = Arc::new(RecordingLauncher::default());
+            *launcher.cancel_state.lock().unwrap() = Some(estado);
+            let output = tool
+                .run(
+                    ctx(dir.path(), launcher),
+                    serde_json::json!({"child_id": 2, "action": "interrupt"}),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert!(!output.is_error);
+            assert_eq!(output.content, esperado);
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupt_of_an_unknown_child_is_the_a2a_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = Arc::new(RecordingLauncher::default());
+        let error = SubagentControlTool
+            .run(
+                ctx(dir.path(), launcher),
+                serde_json::json!({"child_id": 2, "action": "interrupt"}),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, CoreError::TaskNotFound(2)), "{error:?}");
     }
 
     #[tokio::test]

@@ -112,7 +112,11 @@ después el transporte (A7, A8).
     tarjeta, sección «Estado».
 - [ ] **A9. Flujo de eventos** `TaskStatusUpdateEvent` y de artefactos sobre el bus de
   eventos existente, sin canal de interfaz paralelo.
-- [ ] **A10. Cancelar y reanudar.** `CancelTask` lo solicita el cliente y devuelve la
+- [x] **A10. Cancelar y reanudar.** **Hecho el 2026-10-23** (decisiones nuestras, rotuladas):
+  spec `docs/specs/2026-10-23-codeloom-a2a-cancel-design.md`, plan
+  `docs/plans/2026-10-23-codeloom-a2a-cancel.md`. `SubagentLauncher::cancel` devuelve la tarea
+  actualizada y falla con `TaskNotFound` / `TaskNotCancelable`. Sin mando en la interfaz ni cable.
+  Texto original de la tarea: `CancelTask` lo solicita el cliente y devuelve la
   `Task` actualizada; no consta a qué estado pasa (la inferencia `canceled` ha de
   rotularse) ni si `input-required` es cancelable. Reanudar tras `input-required` con
   un mensaje con el mismo `taskId` y `contextId` (consta literal).

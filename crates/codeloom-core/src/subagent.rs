@@ -39,6 +39,14 @@ pub trait SubagentLauncher: Send + Sync {
         message: Option<String>,
     ) -> Result<()>;
 
+    /// `CancelTask` de A2A: pide cancelar al hijo y devuelve su tarea actualizada. Falla con
+    /// `TaskNotFound` si no es hijo de `parent` y con `TaskNotCancelable` si ya terminó. El éxito
+    /// no está garantizado: si el hijo no se asienta a tiempo se devuelve su estado actual, sin
+    /// afirmar que se canceló.
+    async fn cancel(&self, _parent: SessionId, _child: SessionId) -> Result<SubagentDescriptor> {
+        Err(CoreError::Tool("subagent cancel unavailable".into()))
+    }
+
     async fn list(&self, parent: SessionId) -> Result<Vec<SubagentDescriptor>>;
 
     async fn deliver_notices(&self, parent: SessionId) -> Result<Vec<crate::message::Message>>;
@@ -82,6 +90,8 @@ pub struct InProcessSubagentLauncher {
     spill: Option<ToolSpill>,
     /// Presupuesto del padre: cada hijo lo recibe y suma su consumo al total de la familia.
     budget: BudgetConfig,
+    /// Lo máximo que `cancel` espera a que el hijo se asiente; `CANCEL_WAIT` salvo en las pruebas.
+    cancel_wait: std::time::Duration,
 }
 
 /// Descarta la pregunta pendiente del hijo al terminar su trabajo, sea cual sea la
@@ -96,6 +106,12 @@ impl Drop for DiscardOnExit {
         self.broker.discard(self.child);
     }
 }
+
+/// Lo máximo que `cancel` espera a que el hijo se asiente tras la orden de parar.
+const CANCEL_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Cada cuánto `cancel` relee el estado del hijo mientras espera.
+const CANCEL_POLL: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// Mensaje de la tarea rechazada por capacidad agotada. Es el mismo error que recibe el padre.
 const MENSAJE_CAPACIDAD: &str = "maximum of 8 active subagents reached";
@@ -154,6 +170,20 @@ impl TaskTracker {
 }
 
 impl InProcessSubagentLauncher {
+    /// Descriptor vigente de un hijo de `parent`, o `TaskNotFound`.
+    async fn descriptor_of(
+        &self,
+        parent: SessionId,
+        child: SessionId,
+    ) -> Result<SubagentDescriptor> {
+        self.store
+            .list_subagents(parent)
+            .await?
+            .into_iter()
+            .find(|descriptor| descriptor.child == child)
+            .ok_or(CoreError::TaskNotFound(child.0))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         provider: Arc<RwLock<Arc<dyn Provider>>>,
@@ -185,7 +215,16 @@ impl InProcessSubagentLauncher {
             registry: None,
             spill: None,
             budget: BudgetConfig::default(),
+            cancel_wait: CANCEL_WAIT,
         }
+    }
+
+    /// Cambia cuánto espera `cancel` a que el hijo se asiente. Existe para las pruebas, que no
+    /// pueden pausar el reloj porque el almacén usa una piscina de conexiones con plazos reales.
+    #[cfg(test)]
+    fn with_cancel_wait(mut self, espera: std::time::Duration) -> Self {
+        self.cancel_wait = espera;
+        self
     }
 
     /// Comparte el presupuesto de gasto con los hijos que lance: avisan con el total de la familia.
@@ -553,6 +592,9 @@ impl SubagentLauncher for InProcessSubagentLauncher {
         action: &str,
         message: Option<String>,
     ) -> Result<()> {
+        if action == "interrupt" {
+            return self.cancel(parent, child).await.map(|_| ());
+        }
         let descriptor = self
             .store
             .list_subagents(parent)
@@ -577,7 +619,6 @@ impl SubagentLauncher for InProcessSubagentLauncher {
             return Err(CoreError::Tool("subagent has already finished".into()));
         }
         match action {
-            "interrupt" => self.jobs.kill(parent, &job),
             "send_message" => {
                 let message = message
                     .filter(|text| !text.trim().is_empty() && text.len() <= 32_768)
@@ -589,6 +630,45 @@ impl SubagentLauncher for InProcessSubagentLauncher {
             _ => Err(CoreError::Tool(
                 "action must be send_message or interrupt".into(),
             )),
+        }
+    }
+
+    async fn cancel(&self, parent: SessionId, child: SessionId) -> Result<SubagentDescriptor> {
+        let descriptor = self
+            .store
+            .list_subagents(parent)
+            .await?
+            .into_iter()
+            .find(|descriptor| descriptor.child == child)
+            .ok_or(CoreError::TaskNotFound(child.0))?;
+        if descriptor.status.state.is_terminal() {
+            return Err(CoreError::TaskNotCancelable {
+                child: child.0,
+                state: descriptor.status.state,
+            });
+        }
+        // Solo se ordena parar a un trabajo en marcha: si ya se está deteniendo, la orden se dio
+        // antes y repetirla no cambia nada (idempotente mientras no se asiente).
+        let job = JobId(descriptor.job_id.clone());
+        let en_marcha = self.jobs.list(parent).into_iter().any(|snapshot| {
+            snapshot.id == job && snapshot.status == crate::job::JobStatus::Running
+        });
+        if en_marcha {
+            self.jobs.kill(parent, &job)?;
+        }
+        let asentado = async {
+            loop {
+                let actual = self.descriptor_of(parent, child).await?;
+                if actual.status.state.is_terminal() {
+                    return Ok::<_, CoreError>(actual);
+                }
+                tokio::time::sleep(CANCEL_POLL).await;
+            }
+        };
+        match tokio::time::timeout(self.cancel_wait, asentado).await {
+            Ok(resultado) => resultado,
+            // No se asentó a tiempo: se devuelve lo último que consta, que puede no ser `Canceled`.
+            Err(_) => self.descriptor_of(parent, child).await,
         }
     }
 
@@ -2233,6 +2313,232 @@ mod tests {
                 problems: Vec::new(),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn cancel_returns_the_task_canceled_and_drops_its_question() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, parent) = tienda_de_prueba(dir.path(), "cancel-ok.db").await;
+        let jobs = Arc::new(LocalJobRegistry::default());
+        let runtime =
+            lanzador_que_pregunta(dir.path(), store.clone(), jobs.clone(), EventBus::new(64));
+        let (child, _job) = runtime
+            .start(
+                parent,
+                "obrero".into(),
+                "decide algo".into(),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.pending_inputs(parent).is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("el hijo debería quedar esperando una respuesta");
+
+        // Cancelable en `input-required` (D3): la tarea actualizada vuelve ya asentada.
+        let tarea = runtime.cancel(parent, child).await.unwrap();
+
+        assert_eq!(tarea.child, child);
+        assert_eq!(tarea.status.state, TaskState::Canceled);
+        assert!(runtime.pending_inputs(parent).is_empty());
+
+        // Una tarea ya cancelada no vuelve a ser cancelable (D4).
+        match runtime.cancel(parent, child).await {
+            Err(CoreError::TaskNotCancelable { child: id, state }) => {
+                assert_eq!((id, state), (child.0, TaskState::Canceled));
+            }
+            otro => panic!("se esperaba TaskNotCancelable, y salió {otro:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_of_a_completed_child_is_not_cancelable() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, parent) = tienda_de_prueba(dir.path(), "cancel-completed.db").await;
+        let jobs = Arc::new(LocalJobRegistry::default());
+        let proveedor = ProveedorGrabador {
+            peticiones: Arc::new(std::sync::Mutex::new(Vec::new())),
+            puerta: None,
+        };
+        let runtime = lanzador_grabador(
+            dir.path(),
+            store.clone(),
+            jobs.clone(),
+            proveedor,
+            None,
+            None,
+        );
+        let (child, job) = runtime
+            .start(
+                parent,
+                "obrero".into(),
+                "tarea".into(),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        jobs.wait(parent, &job).await.unwrap();
+        espera_estado_del_hijo(&store, parent, child, TaskState::Completed).await;
+
+        match runtime.cancel(parent, child).await {
+            Err(CoreError::TaskNotCancelable { state, .. }) => {
+                assert_eq!(state, TaskState::Completed);
+            }
+            otro => panic!("se esperaba TaskNotCancelable, y salió {otro:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_of_a_child_of_another_parent_is_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, parent) = tienda_de_prueba(dir.path(), "cancel-ajeno.db").await;
+        let jobs = Arc::new(LocalJobRegistry::default());
+        let proveedor = ProveedorGrabador {
+            peticiones: Arc::new(std::sync::Mutex::new(Vec::new())),
+            puerta: None,
+        };
+        let runtime = lanzador_grabador(
+            dir.path(),
+            store.clone(),
+            jobs.clone(),
+            proveedor,
+            None,
+            None,
+        );
+        let (child, job) = runtime
+            .start(
+                parent,
+                "obrero".into(),
+                "tarea".into(),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        jobs.wait(parent, &job).await.unwrap();
+        let otro_padre = store.create_session("/project").await.unwrap();
+
+        match runtime.cancel(otro_padre, child).await {
+            Err(CoreError::TaskNotFound(id)) => assert_eq!(id, child.0),
+            otro => panic!("se esperaba TaskNotFound, y salió {otro:?}"),
+        }
+        match runtime.cancel(parent, SessionId(9999)).await {
+            Err(CoreError::TaskNotFound(id)) => assert_eq!(id, 9999),
+            otro => panic!("se esperaba TaskNotFound, y salió {otro:?}"),
+        }
+    }
+
+    /// Hijo cuyo trabajo ignora la orden de parar: nunca termina. Sirve para ver qué hace `cancel`
+    /// cuando el éxito no llega.
+    async fn hijo_que_no_se_detiene(
+        store: &Arc<SqliteStore>,
+        jobs: &Arc<LocalJobRegistry>,
+        parent: SessionId,
+    ) -> SessionId {
+        let child = store.create_session("/project").await.unwrap();
+        let job = jobs
+            .start(JobSpec {
+                kind: "subagent".into(),
+                label: "terco".into(),
+                owner: parent,
+                output_limit: 1024,
+                run: Box::new(|_handle, _cancel| {
+                    Box::pin(async move {
+                        std::future::pending::<()>().await;
+                        Ok(None)
+                    })
+                }),
+            })
+            .unwrap();
+        store
+            .save_subagent(&SubagentDescriptor {
+                parent,
+                child,
+                job_id: job.id().0.clone(),
+                label: "terco".into(),
+                status: TaskStatus::new(TaskState::Working),
+                artifacts: Vec::new(),
+                notice_delivered: false,
+                agent: None,
+                agent_origin: None,
+            })
+            .await
+            .unwrap();
+        child
+    }
+
+    #[tokio::test]
+    async fn cancel_does_not_claim_success_if_the_child_does_not_settle() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, parent) = tienda_de_prueba(dir.path(), "cancel-terco.db").await;
+        let jobs = Arc::new(LocalJobRegistry::default());
+        let proveedor = ProveedorGrabador {
+            peticiones: Arc::new(std::sync::Mutex::new(Vec::new())),
+            puerta: None,
+        };
+        let runtime = lanzador_grabador(
+            dir.path(),
+            store.clone(),
+            jobs.clone(),
+            proveedor,
+            None,
+            None,
+        );
+        let runtime = runtime.with_cancel_wait(Duration::from_millis(150));
+        let child = hijo_que_no_se_detiene(&store, &jobs, parent).await;
+
+        let tarea = runtime.cancel(parent, child).await.unwrap();
+
+        assert_eq!(
+            tarea.status.state,
+            TaskState::Working,
+            "no se asentó: no puede decirse que se canceló"
+        );
+        // El trabajo recibió la orden de parar (D2) pero sigue deteniéndose.
+        let job = JobId(tarea.job_id.clone());
+        let estado = jobs
+            .list(parent)
+            .into_iter()
+            .find(|snapshot| snapshot.id == job)
+            .unwrap()
+            .status;
+        assert_eq!(estado, JobStatus::Stopping);
+    }
+
+    #[tokio::test]
+    async fn a_repeated_cancel_while_stopping_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, parent) = tienda_de_prueba(dir.path(), "cancel-repetido.db").await;
+        let jobs = Arc::new(LocalJobRegistry::default());
+        let proveedor = ProveedorGrabador {
+            peticiones: Arc::new(std::sync::Mutex::new(Vec::new())),
+            puerta: None,
+        };
+        let runtime = lanzador_grabador(
+            dir.path(),
+            store.clone(),
+            jobs.clone(),
+            proveedor,
+            None,
+            None,
+        );
+        let runtime = runtime.with_cancel_wait(Duration::from_millis(150));
+        let child = hijo_que_no_se_detiene(&store, &jobs, parent).await;
+
+        let primera = runtime.cancel(parent, child).await.unwrap();
+        let segunda = runtime
+            .cancel(parent, child)
+            .await
+            .expect("repetir la orden mientras se detiene no es un error (D4)");
+
+        assert_eq!(primera.status.state, TaskState::Working);
+        assert_eq!(segunda.status.state, TaskState::Working);
     }
 
     #[tokio::test]

@@ -486,8 +486,13 @@ Fuentes: `spec.md` y `a2a.proto` de la copia local del 2026-10-22. Leídos en li
 
 1. Cierre del flujo en estados interrumpidos: §3.1.2 frente a §11.7. No consta cuál prevalece.
 2. Cancelar una tarea ya cancelada: §3.3.1 (mismo efecto) frente a §3.1.5 y §3.3.2 (error).
-3. Si `input-required` y `auth-required` son cancelables: no consta.
-4. Estado resultante de `CancelTask`: no consta.
+   **Resuelta como decisión nuestra el 2026-10-23** (A10): error `TaskNotCancelable` si la tarea ya
+   es terminal; idempotente solo mientras el hijo aún se detiene.
+3. Si `input-required` y `auth-required` son cancelables: no consta. **Resuelta como decisión
+   nuestra (A10): sí lo son.**
+4. Estado resultante de `CancelTask`: no consta. **Resuelta como decisión nuestra (A10):
+   `canceled`, y si el hijo no se asienta a tiempo se informa de su estado actual.**
+   Véase `2026-10-23-codeloom-a2a-cancel-design.md`.
 5. Reanudación de un flujo tras desconexión: no consta.
 6. Campo de seguridad de la tarjeta: `AgentCard.security` (§13.3) frente a `security_requirements` (proto) y `securityRequirements` (ejemplo de §8.5). No consta si son el mismo campo.
 7. El ejemplo de §12.7 omite `protocolVersion`, que el proto marca REQUIRED. No consta si es deliberado.
