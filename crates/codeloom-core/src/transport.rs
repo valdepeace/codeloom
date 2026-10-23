@@ -179,6 +179,91 @@ impl AgentTransport for InProcessTransport {
     }
 }
 
+/// Suite de contrato: lo que cualquier `AgentTransport` debe cumplir, sea local o remoto.
+///
+/// Cabe señalar que solo comprueba comportamientos independientes del transporte (la finalización
+/// de las tareas depende de cada agente). A8 la ejecutará contra el transporte remoto.
+#[cfg(any(test, feature = "test-support"))]
+pub mod contract {
+    use super::*;
+    use crate::a2a::{Part, Role};
+
+    fn mensaje(partes: Vec<Part>) -> Message {
+        Message {
+            message_id: "contrato-1".into(),
+            context_id: None,
+            task_id: None,
+            role: Role::User,
+            parts: partes,
+            metadata: None,
+            extensions: Vec::new(),
+            reference_task_ids: Vec::new(),
+        }
+    }
+
+    /// Ejecuta el contrato. `parent` y `otro_padre` son sesiones distintas, y `otro_padre` no debe
+    /// tener tareas todavía.
+    pub async fn transport_contract(
+        transporte: &dyn AgentTransport,
+        parent: SessionId,
+        otro_padre: SessionId,
+    ) {
+        let peticion = |partes: Vec<Part>| SendRequest {
+            parent,
+            agent: None,
+            label: "contrato".into(),
+            message: mensaje(partes),
+            task_id: None,
+            reference_task_ids: Vec::new(),
+        };
+
+        // Una tarea inexistente no se encuentra ni se cancela.
+        assert!(matches!(
+            transporte.get_task(parent, SessionId(987_654)).await,
+            Err(CoreError::TaskNotFound(987_654))
+        ));
+        assert!(matches!(
+            transporte.cancel_task(parent, SessionId(987_654)).await,
+            Err(CoreError::TaskNotFound(987_654))
+        ));
+        // Un mensaje sin partes no crea nada.
+        assert!(transporte
+            .send_message(peticion(Vec::new()), CancellationToken::new())
+            .await
+            .is_err());
+        assert!(transporte.list_tasks(parent).await.unwrap().is_empty());
+
+        // Una tarea aceptada se puede consultar y listar, y es del padre que la creó.
+        let tarea = transporte
+            .send_message(
+                peticion(vec![Part::text("haz algo")]),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tarea.parent, parent);
+        let consultada = transporte.get_task(parent, tarea.child).await.unwrap();
+        assert_eq!(consultada.child, tarea.child);
+        let listadas = transporte.list_tasks(parent).await.unwrap();
+        assert!(listadas.iter().any(|t| t.child == tarea.child));
+
+        // Otro padre ni la ve ni sabe que existe.
+        assert!(matches!(
+            transporte.get_task(otro_padre, tarea.child).await,
+            Err(CoreError::TaskNotFound(_))
+        ));
+        assert!(matches!(
+            transporte.cancel_task(otro_padre, tarea.child).await,
+            Err(CoreError::TaskNotFound(_))
+        ));
+        assert!(transporte.list_tasks(otro_padre).await.unwrap().is_empty());
+
+        // La tarjeta del agente por defecto existe; la de un agente desconocido, no.
+        assert!(transporte.agent_card(None).await.is_ok());
+        assert!(transporte.agent_card(Some("no-existe")).await.is_err());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -593,5 +678,13 @@ mod tests {
             .agent_card(Some("no-existe"))
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn the_in_process_transport_meets_the_contract() {
+        let banco = banco(vec![]).await;
+        let otro = banco.store.create_session("/project").await.unwrap();
+
+        contract::transport_contract(&banco.transporte, banco.parent, otro).await;
     }
 }
