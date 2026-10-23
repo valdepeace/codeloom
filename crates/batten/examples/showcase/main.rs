@@ -6,6 +6,7 @@ mod demo;
 mod demos;
 mod matrix;
 mod prompt_keys;
+mod theme_view;
 
 use app::{route, Action, Focus, Showcase};
 use batten::widgets::{Anim, Theme, FRAME_INTERVAL};

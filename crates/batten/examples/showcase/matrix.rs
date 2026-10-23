@@ -37,7 +37,7 @@ pub const COLUMNS: [(&str, Option<ThemePreset>); 7] = [
 ];
 
 /// Proveedor de la columna Batten, usado como respaldo para las celdas `Generic`.
-const BATTEN: &str = "Batten";
+pub(crate) const BATTEN: &str = "Batten";
 
 pub struct Matrix {
     /// Componentes con al menos un demo de un proveedor de columna, en el orden de primera
@@ -132,7 +132,7 @@ fn cell(items: &[CatalogItem], component: &str, column: usize) -> Cell {
 }
 
 /// Nombre de proveedor de una columna, o `None` si el índice está fuera de `COLUMNS`.
-fn provider_of_column(column: usize) -> Option<&'static str> {
+pub(crate) fn provider_of_column(column: usize) -> Option<&'static str> {
     COLUMNS.get(column).map(|(name, _)| *name)
 }
 
