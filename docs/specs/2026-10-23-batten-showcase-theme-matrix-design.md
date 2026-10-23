@@ -1,6 +1,6 @@
 # Matriz de componentes por tema en el showcase de Batten
 
-Estado: diseño, 2026-10-23. Idea de la persona usuaria; sin implementar.
+Estado: diseño aprobado en lo esencial, 2026-10-23; sin implementar.
 
 ## Propósito
 
@@ -16,9 +16,13 @@ en Pawan es buscarlo a mano.
    - `●` hay reproducción propia de ese tema.
    - `◐` solo existe el widget genérico, pintado con la paleta del tema.
    - `·` no existe.
-3. Columnas: los temas de `ThemePreset`: Batten (el aspecto *classic*), Martty, Mindfork, Pawan,
-   Crush y MastraCode. *Interpretación propia:* «classic» es Batten, porque ese nombre solo
-   existe como `Look::classic()`; y Mindfork se incluye aunque no se nombró.
+3. Columnas: Batten (el aspecto *classic*), Martty, Mindfork, Pawan, Crush, MastraCode y
+   **CodeLoom**, que la persona usuaria considera «otro tema más». *Interpretación propia:*
+   «classic» es Batten, porque ese nombre solo existe como `Look::classic()`; y Mindfork se
+   incluye aunque no se nombró.
+4. **`●` sin número** (elección delegada a mí): el recuento de demos de la celda se muestra en el
+   pie al situarse encima.
+5. **dotmax no es un tema, es una librería**: va a una nota al pie, no a una columna.
 
 ## Qué hay hoy (medido el 2026-10-23 sobre `demos/mod.rs`)
 
@@ -30,7 +34,8 @@ componentes.
   `●`, y eso es información, no un fallo.
 - **Crush** es la columna con más reproducciones (decenas de componentes); Martty, Mindfork y
   Pawan tienen pocas.
-- Hay proveedores que **no son temas**: CodeLoom (12 demos de herramientas) y dotmax (3).
+- **CodeLoom** tiene 12 demos (todos de herramientas) pero **no existe `ThemePreset::CodeLoom`**:
+  hoy es solo un proveedor de demos, sin paleta propia. **dotmax** (3 demos) es una librería.
 
 ## Diseño
 
@@ -54,11 +59,14 @@ con la variante «Cross-reference comparison». La matriz **no usa ese valor por
 variante de `provider_for` que devuelve `Option` y deja esas entradas fuera de las columnas (en una
 nota al pie), de modo que un demo mal nombrado no infle la columna de Batten en silencio.
 
-### Filas sin columna
+### La columna CodeLoom y la nota de dotmax
 
-Los componentes cuyos únicos demos son de CodeLoom o dotmax (tools de CodeLoom, Braille,
-Progress catalog) no tienen celda en ningún tema. Van a una nota al pie, no a la matriz, para no
-llenarla de `·` que no significan «falta» sino «no es un tema».
+CodeLoom es una columna más. Como no hay paleta de CodeLoom, `Enter` sobre una de sus celdas abre
+el demo **con el tema activo** y lo dice en la línea de ayuda; crear `ThemePreset::CodeLoom` con
+paleta propia es otra tarea y no se hace aquí. El resto de columnas sí aplican su preset.
+
+dotmax (Braille graphics, Progress catalog) es una librería: sus componentes van a una nota al
+pie, no a la matriz, para no llenarla de `·` que no significan «falta» sino «no es un tema».
 
 ### Interfaz
 
@@ -93,7 +101,5 @@ tema y la selección, y el trait `Demo` no ve nada de eso. Se abre desde el índ
 
 ## Preguntas abiertas
 
-- ¿Una celda `Own(n)` debe mostrar el número `n` o basta con `●`? Propuesta: solo `●`, y el
-  número en el pie al situarse encima.
-- ¿Los proveedores CodeLoom y dotmax merecen una columna aparte («sin tema») en vez de la nota al
-  pie?
+- ¿Debe existir `ThemePreset::CodeLoom` con paleta propia? Mientras no exista, esa columna abre
+  los demos con el tema activo.
