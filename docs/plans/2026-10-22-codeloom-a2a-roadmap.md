@@ -114,6 +114,11 @@ después el transporte (A7, A8).
   `codeloom-a2a`. Aquí cobra sentido `auth-required`. Spec y plan preparados el 2026-10-23
   (`2026-10-23-codeloom-a2a-remote-transport-*`), cortados en fases A8a–A8d y con preguntas
   abiertas para la persona usuaria; requiere A4, A7 y A9.
+  - **A8a (consumir) hecha el 2026-10-23, sin cablear en el CLI** (`651e792`, `7fcf4b7`, `4591883`,
+    `8d22eb3`, `b319cac`, `3d84c4e`, `f35cc32`, `4bbfad5`): configuración `[a2a]`, tarjeta remota,
+    perfiles `a2a-remote` con aprobación atada a la tarjeta, cliente JSON-RPC y espejo en el
+    lanzador. Quedan A8b (servir), A8c (SSE), A8d (seguridad) y el cableado en `codeloom-cli` y la
+    TUI; véase la sección «Estado» de la spec.
   - Seguridad, firmas e icono de la tarjeta (`security_schemes`, `security_requirements`,
     `signatures`, `icon_url`) quedan para esta tarea. A6 no los modela; ver la spec de la
     tarjeta, sección «Estado».

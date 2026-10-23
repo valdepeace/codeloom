@@ -105,6 +105,51 @@ Sigue abierto o sin contrastar:
 3. **Pila del servidor:** `axum` (D9).
 4. **Alta de remotos:** perfiles `.md`, con `codeloom.toml` solo para rol y límites (D11).
 
+## Estado
+
+**A8a (consumir) implementada el 2026-10-23**, probada con servidores `wiremock` de bucle local y un
+cliente remoto guionizado; **no se ha probado contra un agente A2A real ni se ha visto en una terminal**.
+Commits: `651e792` (spec literal y fixtures), `7fcf4b7` (`[a2a]`), `4591883` (tarjeta remota),
+`8d22eb3` y `b319cac` (perfiles remotos, aprobación y refresco), `3d84c4e` (cliente JSON-RPC),
+`f35cc32` (espejo en el lanzador) y `4bbfad5` (fábrica y extremo a extremo).
+
+### Lo hecho
+
+- `[a2a] role = off|serve|consume|both` (apagado por defecto), con tiempo de petición y cotas de
+  tarjeta y de respuesta; una cota en cero o por encima del techo es un error.
+- Tarjeta remota: se pide a `/.well-known/agent-card.json` con tiempo y tope de tamaño; no se sigue una
+  redirección a otro anfitrión; solo HTTPS (o HTTP en bucle local); solo la interfaz JSON-RPC de la
+  versión `1.0`, y su URL ha de ser del mismo anfitrión que el punto de entrada. La huella se calcula
+  sobre el JSON normalizado. Todo campo de la tarjeta se acota al convertirla.
+- Perfiles `.md` con `transport: a2a-remote` y `a2a.endpoint`. Un remoto siempre empieza pendiente; se
+  aprueba contra el punto de entrada y la huella de su tarjeta (si cambian, vuelve a pendiente) y
+  `trust_project_agents` no lo aprueba. Su descripción entra al prompt del padre aplanada, acotada,
+  entrecomillada y advertida como dato de un tercero.
+- Cliente JSON-RPC (`SendMessage` con `returnImmediately: true`, `GetTask` sin historial, `CancelTask`),
+  con `A2A-Version: 1.0`, el `tenant` de la interfaz y los códigos de error de A2A traducidos.
+- Espejo en el lanzador: un trabajo que envía el mensaje, sigue la tarea por sondeo y copia estado,
+  mensaje y artefactos. Cancelar envía `CancelTask` y anota solo lo que el remoto respondió. Seguimiento
+  acotado (intervalo, tiempo máximo y tres consultas fallidas seguidas).
+
+### Lo que no consta o queda pendiente
+
+- **Sin cablear en `codeloom-cli` ni en la TUI:** nada construye todavía `A2aClientFactory`, llama a
+  `refresh_remote_cards` ni ofrece una orden para aprobar un remoto. El crate se prueba por separado.
+- **Sin autenticación:** un remoto cuya tarjeta pide seguridad se rechaza («exige autenticación»), a la
+  espera de A8d. Las firmas de la tarjeta no se verifican.
+- **Un remoto que pide entrada (`input-required`) se refleja pero no se puede responder** desde
+  CodeLoom: el mensaje del lanzador no llega al remoto. Mientras tanto la tarea sigue abierta hasta que
+  alguien la cancele o el remoto la cierre.
+- **Sondeo, no SSE** (A8c); no se respetan `Cache-Control` ni `ETag` de la tarjeta; no se renueva la
+  tarjeta salvo que alguien llame a `refresh_remote_cards`.
+- El resultado de un remoto se guarda hasta el tope `max_result_bytes` (256 KiB por defecto) y al
+  modelo llega acotado como el de cualquier subagente.
+- **Decisiones nuestras, no de la spec:** solo la versión `1.0` exacta (un `1.1` no consta como
+  compatible); la interfaz ha de ser del anfitrión del punto de entrada; tres consultas fallidas
+  seguidas dan el contacto por perdido; treinta minutos de seguimiento como máximo.
+- El `id` de cada tarea remota es el que asigna el remoto, y el descriptor local no lo guarda: tras un
+  reinicio el espejo no retoma una tarea remota en curso (el almacén la marca fallida al reabrir).
+
 ## Preguntas abiertas
 
 - Cómo se almacenan y rotan las credenciales de un remoto más allá de variables de entorno.
