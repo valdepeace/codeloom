@@ -82,7 +82,6 @@ use crate::demo::Demo;
 pub struct CatalogItem {
     pub component: &'static str,
     pub variant: &'static str,
-    pub provider: &'static str,
     pub demo: Box<dyn Demo>,
 }
 
@@ -98,13 +97,6 @@ const PROVIDERS: [&str; 8] = [
     "dotmax",
 ];
 
-fn provider_for(variant: &str) -> &'static str {
-    PROVIDERS
-        .into_iter()
-        .find(|provider| variant.starts_with(provider))
-        .unwrap_or("Batten")
-}
-
 /// Proveedor de una variante sin valor por defecto: `None` si no empieza por ninguno de
 /// `PROVIDERS`, para que una variante mal nombrada no cuente como Batten en silencio.
 pub fn strict_provider(variant: &str) -> Option<&'static str> {
@@ -117,7 +109,6 @@ fn item(component: &'static str, variant: &'static str, demo: Box<dyn Demo>) -> 
     CatalogItem {
         component,
         variant,
-        provider: provider_for(variant),
         demo,
     }
 }

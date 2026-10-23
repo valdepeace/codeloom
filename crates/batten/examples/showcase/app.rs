@@ -1,18 +1,17 @@
-//! Estado del showcase: catálogo, selección y foco.
+//! Estado del showcase: tema activo, catálogo, selección y foco.
 
 use crate::demo::Demo;
 use crate::demos::{self, CatalogItem};
 use crate::matrix::{self, Cell, Matrix};
+use crate::theme_view::{self, ThemeEntry, ThemeExample, ThemeView};
 use batten::widgets::{Anim, ThemePreset};
 use ratatui::crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
-use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Index,
     Demo,
     Matrix,
-    ProviderFilter,
     TextFilter,
 }
 
@@ -24,11 +23,10 @@ pub enum Action {
 
 pub struct Showcase {
     demos: Vec<CatalogItem>,
+    /// Índice del catálogo del demo seleccionado (el de un ejemplo, nunca el de una cabecera).
     selected: usize,
     focus: Focus,
     quit: bool,
-    theme_preset: ThemePreset,
-    provider_filter: Option<&'static str>,
     query: String,
     /// Matriz de componentes por tema, derivada una vez del catálogo.
     matrix: Matrix,
@@ -36,27 +34,28 @@ pub struct Showcase {
     matrix_cursor: (usize, usize),
     /// `true` si el demo activo se abrió desde la matriz; `Esc` vuelve entonces a ella.
     matrix_return: bool,
-    /// Columna de la matriz que muestra el pie entre temas, fijada por `Enter` o `F8`. `None`
-    /// cuando se deduce del proveedor del demo seleccionado.
-    view_column: Option<usize>,
+    /// Columna de `matrix::COLUMNS` del tema activo. El tema es estado propio del índice.
+    theme_column: usize,
+    /// Vista del tema activo: sus componentes y ejemplos. Se recalcula al cambiar de tema.
+    view: ThemeView,
 }
 
 impl Showcase {
     pub fn new() -> Self {
         let demos = demos::catalog();
         let matrix = matrix::build(&demos);
+        let view = theme_view::theme_view(&demos, 0);
         Self {
             demos,
             selected: 0,
             focus: Focus::Index,
             quit: false,
-            theme_preset: ThemePreset::Batten,
-            provider_filter: None,
             query: String::new(),
             matrix,
             matrix_cursor: (0, 0),
             matrix_return: false,
-            view_column: None,
+            theme_column: 0,
+            view,
         }
     }
 
@@ -64,51 +63,75 @@ impl Showcase {
         self.demos.len()
     }
 
-    pub fn provider_filter(&self) -> Option<&str> {
-        self.provider_filter
-    }
-
     pub fn query(&self) -> &str {
         &self.query
     }
 
-    pub fn providers(&self) -> Vec<&'static str> {
-        self.demos
-            .iter()
-            .map(|item| item.provider)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect()
+    /// Columna de `matrix::COLUMNS` del tema activo.
+    pub fn theme_column(&self) -> usize {
+        self.theme_column
     }
 
-    pub fn filtered_indices(&self) -> Vec<usize> {
+    /// Vista del tema activo: componentes y ejemplos que el índice muestra.
+    // Sin lectura en el binario hasta la Tarea 3 (pestañas y pie); lo usan los tests.
+    #[allow(dead_code)]
+    pub fn view(&self) -> &ThemeView {
+        &self.view
+    }
+
+    /// Entradas de la vista que pasan el filtro de texto, con sus ejemplos visibles.
+    ///
+    /// Un componente entra entero si su nombre contiene el texto; si no, solo entran sus ejemplos
+    /// cuya etiqueta lo contiene, y si ninguno lo hace el componente se omite. Sin texto, todo.
+    fn visible(&self) -> Vec<(&ThemeEntry, Vec<&ThemeExample>)> {
         let query = self.query.to_lowercase();
-        self.demos
+        self.view
+            .entries
             .iter()
-            .enumerate()
-            .filter_map(|(index, item)| {
-                let provider_matches = self
-                    .provider_filter
-                    .is_none_or(|provider| item.provider == provider);
-                let query_matches = query.is_empty()
-                    || [item.provider, item.component, item.variant]
-                        .iter()
-                        .any(|value| value.to_lowercase().contains(&query));
-                (provider_matches && query_matches).then_some(index)
+            .filter_map(|entry| {
+                if query.is_empty() || entry.component.to_lowercase().contains(&query) {
+                    return Some((entry, entry.examples.iter().collect()));
+                }
+                let examples: Vec<&ThemeExample> = entry
+                    .examples
+                    .iter()
+                    .filter(|example| example.label.to_lowercase().contains(&query))
+                    .collect();
+                (!examples.is_empty()).then_some((entry, examples))
             })
             .collect()
     }
 
+    /// Índices del catálogo seleccionables, en orden de la vista. Son los ejemplos visibles: la
+    /// cabecera de un componente con varios ejemplos no es seleccionable.
+    pub fn filtered_indices(&self) -> Vec<usize> {
+        self.visible()
+            .iter()
+            .flat_map(|(_, examples)| examples.iter().map(|example| example.catalog_index))
+            .collect()
+    }
+
+    /// Filas del índice como `(índice del catálogo, texto)`.
+    ///
+    /// Un componente con un único ejemplo visible es una sola fila seleccionable. Con varios, una
+    /// cabecera sin índice (no seleccionable) y una fila hija por ejemplo, con su etiqueta. El
+    /// marcador (`◐` genérico, `●` propio) va delante del texto de cada cabecera o fila
+    /// seleccionable; las filas hijas no llevan marcador.
     pub fn index_rows(&self) -> Vec<(Option<usize>, String)> {
         let mut rows = Vec::new();
-        let mut last_component = None;
-        for index in self.filtered_indices() {
-            let component = self.demos[index].component;
-            if last_component != Some(component) {
-                rows.push((None, format!("{component} ─")));
-                last_component = Some(component);
+        for (entry, examples) in self.visible() {
+            let marker = if entry.generic { "◐ " } else { "● " };
+            if let [example] = examples.as_slice() {
+                rows.push((
+                    Some(example.catalog_index),
+                    format!("{marker}{}", entry.component),
+                ));
+            } else {
+                rows.push((None, format!("{marker}{} ─", entry.component)));
+                for example in examples {
+                    rows.push((Some(example.catalog_index), format!("  {}", example.label)));
+                }
             }
-            rows.push((Some(index), self.demos[index].variant.to_string()));
         }
         if rows.is_empty() {
             rows.push((None, "Sin resultados".to_string()));
@@ -132,38 +155,16 @@ impl Showcase {
     pub fn select(&mut self, index: usize, open: bool) {
         if index < self.demos.len() {
             self.selected = index;
-            self.view_column = None;
             if open {
                 self.focus = Focus::Demo;
             }
         }
     }
 
-    pub fn select_provider(&mut self, provider: Option<&'static str>) {
-        self.provider_filter = provider;
-        self.keep_selection_visible();
-    }
-
-    pub fn cycle_provider(&mut self, backwards: bool) {
-        let mut choices = vec![None];
-        choices.extend(self.providers().into_iter().map(Some));
-        let current = choices
-            .iter()
-            .position(|choice| *choice == self.provider_filter)
-            .unwrap_or(0);
-        let next = if backwards {
-            (current + choices.len() - 1) % choices.len()
-        } else {
-            (current + 1) % choices.len()
-        };
-        self.select_provider(choices[next]);
-    }
-
     fn keep_selection_visible(&mut self) {
         let filtered = self.filtered_indices();
         if !filtered.contains(&self.selected) {
             self.selected = filtered.first().copied().unwrap_or(0);
-            self.view_column = None;
         }
     }
 
@@ -210,27 +211,54 @@ impl Showcase {
         self.quit
     }
 
+    /// Preset del tema activo; se deriva de su columna, no se guarda aparte.
     pub fn theme_preset(&self) -> ThemePreset {
-        self.theme_preset
+        matrix::COLUMNS
+            .get(self.theme_column)
+            .and_then(|(_, preset)| *preset)
+            .unwrap_or(ThemePreset::Batten)
     }
 
-    fn cycle_theme(&mut self, backwards: bool) {
-        let presets = ThemePreset::ALL;
-        let current = presets
-            .iter()
-            .position(|preset| *preset == self.theme_preset)
-            .unwrap_or(0);
+    /// Cambia el tema del índice por su columna en `matrix::COLUMNS`; los índices fuera de ella
+    /// se ignoran. Recalcula la vista.
+    ///
+    /// Si el componente seleccionado existe en el tema nuevo, se selecciona su primer ejemplo
+    /// visible; si no, el primero de la lista. Con la lista vacía la selección no cambia. No
+    /// cambia el foco ni `matrix_return`.
+    pub fn set_theme_column(&mut self, column: usize) {
+        if column >= matrix::COLUMNS.len() {
+            return;
+        }
+        let previous = self.demos.get(self.selected).map(|item| item.component);
+        self.theme_column = column;
+        self.view = theme_view::theme_view(&self.demos, column);
+        let kept = previous.and_then(|component| self.first_visible_of(component));
+        if let Some(index) = kept.or_else(|| self.filtered_indices().first().copied()) {
+            self.selected = index;
+        }
+    }
+
+    /// Primer ejemplo visible del componente en la vista actual, si lo hay.
+    fn first_visible_of(&self, component: &str) -> Option<usize> {
+        self.visible()
+            .into_iter()
+            .find(|(entry, _)| entry.component == component)
+            .and_then(|(_, examples)| examples.first().map(|example| example.catalog_index))
+    }
+
+    /// Pasa al tema siguiente (o, con `backwards`, al anterior), con vuelta.
+    pub fn cycle_theme_column(&mut self, backwards: bool) {
+        let columns = matrix::COLUMNS.len();
         let next = if backwards {
-            (current + presets.len() - 1) % presets.len()
+            (self.theme_column + columns - 1) % columns
         } else {
-            (current + 1) % presets.len()
+            (self.theme_column + 1) % columns
         };
-        self.theme_preset = presets[next];
+        self.set_theme_column(next);
     }
 
     /// Mueve la selección una posición abajo (con tope) y vuelve el foco al índice.
     pub fn next(&mut self) {
-        self.view_column = None;
         let filtered = self.filtered_indices();
         if let Some(position) = filtered.iter().position(|index| *index == self.selected) {
             if position + 1 < filtered.len() {
@@ -245,7 +273,6 @@ impl Showcase {
 
     /// Mueve la selección una posición arriba (con tope) y vuelve el foco al índice.
     pub fn prev(&mut self) {
-        self.view_column = None;
         let filtered = self.filtered_indices();
         if let Some(position) = filtered.iter().position(|index| *index == self.selected) {
             self.selected = filtered[position.saturating_sub(1)];
@@ -320,8 +347,8 @@ impl Showcase {
         );
     }
 
-    /// Abre el demo de la celda bajo el cursor con el tema de su columna. Las celdas
-    /// `Missing` no hacen nada.
+    /// Cambia al tema de la columna de la celda bajo el cursor y abre el demo de esa celda. Las
+    /// celdas `Missing` no hacen nada.
     pub fn open_matrix_cell(&mut self) {
         let (row, column) = self.matrix_cursor;
         let Some(component) = self.matrix.rows.get(row).map(|row| row.component) else {
@@ -330,71 +357,11 @@ impl Showcase {
         let Some(index) = matrix::target(&self.demos, component, column) else {
             return;
         };
+        // Un filtro de texto activo podría ocultar el ejemplo que se abre: se limpia antes.
+        self.query.clear();
+        self.set_theme_column(column);
         self.select(index, true);
-        self.view_column = Some(column);
         self.matrix_return = true;
-        if let Some((_, Some(preset))) = matrix::COLUMNS.get(column) {
-            self.theme_preset = *preset;
-        }
-    }
-
-    /// Columna de la matriz que corresponde al demo mostrado: la fijada por `Enter` o `F8` si la
-    /// hay; si no, la del proveedor del demo seleccionado (`None` si no es una columna).
-    pub fn current_column(&self) -> Option<usize> {
-        if self.view_column.is_some() {
-            return self.view_column;
-        }
-        let variant = self.demos.get(self.selected)?.variant;
-        let provider = demos::strict_provider(variant)?;
-        matrix::COLUMNS
-            .iter()
-            .position(|(name, _)| *name == provider)
-    }
-
-    /// Pasa a la columna siguiente (o, con `backwards`, anterior) de la fila del componente del
-    /// demo actual que no sea `Missing`, con vuelta, y abre ese demo con el tema de la columna.
-    /// Sin fila para el componente, o sin otra columna disponible, no hace nada. No cambia el
-    /// foco ni `matrix_return`.
-    pub fn cycle_component_theme(&mut self, backwards: bool) {
-        let Some(component) = self.demos.get(self.selected).map(|item| item.component) else {
-            return;
-        };
-        let Some(row) = self
-            .matrix
-            .rows
-            .iter()
-            .find(|row| row.component == component)
-        else {
-            return;
-        };
-        let columns = matrix::COLUMNS.len();
-        // Sin columna actual, el recorrido empieza antes de la primera (hacia delante) o después
-        // de la última (hacia atrás); con ella, se recorren todas menos la propia.
-        let (start, steps) = match self.current_column() {
-            Some(column) => (column, columns - 1),
-            None if backwards => (0, columns),
-            None => (columns - 1, columns),
-        };
-        let found = (1..=steps).find_map(|step| {
-            let column = if backwards {
-                (start + columns - step) % columns
-            } else {
-                (start + step) % columns
-            };
-            if row.cells[column] == Cell::Missing {
-                return None;
-            }
-            matrix::target(&self.demos, component, column).map(|index| (column, index))
-        });
-        let Some((column, index)) = found else {
-            return;
-        };
-        // `select` deja la columna sin fijar; se fija después, como hace `Enter` en la matriz.
-        self.select(index, false);
-        self.view_column = Some(column);
-        if let Some((_, Some(preset))) = matrix::COLUMNS.get(column) {
-            self.theme_preset = *preset;
-        }
     }
 
     pub fn current(&mut self) -> Option<&mut Box<dyn Demo>> {
@@ -415,6 +382,10 @@ impl Showcase {
         self.focus = Focus::Demo;
     }
 
+    /// Construye un showcase de prueba con un demo por entrada.
+    ///
+    /// Solo para tests de navegación: el proveedor «Test» no existe en la matriz, así que la vista
+    /// se construye a mano con una entrada de un único ejemplo por demo (todas bajo «Tests»).
     #[cfg(test)]
     pub(crate) fn with_demos(demos: Vec<Box<dyn Demo>>) -> Self {
         let demos: Vec<CatalogItem> = demos
@@ -422,23 +393,34 @@ impl Showcase {
             .map(|demo| CatalogItem {
                 component: "Tests",
                 variant: "Test",
-                provider: "Test",
                 demo,
             })
             .collect();
         let matrix = matrix::build(&demos);
+        let view = ThemeView {
+            entries: (0..demos.len())
+                .map(|catalog_index| ThemeEntry {
+                    component: "Tests",
+                    generic: false,
+                    examples: vec![ThemeExample {
+                        catalog_index,
+                        label: "Test".to_string(),
+                    }],
+                })
+                .collect(),
+            missing: 0,
+        };
         Self {
             demos,
             selected: 0,
             focus: Focus::Index,
             quit: false,
-            theme_preset: ThemePreset::Batten,
-            provider_filter: None,
             query: String::new(),
             matrix,
             matrix_cursor: (0, 0),
             matrix_return: false,
-            view_column: None,
+            theme_column: 0,
+            view,
         }
     }
 }
@@ -458,11 +440,7 @@ pub fn route(show: &mut Showcase, kind: KeyEventKind, code: KeyCode, mods: KeyMo
         return Action::Quit;
     }
     if code == KeyCode::F(7) {
-        show.cycle_theme(mods.contains(KeyModifiers::SHIFT));
-        return Action::None;
-    }
-    if code == KeyCode::F(8) && show.focus() == Focus::Demo {
-        show.cycle_component_theme(mods.contains(KeyModifiers::SHIFT));
+        show.cycle_theme_column(mods.contains(KeyModifiers::SHIFT));
         return Action::None;
     }
     match show.focus {
@@ -475,16 +453,20 @@ pub fn route(show: &mut Showcase, kind: KeyEventKind, code: KeyCode, mods: KeyMo
                 show.next();
                 Action::None
             }
+            KeyCode::Left => {
+                show.cycle_theme_column(true);
+                Action::None
+            }
+            KeyCode::Right => {
+                show.cycle_theme_column(false);
+                Action::None
+            }
             KeyCode::Tab => {
                 show.toggle_focus();
                 Action::None
             }
             KeyCode::Char('/') => {
                 show.focus = Focus::TextFilter;
-                Action::None
-            }
-            KeyCode::Char('p') => {
-                show.focus = Focus::ProviderFilter;
                 Action::None
             }
             KeyCode::Char('m') => {
@@ -494,25 +476,6 @@ pub fn route(show: &mut Showcase, kind: KeyEventKind, code: KeyCode, mods: KeyMo
             KeyCode::Char('q') => {
                 show.quit = true;
                 Action::Quit
-            }
-            _ => Action::None,
-        },
-        Focus::ProviderFilter => match code {
-            KeyCode::Left => {
-                show.cycle_provider(true);
-                Action::None
-            }
-            KeyCode::Right => {
-                show.cycle_provider(false);
-                Action::None
-            }
-            KeyCode::Tab | KeyCode::Enter => {
-                show.focus = Focus::TextFilter;
-                Action::None
-            }
-            KeyCode::Esc => {
-                show.focus = Focus::Index;
-                Action::None
             }
             _ => Action::None,
         },
@@ -901,11 +864,12 @@ mod tests {
         assert!(!show.matrix_return);
     }
 
-    // ADAPTADO: CodeLoom ya tiene preset
+    // ADAPTADO: el preset ya no es un campo (se deriva de la columna); el tema de partida se fija
+    // con `set_theme_column` en lugar de asignar `theme_preset`.
     #[test]
     fn enter_on_codeloom_applies_its_palette() {
         let mut show = Showcase::new();
-        show.theme_preset = ThemePreset::Pawan;
+        show.set_theme_column(column_index("Pawan"));
         press(&mut show, KeyCode::Char('m'));
         let codeloom = column_index("CodeLoom");
         let component = component_where(&show, codeloom, |cell| matches!(cell, Cell::Own(_)));
@@ -953,125 +917,183 @@ mod tests {
         assert_eq!(show.focus(), Focus::Index);
     }
 
-    /// Pulsa `F8` (o `Shift+F8` con `shift`).
-    fn f8(show: &mut Showcase, shift: bool) {
-        let mods = if shift {
-            KeyModifiers::SHIFT
-        } else {
-            KeyModifiers::NONE
-        };
-        route(show, KeyEventKind::Press, KeyCode::F(8), mods);
+    #[test]
+    fn changing_theme_keeps_the_component_when_it_exists() {
+        let mut show = Showcase::new();
+        show.select(first_demo(&show, "Composer", "Batten"), false);
+        show.set_theme_column(column_index("Crush"));
+        assert_eq!(show.selected(), first_demo(&show, "Composer", "Crush"));
+        assert_eq!(show.theme_preset(), ThemePreset::Crush);
+        assert_eq!(show.focus(), Focus::Index);
     }
 
-    /// Selecciona el primer demo de (componente, proveedor) y pasa el foco al demo.
-    fn open_demo(show: &mut Showcase, component: &str, provider: &str) {
-        let index = first_demo(show, component, provider);
-        show.select(index, false);
-        press(show, KeyCode::Tab);
+    #[test]
+    fn changing_theme_selects_the_first_when_it_does_not() {
+        let mut show = Showcase::new();
+        // Plan card solo tiene demo de Crush: en Batten no existe.
+        show.set_theme_column(column_index("Crush"));
+        show.select(first_demo(&show, "Plan card", "Crush"), false);
+        show.set_theme_column(column_index("Batten"));
+        assert_eq!(show.selected(), show.filtered_indices()[0]);
+        assert_ne!(show.component_at(show.selected()), Some("Plan card"));
+        assert_eq!(show.theme_preset(), ThemePreset::Batten);
+    }
+
+    #[test]
+    fn left_right_cycle_the_theme_with_wrap() {
+        let mut show = Showcase::new();
+        assert_eq!(show.theme_column(), 0);
+        press(&mut show, KeyCode::Left); // vuelta: Batten -> CodeLoom
+        assert_eq!(show.theme_column(), matrix::COLUMNS.len() - 1);
+        assert_eq!(show.theme_preset(), ThemePreset::CodeLoom);
+        press(&mut show, KeyCode::Right); // vuelta: CodeLoom -> Batten
+        assert_eq!(show.theme_column(), 0);
+        press(&mut show, KeyCode::Right);
+        assert_eq!(show.theme_column(), 1);
+        assert_eq!(show.focus(), Focus::Index);
+    }
+
+    #[test]
+    fn left_right_do_not_change_the_theme_in_demo_focus() {
+        let mut show = Showcase::new();
+        show.select(first_demo(&show, "Composer", "Batten"), true);
+        assert_eq!(show.focus(), Focus::Demo);
+        press(&mut show, KeyCode::Left);
+        press(&mut show, KeyCode::Right);
+        assert_eq!(show.theme_column(), 0);
         assert_eq!(show.focus(), Focus::Demo);
     }
 
-    /// Celda de la matriz de (componente, columna), buscándolas por nombre.
-    fn cell_at(show: &Showcase, component: &str, column: &str) -> Cell {
-        let row = show
-            .matrix()
-            .rows
+    #[test]
+    fn f7_still_cycles_the_theme() {
+        let mut show = Showcase::new();
+        route(
+            &mut show,
+            KeyEventKind::Press,
+            KeyCode::F(7),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(show.theme_column(), 1);
+        route(
+            &mut show,
+            KeyEventKind::Press,
+            KeyCode::F(7),
+            KeyModifiers::SHIFT,
+        );
+        assert_eq!(show.theme_column(), 0);
+        // Con el foco en el demo, F7 también cambia de tema.
+        press(&mut show, KeyCode::Tab);
+        route(
+            &mut show,
+            KeyEventKind::Press,
+            KeyCode::F(7),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(show.theme_column(), 1);
+        assert_eq!(show.focus(), Focus::Demo);
+    }
+
+    #[test]
+    fn a_component_with_several_examples_has_child_rows() {
+        let mut show = Showcase::new();
+        show.set_theme_column(column_index("Crush"));
+        let rows = show.index_rows();
+        let header = rows
             .iter()
-            .find(|row| row.component == component)
-            .expect("fila del componente");
-        row.cells[column_index(column)]
+            .position(|(index, label)| index.is_none() && label.starts_with("● Assistant message"))
+            .expect("cabecera de Assistant message");
+        assert_eq!(rows[header].1, "● Assistant message ─");
+        let children: Vec<&str> = rows[header + 1..]
+            .iter()
+            // Las filas hijas van sangradas; las de componentes con un ejemplo no.
+            .take_while(|(index, label)| index.is_some() && label.starts_with("  "))
+            .map(|(_, label)| label.as_str())
+            .collect();
+        assert_eq!(children, ["  pending", "  refusal", "  summary"]);
+        for (index, _) in rows[header + 1..].iter().take(children.len()) {
+            let index = index.expect("fila hija seleccionable");
+            assert_eq!(show.component_at(index), Some("Assistant message"));
+        }
     }
 
     #[test]
-    fn f8_switches_theme_and_demo_together() {
+    fn a_component_with_one_example_has_no_child_rows() {
         let mut show = Showcase::new();
-        open_demo(&mut show, "Composer", "Batten");
-        f8(&mut show, false);
-        assert_eq!(show.selected(), first_demo(&show, "Composer", "Martty"));
-        assert_eq!(show.theme_preset(), ThemePreset::Martty);
-        assert_eq!(show.focus(), Focus::Demo);
+        show.set_theme_column(column_index("Crush"));
+        let rows = show.index_rows();
+        let plan = first_demo(&show, "Plan card", "Crush");
+        assert!(rows.contains(&(Some(plan), "● Plan card".to_string())));
+        assert!(rows
+            .iter()
+            .all(|(_, label)| !label.ends_with("Plan card ─")));
     }
 
     #[test]
-    fn f8_skips_missing_columns() {
+    fn text_filter_matches_component_names_in_the_theme() {
         let mut show = Showcase::new();
-        // Welcome no tiene demo de Mindfork ni Batten: esa celda es Missing y se salta.
-        assert_eq!(cell_at(&show, "Welcome", "Mindfork"), Cell::Missing);
-        open_demo(&mut show, "Welcome", "Martty");
-        f8(&mut show, false);
-        assert_eq!(show.current_column(), Some(column_index("Pawan")));
-        assert_eq!(show.selected(), first_demo(&show, "Welcome", "Pawan"));
-        assert_eq!(show.theme_preset(), ThemePreset::Pawan);
-        f8(&mut show, true);
-        assert_eq!(show.current_column(), Some(column_index("Martty")));
+        show.set_theme_column(column_index("Crush"));
+        for c in "PLAN CARD".chars() {
+            show.push_query(c);
+        }
+        assert_eq!(
+            show.filtered_indices(),
+            vec![first_demo(&show, "Plan card", "Crush")]
+        );
+        // El filtro es del tema: en Batten no hay «Plan card».
+        show.set_theme_column(column_index("Batten"));
+        assert_eq!(
+            show.index_rows(),
+            vec![(None, "Sin resultados".to_string())]
+        );
+        // El filtro también casa con la etiqueta del ejemplo.
+        show.clear_query();
+        show.set_theme_column(column_index("Crush"));
+        for c in "pending".chars() {
+            show.push_query(c);
+        }
+        assert!(show.filtered_indices().contains(&first_demo(
+            &show,
+            "Assistant message",
+            "Crush · pending"
+        )));
     }
 
     #[test]
-    fn f8_on_a_generic_cell_opens_the_batten_demo_with_the_column_theme() {
-        let mut show = Showcase::new();
-        open_demo(&mut show, "Composer", "Mindfork");
-        f8(&mut show, false);
-        assert_eq!(cell_at(&show, "Composer", "Pawan"), Cell::Generic);
-        assert_eq!(show.selected(), first_demo(&show, "Composer", "Batten"));
-        assert_eq!(show.theme_preset(), ThemePreset::Pawan);
-    }
-
-    #[test]
-    fn f8_does_nothing_for_a_component_without_a_row() {
-        let mut show = Showcase::new();
-        // Braille graphics es de dotmax: es librería y no tiene fila en la matriz.
-        open_demo(&mut show, "Braille graphics", "dotmax");
-        let before = (show.selected(), show.theme_preset());
-        f8(&mut show, false);
-        f8(&mut show, true);
-        assert_eq!((show.selected(), show.theme_preset()), before);
-        assert_eq!(show.focus(), Focus::Demo);
-    }
-
-    #[test]
-    fn f8_wraps_around_and_shift_f8_goes_back() {
-        let mut show = Showcase::new();
-        open_demo(&mut show, "Composer", "Martty");
-        f8(&mut show, true); // Martty -> Batten
-        assert_eq!(show.current_column(), Some(column_index("Batten")));
-        f8(&mut show, true); // Batten -> CodeLoom, por la vuelta al final
-        assert_eq!(show.current_column(), Some(column_index("CodeLoom")));
-        assert_eq!(show.selected(), first_demo(&show, "Composer", "Batten"));
-        f8(&mut show, false); // CodeLoom -> Batten, por la vuelta al principio
-        assert_eq!(show.current_column(), Some(column_index("Batten")));
-    }
-
-    #[test]
-    fn f8_keeps_the_focus_on_the_demo() {
-        let mut show = Showcase::new();
-        open_demo(&mut show, "Composer", "Batten");
-        f8(&mut show, false);
-        assert_eq!(show.focus(), Focus::Demo);
-    }
-
-    #[test]
-    fn selecting_from_the_index_derives_the_column_from_the_demo() {
+    fn matrix_enter_switches_theme_and_selects_the_example() {
         let mut show = Showcase::new();
         press(&mut show, KeyCode::Char('m'));
         place(&mut show, "Composer", "Pawan");
         press(&mut show, KeyCode::Enter);
-        assert_eq!(show.current_column(), Some(column_index("Pawan")));
-        press(&mut show, KeyCode::Tab); // al índice
-        show.select(first_demo(&show, "Composer", "Crush"), true);
-        assert_eq!(show.current_column(), Some(column_index("Crush")));
+        assert_eq!(show.focus(), Focus::Demo);
+        assert_eq!(show.theme_column(), column_index("Pawan"));
+        assert_eq!(show.selected(), first_demo(&show, "Composer", "Batten"));
+        assert!(show.matrix_return);
+        assert!(show
+            .view()
+            .entries
+            .iter()
+            .any(|entry| entry.component == "Composer" && entry.generic));
     }
 
+    /// Un filtro de texto que ocultaría el ejemplo abierto desde la matriz se limpia: si no, el
+    /// índice quedaría sin nada seleccionado.
     #[test]
-    fn selecting_from_the_index_resets_the_view_column() {
+    fn matrix_enter_clears_a_filter_that_would_hide_the_example() {
         let mut show = Showcase::new();
+        press(&mut show, KeyCode::Char('/'));
+        for c in "zzzz".chars() {
+            press(&mut show, KeyCode::Char(c));
+        }
+        press(&mut show, KeyCode::Enter);
+        assert_eq!(show.query(), "zzzz", "precondición: hay un filtro activo");
         press(&mut show, KeyCode::Char('m'));
         place(&mut show, "Composer", "Pawan");
         press(&mut show, KeyCode::Enter);
-        assert_eq!(show.view_column, Some(column_index("Pawan")));
-        press(&mut show, KeyCode::Tab); // al índice
-        press(&mut show, KeyCode::Down);
-        assert_eq!(show.view_column, None);
-        show.select(0, false);
-        assert_eq!(show.view_column, None);
+        assert_eq!(show.query(), "");
+        let selected = show.selected();
+        assert!(
+            show.filtered_indices().contains(&selected),
+            "el ejemplo abierto debe verse en el índice"
+        );
     }
 }

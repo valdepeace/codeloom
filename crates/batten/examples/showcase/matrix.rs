@@ -151,6 +151,8 @@ pub fn glyph(cell: Cell, theme: &Theme) -> (&'static str, Style) {
 }
 
 /// Nota de estado de una celda (componente, columna), para el pie de la vista entre temas.
+// Sin uso fuera de los tests hasta la Tarea 3 (nota del pie); el `allow` se retira entonces.
+#[allow(dead_code)]
 pub fn status_note(component: &str, column: usize, cell: Cell) -> String {
     let Some((name, _)) = COLUMNS.get(column) else {
         return String::new();
@@ -167,6 +169,8 @@ pub fn status_note(component: &str, column: usize, cell: Cell) -> String {
 }
 
 /// Tira de una fila: para cada columna, su nombre, su celda y si es la columna `current`.
+// Sin uso fuera de los tests hasta la Tarea 3 (tira del pie); el `allow` se retira entonces.
+#[allow(dead_code)]
 pub fn strip(row: &MatrixRow, current: Option<usize>) -> Vec<(String, Cell, bool)> {
     COLUMNS
         .iter()
@@ -380,7 +384,6 @@ mod tests {
         CatalogItem {
             component,
             variant,
-            provider: "Test",
             demo: Box::new(Empty),
         }
     }

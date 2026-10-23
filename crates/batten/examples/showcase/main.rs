@@ -10,7 +10,7 @@ mod theme_view;
 
 use app::{route, Action, Focus, Showcase};
 use batten::widgets::{Anim, Theme, FRAME_INTERVAL};
-use matrix::{draw_matrix, fit, glyph, status_note, strip, MatrixRow};
+use matrix::draw_matrix;
 use ratatui::crossterm::event::{self, Event, MouseButton, MouseEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Modifier;
@@ -72,12 +72,10 @@ fn draw(f: &mut Frame, show: &mut Showcase, _anim: &Anim, theme: &Theme) {
         Block::default().style(theme.style(batten::state::StyleToken::Default)),
         area,
     );
-    // El pie ocupa dos líneas solo cuando muestra la vista entre temas del componente actual.
-    let footer_height = if component_view(show).is_some() { 2 } else { 1 };
     let [filters, body, footer] = Layout::vertical([
         Constraint::Length(2),
         Constraint::Min(1),
-        Constraint::Length(footer_height),
+        Constraint::Length(1),
     ])
     .areas(area);
     draw_filters(f, filters, show, theme);
@@ -119,25 +117,26 @@ fn draw(f: &mut Frame, show: &mut Showcase, _anim: &Anim, theme: &Theme) {
 }
 
 fn draw_filters(f: &mut Frame, area: Rect, show: &Showcase, theme: &Theme) {
-    let [provider_area, query_area] =
+    let [theme_area, query_area] =
         Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
     let muted = theme.style(batten::state::StyleToken::Muted);
-    let active = theme
-        .style(batten::state::StyleToken::Accent)
-        .add_modifier(Modifier::BOLD);
-    let mut provider_spans = vec![Span::styled("Provider: ", muted)];
-    let selected = show.provider_filter();
-    let all_style = if selected.is_none() { active } else { muted };
-    provider_spans.push(Span::styled(" All ", all_style));
-    for provider in show.providers() {
-        let style = if selected == Some(provider) {
-            active
-        } else {
-            muted
-        };
-        provider_spans.push(Span::styled(format!(" {provider} "), style));
-    }
-    f.render_widget(Paragraph::new(Line::from(provider_spans)), provider_area);
+    // Provisional hasta la Tarea 3 (pestañas de tema): los siete temas en texto, el activo entre
+    // corchetes.
+    let names: Vec<String> = matrix::COLUMNS
+        .iter()
+        .enumerate()
+        .map(|(column, (name, _))| {
+            if column == show.theme_column() {
+                format!("[{name}]")
+            } else {
+                name.to_string()
+            }
+        })
+        .collect();
+    f.render_widget(
+        Paragraph::new(Line::styled(names.join("  "), muted)),
+        theme_area,
+    );
 
     let cursor = if show.focus() == Focus::TextFilter {
         "▏"
@@ -145,7 +144,7 @@ fn draw_filters(f: &mut Frame, area: Rect, show: &Showcase, theme: &Theme) {
         ""
     };
     let query = if show.query().is_empty() && show.focus() != Focus::TextFilter {
-        "provider · component · variant".to_string()
+        "componente · ejemplo".to_string()
     } else {
         show.query().to_string()
     };
@@ -169,24 +168,8 @@ fn handle_mouse(show: &mut Showcase, column: u16, row: u16, screen: Rect) {
         return;
     }
     let filter_end = screen.y.saturating_add(2);
+    // La fila 0 (pestañas de tema) no hace nada hasta la Tarea 4 (ratón).
     if row == screen.y {
-        let mut x = screen.x.saturating_add(10);
-        if column >= x && usize::from(column - x) < 5 {
-            show.select_provider(None);
-            show.set_focus(Focus::ProviderFilter);
-            return;
-        }
-        x = x.saturating_add(5);
-        for provider in show.providers() {
-            let width = provider.chars().count() as u16 + 2;
-            if column >= x && column < x.saturating_add(width) {
-                show.select_provider(Some(provider));
-                show.set_focus(Focus::ProviderFilter);
-                return;
-            }
-            x = x.saturating_add(width);
-        }
-        show.set_focus(Focus::ProviderFilter);
         return;
     }
     if row == screen.y.saturating_add(1) {
@@ -279,10 +262,9 @@ fn draw_header(f: &mut Frame, area: Rect, show: &Showcase, theme: &Theme) {
         ),
         Line::styled(
             match show.focus() {
-                Focus::Index => "↑/↓: variante · Tab: abrir · F7: paleta · q: salir",
-                Focus::Demo => "F8: tema del componente · F7: paleta · Tab/Esc: volver al índice",
+                Focus::Index => "↑/↓: variante · ←/→: tema · Tab: abrir · q: salir",
+                Focus::Demo => "F7/Shift+F7: tema · Tab/Esc: volver al índice",
                 Focus::Matrix => "←/→/↑/↓: celda · Enter: abrir · Esc: índice · F7: paleta",
-                Focus::ProviderFilter => "←/→: proveedor · Tab/Enter: buscar · Esc: índice",
                 Focus::TextFilter => "Escribe para filtrar · Enter: índice · Esc: limpiar",
             },
             theme.style(batten::state::StyleToken::Muted),
@@ -305,9 +287,9 @@ fn draw_collapsed(f: &mut Frame, area: Rect, show: &Showcase, theme: &Theme) {
         ),
         Line::styled(
             if show.focus() == Focus::Demo {
-                "F8: tema del componente · F7: paleta · Tab/Esc: volver al índice"
+                "F7/Shift+F7: tema · Tab/Esc: volver al índice"
             } else {
-                "↑/↓: variante · Tab: abrir · F7: paleta · q: salir"
+                "↑/↓: variante · ←/→: tema · Tab: abrir · q: salir"
             },
             theme.style(batten::state::StyleToken::Muted),
         ),
@@ -315,74 +297,16 @@ fn draw_collapsed(f: &mut Frame, area: Rect, show: &Showcase, theme: &Theme) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
-/// Fila de la matriz del componente del demo actual y su columna, si el pie debe mostrar la vista
-/// entre temas. `None` en la matriz, si el componente no tiene fila o si no hay columna actual.
-fn component_view(show: &Showcase) -> Option<(&MatrixRow, usize)> {
-    if show.focus() == Focus::Matrix {
-        return None;
-    }
-    let component = show.component_at(show.selected())?;
-    let row = show
-        .matrix()
-        .rows
-        .iter()
-        .find(|row| row.component == component)?;
-    let column = show.current_column()?;
-    (column < row.cells.len()).then_some((row, column))
-}
-
-/// Pie de la pantalla. Con fila para el componente actual, dos líneas: la tira de temas y la nota
-/// de la columna actual; si no, la línea de siempre con el tema activo.
+/// Pie de una línea con el tema activo. El detalle del componente (tira y nota) vuelve en la
+/// Tarea 3.
 fn draw_footer(f: &mut Frame, area: Rect, show: &Showcase, theme: &Theme) {
-    let preset = show.theme_preset();
-    let Some((row, column)) = component_view(show) else {
-        f.render_widget(
-            Paragraph::new(format!(
-                "batten showcase · F7/Shift+F7 tema: {}",
-                preset.name()
-            ))
-            .style(theme.style(batten::state::StyleToken::Muted)),
-            area,
-        );
-        return;
-    };
-    let muted = theme.style(batten::state::StyleToken::Muted);
-    let current_style = theme
-        .style(batten::state::StyleToken::Accent)
-        .add_modifier(Modifier::BOLD);
-    let mut spans = Vec::new();
-    for (index, (name, cell, current)) in strip(row, Some(column)).into_iter().enumerate() {
-        if index > 0 {
-            spans.push(Span::styled(" · ", muted));
-        }
-        let (symbol, style) = glyph(cell, theme);
-        if current {
-            spans.push(Span::styled(format!("{name} {symbol}"), current_style));
-        } else {
-            spans.push(Span::styled(format!("{name} "), muted));
-            spans.push(Span::styled(symbol, style));
-        }
-    }
-    let [strip_area, note_area] =
-        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
-    f.render_widget(Paragraph::new(Line::from(spans)), strip_area);
-
-    // La nota manda: el tema activo solo se añade si cabe entero detrás de ella. Antes, al no
-    // caber, se recortaba la nota para conservar el tema y se perdía lo más útil.
-    let width = usize::from(area.width);
-    let note = status_note(row.component, column, row.cells[column]);
-    let suffix = format!(" · F7/Shift+F7 tema: {}", preset.name());
-    let text = if note.chars().count() + suffix.chars().count() <= width {
-        format!("{note}{suffix}")
-    } else {
-        fit(&note, width)
-    };
     f.render_widget(
-        Paragraph::new(Line::styled(
-            text,
-            theme.style(batten::state::StyleToken::Default),
-        )),
-        note_area,
+        Paragraph::new(format!(
+            "batten showcase · F7/Shift+F7 tema: {}",
+            show.theme_preset().name()
+        ))
+        .style(theme.style(batten::state::StyleToken::Muted)),
+        area,
     );
 }
 
@@ -568,58 +492,6 @@ mod tests {
                 show.component_at(i) == Some(component) && show.variant_at(i) == Some(variant)
             })
             .expect("demo en el catálogo")
-    }
-
-    #[test]
-    fn footer_shows_the_strip_and_the_note_for_a_component_with_a_row() {
-        let mut show = Showcase::new();
-        show.select(demo_index(&show, "Composer", "Crush"), false);
-        let buffer = render(&mut show, 100, 30);
-        let lines = lines(&buffer, 0);
-        let (strip_line, note_line) = (&lines[28], &lines[29]);
-        assert!(
-            strip_line.contains(
-                "Batten ● · Martty ● · Mindfork ● · Pawan ◐ · Crush ● · MastraCode ◐ · CodeLoom ◐"
-            ),
-            "tira de temas: {strip_line}"
-        );
-        assert!(
-            note_line.contains("● Composer · Crush: demo propio"),
-            "nota: {note_line}"
-        );
-        assert!(
-            note_line.contains("F7/Shift+F7 tema:"),
-            "nota sin tema: {note_line}"
-        );
-    }
-
-    /// Si la nota es larga, manda la nota: no se recorta para dejar sitio al tema activo.
-    #[test]
-    fn a_long_note_is_not_cut_to_make_room_for_the_theme_name() {
-        let mut show = Showcase::new();
-        show.select(demo_index(&show, "Composer", "Crush"), false);
-        // Shift+F8 desde Crush lleva a Pawan, que es una celda genérica.
-        route(
-            &mut show,
-            KeyEventKind::Press,
-            KeyCode::Tab,
-            KeyModifiers::NONE,
-        );
-        route(
-            &mut show,
-            KeyEventKind::Press,
-            KeyCode::F(8),
-            KeyModifiers::SHIFT,
-        );
-        let buffer = render(&mut show, 100, 30);
-        let lines = lines(&buffer, 0);
-        assert!(
-            lines[29]
-                .contains("parcialmente implementado (genérico de Batten con la paleta de Pawan)"),
-            "la nota debe verse entera: {}",
-            lines[29]
-        );
-        assert!(!lines[29].contains('…'), "{}", lines[29]);
     }
 
     #[test]

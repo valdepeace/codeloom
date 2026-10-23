@@ -8,8 +8,6 @@ use crate::demos::{strict_provider, CatalogItem};
 use crate::matrix::{self, Cell, BATTEN};
 
 /// Componente de un tema, con sus ejemplos en ese tema.
-// Sin uso en el dibujo hasta la Tarea 2: el `allow` se retira entonces.
-#[allow(dead_code)]
 pub struct ThemeEntry {
     /// Nombre del componente, tal como aparece en la matriz.
     pub component: &'static str,
@@ -20,8 +18,6 @@ pub struct ThemeEntry {
 }
 
 /// Un ejemplo de un componente dentro de un tema.
-// Sin uso en el dibujo hasta la Tarea 2: el `allow` se retira entonces.
-#[allow(dead_code)]
 pub struct ThemeExample {
     /// Índice del demo en el catálogo (`items`).
     pub catalog_index: usize,
@@ -30,20 +26,18 @@ pub struct ThemeExample {
 }
 
 /// Vista de un tema: sus componentes, en el orden de la matriz, y cuántos no existen en él.
-// Sin uso en el dibujo hasta la Tarea 2: el `allow` se retira entonces.
-#[allow(dead_code)]
 pub struct ThemeView {
     /// Componentes con demo propio o genérico en el tema, en el orden de las filas de la matriz.
     pub entries: Vec<ThemeEntry>,
     /// Componentes que no existen en el tema; no se listan, pero se cuentan.
+    // Sin lectura en el binario hasta la Tarea 3 (pie con el recuento); lo leen los tests.
+    #[allow(dead_code)]
     pub missing: usize,
 }
 
 /// Deriva la vista del tema de la columna `column` (índice en `matrix::COLUMNS`).
 ///
 /// Una columna fuera de rango produce una vista vacía.
-// Sin uso en el dibujo hasta la Tarea 2: el `allow` se retira entonces.
-#[allow(dead_code)]
 pub fn theme_view(items: &[CatalogItem], column: usize) -> ThemeView {
     let Some(provider) = matrix::provider_of_column(column) else {
         return ThemeView {
@@ -90,7 +84,7 @@ pub fn theme_view(items: &[CatalogItem], column: usize) -> ThemeView {
 fn label(variant: &str) -> String {
     let prefix = strict_provider(variant).unwrap_or("");
     let rest = variant[prefix.len()..]
-        .trim_start_matches(|c: char| matches!(c, ' ' | '·' | '-' | ':'))
+        .trim_start_matches([' ', '·', '-', ':'])
         .trim_end();
     if rest.is_empty() {
         "principal".to_string()
@@ -126,7 +120,6 @@ mod tests {
         CatalogItem {
             component,
             variant,
-            provider: "Test",
             demo: Box::new(Empty),
         }
     }
