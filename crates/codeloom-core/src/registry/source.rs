@@ -4,6 +4,7 @@
 //! precedencia: eso lo resuelve `AgentRegistry` (en `mod.rs`). Así añadir una fuente nueva,
 //! como la remota de A8, no obliga a tocar el registro.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::card::AgentCard;
@@ -113,8 +114,13 @@ pub struct RemoteFetched {
     /// URL de la interfaz por la que se le envían las tareas.
     pub jsonrpc_url: String,
     pub tenant: Option<String>,
-    /// El remoto pide autenticación, que el cliente aún no sabe dar.
+    /// El remoto declara requisitos de seguridad en su tarjeta.
     pub requires_auth: bool,
+    /// Seguridad de la tarjeta en una forma opaca para el núcleo (la interpreta el crate de A2A).
+    pub security: Option<String>,
+    /// Por qué el cliente no puede autenticarse con él (esquema no soportado, falta una variable
+    /// de entorno…), ya redactado para mostrarlo. `None` si puede, o si no hace falta.
+    pub auth_problem: Option<String>,
 }
 
 /// Puntero a un agente remoto, tal como lo declara un perfil.
@@ -124,6 +130,9 @@ pub struct RemoteSpec {
     pub endpoint: String,
     /// `None` mientras la tarjeta no se haya descargado; sin ella no se puede aprobar ni usar.
     pub fetched: Option<RemoteFetched>,
+    /// Nombre de esquema de la tarjeta → nombre de la variable de entorno con su credencial
+    /// (`a2a.credentials` del perfil). Nunca el valor del secreto.
+    pub credentials: BTreeMap<String, String>,
 }
 
 /// Cómo se ejecuta un agente.
@@ -305,6 +314,7 @@ fn entrada_desde_perfil(
             execution: Execution::Remote(RemoteSpec {
                 endpoint,
                 fetched: None,
+                credentials: perfil.remote_credentials,
             }),
             content_hash,
         };

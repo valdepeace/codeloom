@@ -34,7 +34,10 @@ async fn cliente() -> std::sync::Arc<dyn RemoteTaskClient> {
             jsonrpc_url: tarjeta.jsonrpc_url,
             tenant: tarjeta.tenant,
             requires_auth: tarjeta.requires_auth,
+            security: None,
+            auth_problem: None,
         }),
+        credentials: Default::default(),
     };
     A2aClientFactory::from_config(&config)
         .unwrap()

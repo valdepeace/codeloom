@@ -8,6 +8,8 @@
 //! aplicados y no se ejecutan. Cualquier otra clave se ignora con aviso: un campo nuevo no
 //! rompe la carga.
 
+use std::collections::BTreeMap;
+
 use serde_yaml_bw::{Mapping, Value};
 
 /// Perfil ya validado de un agente local.
@@ -31,6 +33,9 @@ pub struct AgentProfile {
     /// Punto de entrada del agente remoto (`transport: a2a-remote` y `a2a.endpoint`). Con él el
     /// perfil es un puntero a un remoto, no un agente local: persona, modelo y cuerpo no se usan.
     pub remote_endpoint: Option<String>,
+    /// `a2a.credentials` de un perfil remoto: nombre de esquema de la tarjeta → nombre de la
+    /// variable de entorno que guarda su credencial (A8d). Nunca el secreto.
+    pub remote_credentials: BTreeMap<String, String>,
 }
 
 /// Problema de un perfil. Los avisos viajan junto al perfil; los errores impiden cargarlo.
@@ -79,6 +84,11 @@ pub fn parse_profile(
     };
 
     let remote_endpoint = endpoint_remoto(mapa)?;
+    let remote_credentials = if remote_endpoint.is_some() {
+        credenciales_remotas(mapa)?
+    } else {
+        BTreeMap::new()
+    };
 
     // Las claves desconocidas avisan; las declaradas-y-no-aplicadas avisan y se anotan.
     let mut avisos = Vec::new();
@@ -159,6 +169,7 @@ pub fn parse_profile(
         max_depth: entero_opcional(mapa, "max_depth")?,
         declared_not_applied,
         remote_endpoint,
+        remote_credentials,
     };
     Ok((perfil, avisos))
 }
@@ -208,6 +219,62 @@ fn endpoint_remoto(mapa: &Mapping) -> Result<Option<String>, ProfileProblem> {
         ProfileProblem::BadFrontmatter(format!("`a2a.endpoint` no es admisible: {motivo}"))
     })?;
     Ok(Some(endpoint))
+}
+
+/// Máximo de credenciales declaradas en un perfil.
+const MAX_CREDENCIALES: usize = 20;
+/// Máximo de bytes de un nombre de esquema o de variable.
+const MAX_NOMBRE_CREDENCIAL: usize = 128;
+
+/// Nombre de variable de entorno admisible: `[A-Za-z_][A-Za-z0-9_]*`.
+fn es_nombre_de_variable(texto: &str) -> bool {
+    let mut caracteres = texto.chars();
+    texto.len() <= MAX_NOMBRE_CREDENCIAL
+        && caracteres
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && caracteres.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// `a2a.credentials` de un perfil remoto. El valor ha de ser el **nombre** de una variable de
+/// entorno: si parece un secreto escrito a mano, el perfil no carga y el mensaje no lo repite.
+fn credenciales_remotas(mapa: &Mapping) -> Result<BTreeMap<String, String>, ProfileProblem> {
+    let Some(a2a) = mapa.get("a2a").and_then(Value::as_mapping) else {
+        return Ok(BTreeMap::new());
+    };
+    let credenciales = match a2a.get("credentials") {
+        None | Some(Value::Null(_)) => return Ok(BTreeMap::new()),
+        Some(valor) => valor.as_mapping().ok_or_else(|| {
+            ProfileProblem::BadFrontmatter("`a2a.credentials` debe ser un mapa".to_string())
+        })?,
+    };
+    if credenciales.len() > MAX_CREDENCIALES {
+        return Err(ProfileProblem::BadFrontmatter(format!(
+            "`a2a.credentials` admite como mucho {MAX_CREDENCIALES} entradas"
+        )));
+    }
+    let mut resultado = BTreeMap::new();
+    for (esquema, variable) in credenciales.iter() {
+        let esquema = esquema.as_str().filter(|e| !e.is_empty()).ok_or_else(|| {
+            ProfileProblem::BadFrontmatter(
+                "`a2a.credentials`: el nombre del esquema debe ser texto no vacío".to_string(),
+            )
+        })?;
+        let variable =
+            variable
+                .as_str()
+                .map(str::trim)
+                .filter(|v| es_nombre_de_variable(v))
+                .ok_or_else(|| {
+                    ProfileProblem::BadFrontmatter(format!(
+                    "`a2a.credentials`: el valor de «{}» debe ser el nombre de una variable de \
+                     entorno, no el secreto",
+                    esquema.chars().take(MAX_NOMBRE_CREDENCIAL).collect::<String>()
+                ))
+                })?;
+        resultado.insert(esquema.to_string(), variable.to_string());
+    }
+    Ok(resultado)
 }
 
 /// Parte el texto (ya en LF) en frontmatter y cuerpo. El frontmatter va entre dos líneas
@@ -530,6 +597,66 @@ Si la tarea es de otra especialidad, dilo y delega con `delegate`.
                 "{extra}"
             );
         }
+    }
+
+    #[test]
+    fn a_remote_profile_reads_its_credentials() {
+        let texto = perfil_remoto(
+            "transport: a2a-remote\na2a:\n  endpoint: https://agente.example\n  credentials:\n    claveApi: AGENTE_KEY\n    otro: _TOKEN2\n",
+        );
+
+        let (perfil, avisos) = parse_profile("lejano", &texto).unwrap();
+
+        assert!(avisos.is_empty(), "{avisos:?}");
+        assert_eq!(
+            perfil
+                .remote_credentials
+                .get("claveApi")
+                .map(String::as_str),
+            Some("AGENTE_KEY")
+        );
+        assert_eq!(perfil.remote_credentials.len(), 2);
+    }
+
+    #[test]
+    fn a_credential_that_is_not_an_env_var_name_does_not_load_and_is_not_echoed() {
+        for valor in ["sk-abc123 secreto", "con espacio", "1EMPIEZA", "a.b"] {
+            let texto = perfil_remoto(&format!(
+                "transport: a2a-remote\na2a:\n  endpoint: https://agente.example\n  credentials:\n    claveApi: \"{valor}\"\n"
+            ));
+
+            let error = parse_profile("lejano", &texto).unwrap_err();
+
+            assert!(
+                matches!(error, ProfileProblem::BadFrontmatter(_)),
+                "{valor}: {error:?}"
+            );
+            assert!(!error.to_string().contains(valor), "{error}");
+        }
+    }
+
+    #[test]
+    fn credentials_must_be_a_map_and_are_capped() {
+        let texto = perfil_remoto(
+            "transport: a2a-remote\na2a:\n  endpoint: https://agente.example\n  credentials: [uno]\n",
+        );
+        assert!(parse_profile("lejano", &texto).is_err());
+
+        let muchas: String = (0..30).map(|i| format!("    e{i}: VAR{i}\n")).collect();
+        let texto = perfil_remoto(&format!(
+            "transport: a2a-remote\na2a:\n  endpoint: https://agente.example\n  credentials:\n{muchas}"
+        ));
+        assert!(parse_profile("lejano", &texto).is_err());
+    }
+
+    #[test]
+    fn a_remote_profile_without_credentials_has_none() {
+        let texto =
+            perfil_remoto("transport: a2a-remote\na2a:\n  endpoint: https://agente.example\n");
+
+        let (perfil, _) = parse_profile("lejano", &texto).unwrap();
+
+        assert!(perfil.remote_credentials.is_empty());
     }
 
     #[test]

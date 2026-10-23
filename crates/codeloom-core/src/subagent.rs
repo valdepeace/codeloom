@@ -367,10 +367,11 @@ impl InProcessSubagentLauncher {
                 "agente «{nombre}» pendiente de aprobación: apruébalo antes de usarlo"
             )));
         }
-        if let Execution::Remote(spec) = &entrada.execution {
-            if spec.fetched.as_ref().is_some_and(|d| d.requires_auth) {
+        if let (Execution::Remote(spec), Some(fabrica)) = (&entrada.execution, &self.remote_clients)
+        {
+            if let Some(motivo) = fabrica.unavailable_reason(nombre, spec) {
                 return Err(CoreError::Tool(format!(
-                    "el agente remoto «{nombre}» exige autenticación, que aún no está soportada"
+                    "el agente remoto «{nombre}» no se puede usar: {motivo}"
                 )));
             }
         }
@@ -2762,6 +2763,7 @@ mod tests {
                     execution: Execution::Remote(crate::registry::RemoteSpec {
                         endpoint: "https://agente.example".into(),
                         fetched: None,
+                        credentials: Default::default(),
                     }),
                     content_hash: None,
                 }],
@@ -3869,7 +3871,9 @@ mod tests {
         }
     }
 
-    struct FabricaFija(Arc<ClienteGuionizado>);
+    /// Fábrica de prueba: entrega siempre el mismo cliente; con motivo, dice que el remoto no se
+    /// puede usar (como haría la real si faltase una credencial).
+    struct FabricaFija(Arc<ClienteGuionizado>, Option<String>);
 
     impl RemoteClientFactory for FabricaFija {
         fn client_for(
@@ -3878,6 +3882,14 @@ mod tests {
             _spec: &crate::registry::RemoteSpec,
         ) -> Option<Arc<dyn RemoteTaskClient>> {
             Some(self.0.clone())
+        }
+
+        fn unavailable_reason(
+            &self,
+            _name: &str,
+            _spec: &crate::registry::RemoteSpec,
+        ) -> Option<String> {
+            self.1.clone()
         }
     }
 
@@ -3922,6 +3934,8 @@ mod tests {
                     jsonrpc_url: "https://agente.example/a2a/v1".into(),
                     tenant: None,
                     requires_auth,
+                    security: None,
+                    auth_problem: None,
                 },
             )),
         );
@@ -3944,7 +3958,10 @@ mod tests {
             bus.clone(),
         )
         .with_registry(Arc::new(registro))
-        .with_remote_clients(Arc::new(FabricaFija(cliente.clone())))
+        .with_remote_clients(Arc::new(FabricaFija(
+            cliente.clone(),
+            requires_auth.then(|| "falta la variable de entorno AGENTE_KEY".to_string()),
+        )))
         .with_remote_timing(Duration::from_millis(5), max_follow);
         Entorno {
             lanzador,
@@ -4359,7 +4376,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_remote_that_requires_authentication_is_refused_for_now() {
+    async fn a_remote_is_refused_with_the_reason_the_factory_gives() {
         let entorno = entorno_remoto(
             ClienteGuionizado::trabajando(),
             true,
@@ -4380,7 +4397,8 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(error.to_string().contains("exige autenticación"), "{error}");
+        assert!(error.to_string().contains("AGENTE_KEY"), "{error}");
+        assert!(error.to_string().contains("no se puede usar"), "{error}");
         assert!(entorno
             .store
             .list_subagents(entorno.parent)

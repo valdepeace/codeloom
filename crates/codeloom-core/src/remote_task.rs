@@ -39,6 +39,9 @@ pub enum RemoteTaskError {
     Unsupported(String),
     #[error("remote request timed out")]
     Timeout,
+    /// El remoto rechazó las credenciales (HTTP 401 o 403). El texto no repite la credencial.
+    #[error("remote rejected the credentials: {0}")]
+    AuthFailed(String),
     #[error("remote error: {0}")]
     Other(String),
 }
@@ -48,6 +51,13 @@ pub enum RemoteTaskError {
 pub trait RemoteClientFactory: Send + Sync {
     /// Cliente del remoto `name`, o `None` si no se puede construir (p. ej. sin tarjeta descargada).
     fn client_for(&self, name: &str, spec: &RemoteSpec) -> Option<Arc<dyn RemoteTaskClient>>;
+
+    /// Motivo, ya redactado, por el que el remoto no se puede usar aunque haya cliente (p. ej. le
+    /// falta una credencial). `None` si se puede usar. Se consulta justo antes de delegar, de modo
+    /// que una variable de entorno recién definida se nota sin reiniciar.
+    fn unavailable_reason(&self, _name: &str, _spec: &RemoteSpec) -> Option<String> {
+        None
+    }
 }
 
 /// Cliente de un agente remoto concreto (un punto de entrada y una interfaz ya elegida).

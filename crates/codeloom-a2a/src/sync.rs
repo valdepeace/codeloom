@@ -63,6 +63,8 @@ pub async fn refresh_remote_cards(
                         jsonrpc_url: remota.jsonrpc_url,
                         tenant: remota.tenant,
                         requires_auth: remota.requires_auth,
+                        security: None,
+                        auth_problem: None,
                     },
                 ))
             }

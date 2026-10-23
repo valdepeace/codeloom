@@ -1230,6 +1230,8 @@ mod tests {
             jsonrpc_url: "https://agente.example/a2a/v1".into(),
             tenant: None,
             requires_auth: false,
+            security: None,
+            auth_problem: None,
         }
     }
 
