@@ -391,10 +391,13 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "codeloom-core",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "tokio",
  "toml",
+ "wiremock",
 ]
 
 [[package]]

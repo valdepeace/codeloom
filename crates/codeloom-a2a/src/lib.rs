@@ -2,5 +2,7 @@
 //!
 //! Cabe señalar que este crate no abre sockets ni conoce el transporte; solo fija los nombres.
 
+pub mod card;
 pub mod config;
+pub mod remote;
 pub mod wire;
