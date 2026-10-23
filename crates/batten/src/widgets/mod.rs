@@ -7,6 +7,7 @@ pub mod button;
 pub mod chip;
 pub mod command_suggestions;
 pub mod composer;
+pub mod context_meter;
 pub mod diff;
 pub mod file_changes;
 pub mod funcionalidad_table;
