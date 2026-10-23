@@ -16,6 +16,7 @@ path = "src/main.rs"
 codeloom-core = { path = "../codeloom-core" }
 codeloom-tui = { path = "../codeloom-tui" }
 codeloom-herdr = { path = "../codeloom-herdr" }
+codeloom-a2a = { path = "../codeloom-a2a" }
 tokio.workspace = true
 tokio-util.workspace = true
 anyhow.workspace = true
@@ -26,3 +27,4 @@ dotenvy = "0.15"
 [dev-dependencies]
 wiremock = "0.6"
 tempfile = "3"
+serde_json.workspace = true

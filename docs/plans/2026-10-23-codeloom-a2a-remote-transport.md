@@ -71,6 +71,11 @@
   prueba de extremo a extremo con `wiremock`).** La suite `transport_contract` no se ejecutó contra
   un remoto: lo que añade el remoto no es un transporte distinto sino el espejo, que se prueba aparte.
 - **Seguimiento por sondeo**, no por SSE (eso es A8c).
+- **Cableado en el binario (2026-10-23).** `loom`/`codeloom` leen `[a2a]` al arrancar; con
+  `role = "consume"` o `"both"` construyen la fábrica de clientes, se la pasan al agente (y, por él,
+  a los subagentes) y descargan las tarjetas de los remotos en segundo plano. La aprobación se hace
+  con el popup de `/agents`, que ya sirve a los remotos. La tarjeta no se renueva sola tras el
+  arranque, y no hay prueba contra un agente A2A real ni en terminal real.
 
 ### Fase A8b: servir (solo tras A8d-T1)
 

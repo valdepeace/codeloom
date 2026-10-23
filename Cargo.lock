@@ -410,11 +410,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "codeloom-a2a",
  "codeloom-core",
  "codeloom-herdr",
  "codeloom-tui",
  "dirs",
  "dotenvy",
+ "serde_json",
  "tempfile",
  "tokio",
  "tokio-util",

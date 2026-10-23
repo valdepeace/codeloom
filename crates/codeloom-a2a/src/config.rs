@@ -72,6 +72,14 @@ impl A2aConfig {
         Ok(config)
     }
 
+    /// Lee la sección `[a2a]` del fichero `path`. Un fichero ausente es un error, como en las demás
+    /// secciones; quien llama ya cargó la configuración principal del mismo fichero.
+    pub fn load(path: &std::path::Path) -> Result<A2aConfig> {
+        let texto = std::fs::read_to_string(path)
+            .map_err(|e| CoreError::Config(format!("read {}: {e}", path.display())))?;
+        Self::from_toml(&texto)
+    }
+
     fn validar(&self) -> Result<()> {
         let segundos = 1..=TECHO_SEGUNDOS;
         if !segundos.contains(&self.request_timeout_secs) {
@@ -158,5 +166,21 @@ mod tests {
     #[test]
     fn an_unknown_role_is_an_error() {
         assert!(A2aConfig::from_toml("[a2a]\nrole = \"everything\"\n").is_err());
+    }
+
+    #[test]
+    fn load_reads_the_section_from_a_file_and_fails_without_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let ruta = dir.path().join("codeloom.toml");
+        std::fs::write(
+            &ruta,
+            "[a2a]
+role = \"consume\"
+",
+        )
+        .unwrap();
+
+        assert!(A2aConfig::load(&ruta).unwrap().consumes());
+        assert!(A2aConfig::load(&dir.path().join("no-existe.toml")).is_err());
     }
 }

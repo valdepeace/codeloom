@@ -148,6 +148,7 @@ pub struct AgentLoop {
     delegation_confirm: ConfirmDelegation,
     /// Volcado a disco de las salidas recortadas; `None` no guarda nada y no añade ruta.
     spill: Option<ToolSpill>,
+    remote_clients: Option<Arc<dyn crate::remote_task::RemoteClientFactory>>,
     /// Presupuesto de gasto de la sesión; vacío no avisa ni lee el consumo acumulado. Los
     /// subagentes lo reciben y suman al mismo total (véase `budget_family`).
     budget: BudgetConfig,
@@ -231,6 +232,7 @@ impl AgentLoop {
             registry: None,
             delegation_confirm: ConfirmDelegation::default(),
             spill: None,
+            remote_clients: None,
             budget: BudgetConfig::default(),
             budget_family: None,
             compaction: compact::CompactionConfig::default(),
@@ -288,6 +290,20 @@ impl AgentLoop {
     pub fn with_spill(mut self, spill: ToolSpill) -> Self {
         self.spill = Some(spill);
         // Igual que `with_catalog`: si el lanzador ya existía, se reconstruye con el volcado.
+        if self.subagents.is_some() {
+            self.subagents = Some(self.subagent_launcher());
+        }
+        self
+    }
+
+    /// Fija la fábrica de clientes de agentes remotos (A8a). Sin ella, el lanzador rechaza los
+    /// agentes remotos con un error claro. Los subagentes que lance la heredan.
+    pub fn with_remote_clients(
+        mut self,
+        fabrica: Arc<dyn crate::remote_task::RemoteClientFactory>,
+    ) -> Self {
+        self.remote_clients = Some(fabrica);
+        // Igual que `with_spill`: si el lanzador ya existía, se reconstruye con la fábrica.
         if self.subagents.is_some() {
             self.subagents = Some(self.subagent_launcher());
         }
@@ -407,6 +423,10 @@ impl AgentLoop {
         };
         let lanzador = match &self.spill {
             Some(spill) => lanzador.with_spill(spill.clone()),
+            None => lanzador,
+        };
+        let lanzador = match &self.remote_clients {
+            Some(fabrica) => lanzador.with_remote_clients(fabrica.clone()),
             None => lanzador,
         };
         Arc::new(lanzador)

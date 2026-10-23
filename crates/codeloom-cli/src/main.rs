@@ -161,6 +161,8 @@ async fn main() -> Result<()> {
     let presupuesto = BudgetConfig::load(&config_path)?;
     // Igual que `[budget]`: una sección `[compaction]` mal escrita impide arrancar con un error claro.
     let compactacion = CompactionConfig::load(&config_path)?;
+    // Igual que las anteriores: una sección `[a2a]` mal escrita impide arrancar con un error claro.
+    let a2a = codeloom_a2a::config::A2aConfig::load(&config_path)?;
     let cwd_label = cwd.display().to_string();
     let model_label = cfg.model.clone();
     let provider = build_provider(&cfg)?;
@@ -183,6 +185,7 @@ async fn main() -> Result<()> {
     let registro_agentes = Arc::new(arranque.registro);
     // La vigilancia dura lo que `main`: al soltar el `WatcherHandle` se detiene.
     let _vigilancia_agentes = registro_agentes.spawn_watcher(arranque.directorios, bus.clone());
+    let fabrica_remotos = arrancar_remotos(&a2a, &registro_agentes, &bus)?;
     let (perm_tx, perm_rx) = tokio::sync::mpsc::channel(8);
     let (ask_tx, ask_rx) = tokio::sync::mpsc::channel(4);
     let permission = Arc::new(if cli.print.is_some() {
@@ -200,23 +203,26 @@ async fn main() -> Result<()> {
     // Catálogo compartido con el agente (y sus hijos): vacío hasta que llega la carga en
     // segundo plano, así que los apuntes de antes llevan precio `NULL`.
     let catalog = Arc::new(std::sync::RwLock::new(Catalog::default()));
-    let agent = Arc::new(
-        AgentLoop::new(
-            provider,
-            store.clone(),
-            Arc::new(build_tools()),
-            bus,
-            permission,
-            cfg.clone(),
-            cwd,
-        )
-        .with_catalog(catalog.clone())
-        .with_agent_registry(registro_agentes.clone())
-        .with_delegation_confirm(agents_cfg.confirm_delegation)
-        .with_spill(ToolSpill::new(data_dir.join("tool-output")))
-        .with_budget(presupuesto)
-        .with_compaction(compactacion),
-    );
+    let agent = AgentLoop::new(
+        provider,
+        store.clone(),
+        Arc::new(build_tools()),
+        bus,
+        permission,
+        cfg.clone(),
+        cwd,
+    )
+    .with_catalog(catalog.clone())
+    .with_agent_registry(registro_agentes.clone())
+    .with_delegation_confirm(agents_cfg.confirm_delegation)
+    .with_spill(ToolSpill::new(data_dir.join("tool-output")))
+    .with_budget(presupuesto)
+    .with_compaction(compactacion);
+    let agent = match fabrica_remotos {
+        Some(fabrica) => agent.with_remote_clients(fabrica),
+        None => agent,
+    };
+    let agent = Arc::new(agent);
 
     if let Some(prompt) = cli.print {
         let session = store.create_session(&project).await?;
@@ -464,6 +470,30 @@ fn arrancar_agentes(home: Option<&Path>, raiz: &Path, agents: &AgentsConfig) -> 
     }
 }
 
+/// Pone en marcha el consumo de agentes remotos si `[a2a] role` lo pide (A8a). Con el rol apagado
+/// no se crea cliente alguno ni se hace petición. Las tarjetas se descargan en segundo plano para
+/// no retrasar el arranque; un remoto que no responde queda como problema de carga de ese agente
+/// y nunca se aprueba solo.
+fn arrancar_remotos(
+    a2a: &codeloom_a2a::config::A2aConfig,
+    registro: &Arc<AgentRegistry>,
+    bus: &EventBus,
+) -> Result<Option<Arc<dyn codeloom_core::remote_task::RemoteClientFactory>>> {
+    let Some(cliente) = codeloom_a2a::remote::http_client(a2a)? else {
+        return Ok(None);
+    };
+    let Some(fabrica) = codeloom_a2a::client::A2aClientFactory::from_config(a2a)? else {
+        return Ok(None);
+    };
+    let (registro, bus, config) = (registro.clone(), bus.clone(), a2a.clone());
+    tokio::spawn(async move {
+        // El informe se descarta: el registro ya publica el cambio y deja cada fallo como
+        // problema de carga de su agente, que es donde la persona usuaria lo ve.
+        let _ = codeloom_a2a::sync::refresh_remote_cards(&registro, &bus, &cliente, &config).await;
+    });
+    Ok(Some(Arc::new(fabrica)))
+}
+
 /// Resuelve una ruta de `[agents]`: un `~/` inicial va al directorio personal y una ruta
 /// relativa cuelga de la raíz del proyecto. `None` si depende de un home que no existe.
 fn resolver_ruta(ruta: &Path, home: Option<&Path>, raiz: &Path) -> Option<PathBuf> {
@@ -484,6 +514,7 @@ fn resolver_ruta(ruta: &Path, home: Option<&Path>, raiz: &Path) -> Option<PathBu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codeloom_core::registry::Approval;
 
     fn test_config() -> CodeLoomConfig {
         CodeLoomConfig {
@@ -538,8 +569,6 @@ mod tests {
         let updated = config_from_provider_settings(settings, &current).unwrap();
         assert_eq!(updated.effort.as_deref(), Some("high"));
     }
-
-    use codeloom_core::registry::Approval;
 
     fn perfil_de_prueba(nombre: &str) -> String {
         format!("---\nname: {nombre}\ndescription: Agente de prueba\n---\n\nCuerpo.\n")
@@ -604,6 +633,101 @@ mod tests {
                 home.path().join("mis-agentes"),
                 proyecto.path().join("config").join("agentes"),
             ]
+        );
+    }
+
+    /// Registro con un único remoto `lejano` apuntando a `endpoint`, y el directorio que lo guarda.
+    fn registro_con_remoto(endpoint: &str) -> (Arc<AgentRegistry>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lejano.md"),
+            format!(
+                "---
+name: lejano
+description: Alta manual
+transport: a2a-remote
+a2a:
+  endpoint: {endpoint}
+---
+"
+            ),
+        )
+        .unwrap();
+        let registro = Arc::new(AgentRegistry::new(vec![
+            Box::new(BuiltInSource),
+            Box::new(FileSource::new(
+                dir.path().to_path_buf(),
+                ProfileLevel::Global,
+            )),
+        ]));
+        (registro, dir)
+    }
+
+    #[tokio::test]
+    async fn with_the_a2a_role_off_no_remote_machinery_is_started() {
+        let servidor = wiremock::MockServer::start().await;
+        let (registro, _dir) = registro_con_remoto(&servidor.uri());
+
+        let fabrica = arrancar_remotos(
+            &codeloom_a2a::config::A2aConfig::default(),
+            &registro,
+            &EventBus::new(16),
+        )
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        assert!(fabrica.is_none());
+        assert!(servidor.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn with_the_a2a_role_consume_the_remote_card_is_fetched_and_never_approved() {
+        use wiremock::matchers::{method, path};
+        let servidor = wiremock::MockServer::start().await;
+        let mut tarjeta: serde_json::Value = serde_json::from_str(include_str!(
+            "../../codeloom-a2a/tests/fixtures/agent-card.sample.json"
+        ))
+        .unwrap();
+        for interfaz in tarjeta["supportedInterfaces"].as_array_mut().unwrap() {
+            interfaz["url"] = serde_json::json!(format!("{}/a2a/v1", servidor.uri()));
+        }
+        tarjeta
+            .as_object_mut()
+            .unwrap()
+            .remove("securityRequirements");
+        wiremock::Mock::given(method("GET"))
+            .and(path("/.well-known/agent-card.json"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(tarjeta))
+            .mount(&servidor)
+            .await;
+        let (registro, _dir) = registro_con_remoto(&servidor.uri());
+        let a2a = codeloom_a2a::config::A2aConfig {
+            role: codeloom_a2a::config::A2aRole::Consume,
+            request_timeout_secs: 2,
+            ..Default::default()
+        };
+
+        let fabrica = arrancar_remotos(&a2a, &registro, &EventBus::new(16)).unwrap();
+
+        assert!(fabrica.is_some());
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let descargada = registro.snapshot().entries().into_iter().any(|e| {
+                    matches!(&e.execution, codeloom_core::registry::Execution::Remote(spec)
+                        if e.name == "lejano" && spec.fetched.is_some())
+                });
+                if descargada {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("la tarjeta debería descargarse y anotarse en el registro");
+        assert_eq!(
+            registro.snapshot().approval("lejano"),
+            Some(Approval::Pending),
+            "descargar la tarjeta no aprueba nada"
         );
     }
 }
