@@ -99,6 +99,15 @@ fn unir_texto(parts: &[Part]) -> String {
 }
 
 impl Message {
+    /// Mensaje de la persona usuaria (o de un agente que delega): `role = User`, una `Part` de
+    /// texto y un `message_id` generado con `new_id`.
+    pub fn user_text(text: impl Into<String>) -> Message {
+        Message {
+            role: Role::User,
+            ..Message::agent_text(text)
+        }
+    }
+
     /// Mensaje de estado emitido por el agente: `role = Agent`, una `Part` de texto y un
     /// `message_id` generado con `new_id`.
     pub fn agent_text(text: impl Into<String>) -> Message {
