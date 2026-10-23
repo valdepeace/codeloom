@@ -75,7 +75,12 @@
   `role = "consume"` o `"both"` construyen la fábrica de clientes, se la pasan al agente (y, por él,
   a los subagentes) y descargan las tarjetas de los remotos en segundo plano. La aprobación se hace
   con el popup de `/agents`, que ya sirve a los remotos. La tarjeta no se renueva sola tras el
-  arranque, y no hay prueba contra un agente A2A real ni en terminal real.
+  arranque.
+- **Verificado en vivo (2026-10-23).** Contra un servidor construido con el SDK oficial `a2a-sdk`
+  1.2.3 (`GetTask`, `SendMessage` y `CancelTask`, prueba manual `tests/live_remote.rs`) y, en una
+  terminal real, el camino completo: perfil `.md` → tarjeta descargada → aprobación en `/agents` →
+  delegación del modelo → subagente remoto `completed`. Sigue sin verse en vivo la cancelación desde
+  la TUI, ni un remoto que pida entrada o autenticación.
 
 ### Fase A8b: servir (solo tras A8d-T1)
 
