@@ -79,9 +79,13 @@ que no tiene cota acabará, tarde o temprano, desbordándose.**
 6. **El prompt de sistema también tiene cota.** Ficheros de contexto (`AGENTS.md`,
    `CODELOOM.md`), lista de agentes, habilidades y memoria se inyectan en cada petición.
    *Estado: **pendiente**; hoy se cargan enteros y sin tope.*
-7. **Todo bucle tiene techo, y el coste también.** Existen `max_steps` y `max_turns`; no existe
-   presupuesto de tokens por turno ni por sesión. El sondeo (`job_output` en bucle) es un bucle
-   disfrazado: se evita en el prompt, pero no se garantiza. *Estado: **parcial**.*
+7. **Todo bucle tiene techo, y el coste también.** Existen `max_steps` y `max_turns`. Desde el
+   2026-10-23 hay **aviso** de presupuesto por sesión (tokens y/o dólares, sección `[budget]`),
+   al 80 % y al 100 %, por decisión de producto **solo avisa**: no detiene el turno, no
+   pregunta y no informa al modelo (`2026-10-23-codeloom-budget-warning-design.md`). El sondeo
+   (`job_output` en bucle) es un bucle disfrazado: se evita en el prompt, pero no se garantiza.
+   *Estado: **parcial**: sin tope duro por decisión, y el gasto de los subagentes no suma al
+   presupuesto del padre.*
 8. **Lo que cruza de un agente a otro también se acota.** El resultado de un subagente vuelve al
    padre y lo paga cada paso siguiente. *Estado: hecho: el aviso de finalización del hijo se recorta a 8 000 bytes.*
 9. **La memoria de la interfaz tiene cota.** Registros por hijo (200 elementos), cachés de
@@ -106,6 +110,7 @@ que no tiene cota acabará, tarde o temprano, desbordándose.**
 - ¿Qué tope tiene sentido por herramienta? 20 000 bytes (≈ 5 000 tokens) es una cota general
   prudente, muy por debajo de los 25 000 tokens de Claude Code, y no una medida afinada. Conviene
   medir con sesiones reales.
-- ¿Presupuesto de tokens por turno y por sesión, con aviso a la persona usuaria al acercarse?
+- Presupuesto de tokens: resuelto como aviso por sesión (regla 7). Quedan abiertos el presupuesto
+  por turno y que el gasto de los hijos sume al del padre.
 - ¿Compactación a petición (`/compact`)? La automática ya existe; falta el mando manual, que
   exige una infraestructura de comandos con barra que la TUI no tiene.

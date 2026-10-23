@@ -61,3 +61,28 @@ el aviso lo dice («según los precios conocidos») en lugar de afirmar un total
 - **Presupuesto por turno** (qwen-code lo ofrece por directiva) y **por día**: no.
 - **Aviso al modelo** (codex): descartado por la decisión de producto.
 - **Recarga en caliente** de `[budget]`: se lee al arrancar.
+
+## Estado
+
+Implementado el 2026-10-23, **sin verlo aún en una terminal real**. Commits: `2a8b09c`
+(configuración y cruce de umbrales), `36b7984` (bucle y arranque) y `96387df` (línea en la TUI).
+
+### Desviaciones respecto al diseño original, deliberadas
+
+- **Solo cuentan los apuntes de la propia sesión.** El almacén (`session_usage`) devuelve también
+  el consumo de los subagentes. De contarlo, un hijo podía rebasar un umbral entre dos respuestas
+  del padre y el aviso no saltaba jamás, porque el acumulado «anterior» ya lo superaba. Lo
+  detectó la revisión de la implementación y lo fija un test.
+- **Un `[budget]` mal escrito impide arrancar**, igual que `[agents]`. Un aviso por la salida de
+  errores se perdería tras la pantalla alternativa de la interfaz.
+
+### Lo que no consta o queda pendiente
+
+- **Incoherencia visible:** los contadores de consumo de la interfaz pueden sumar los hijos
+  (vienen de la misma consulta del almacén), mientras que el presupuesto no. Una persona puede
+  ver un total mayor que el que mide el aviso. No se ha comprobado en pantalla.
+- **Los hijos no heredan el presupuesto** y su gasto no suma al del padre: es la fuga más probable.
+- Los tokens se muestran con `format_tokens` (400 123 sale como «400k»): la precisión del aviso es
+  la de ese formato.
+- Con dólares, el límite lleva «USD» y lo usado solo la cifra («8.00 usados»).
+- Presupuesto por turno, por día y recarga en caliente: sin hacer.

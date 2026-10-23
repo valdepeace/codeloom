@@ -77,7 +77,8 @@ Comparativa en `docs/references/contexto-y-coste/comparativa-herramientas.md`. C
 
 ## Preguntas abiertas
 
-- Al alcanzar un presupuesto de tokens: ¿parar el turno, preguntar, o solo avisar?
+- Al alcanzar un presupuesto de tokens: decidido el 2026-10-23, **solo avisar**
+  (`2026-10-23-codeloom-budget-warning-design.md`).
 - ¿Basta la limpieza de resultados o hará falta resumir con el modelo? Se decidió resumir, como
   hacen los demás agentes: `2026-10-23-codeloom-context-summary-design.md`.
 
