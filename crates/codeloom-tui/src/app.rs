@@ -1639,6 +1639,21 @@ impl App {
     /// `session` (el padre para su turno, el hijo para lo suyo). Sin sesión abierta se usa
     /// `SessionId(0)` como marcador: la recarga de la sesión sustituye esta lista por la de la
     /// base de datos, así que no duplica ni deja marcadores persistidos.
+    /// Suma un consumo a los contadores de la sesión y del turno, y lo apunta. No toca el medidor
+    /// de contexto: eso lo decide quien llama, según sea `Usage` o `CompactionUsage`.
+    fn add_usage_counters(&mut self, input_tokens: u32, output_tokens: u32) {
+        self.input_tokens = self.input_tokens.saturating_add(u64::from(input_tokens));
+        self.output_tokens = self.output_tokens.saturating_add(u64::from(output_tokens));
+        self.turn_input_tokens = self
+            .turn_input_tokens
+            .saturating_add(u64::from(input_tokens));
+        self.turn_output_tokens = self
+            .turn_output_tokens
+            .saturating_add(u64::from(output_tokens));
+        let session = self.session_id.unwrap_or(SessionId(0));
+        self.record_live_usage(session, input_tokens, output_tokens);
+    }
+
     fn record_live_usage(&mut self, session: SessionId, input_tokens: u32, output_tokens: u32) {
         let (input_price, output_price) = self.model_prices().unzip();
         let created_at_ms = std::time::SystemTime::now()
@@ -2414,6 +2429,10 @@ impl App {
             LiveEvent::Usage {
                 input_tokens,
                 output_tokens,
+            }
+            | LiveEvent::CompactionUsage {
+                input_tokens,
+                output_tokens,
             } => {
                 stats.input_tokens = stats.input_tokens.saturating_add(u64::from(input_tokens));
                 stats.output_tokens = stats.output_tokens.saturating_add(u64::from(output_tokens));
@@ -2559,22 +2578,19 @@ impl App {
                 input_tokens,
                 output_tokens,
             } => {
-                self.input_tokens = self.input_tokens.saturating_add(u64::from(input_tokens));
-                self.output_tokens = self.output_tokens.saturating_add(u64::from(output_tokens));
-                self.turn_input_tokens = self
-                    .turn_input_tokens
-                    .saturating_add(u64::from(input_tokens));
-                self.turn_output_tokens = self
-                    .turn_output_tokens
-                    .saturating_add(u64::from(output_tokens));
+                self.add_usage_counters(input_tokens, output_tokens);
                 // Solo el uso de la sesión mostrada fija el medidor; el de los hijos llega por
                 // `ChildEvent` y no pasa por aquí.
                 if input_tokens > 0 {
                     self.context_tokens = u64::from(input_tokens);
                 }
-                let session = self.session_id.unwrap_or(SessionId(0));
-                self.record_live_usage(session, input_tokens, output_tokens);
             }
+            // El consumo de resumir cuenta como gasto igual que cualquier llamada, pero no es el
+            // contexto del turno: no fija el medidor.
+            LiveEvent::CompactionUsage {
+                input_tokens,
+                output_tokens,
+            } => self.add_usage_counters(input_tokens, output_tokens),
             // El resumen ya llega como mensaje (`MessageAdded`), que `parse_notice` reconoce y
             // pinta como aviso propio. Aquí no se añade una segunda línea. Lo que sí cambia es la
             // memoria del medidor: el resumen vigente pasa a contar como memoria.
@@ -2705,6 +2721,10 @@ impl App {
                     // El consumo de un hijo se atribuye al modelo actual de la interfaz, pero
                     // con la sesión del hijo para que su coste se pueda separar.
                     if let LiveEvent::Usage {
+                        input_tokens,
+                        output_tokens,
+                    }
+                    | LiveEvent::CompactionUsage {
                         input_tokens,
                         output_tokens,
                     } = event.as_ref()
@@ -6447,6 +6467,33 @@ linea 2",
             summary_bytes: 101,
         });
         assert_eq!(app.context_memory, 26, "el redondeo sube");
+    }
+
+    #[test]
+    fn compaction_usage_counts_but_does_not_move_the_meter() {
+        let mut app = App::new();
+        app.apply(LiveEvent::Usage {
+            input_tokens: 1_200,
+            output_tokens: 30,
+        });
+        app.apply(LiveEvent::CompactionUsage {
+            input_tokens: 700,
+            output_tokens: 90,
+        });
+        assert_eq!(
+            app.context_tokens, 1_200,
+            "el consumo del resumen no mueve el medidor"
+        );
+        assert_eq!((app.input_tokens, app.output_tokens), (1_900, 120));
+        assert_eq!(
+            (app.turn_input_tokens, app.turn_output_tokens),
+            (1_900, 120)
+        );
+        assert_eq!(
+            app.usage_records.len(),
+            2,
+            "el consumo del resumen se apunta"
+        );
     }
 
     #[test]

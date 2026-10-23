@@ -19,6 +19,12 @@ pub enum LiveEvent {
         input_tokens: u32,
         output_tokens: u32,
     },
+    /// Consumo de la llamada que genera un resumen de compactación. Suma a los contadores como
+    /// `Usage`, pero no mueve el medidor de contexto: no es el contexto del turno.
+    CompactionUsage {
+        input_tokens: u32,
+        output_tokens: u32,
+    },
     /// La sesión resumió su historial antiguo: `replaced` mensajes quedaron cubiertos por un
     /// resumen de `summary_bytes` bytes, tras estimar `tokens_before` tokens de contexto.
     ContextCompacted {
@@ -113,6 +119,7 @@ impl LiveEvent {
             | LiveEvent::ToolStarted { .. }
             | LiveEvent::ToolFinished { .. }
             | LiveEvent::Usage { .. }
+            | LiveEvent::CompactionUsage { .. }
             | LiveEvent::ContextCompacted { .. }
             | LiveEvent::BudgetWarning { .. }
             | LiveEvent::FileDiff { .. }

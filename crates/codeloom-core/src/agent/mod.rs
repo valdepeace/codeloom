@@ -583,7 +583,8 @@ impl AgentLoop {
     /// Resume lo antiguo del historial de `session` y lo persiste como mensaje de resumen. Devuelve
     /// `Ok(true)` si compactó, y `Ok(false)` si no había nada que resumir, si el modelo devolvió un
     /// resumen vacío o si se canceló (en cuyo caso no se persiste nada). Un fallo del proveedor se
-    /// propaga como `Err`.
+    /// propaga como `Err`. El consumo de la llamada de resumen se apunta y se publica como
+    /// `CompactionUsage` aunque el resumen se descarte.
     async fn compact(
         &self,
         session: SessionId,
@@ -591,96 +592,31 @@ impl AgentLoop {
         tokens_before: u64,
         cancel: &CancellationToken,
     ) -> Result<bool> {
-        let Some(cut) = compact::choose_cut(history) else {
-            return Ok(false);
-        };
         let provider = self.provider.read().unwrap().clone();
-        let config = self.config.read().unwrap().clone();
+        let model = self.config.read().unwrap().model.clone();
+        let (resumen, uso) = generate_summary(provider, model, history, cancel).await?;
 
-        // Lo que se resume: lo efectivo anterior al corte (incluido el resumen previo, si lo hay).
-        let anteriores: Vec<Message> = compact::effective_indices(history)
-            .into_iter()
-            .filter(|&i| i < cut)
-            .map(|i| history[i].clone())
-            .collect();
-        let mut mensajes = clear::clear_old_tool_results(&anteriores, clear::KEEP_TOOL_RESULTS);
-        mensajes.push(Message::user(INSTRUCCION_DE_RESUMEN));
-
-        let req = ProviderRequest {
-            model: config.model.clone(),
-            system: compact::SUMMARY_SYSTEM_PROMPT.to_string(),
-            messages: mensajes,
-            tools: vec![],
-            temperature: 0.0,
-            max_tokens: compact::SUMMARY_MAX_TOKENS,
-            effort: None,
-        };
-        let mut stream = tokio::select! {
-            _ = cancel.cancelled() => return Ok(false),
-            result = provider.stream(req, cancel.clone()) => result?,
-        };
-        let mut recogido = String::new();
-        // Un flujo que acaba en error o sin `Done` ha podido quedarse a medias: un resumen
-        // truncado por un fallo se descarta en lugar de presentarse como bueno.
-        let mut cierre: Option<FinishReason> = None;
-        let mut uso: Option<Usage> = None;
-        loop {
-            let chunk = tokio::select! {
-                _ = cancel.cancelled() => return Ok(false),
-                chunk = stream.next() => chunk,
-            };
-            match chunk {
-                Some(StreamChunk::TextDelta(t)) => recogido.push_str(&t),
-                Some(StreamChunk::Usage(parcial)) => {
-                    let total = uso.get_or_insert(Usage {
-                        input_tokens: 0,
-                        output_tokens: 0,
-                    });
-                    total.input_tokens = total.input_tokens.saturating_add(parcial.input_tokens);
-                    total.output_tokens = total.output_tokens.saturating_add(parcial.output_tokens);
-                    self.bus.publish(LiveEvent::Usage {
-                        input_tokens: parcial.input_tokens,
-                        output_tokens: parcial.output_tokens,
-                    });
-                }
-                Some(StreamChunk::Done(razon)) => {
-                    cierre = Some(razon);
-                    break;
-                }
-                None => break,
-                Some(_) => {}
-            }
-        }
         // La llamada de resumen cuesta lo mismo que cualquier otra, se acepte el resumen o no:
-        // el consumo se apunta siempre para que el coste de compactar sea visible.
-        if let Some(total) = &uso {
-            self.record_usage(session, total).await;
+        // el consumo se apunta siempre para que el coste de compactar sea visible. Se publica como
+        // `CompactionUsage` para que no mueva el medidor de contexto.
+        if let Some(uso) = &uso {
+            self.bus.publish(LiveEvent::CompactionUsage {
+                input_tokens: uso.input_tokens,
+                output_tokens: uso.output_tokens,
+            });
+            self.record_usage(session, uso).await;
         }
-        if cancel.is_cancelled() {
+        let Some(resumen) = resumen else {
             return Ok(false);
-        }
-        if matches!(cierre, None | Some(FinishReason::Error)) {
-            tracing::warn!("el flujo del resumen terminó sin cierre válido; se descarta");
-            return Ok(false);
-        }
+        };
 
-        let recogido = recogido.trim();
-        if recogido.is_empty() {
-            return Ok(false);
-        }
-        // El marcador de `limit_bytes` se suma al texto conservado: se le reserva hueco para que
-        // el resumen entero respete `MAX_SUMMARY_BYTES`.
-        let resumen = limit_bytes(
-            recogido,
-            compact::MAX_SUMMARY_BYTES.saturating_sub(MARCADOR_DE_RECORTE),
-        );
-        let mensaje = compact::summary_message(cut, &resumen);
+        let mensaje = compact::summary_message(resumen.covers, &resumen.text);
         self.store.append_message(session, &mensaje).await?;
         self.bus.publish(LiveEvent::MessageAdded(mensaje));
         self.bus.publish(LiveEvent::ContextCompacted {
-            replaced: cut,
+            replaced: resumen.covers,
             tokens_before,
-            summary_bytes: resumen.len(),
+            summary_bytes: resumen.text.len(),
         });
         Ok(true)
     }
@@ -730,6 +666,109 @@ impl AgentLoop {
         }
         Ok(delivered)
     }
+}
+
+/// Resumen del tramo antiguo del historial, aún sin activar. `covers` es el corte: los mensajes
+/// anteriores a él quedan cubiertos por `text`. `usage` es el consumo de la llamada de resumen.
+#[derive(Debug, Clone)]
+pub struct GeneratedSummary {
+    pub text: String,
+    pub usage: Option<Usage>,
+    pub covers: usize,
+}
+
+/// Pide al modelo el resumen del tramo antiguo de `history`. No persiste nada ni publica eventos:
+/// el llamador decide qué hacer con el texto y con el consumo.
+///
+/// Devuelve `(resumen, consumo)`. El consumo va aparte porque se apunta siempre, también cuando el
+/// resumen se descarta. Por eso `resumen` es `None` si no hay corte, si se cancela, si el flujo no
+/// cierra bien o si el texto queda vacío, mientras que `consumo` es `Some` en cuanto la llamada
+/// llegó a consumir tokens.
+pub async fn generate_summary(
+    provider: Arc<dyn Provider>,
+    model: String,
+    history: &[Message],
+    cancel: &CancellationToken,
+) -> Result<(Option<GeneratedSummary>, Option<Usage>)> {
+    let Some(cut) = compact::choose_cut(history) else {
+        return Ok((None, None));
+    };
+
+    // Lo que se resume: lo efectivo anterior al corte (incluido el resumen previo, si lo hay).
+    let anteriores: Vec<Message> = compact::effective_indices(history)
+        .into_iter()
+        .filter(|&i| i < cut)
+        .map(|i| history[i].clone())
+        .collect();
+    let mut mensajes = clear::clear_old_tool_results(&anteriores, clear::KEEP_TOOL_RESULTS);
+    mensajes.push(Message::user(INSTRUCCION_DE_RESUMEN));
+
+    let req = ProviderRequest {
+        model,
+        system: compact::SUMMARY_SYSTEM_PROMPT.to_string(),
+        messages: mensajes,
+        tools: vec![],
+        temperature: 0.0,
+        max_tokens: compact::SUMMARY_MAX_TOKENS,
+        effort: None,
+    };
+    let mut stream = tokio::select! {
+        _ = cancel.cancelled() => return Ok((None, None)),
+        result = provider.stream(req, cancel.clone()) => result?,
+    };
+    let mut recogido = String::new();
+    // Un flujo que acaba en error o sin `Done` ha podido quedarse a medias: un resumen
+    // truncado por un fallo se descarta en lugar de presentarse como bueno.
+    let mut cierre: Option<FinishReason> = None;
+    let mut uso: Option<Usage> = None;
+    loop {
+        let chunk = tokio::select! {
+            _ = cancel.cancelled() => break,
+            chunk = stream.next() => chunk,
+        };
+        match chunk {
+            Some(StreamChunk::TextDelta(t)) => recogido.push_str(&t),
+            Some(StreamChunk::Usage(parcial)) => {
+                let total = uso.get_or_insert(Usage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                });
+                total.input_tokens = total.input_tokens.saturating_add(parcial.input_tokens);
+                total.output_tokens = total.output_tokens.saturating_add(parcial.output_tokens);
+            }
+            Some(StreamChunk::Done(razon)) => {
+                cierre = Some(razon);
+                break;
+            }
+            None => break,
+            Some(_) => {}
+        }
+    }
+    if cancel.is_cancelled() {
+        return Ok((None, uso));
+    }
+    if matches!(cierre, None | Some(FinishReason::Error)) {
+        tracing::warn!("el flujo del resumen terminó sin cierre válido; se descarta");
+        return Ok((None, uso));
+    }
+
+    let recogido = recogido.trim();
+    if recogido.is_empty() {
+        return Ok((None, uso));
+    }
+    // El marcador de `limit_bytes` se suma al texto conservado: se le reserva hueco para que
+    // el resumen entero respete `MAX_SUMMARY_BYTES`.
+    let texto = limit_bytes(
+        recogido,
+        compact::MAX_SUMMARY_BYTES.saturating_sub(MARCADOR_DE_RECORTE),
+    )
+    .into_owned();
+    let resumen = GeneratedSummary {
+        text: texto,
+        usage: uso.clone(),
+        covers: cut,
+    };
+    Ok((Some(resumen), uso))
 }
 
 #[cfg(test)]
@@ -2240,10 +2279,11 @@ Cuerpo.
             assert_eq!(apuntes[0].input_tokens, 700);
             assert_eq!(apuntes[0].output_tokens, 90);
             let mut visto = false;
+            // ADAPTADO: el consumo del resumen usa CompactionUsage
             while let Ok(evento) = rx.try_recv() {
                 visto |= matches!(
                     evento,
-                    LiveEvent::Usage {
+                    LiveEvent::CompactionUsage {
                         input_tokens: 700,
                         output_tokens: 90
                     }
@@ -2251,6 +2291,55 @@ Cuerpo.
             }
             assert!(visto, "el consumo también llega a los contadores en vivo");
         }
+    }
+
+    #[tokio::test]
+    async fn generate_summary_does_not_touch_the_store_or_the_bus() {
+        let e = entorno_de_resumen("resumen", &historial_grande(100)).await;
+        let antes = e.store.messages(e.sid).await.unwrap();
+        let mut rx = e.bus.subscribe();
+        let cancel = CancellationToken::new();
+        let proveedor: Arc<dyn Provider> = e.proveedor.clone();
+
+        let (resumen, uso) = generate_summary(proveedor, "m".into(), &antes, &cancel)
+            .await
+            .unwrap();
+        let resumen = resumen.expect("hay resumen");
+        assert_eq!(resumen.text, "resumen");
+        assert_eq!(resumen.covers, compact::choose_cut(&antes).unwrap());
+        // El consumo sale en la respuesta, para que el llamador lo apunte.
+        assert_eq!(
+            uso.map(|u| (u.input_tokens, u.output_tokens)),
+            Some((700, 90))
+        );
+
+        assert_eq!(e.store.messages(e.sid).await.unwrap().len(), antes.len());
+        assert!(e.store.session_usage(e.sid).await.unwrap().is_empty());
+        assert!(rx.try_recv().is_err(), "no publica ningún evento");
+    }
+
+    #[tokio::test]
+    async fn compact_usage_goes_through_compaction_usage_not_usage() {
+        let e = entorno_de_resumen("resumen", &historial_grande(100)).await;
+        let antes = e.store.messages(e.sid).await.unwrap();
+        let mut rx = e.bus.subscribe();
+        let cancel = CancellationToken::new();
+        assert!(e.agente.compact(e.sid, &antes, 0, &cancel).await.unwrap());
+
+        let mut consumos_de_resumen = Vec::new();
+        let mut usos_normales = 0;
+        while let Ok(evento) = rx.try_recv() {
+            match evento {
+                LiveEvent::CompactionUsage {
+                    input_tokens,
+                    output_tokens,
+                } => consumos_de_resumen.push((input_tokens, output_tokens)),
+                LiveEvent::Usage { .. } => usos_normales += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(consumos_de_resumen, vec![(700, 90)]);
+        assert_eq!(usos_normales, 0, "el resumen no debe publicar Usage");
     }
 
     #[tokio::test]
