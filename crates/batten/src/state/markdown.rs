@@ -144,7 +144,9 @@ impl Builder {
                 self.start_line();
                 self.raw(&s, Some(StyleToken::Code));
             }
-            Event::SoftBreak => self.content(" "),
+            // Un salto simple se respeta (estilo GFM, como codex): quien escribe líneas seguidas
+            // las quiere seguidas. La sangría de lista y las barras de cita las repone `start_line`.
+            Event::SoftBreak => self.flush(),
             Event::HardBreak => self.flush(),
             Event::Rule => {
                 self.flush();
@@ -348,5 +350,48 @@ mod tests {
     fn no_trailing_blank_lines() {
         let l = md("uno\n\ndos\n\n");
         assert_eq!(texts(&l), vec!["uno", "", "dos"]);
+    }
+
+    #[test]
+    fn a_single_newline_inside_a_paragraph_stays_a_line_break() {
+        // Estilo GFM y de los editores de referencia (codex, mindfork): quien escribe las
+        // líneas seguidas quiere verlas seguidas, no fundidas en una sola.
+        assert_eq!(
+            texts(&md("uno
+dos
+tres")),
+            vec!["uno", "dos", "tres"]
+        );
+        assert_eq!(
+            texts(&md("a **b**
+c")),
+            vec!["a b", "c"]
+        );
+    }
+
+    #[test]
+    fn a_blank_line_still_separates_paragraphs_with_one_blank() {
+        assert_eq!(
+            texts(&md("uno
+dos
+
+tres")),
+            vec!["uno", "dos", "", "tres"]
+        );
+    }
+
+    #[test]
+    fn a_soft_break_inside_a_list_item_continues_indented_and_inside_a_quote_keeps_the_bar() {
+        assert_eq!(
+            texts(&md("- uno
+  dos
+- tres")),
+            vec!["• uno", "  dos", "• tres"]
+        );
+        assert_eq!(
+            texts(&md("> a
+> b")),
+            vec!["│ a", "│ b"]
+        );
     }
 }
