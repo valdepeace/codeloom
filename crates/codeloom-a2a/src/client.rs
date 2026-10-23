@@ -5,17 +5,22 @@
 //! un error de A2A se traduce a su equivalente y cualquier otra cosa es un error visible.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use codeloom_core::a2a::{Artifact, Message};
-use codeloom_core::remote_task::{RemoteReply, RemoteTask, RemoteTaskClient, RemoteTaskError};
+use codeloom_core::registry::RemoteSpec;
+use codeloom_core::remote_task::{
+    RemoteClientFactory, RemoteReply, RemoteTask, RemoteTaskClient, RemoteTaskError,
+};
 use codeloom_core::task::TaskStatus;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::card::VERSION_SOPORTADA;
-use crate::remote::{leer_acotado, mapear, RemoteError};
+use crate::config::A2aConfig;
+use crate::remote::{http_client, leer_acotado, mapear, RemoteError};
 use crate::wire::{state_from_wire, timestamp_from_wire, WireMessage, WireTask};
 
 /// Cota de los textos de error de un tercero que se copian a un mensaje nuestro.
@@ -129,6 +134,36 @@ impl JsonRpcClient {
                 "response must carry exactly one of result and error".into(),
             )),
         }
+    }
+}
+
+/// Fábrica de clientes de los remotos del registro: la que se entrega al lanzador. Solo existe con
+/// el rol `consume` (o `both`); con A2A apagado no se construye y los remotos no se ejecutan.
+pub struct A2aClientFactory {
+    http: Client,
+    max_result_bytes: usize,
+}
+
+impl A2aClientFactory {
+    /// `None` si el rol no es de consumo: no se construye ningún cliente HTTP.
+    pub fn from_config(config: &A2aConfig) -> Result<Option<Self>, RemoteError> {
+        Ok(http_client(config)?.map(|http| A2aClientFactory {
+            http,
+            max_result_bytes: config.max_result_bytes,
+        }))
+    }
+}
+
+impl RemoteClientFactory for A2aClientFactory {
+    /// Cliente de la interfaz que la tarjeta descargada declaró; sin tarjeta, ninguno.
+    fn client_for(&self, _name: &str, spec: &RemoteSpec) -> Option<Arc<dyn RemoteTaskClient>> {
+        let descargada = spec.fetched.as_ref()?;
+        Some(Arc::new(JsonRpcClient::new(
+            self.http.clone(),
+            descargada.jsonrpc_url.clone(),
+            descargada.tenant.clone(),
+            self.max_result_bytes,
+        )))
     }
 }
 
