@@ -117,9 +117,10 @@ después el transporte (A7, A8).
   - Seguridad, firmas e icono de la tarjeta (`security_schemes`, `security_requirements`,
     `signatures`, `icon_url`) quedan para esta tarea. A6 no los modela; ver la spec de la
     tarjeta, sección «Estado».
-- [ ] **A9. Flujo de eventos** `TaskStatusUpdateEvent` y de artefactos sobre el bus de
-  eventos existente, sin canal de interfaz paralelo. Spec y plan preparados el 2026-10-23
-  (`2026-10-23-codeloom-a2a-task-events-*`); requiere A7 y empieza por contrastar el proto.
+- [x] **A9. Flujo de eventos** `TaskStatusUpdateEvent` y de artefactos sobre el bus de
+  eventos existente, sin canal de interfaz paralelo. **Hecho el 2026-10-23** (`6a5c457`, `3f00cc4`,
+  `a20e07a`, `9fdf358`): eventos derivados del bus, `subscribe_task` y tipos del cable. Spec y plan
+  `2026-10-23-codeloom-a2a-task-events-*`.
 - [x] **A10. Cancelar y reanudar.** **Hecho el 2026-10-23** (decisiones nuestras, rotuladas):
   spec `docs/specs/2026-10-23-codeloom-a2a-cancel-design.md`, plan
   `docs/plans/2026-10-23-codeloom-a2a-cancel.md`. `SubagentLauncher::cancel` devuelve la tarea

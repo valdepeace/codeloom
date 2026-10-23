@@ -36,9 +36,9 @@
 `StreamResponse` y
 `fn eventos_de_cambio(anterior: &SubagentDescriptor, nuevo: &SubagentDescriptor) -> Vec<StreamResponse>`.
 
-- [ ] Pruebas: `a_state_change_emits_a_status_update`, `an_unchanged_state_emits_nothing`,
+- [x] Pruebas: `a_state_change_emits_a_status_update`, `an_unchanged_state_emits_nothing`,
   `a_new_artifact_emits_an_artifact_update`, `events_keep_the_order_state_then_artifacts`.
-- [ ] Implementar; commitear.
+- [x] Implementar; commitear.
 
 ### Tarea 2: el flujo sobre el bus
 
@@ -47,18 +47,18 @@
 **Interfaces:** produce `fn flujo_de_tarea(bus: &EventBus, actual: SubagentDescriptor) ->
 BoxStream<'static, StreamResponse>`: instantánea, luego eventos, cierre tras el estado terminal.
 
-- [ ] Pruebas: `the_stream_starts_with_a_snapshot`, `the_stream_closes_after_the_terminal_state`,
+- [x] Pruebas: `the_stream_starts_with_a_snapshot`, `the_stream_closes_after_the_terminal_state`,
   `input_required_keeps_the_stream_open`, `a_lagging_subscriber_gets_a_fresh_snapshot`,
   `two_subscribers_are_independent`.
-- [ ] Implementar con la suscripción al bus filtrada por `(parent, child)`; commitear.
+- [x] Implementar con la suscripción al bus filtrada por `(parent, child)`; commitear.
 
 ### Tarea 3: `subscribe_task` en el contrato
 
 **Ficheros:** `crates/codeloom-core/src/transport.rs`.
 
-- [ ] Añadir `subscribe_task(parent, SessionId) -> Result<BoxStream<...>>` al trait (con
+- [x] Añadir `subscribe_task(parent, SessionId) -> Result<BoxStream<...>>` al trait (con
   implementación por defecto que falla) y a `InProcessTransport`; ampliar `transport_contract`.
-- [ ] Pruebas: `subscribe_to_an_unknown_task_is_not_found`,
+- [x] Pruebas: `subscribe_to_an_unknown_task_is_not_found`,
   `subscribe_to_a_terminal_task_is_unsupported`, `a_full_run_streams_working_then_completed`
   con un hijo real del lanzador de prueba; commitear.
 
@@ -66,6 +66,6 @@ BoxStream<'static, StreamResponse>`: instantánea, luego eventos, cierre tras el
 
 **Ficheros:** `crates/codeloom-a2a/src/wire.rs`, las specs.
 
-- [ ] `WireStreamResponse` con exactamente una de `task`, `message`, `statusUpdate`,
+- [x] `WireStreamResponse` con exactamente una de `task`, `message`, `statusUpdate`,
   `artifactUpdate` (el `oneof payload` del proto); pruebas de serialización y de rechazo de cero o dos claves.
-- [ ] «Estado» de la spec y roadmap (A9 [x]); commitear.
+- [x] «Estado» de la spec y roadmap (A9 [x]); commitear.
