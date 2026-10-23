@@ -6,5 +6,6 @@ pub mod card;
 pub mod client;
 pub mod config;
 pub mod remote;
+pub mod security;
 pub mod sync;
 pub mod wire;
