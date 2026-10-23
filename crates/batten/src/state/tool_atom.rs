@@ -61,6 +61,8 @@ enum Part {
     /// Texto libre corto: pregunta, etiqueta de hijo o identificador de job.
     Text,
     Path,
+    /// Directorio de una ruta de fichero: lo que antecede al nombre, con su separador final.
+    Dir,
     Pattern,
     /// Dato secundario y corto: rango de líneas, filtro `glob`.
     Detail,
@@ -81,7 +83,7 @@ fn style_of(part: Part) -> StyleToken {
         Part::Command => StyleToken::ToolCommand,
         Part::Text => StyleToken::Default,
         Part::Path | Part::Pattern => StyleToken::ToolPath,
-        Part::Detail => StyleToken::Muted,
+        Part::Dir | Part::Detail => StyleToken::Muted,
         Part::Count => StyleToken::ToolCount,
         Part::Added => StyleToken::DiffInsert,
         Part::Removed => StyleToken::DiffDelete,
@@ -109,10 +111,13 @@ fn with_tail(main: &str, main_part: Part, tail: Option<String>) -> Vec<(Part, St
     let tail = tail.map(|tail| truncate_graphemes(&tail, TAIL_GRAPHEMES));
     // El espacio separador cuenta como un grafema más.
     let reserved = tail.as_deref().map_or(0, |t| t.graphemes(true).count() + 1);
-    let mut parts = vec![(
-        main_part,
-        truncate_graphemes(main, SUMMARY_GRAPHEMES - reserved),
-    )];
+    let max = SUMMARY_GRAPHEMES - reserved;
+    let main = if main_part == Part::Path {
+        truncate_path(main, max)
+    } else {
+        truncate_graphemes(main, max)
+    };
+    let mut parts = vec![(main_part, main)];
     if let Some(tail) = tail {
         parts.push((Part::Detail, tail));
     }
@@ -143,9 +148,48 @@ fn head_line(item: &ToolItem, parts: &[(Part, String)]) -> Line {
     }
     for (index, (part, text)) in parts.iter().enumerate() {
         head.text.push_str(if index == 0 { "  " } else { " " });
-        push_text(&mut head, text, *part);
+        if *part == Part::Path {
+            push_path(&mut head, text);
+        } else {
+            push_text(&mut head, text, *part);
+        }
     }
     head
+}
+
+/// Añade una ruta de fichero a `line`: el directorio apagado y el nombre resaltado, de modo que
+/// el fichero se vea de un vistazo. Una ruta sin directorio es solo el nombre.
+fn push_path(line: &mut Line, path: &str) {
+    let (dir, name) = split_path(path);
+    if !dir.is_empty() {
+        push_text(line, dir, Part::Dir);
+    }
+    push_text(line, name, Part::Path);
+}
+
+/// Parte `path` en directorio (con su separador final) y nombre. Admite `/` y `\`.
+fn split_path(path: &str) -> (&str, &str) {
+    match path.rfind(['/', '\\']) {
+        Some(at) if at + 1 < path.len() => path.split_at(at + 1),
+        _ => ("", path),
+    }
+}
+
+/// Recorta una ruta a `max` grafemas por la izquierda, de modo que el nombre del fichero se
+/// conserve siempre: `…/src/render.rs`. Si ni el nombre cabe, se recorta él por la izquierda.
+fn truncate_path(path: &str, max: usize) -> String {
+    let graphemes: Vec<&str> = path.graphemes(true).collect();
+    if graphemes.len() <= max {
+        return path.to_string();
+    }
+    let keep = max.saturating_sub(1);
+    let tail: String = graphemes[graphemes.len() - keep..].concat();
+    // Se empieza en un separador para no dejar a medias el nombre de un directorio.
+    let tail = match tail.find(['/', '\\']) {
+        Some(at) if at + 1 < tail.len() => &tail[at..],
+        _ => tail.as_str(),
+    };
+    format!("…{tail}")
 }
 
 /// Cabecera con `parts` seguida del cuerpo común de la herramienta.
@@ -241,7 +285,7 @@ fn edit_head(item: &ToolItem, path: &str, diff: &Diff) -> Line {
     let stats = format!("+{added} -{removed}");
     // Se reservan los dos espacios separadores y el recuento.
     let reserved = stats.graphemes(true).count() + 2;
-    let path = truncate_graphemes(path, SUMMARY_GRAPHEMES - reserved);
+    let path = truncate_path(path, SUMMARY_GRAPHEMES - reserved);
     let mut head = head_line(item, &[(Part::Path, path)]);
     head.text.push_str("  ");
     push_text(&mut head, &format!("+{added}"), Part::Added);
@@ -977,10 +1021,9 @@ mod tests {
             ..primary("src/lib.rs")
         };
         let lines = tool_lines_with(&item, &facts);
-        assert_eq!(
-            token_of(&lines[0], "src/lib.rs"),
-            Some(StyleToken::ToolPath)
-        );
+        // El nombre del fichero se resalta y el directorio queda apagado.
+        assert_eq!(token_of(&lines[0], "lib.rs"), Some(StyleToken::ToolPath));
+        assert_eq!(token_of(&lines[0], "src/"), Some(StyleToken::Muted));
         // El rango es un dato secundario, no la ruta.
         assert_eq!(token_of(&lines[0], "L10-29"), Some(StyleToken::Muted));
     }
@@ -1000,9 +1043,54 @@ mod tests {
     fn edit_path_span_uses_tool_path_token() {
         let item = edit_item();
         let lines = tool_lines_with(&item, &edit_facts("src/lib.rs", "a\n", "b\n"));
+        assert_eq!(token_of(&lines[0], "lib.rs"), Some(StyleToken::ToolPath));
+        assert_eq!(token_of(&lines[0], "src/"), Some(StyleToken::Muted));
+    }
+
+    #[test]
+    fn a_file_path_is_split_into_a_dim_directory_and_a_highlighted_name() {
+        let item = ToolItem::new("c1", "view");
+        let lines = tool_lines_with(&item, &primary("crates/codeloom-tui/src/render.rs"));
+
+        assert_eq!(lines[0].plain(), "view  crates/codeloom-tui/src/render.rs");
         assert_eq!(
-            token_of(&lines[0], "src/lib.rs"),
-            Some(StyleToken::ToolPath)
+            token_of(&lines[0], "crates/codeloom-tui/src/"),
+            Some(StyleToken::Muted)
         );
+        assert_eq!(token_of(&lines[0], "render.rs"), Some(StyleToken::ToolPath));
+    }
+
+    #[test]
+    fn a_bare_file_name_is_all_highlighted_and_windows_separators_split_too() {
+        let item = ToolItem::new("c1", "view");
+        let lines = tool_lines_with(&item, &primary("README.md"));
+        assert_eq!(token_of(&lines[0], "README.md"), Some(StyleToken::ToolPath));
+
+        let lines = tool_lines_with(&item, &primary(r"src\main.rs"));
+        assert_eq!(token_of(&lines[0], r"src\"), Some(StyleToken::Muted));
+        assert_eq!(token_of(&lines[0], "main.rs"), Some(StyleToken::ToolPath));
+    }
+
+    #[test]
+    fn a_long_path_is_cut_on_the_left_so_the_file_name_survives() {
+        let item = ToolItem::new("c1", "view");
+        let largo = format!("{}/render.rs", "directorio-muy-largo/".repeat(8));
+        let lines = tool_lines_with(&item, &primary(&largo));
+
+        let cabecera = lines[0].plain();
+        assert!(cabecera.ends_with("/render.rs"), "{cabecera}");
+        assert!(cabecera.contains("  …/"), "{cabecera}");
+        assert!(cabecera.graphemes(true).count() <= SUMMARY_GRAPHEMES + "view  ".len());
+        assert_eq!(token_of(&lines[0], "render.rs"), Some(StyleToken::ToolPath));
+    }
+
+    #[test]
+    fn truncate_path_keeps_short_paths_and_cuts_a_huge_name_from_the_left() {
+        assert_eq!(truncate_path("src/lib.rs", 80), "src/lib.rs");
+        assert_eq!(truncate_path("a/b/c/d/lib.rs", 10), "…/d/lib.rs");
+        let nombre = "n".repeat(30);
+        let cortado = truncate_path(&nombre, 10);
+        assert_eq!(cortado.graphemes(true).count(), 10);
+        assert!(cortado.starts_with('…'));
     }
 }
