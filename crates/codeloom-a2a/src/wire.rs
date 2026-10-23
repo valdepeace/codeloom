@@ -5,6 +5,7 @@ use base64::Engine;
 use codeloom_core::a2a::{Artifact, Message, Part, PartContent, Role};
 use codeloom_core::session::SubagentDescriptor;
 use codeloom_core::task::{TaskState, TaskStatus};
+use codeloom_core::task_events::{StreamResponse, TaskArtifactUpdateEvent, TaskStatusUpdateEvent};
 use serde::{Deserialize, Serialize};
 
 /// Fallo al leer un valor del cable.
@@ -18,6 +19,8 @@ pub enum WireError {
     PartContent(usize),
     #[error("`raw` is not valid base64: {0}")]
     InvalidBase64(String),
+    #[error("a stream response must have exactly one payload, and has {0}")]
+    StreamPayload(usize),
 }
 
 /// Nombre del cable de un estado: el del proto v1.0, p. ej. `TASK_STATE_WORKING`.
@@ -378,6 +381,109 @@ impl From<&SubagentDescriptor> for WireTask {
     }
 }
 
+/// `TaskStatusUpdateEvent` en el cable (`statusUpdate` dentro de `StreamResponse`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WireStatusUpdate {
+    pub task_id: String,
+    pub context_id: String,
+    pub status: WireTaskStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// `TaskArtifactUpdateEvent` en el cable (`artifactUpdate`). `append` y `lastChunk` son booleanos
+/// con valor por defecto falso: no se emiten cuando lo son.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WireArtifactUpdate {
+    pub task_id: String,
+    pub context_id: String,
+    pub artifact: WireArtifact,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub append: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub last_chunk: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// `StreamResponse` en el cable: exactamente una de `task`, `message`, `statusUpdate` y
+/// `artifactUpdate` (el `oneof payload` del proto).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WireStreamResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<WireTask>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<WireMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_update: Option<WireStatusUpdate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_update: Option<WireArtifactUpdate>,
+}
+
+impl WireStreamResponse {
+    /// Comprueba que haya exactamente una carga; un mensaje recibido con cero o varias no es válido.
+    pub fn validate(&self) -> Result<(), WireError> {
+        let presentes = [
+            self.task.is_some(),
+            self.message.is_some(),
+            self.status_update.is_some(),
+            self.artifact_update.is_some(),
+        ]
+        .into_iter()
+        .filter(|presente| *presente)
+        .count();
+        if presentes == 1 {
+            Ok(())
+        } else {
+            Err(WireError::StreamPayload(presentes))
+        }
+    }
+}
+
+impl From<&TaskStatusUpdateEvent> for WireStatusUpdate {
+    fn from(evento: &TaskStatusUpdateEvent) -> Self {
+        WireStatusUpdate {
+            task_id: evento.task_id.clone(),
+            context_id: evento.context_id.clone(),
+            status: WireTaskStatus::from(&evento.status),
+            metadata: evento.metadata.clone(),
+        }
+    }
+}
+
+impl From<&TaskArtifactUpdateEvent> for WireArtifactUpdate {
+    fn from(evento: &TaskArtifactUpdateEvent) -> Self {
+        WireArtifactUpdate {
+            task_id: evento.task_id.clone(),
+            context_id: evento.context_id.clone(),
+            artifact: WireArtifact::from(&evento.artifact),
+            append: evento.append,
+            last_chunk: evento.last_chunk,
+            metadata: evento.metadata.clone(),
+        }
+    }
+}
+
+impl From<&StreamResponse> for WireStreamResponse {
+    fn from(respuesta: &StreamResponse) -> Self {
+        let mut wire = WireStreamResponse::default();
+        match respuesta {
+            StreamResponse::Task(descriptor) => wire.task = Some(WireTask::from(descriptor)),
+            StreamResponse::Message(mensaje) => wire.message = Some(WireMessage::from(mensaje)),
+            StreamResponse::StatusUpdate(evento) => {
+                wire.status_update = Some(WireStatusUpdate::from(evento))
+            }
+            StreamResponse::ArtifactUpdate(evento) => {
+                wire.artifact_update = Some(WireArtifactUpdate::from(evento))
+            }
+        }
+        wire
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -655,5 +761,95 @@ mod tests {
         assert_eq!(json["timestamp"], "2024-02-29T12:34:56.789Z");
         assert_eq!(json["message"]["role"], "ROLE_AGENT");
         assert_eq!(json["message"]["parts"][0]["text"], "¿qué hago?");
+    }
+
+    #[test]
+    fn a_status_update_serializes_under_status_update_with_camel_case() {
+        let evento = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            task_id: "9".into(),
+            context_id: "4".into(),
+            status: TaskStatus {
+                state: TaskState::Working,
+                message: None,
+                timestamp_ms: 1_709_210_096_789,
+            },
+            metadata: None,
+        });
+
+        let json = serde_json::to_value(WireStreamResponse::from(&evento)).unwrap();
+
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "statusUpdate": {
+                    "taskId": "9",
+                    "contextId": "4",
+                    "status": {
+                        "state": "TASK_STATE_WORKING",
+                        "timestamp": "2024-02-29T12:34:56.789Z"
+                    }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn an_artifact_update_omits_false_flags_and_keeps_true_ones() {
+        let mut evento = TaskArtifactUpdateEvent {
+            task_id: "9".into(),
+            context_id: "4".into(),
+            artifact: Artifact::text_artifact("listo"),
+            append: false,
+            last_chunk: true,
+            metadata: None,
+        };
+        let json = serde_json::to_value(WireStreamResponse::from(&StreamResponse::ArtifactUpdate(
+            evento.clone(),
+        )))
+        .unwrap();
+        let carga = &json["artifactUpdate"];
+        assert_eq!(carga["lastChunk"], true);
+        assert!(carga.get("append").is_none());
+        assert_eq!(carga["artifact"]["parts"][0]["text"], "listo");
+
+        evento.last_chunk = false;
+        evento.append = true;
+        let json = serde_json::to_value(WireStreamResponse::from(&StreamResponse::ArtifactUpdate(
+            evento,
+        )))
+        .unwrap();
+        assert_eq!(json["artifactUpdate"]["append"], true);
+        assert!(json["artifactUpdate"].get("lastChunk").is_none());
+    }
+
+    #[test]
+    fn a_task_snapshot_and_a_message_serialize_under_their_own_key() {
+        let tarea = StreamResponse::Task(descriptor(TaskState::Working, Vec::new()));
+        let json = serde_json::to_value(WireStreamResponse::from(&tarea)).unwrap();
+        assert_eq!(json["task"]["status"]["state"], "TASK_STATE_WORKING");
+        assert_eq!(json.as_object().unwrap().len(), 1);
+
+        let mensaje = StreamResponse::Message(Message::agent_text("hola"));
+        let json = serde_json::to_value(WireStreamResponse::from(&mensaje)).unwrap();
+        assert_eq!(json["message"]["role"], "ROLE_AGENT");
+        assert_eq!(json.as_object().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_stream_response_with_zero_or_two_payloads_is_rejected() {
+        let vacia: WireStreamResponse = serde_json::from_str("{}").unwrap();
+        assert_eq!(vacia.validate(), Err(WireError::StreamPayload(0)));
+
+        let dos: WireStreamResponse = serde_json::from_str(
+            r#"{"message":{"messageId":"m","role":"ROLE_USER","parts":[{"text":"x"}]},
+                "task":{"id":"1","status":{"state":"TASK_STATE_WORKING"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(dos.validate(), Err(WireError::StreamPayload(2)));
+
+        let una: WireStreamResponse =
+            serde_json::from_str(r#"{"task":{"id":"1","status":{"state":"TASK_STATE_WORKING"}}}"#)
+                .unwrap();
+        assert_eq!(una.validate(), Ok(()));
     }
 }
