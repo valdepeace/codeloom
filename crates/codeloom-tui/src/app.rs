@@ -2487,6 +2487,9 @@ impl App {
             // El resumen ya llega como mensaje (`MessageAdded`), que `parse_notice` reconoce y
             // pinta como aviso propio. Aquí no se añade una segunda línea.
             LiveEvent::ContextCompacted { .. } => {}
+            // El pintado del aviso de presupuesto corresponde a la tarea 3 del plan; hasta entonces
+            // el evento se ignora.
+            LiveEvent::BudgetWarning { .. } => {}
             LiveEvent::ToolStarted { call_id, name } => {
                 self.set_phase("running tools");
                 let tool = self.tool_mut(&call_id, &name);

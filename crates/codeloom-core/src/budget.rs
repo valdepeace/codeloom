@@ -84,7 +84,11 @@ pub struct BudgetWarning {
 
 /// Avisos de los umbrales que cruza el acumulado de la sesión al añadir `added`.
 ///
-/// `before` son los apuntes previos de la sesión. Un umbral avisa si `antes < umbral <= despues`,
+/// `before` son los apuntes previos; solo cuentan los de la sesión de `added`. El almacén
+/// devuelve también el consumo de los subagentes, pero el presupuesto es por sesión y no lo
+/// hereda: si contara, un hijo podría rebasar un umbral entre dos respuestas del padre y el aviso
+/// no saltaría nunca, porque el acumulado «anterior» ya lo habría superado.
+/// Un umbral avisa si `antes < umbral <= despues`,
 /// de modo que cada nivel se comunica una sola vez por sesión sin guardar estado. Los avisos salen
 /// en orden de métrica (tokens y luego coste) y de nivel ascendente.
 pub fn budget_crossings(
@@ -93,6 +97,10 @@ pub fn budget_crossings(
     added: &UsageRecord,
 ) -> Vec<BudgetWarning> {
     let mut avisos = Vec::new();
+    let before: Vec<&UsageRecord> = before
+        .iter()
+        .filter(|r| r.session == added.session)
+        .collect();
 
     if let Some(limite) = config.session_tokens {
         let antes: f64 = before
@@ -113,7 +121,7 @@ pub fn budget_crossings(
     if let Some(limite) = config.session_cost_usd {
         let mut antes = 0.0;
         let mut partial = false;
-        for registro in before {
+        for registro in &before {
             match registro.cost() {
                 Some(coste) => antes += coste,
                 None => partial = true,
@@ -320,6 +328,25 @@ mod tests {
             sin_precio.is_empty(),
             "un apunte sin precio no cruza umbrales"
         );
+    }
+
+    #[test]
+    fn records_of_other_sessions_do_not_count() {
+        // Un hijo gastó 900 de 1000 en otra sesión; el padre gasta 100. El acumulado del padre es
+        // 100, así que no cruza el 80 %. Si el gasto del hijo contara, «antes» ya superaría el
+        // umbral y tampoco avisaría: por eso se prueba también el caso inverso.
+        let mut hijo = registro(900, 0, None);
+        hijo.session = SessionId(2);
+        let padre = registro(100, 0, None);
+        assert!(budget_crossings(&solo_tokens(1000), &[hijo.clone()], &padre).is_empty());
+
+        // El padre lleva 700 propios; el hijo 900 aparte. El apunte de 150 del padre lleva su
+        // acumulado a 850 y debe avisar del 80 %, aunque el total con el hijo ya estuviera pasado.
+        let previo = registro(700, 0, None);
+        let aviso = budget_crossings(&solo_tokens(1000), &[hijo, previo], &registro(150, 0, None));
+        assert_eq!(aviso.len(), 1);
+        assert_eq!(aviso[0].level_percent, 80);
+        assert_eq!(aviso[0].used, 850.0);
     }
 
     #[test]

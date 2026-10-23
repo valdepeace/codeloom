@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use codeloom_core::agent::AgentLoop;
+use codeloom_core::budget::BudgetConfig;
 use codeloom_core::catalog::{
     cache_path, fetch_raw, is_stale, read_cache, refresh, Catalog, CATALOG_URL,
 };
@@ -154,6 +155,9 @@ async fn main() -> Result<()> {
     let config_path = cwd.join("codeloom.toml");
     let cfg = CodeLoomConfig::load(&config_path)?;
     let agents_cfg = AgentsConfig::load(&config_path)?;
+    // Como `[agents]`, un `[budget]` mal escrito impide arrancar con un error claro: un aviso
+    // por stderr se perdería tras la pantalla alternativa de la interfaz.
+    let presupuesto = BudgetConfig::load(&config_path)?;
     let cwd_label = cwd.display().to_string();
     let model_label = cfg.model.clone();
     let provider = build_provider(&cfg)?;
@@ -206,7 +210,8 @@ async fn main() -> Result<()> {
         .with_catalog(catalog.clone())
         .with_agent_registry(registro_agentes.clone())
         .with_delegation_confirm(agents_cfg.confirm_delegation)
-        .with_spill(ToolSpill::new(data_dir.join("tool-output"))),
+        .with_spill(ToolSpill::new(data_dir.join("tool-output")))
+        .with_budget(presupuesto),
     );
 
     if let Some(prompt) = cli.print {

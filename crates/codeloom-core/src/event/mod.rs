@@ -26,6 +26,16 @@ pub enum LiveEvent {
         tokens_before: u64,
         summary_bytes: usize,
     },
+    /// El gasto acumulado de la sesión cruza un umbral del presupuesto (`[budget]`). `used` y
+    /// `limit` van en tokens o en dólares según `metric`; `partial` indica que el coste no suma
+    /// los apuntes sin precio conocido. Solo avisa: no detiene el turno.
+    BudgetWarning {
+        metric: crate::budget::BudgetMetric,
+        level_percent: u8,
+        used: f64,
+        limit: f64,
+        partial: bool,
+    },
     MessageAdded(Message),
     SessionMessageAdded {
         session: crate::session::SessionId,
@@ -104,6 +114,7 @@ impl LiveEvent {
             | LiveEvent::ToolFinished { .. }
             | LiveEvent::Usage { .. }
             | LiveEvent::ContextCompacted { .. }
+            | LiveEvent::BudgetWarning { .. }
             | LiveEvent::FileDiff { .. }
             | LiveEvent::MessageAdded(_)
             | LiveEvent::TurnEnded
