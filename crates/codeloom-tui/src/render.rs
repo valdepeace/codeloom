@@ -225,14 +225,14 @@ fn tree_gutter(width: u16) -> u16 {
 fn tree_glyph(kind: batten::state::LineKind) -> Option<char> {
     use batten::state::LineKind;
     match kind {
-        LineKind::User => Some('›'),
-        LineKind::Assistant => Some('◆'),
-        LineKind::Thinking => Some('…'),
-        LineKind::System => Some('•'),
-        LineKind::Error => Some('×'),
+        LineKind::User => Some('»'),
+        LineKind::Assistant => Some('≋'),
+        LineKind::Thinking => Some('⋯'),
+        LineKind::System => Some('◌'),
+        LineKind::Error => Some('✕'),
         LineKind::Todo => Some('☐'),
-        LineKind::Plan => Some('◇'),
-        LineKind::Banner => Some('◈'),
+        LineKind::Plan => Some('◊'),
+        LineKind::Banner => Some('✦'),
         _ => None,
     }
 }
@@ -2034,7 +2034,7 @@ dos",
         let area = app.transcript_area.expect("el transcript fija su área");
 
         // Cada bloque abre y cierra su propia línea, con el glifo de su rol; ninguno cuelga de otro.
-        let glifos = ['›', '◆', '›'];
+        let glifos = ['»', '≋', '»'];
         for (entrada, filas) in [(0, 2), (1, 3), (2, 2)] {
             assert_eq!(
                 gutter_at(&term, area, screen_row(&app, area, entrada, 0)),
@@ -2065,7 +2065,7 @@ dos",
         let term = terminal_of(&mut app, 100, 30);
         let area = app.transcript_area.expect("el transcript fija su área");
 
-        assert_eq!(gutter_at(&term, area, screen_row(&app, area, 1, 0)), "─• ");
+        assert_eq!(gutter_at(&term, area, screen_row(&app, area, 1, 0)), "─◌ ");
     }
 
     #[test]
@@ -2100,7 +2100,7 @@ dos",
         for y in area.y..area.bottom() {
             let guia = gutter_at(&term, area, y);
             assert!(
-                ["╭› ", "│  ", "╰─ ", "─› "].contains(&guia.as_str()),
+                ["╭» ", "│  ", "╰─ ", "─» "].contains(&guia.as_str()),
                 "fila {y}: «{guia}»"
             );
         }
@@ -2127,7 +2127,7 @@ tres",
         for row in start..end {
             let y = area.y + (row - app.viewport.top()) as u16;
             let esperado = if row == start {
-                "┏◆ "
+                "┏≋ "
             } else if row + 1 == end {
                 "┗━ "
             } else {
@@ -2141,7 +2141,7 @@ tres",
         }
         // Los demás bloques siguen con el trazo fino.
         let y = area.y + (block_rows(&app, 0).0 - app.viewport.top()) as u16;
-        assert_eq!(gutter_at(&term, area, y), "╭› ");
+        assert_eq!(gutter_at(&term, area, y), "╭» ");
     }
 
     #[test]
@@ -2168,17 +2168,52 @@ tres",
         let y = screen_row(&app, area, 0, 0);
         assert_eq!(
             gutter_at(&sin_foco, area, y),
-            "╭› ",
+            "╭» ",
             "sin foco no hay trazo grueso"
         );
 
         app.focus = Focus::Transcript;
         let con_foco = terminal_of(&mut app, 100, 30);
-        assert_eq!(gutter_at(&con_foco, area, y), "┏› ");
+        assert_eq!(gutter_at(&con_foco, area, y), "┏» ");
         assert_eq!(
             con_foco.backend().buffer()[(area.x - TREE_GUTTER, y)].fg,
             app.theme.styles.accent.fg.unwrap()
         );
+    }
+
+    #[test]
+    fn every_role_glyph_is_one_column_wide_and_distinct() {
+        use batten::state::{DiffKind, LineKind, ToolStatus};
+        let roles = [
+            LineKind::User,
+            LineKind::Assistant,
+            LineKind::Thinking,
+            LineKind::System,
+            LineKind::Error,
+            LineKind::Todo,
+            LineKind::Plan,
+            LineKind::Banner,
+        ];
+        let glifos: Vec<char> = roles
+            .iter()
+            .map(|k| tree_glyph(*k).expect("lleva glifo"))
+            .collect();
+
+        // Un glifo de otro ancho descuadraría el carril; dos iguales harían ilegible el rol.
+        for g in &glifos {
+            assert_eq!(
+                Span::raw(g.to_string()).width(),
+                1,
+                "«{g}» no mide una columna"
+            );
+        }
+        let mut unicos = glifos.clone();
+        unicos.sort();
+        unicos.dedup();
+        assert_eq!(unicos.len(), glifos.len(), "glifos repetidos: {glifos:?}");
+        // Las herramientas y los subagentes traen su propio icono de estado en el texto.
+        assert_eq!(tree_glyph(LineKind::ToolHead(ToolStatus::Success)), None);
+        assert_eq!(tree_glyph(LineKind::ToolDiff(DiffKind::Insert)), None);
     }
 
     #[test]
