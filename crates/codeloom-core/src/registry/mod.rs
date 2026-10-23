@@ -8,6 +8,7 @@
 //! en tareas siguientes de `docs/plans/2026-10-22-codeloom-a2a-agent-registry.md`.
 
 pub mod profile;
+pub mod router;
 pub mod source;
 pub mod trust;
 pub mod watch;
@@ -95,6 +96,37 @@ impl RegistrySnapshot {
             // Sin transporte todavía (A8): no hay forma de confiar en él. Denegar por defecto.
             AgentOrigin::Remote { .. } => Approval::Pending,
         })
+    }
+
+    /// Agentes entre los que el enrutador (A12b) puede elegir: solo los que se pueden usar ya,
+    /// es decir, los integrados, los globales y los de proyecto o remotos **aprobados**. Un agente
+    /// pendiente nunca es candidato. Las etiquetas y los ejemplos salen de las skills de la tarjeta.
+    pub fn route_candidates(&self) -> Vec<router::RouteCandidate> {
+        self.entries()
+            .into_iter()
+            .filter(|entrada| {
+                matches!(
+                    self.approval(&entrada.name),
+                    Some(Approval::NotRequired | Approval::Approved)
+                )
+            })
+            .map(|entrada| router::RouteCandidate {
+                name: entrada.name.clone(),
+                description: entrada.card.description.clone(),
+                tags: entrada
+                    .card
+                    .skills
+                    .iter()
+                    .flat_map(|skill| skill.tags.iter().cloned())
+                    .collect(),
+                examples: entrada
+                    .card
+                    .skills
+                    .iter()
+                    .flat_map(|skill| skill.examples.iter().cloned())
+                    .collect(),
+            })
+            .collect()
     }
 
     /// Sección del prompt de sistema que enumera los agentes a los que la herramienta
@@ -581,6 +613,27 @@ mod tests {
             })
         );
         assert!(instantanea.problems().is_empty());
+    }
+
+    #[test]
+    fn unapproved_agents_are_never_route_candidates() {
+        let global = tempfile::tempdir().unwrap();
+        let proyecto = tempfile::tempdir().unwrap();
+        escribir(global.path(), "rust.md", &perfil("rust", "Experto en Rust"));
+        escribir(
+            proyecto.path(),
+            "front.md",
+            &perfil("front", "Interfaz del proyecto"),
+        );
+
+        let nombres: Vec<String> = registro_con_global_y_proyecto(global.path(), proyecto.path())
+            .snapshot()
+            .route_candidates()
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+
+        assert_eq!(nombres, ["default", "rust"]);
     }
 
     #[test]
