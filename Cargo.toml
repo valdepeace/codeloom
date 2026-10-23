@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/codeloom-core", "crates/codeloom-tui", "crates/codeloom-cli", "crates/codeloom-herdr", "crates/batten"]
+members = ["crates/codeloom-core", "crates/codeloom-tui", "crates/codeloom-cli", "crates/codeloom-herdr", "crates/batten", "crates/codeloom-a2a"]
 
 [workspace.package]
 version = "0.1.0"
