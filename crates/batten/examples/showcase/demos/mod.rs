@@ -86,20 +86,31 @@ pub struct CatalogItem {
     pub demo: Box<dyn Demo>,
 }
 
+/// Proveedores reconocidos por el prefijo de la variante, en el orden en que se prueban.
+const PROVIDERS: [&str; 8] = [
+    "Batten",
+    "CodeLoom",
+    "Crush",
+    "Martty",
+    "Mindfork",
+    "Pawan",
+    "MastraCode",
+    "dotmax",
+];
+
 fn provider_for(variant: &str) -> &'static str {
-    [
-        "Batten",
-        "CodeLoom",
-        "Crush",
-        "Martty",
-        "Mindfork",
-        "Pawan",
-        "MastraCode",
-        "dotmax",
-    ]
-    .into_iter()
-    .find(|provider| variant.starts_with(provider))
-    .unwrap_or("Batten")
+    PROVIDERS
+        .into_iter()
+        .find(|provider| variant.starts_with(provider))
+        .unwrap_or("Batten")
+}
+
+/// Proveedor de una variante sin valor por defecto: `None` si no empieza por ninguno de
+/// `PROVIDERS`, para que una variante mal nombrada no cuente como Batten en silencio.
+pub fn strict_provider(variant: &str) -> Option<&'static str> {
+    PROVIDERS
+        .into_iter()
+        .find(|provider| variant.starts_with(provider))
 }
 
 fn item(component: &'static str, variant: &'static str, demo: Box<dyn Demo>) -> CatalogItem {

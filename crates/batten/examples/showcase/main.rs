@@ -4,6 +4,7 @@
 mod app;
 mod demo;
 mod demos;
+mod matrix;
 mod prompt_keys;
 
 use app::{route, Action, Focus, Showcase};
