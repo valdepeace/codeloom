@@ -74,4 +74,13 @@ No se abre un canal paralelo ni se inventan eventos.
 
 ## Estado
 
-Sin implementar.
+Implementada el 2026-10-24 (commits `b95f3bb` servidor y `e749a83` cliente).
+
+- **Verificado:** pruebas unitarias y de integración con HTTP real (nuestro cliente contra nuestro
+  servidor) y, a mano, el servidor frente al SDK oficial de Python (`a2a-sdk`) en modo
+  `streaming=True`: cuatro eventos (tarea, `WORKING`, artefacto, `COMPLETED`).
+- **Hallazgo corregido:** con estado terminal, los artefactos se emiten antes y el estado cierra la
+  secuencia (lo contrario dejaba al cliente sin los artefactos finales).
+- **No consta:** el seguimiento por flujo contra un remoto real de terceros que lo ofrezca (solo se
+  ha probado con el SDK y con dobles), ni en una terminal real. El sondeo sigue de reserva ante
+  cualquier fallo del flujo.

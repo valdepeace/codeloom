@@ -141,7 +141,7 @@ ha comprobado y lo que no:
 - **No comprobado:** un modelo real detrás del servidor; la línea «A2A entrante» en una terminal
   real (solo la cubre una prueba unitaria de la TUI); TLS (lo pone el proxy, no CodeLoom); carga
   con muchos clientes.
-- **Límites declarados:** sin streaming (`SendStreamingMessage`, `SubscribeToTask`, `ListTasks` y `GetExtendedAgentCard` responden −32004),
+- **Límites declarados:** el streaming llegó con A8c (véase su spec), pero `ListTasks` y `GetExtendedAgentCard` responden −32004,
   sin notificaciones push, sin tarjeta extendida, un único principal, solo partes de texto, y el
   agente servido es de solo lectura. La tarjeta anuncia `url` de la dirección de escucha o de
   `public_url`; con puerto 0 (solo pruebas) no es utilizable.

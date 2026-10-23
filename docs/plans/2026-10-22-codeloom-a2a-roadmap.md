@@ -117,7 +117,7 @@ después el transporte (A7, A8).
   - **A8a (consumir) hecha el 2026-10-23, sin cablear en el CLI** (`651e792`, `7fcf4b7`, `4591883`,
     `8d22eb3`, `b319cac`, `3d84c4e`, `f35cc32`, `4bbfad5`): configuración `[a2a]`, tarjeta remota,
     perfiles `a2a-remote` con aprobación atada a la tarjeta, cliente JSON-RPC y espejo en el
-    lanzador. Quedan A8b (servir), A8c (SSE), A8d (seguridad) y el cableado en `codeloom-cli` y la
+    lanzador. Quedan A8d (seguridad; A8b servir y A8c SSE ya están hechas) y el cableado en `codeloom-cli` y la
     TUI; véase la sección «Estado» de la spec.
   - **A8d (autenticación hacia remotos, lado cliente) hecha el 2026-10-23** (`513a814`, `d915619`,
     `dc8145c`, `bb094ac`): clave de API en cabecera o consulta y `Bearer`/`Basic`, con la credencial en

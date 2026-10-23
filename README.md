@@ -36,7 +36,7 @@ Ciertamente, falta mucho (véase «Lo que aún no está»), pero ya no es solo d
   lleva una cota (véase el decálogo, más abajo).
 
 **Lo que aún no está:** OAuth2/OpenID Connect/mTLS contra remotos (el resto de A8d), flujo
-SSE y streaming al servir (A8c), TLS propio al servir, MCP, LSP, skills y memoria (m4), y el plugin completo de
+TLS propio al servir, MCP, LSP, skills y memoria (m4), y el plugin completo de
 herdr (m3; hoy solo se detecta el entorno y se le reporta el estado).
 
 ## Puesta en marcha
@@ -120,7 +120,9 @@ auth = { scheme = "bearer", env = "CODELOOM_A2A_TOKEN" }   # el secreto vive en 
 ```
 
 Los clientes encuentran la tarjeta en `/.well-known/agent-card.json` y llaman a
-`POST /a2a` (JSON-RPC: `SendMessage`, `GetTask`, `CancelTask`).
+`POST /a2a` (JSON-RPC: `SendMessage`, `GetTask`, `CancelTask` y, por SSE, `SendStreamingMessage`
+y `SubscribeToTask`). Como cliente, sigue por flujo las tareas de los remotos que declaran
+streaming y sondea si el flujo falla.
 
 ## Nomenclatura
 
