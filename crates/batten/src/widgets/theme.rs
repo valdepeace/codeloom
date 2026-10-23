@@ -231,16 +231,18 @@ pub enum ThemePreset {
     Pawan,
     Crush,
     MastraCode,
+    CodeLoom,
 }
 
 impl ThemePreset {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Batten,
         Self::Martty,
         Self::Mindfork,
         Self::Pawan,
         Self::Crush,
         Self::MastraCode,
+        Self::CodeLoom,
     ];
 
     pub fn name(self) -> &'static str {
@@ -251,6 +253,7 @@ impl ThemePreset {
             Self::Pawan => "Pawan",
             Self::Crush => "Crush · Charmtone",
             Self::MastraCode => "MastraCode",
+            Self::CodeLoom => "CodeLoom",
         }
     }
 }
@@ -373,6 +376,20 @@ impl Theme {
                 Color::Rgb(239, 68, 68),
                 Color::Rgb(98, 246, 157),
                 Color::Rgb(63, 63, 70),
+            ),
+            // Paleta propia de CodeLoom. El acento (194, 90, 39) y el borde (92, 99, 112)
+            // salen del logo (`widgets/logo.rs`); el resto de colores es decisión propia.
+            CodeLoom => (
+                Color::Rgb(20, 21, 26),
+                Color::Rgb(222, 224, 228),
+                Color::Rgb(139, 145, 156),
+                Color::Rgb(194, 90, 39),
+                Color::Rgb(226, 132, 78),
+                Color::Rgb(222, 224, 228),
+                Color::Rgb(229, 192, 123),
+                Color::Rgb(224, 108, 117),
+                Color::Rgb(152, 195, 121),
+                Color::Rgb(92, 99, 112),
             ),
         };
 
@@ -876,6 +893,28 @@ mod tests {
         assert_eq!(th.style(StyleToken::ToolPath).fg, Some(Color::Magenta));
         assert_eq!(th.style(StyleToken::ToolCount).fg, Some(Color::Green));
         assert!(th.extensions.is_empty());
+    }
+
+    #[test]
+    fn every_preset_in_all_has_a_name_and_a_theme() {
+        for preset in ThemePreset::ALL {
+            assert!(!preset.name().is_empty(), "{preset:?} sin nombre");
+            // Construir el tema no debe entrar en pánico para ningún preset.
+            let _ = Theme::preset(preset);
+        }
+    }
+
+    #[test]
+    fn codeloom_is_the_last_preset() {
+        assert_eq!(ThemePreset::ALL.last(), Some(&ThemePreset::CodeLoom));
+        assert_eq!(ThemePreset::CodeLoom.name(), "CodeLoom");
+    }
+
+    #[test]
+    fn codeloom_preset_uses_the_logo_colors() {
+        let theme = Theme::preset(ThemePreset::CodeLoom);
+        assert_eq!(theme.styles.accent.fg, Some(Color::Rgb(0xc2, 0x5a, 0x27)));
+        assert_eq!(theme.styles.border.fg, Some(Color::Rgb(0x5c, 0x63, 0x70)));
     }
 
     #[test]

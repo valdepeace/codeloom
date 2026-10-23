@@ -33,7 +33,7 @@ pub const COLUMNS: [(&str, Option<ThemePreset>); 7] = [
     ("Pawan", Some(ThemePreset::Pawan)),
     ("Crush", Some(ThemePreset::Crush)),
     ("MastraCode", Some(ThemePreset::MastraCode)),
-    ("CodeLoom", None),
+    ("CodeLoom", Some(ThemePreset::CodeLoom)),
 ];
 
 /// Proveedor de la columna Batten, usado como respaldo para las celdas `Generic`.
@@ -151,12 +151,11 @@ pub fn glyph(cell: Cell, theme: &Theme) -> (&'static str, Style) {
 }
 
 /// Nota de estado de una celda (componente, columna), para el pie de la vista entre temas.
-/// Con la columna CodeLoom (sin paleta propia) añade que se usa el tema activo.
 pub fn status_note(component: &str, column: usize, cell: Cell) -> String {
-    let Some((name, preset)) = COLUMNS.get(column) else {
+    let Some((name, _)) = COLUMNS.get(column) else {
         return String::new();
     };
-    let text = match cell {
+    match cell {
         Cell::Own(1) => format!("● {component} · {name}: demo propio"),
         Cell::Own(n) => format!("● {component} · {name}: {n} variantes propias"),
         // Breve a propósito: el pie recorta por la derecha y no debe perder lo esencial.
@@ -164,11 +163,6 @@ pub fn status_note(component: &str, column: usize, cell: Cell) -> String {
             "◐ {component} · {name}: parcialmente implementado (genérico de Batten con la paleta de {name})"
         ),
         Cell::Missing => format!("· {component} · {name}: no existe"),
-    };
-    if preset.is_none() {
-        format!("{text} (sin paleta propia: se usa el tema activo)")
-    } else {
-        text
     }
 }
 
@@ -314,22 +308,16 @@ fn row_line(
 /// Texto de la celda bajo el cursor: componente, columna y estado. Vacío si no hay filas.
 fn cell_text(show: &Showcase) -> String {
     let (row_index, column) = show.matrix_cursor();
-    let (Some(row), Some((name, preset))) =
-        (show.matrix().rows.get(row_index), COLUMNS.get(column))
+    let (Some(row), Some((name, _))) = (show.matrix().rows.get(row_index), COLUMNS.get(column))
     else {
         return String::new();
     };
     let head = format!("{} · {name}", row.component);
-    let state = match show.matrix_cell() {
+    match show.matrix_cell() {
         Some(Cell::Own(1)) => format!("{head}: 1 demo propio"),
         Some(Cell::Own(n)) => format!("{head}: {n} demos propios"),
         Some(Cell::Generic) => format!("{head}: sin demo propio, se usa el de Batten"),
         Some(Cell::Missing) | None => format!("{head}: no existe"),
-    };
-    if preset.is_none() {
-        format!("{state} (sin paleta propia: se usa el tema activo)")
-    } else {
-        state
     }
 }
 
@@ -550,11 +538,19 @@ mod tests {
         );
     }
 
+    // ADAPTADO: CodeLoom ya tiene preset
     #[test]
-    fn codeloom_note_says_no_palette() {
-        let suffix = " (sin paleta propia: se usa el tema activo)";
+    fn codeloom_note_has_no_special_suffix() {
+        assert_eq!(
+            status_note("Chip", col("CodeLoom"), Cell::Own(1)),
+            "● Chip · CodeLoom: demo propio"
+        );
+        assert_eq!(
+            status_note("Chip", col("CodeLoom"), Cell::Missing),
+            "· Chip · CodeLoom: no existe"
+        );
         for cell in [Cell::Own(1), Cell::Generic, Cell::Missing] {
-            assert!(status_note("Chip", col("CodeLoom"), cell).ends_with(suffix));
+            assert!(!status_note("Chip", col("CodeLoom"), cell).contains("sin paleta"));
         }
         assert!(!status_note("Chip", col("Crush"), Cell::Own(1)).contains("sin paleta"));
     }

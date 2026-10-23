@@ -321,7 +321,7 @@ impl Showcase {
     }
 
     /// Abre el demo de la celda bajo el cursor con el tema de su columna. Las celdas
-    /// `Missing` no hacen nada; la columna CodeLoom no cambia el tema activo.
+    /// `Missing` no hacen nada.
     pub fn open_matrix_cell(&mut self) {
         let (row, column) = self.matrix_cursor;
         let Some(component) = self.matrix.rows.get(row).map(|row| row.component) else {
@@ -901,8 +901,9 @@ mod tests {
         assert!(!show.matrix_return);
     }
 
+    // ADAPTADO: CodeLoom ya tiene preset
     #[test]
-    fn enter_on_codeloom_keeps_the_active_theme() {
+    fn enter_on_codeloom_applies_its_palette() {
         let mut show = Showcase::new();
         show.theme_preset = ThemePreset::Pawan;
         press(&mut show, KeyCode::Char('m'));
@@ -912,7 +913,7 @@ mod tests {
         press(&mut show, KeyCode::Enter);
         assert_eq!(show.focus(), Focus::Demo);
         assert_eq!(show.selected(), first_demo(&show, component, "CodeLoom"));
-        assert_eq!(show.theme_preset(), ThemePreset::Pawan);
+        assert_eq!(show.theme_preset(), ThemePreset::CodeLoom);
     }
 
     #[test]

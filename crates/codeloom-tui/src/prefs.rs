@@ -24,6 +24,7 @@ fn key(preset: ThemePreset) -> &'static str {
         ThemePreset::Pawan => "pawan",
         ThemePreset::Crush => "crush",
         ThemePreset::MastraCode => "mastracode",
+        ThemePreset::CodeLoom => "codeloom",
     }
 }
 
@@ -119,6 +120,16 @@ mod tests {
             save_theme(&path, preset).unwrap();
             assert_eq!(load_theme(&path), Some(preset), "preset {preset:?}");
         }
+    }
+
+    #[test]
+    fn codeloom_theme_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ui.toml");
+        save_theme(&path, ThemePreset::CodeLoom).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text, "theme = \"codeloom\"\n");
+        assert_eq!(load_theme(&path), Some(ThemePreset::CodeLoom));
     }
 
     #[test]
