@@ -27,12 +27,20 @@
 
 ### Tarea 0: reconciliar la fuente normativa
 
-- [ ] El proto ya está en los fixtures (A9, tarea 0). Falta localizar o descargar `spec.md` y,
-  con ella, contrastar lo ya anotado (métodos PascalCase, códigos de error, `ErrorInfo`, cabecera
-  de versión). Guardar **fixtures literales**
-  (tarjeta, `SendMessage`, `GetTask`, `CancelTask`, errores) en
-  `crates/codeloom-a2a/tests/fixtures/`. Corregir la spec y `wire.rs` si algo no coincide.
-  Commitear solo documentos y fixtures.
+- [x] Hecha el 2026-10-23. La especificación está en
+  `https://raw.githubusercontent.com/a2aproject/A2A/main/docs/specification.md` (158 KB; no se
+  guarda entera en el repositorio). Contrastado y confirmado: métodos PascalCase (§9.1, §9.4),
+  códigos de error (§5.4, §9.5), `ErrorInfo` en `error.data` (array), `A2A-Version` en cada petición
+  (§3.6.1, §9.2), tarjeta en `/.well-known/agent-card.json` (§8.2), y la elección de interfaz:
+  la primera entrada de `supportedInterfaces` que el cliente soporte, con su propia URL y `tenant`
+  (§8.3.2). Fixtures en `crates/codeloom-a2a/tests/fixtures/` (véase su `README.md`: la tarjeta, los
+  errores y las peticiones de `GetTask` y `CancelTask` son literales; el par de `SendMessage` es
+  **compuesto**, porque la spec no trae ejemplo literal del binding JSON-RPC).
+  Hallazgos que cambian el plan: `SendMessage` es **bloqueante por defecto** (espera estado terminal
+  o interrumpido; `returnImmediately: true` lo evita, §3.2.2), así que el cliente enviará
+  `returnImmediately: true` y seguirá la tarea; el endpoint JSON-RPC sale de la tarjeta, no es
+  `/rpc`; el §9.3 de la spec aún dice `"method": "category/action"` y el §9.4.1 deja sin cerrar un
+  bloque: erratas de la propia spec, se sigue §9.4.
 
 ### Fase A8a: consumir
 
