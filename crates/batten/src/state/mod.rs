@@ -9,6 +9,7 @@ pub mod file_changes;
 pub mod history;
 pub mod markdown;
 pub mod node_lines;
+pub mod path_text;
 pub mod permission;
 pub mod question;
 pub mod selection;

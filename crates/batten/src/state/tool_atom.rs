@@ -5,6 +5,7 @@
 //! que vive fuera de `batten` (`codeloom-tui`), de modo que la pieza solo pinta
 //! hechos y estado.
 
+use super::path_text::{split_path, truncate_path};
 use super::tool_lines::{body_lines, more_line, truncate_graphemes, SUMMARY_GRAPHEMES};
 use super::{
     tool_lines, Diff, DiffKind, DiffLine, Line, LineKind, SpanSpec, StyleToken, ToolItem,
@@ -165,31 +166,6 @@ fn push_path(line: &mut Line, path: &str) {
         push_text(line, dir, Part::Dir);
     }
     push_text(line, name, Part::Path);
-}
-
-/// Parte `path` en directorio (con su separador final) y nombre. Admite `/` y `\`.
-fn split_path(path: &str) -> (&str, &str) {
-    match path.rfind(['/', '\\']) {
-        Some(at) if at + 1 < path.len() => path.split_at(at + 1),
-        _ => ("", path),
-    }
-}
-
-/// Recorta una ruta a `max` grafemas por la izquierda, de modo que el nombre del fichero se
-/// conserve siempre: `…/src/render.rs`. Si ni el nombre cabe, se recorta él por la izquierda.
-fn truncate_path(path: &str, max: usize) -> String {
-    let graphemes: Vec<&str> = path.graphemes(true).collect();
-    if graphemes.len() <= max {
-        return path.to_string();
-    }
-    let keep = max.saturating_sub(1);
-    let tail: String = graphemes[graphemes.len() - keep..].concat();
-    // Se empieza en un separador para no dejar a medias el nombre de un directorio.
-    let tail = match tail.find(['/', '\\']) {
-        Some(at) if at + 1 < tail.len() => &tail[at..],
-        _ => tail.as_str(),
-    };
-    format!("…{tail}")
 }
 
 /// Cabecera con `parts` seguida del cuerpo común de la herramienta.
@@ -1082,15 +1058,5 @@ mod tests {
         assert!(cabecera.contains("  …/"), "{cabecera}");
         assert!(cabecera.graphemes(true).count() <= SUMMARY_GRAPHEMES + "view  ".len());
         assert_eq!(token_of(&lines[0], "render.rs"), Some(StyleToken::ToolPath));
-    }
-
-    #[test]
-    fn truncate_path_keeps_short_paths_and_cuts_a_huge_name_from_the_left() {
-        assert_eq!(truncate_path("src/lib.rs", 80), "src/lib.rs");
-        assert_eq!(truncate_path("a/b/c/d/lib.rs", 10), "…/d/lib.rs");
-        let nombre = "n".repeat(30);
-        let cortado = truncate_path(&nombre, 10);
-        assert_eq!(cortado.graphemes(true).count(), 10);
-        assert!(cortado.starts_with('…'));
     }
 }

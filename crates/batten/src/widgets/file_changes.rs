@@ -1,7 +1,7 @@
 //! Sección de ficheros modificados: título + `+A`/`-R` por fichero.
 
+use crate::state::path_text::{split_path, truncate_path};
 use crate::state::{FileChanges, StyleToken};
-use crate::widgets::text::truncate;
 use crate::widgets::Theme;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
@@ -28,14 +28,30 @@ pub fn render(frame: &mut Frame, area: Rect, title: &str, changes: &FileChanges,
     for c in changes.iter().take(visible) {
         let counts = format!(" +{} -{}", c.added, c.removed);
         let used = counts.chars().count();
-        lines.push(Line::from(vec![
-            Span::styled(
-                truncate(&c.path, width.saturating_sub(used)),
+        // El directorio queda apagado y el nombre resaltado; si no cabe, se recorta por la
+        // izquierda para que el nombre del fichero no se pierda.
+        let path = truncate_path(&c.path, width.saturating_sub(used));
+        let (dir, name) = split_path(&path);
+        let mut spans = Vec::with_capacity(4);
+        if !dir.is_empty() {
+            spans.push(Span::styled(
+                dir.to_string(),
                 theme.style(StyleToken::Muted),
-            ),
-            Span::styled(format!(" +{}", c.added), theme.style(StyleToken::Success)),
-            Span::styled(format!(" -{}", c.removed), theme.style(StyleToken::Error)),
-        ]));
+            ));
+        }
+        spans.push(Span::styled(
+            name.to_string(),
+            theme.style(StyleToken::ToolPath),
+        ));
+        spans.push(Span::styled(
+            format!(" +{}", c.added),
+            theme.style(StyleToken::Success),
+        ));
+        spans.push(Span::styled(
+            format!(" -{}", c.removed),
+            theme.style(StyleToken::Error),
+        ));
+        lines.push(Line::from(spans));
     }
     let hidden = changes.len().saturating_sub(visible);
     if hidden > 0 {
@@ -119,5 +135,42 @@ mod tests {
     fn zero_size_does_not_panic() {
         let _ = buffer(&sample(), 0, 0);
         let _ = buffer(&FileChanges::new(), 0, 0);
+    }
+
+    #[test]
+    fn the_name_is_highlighted_and_the_directory_dimmed() {
+        let theme = Theme::test();
+        let mut c = FileChanges::new();
+        c.upsert(FileChange {
+            path: "crates/batten/src/lib.rs".into(),
+            added: 1,
+            removed: 0,
+        });
+        let mut term = Terminal::new(TestBackend::new(40, 4)).unwrap();
+        term.draw(|f| render(f, f.area(), "ficheros", &c, &theme))
+            .unwrap();
+        let buf = term.backend().buffer();
+        // Fila 1: «crates/batten/src/» apagado y «lib.rs» resaltado.
+        let dir = &buf[(0, 1)];
+        let nombre = &buf[("crates/batten/src/".len() as u16, 1)];
+
+        assert_eq!(nombre.symbol(), "l");
+        assert_eq!(Some(dir.fg), theme.style(StyleToken::Muted).fg);
+        assert_eq!(Some(nombre.fg), theme.style(StyleToken::ToolPath).fg);
+        assert_ne!(dir.fg, nombre.fg, "directorio y nombre deben distinguirse");
+    }
+
+    #[test]
+    fn a_long_path_keeps_its_file_name_when_it_does_not_fit() {
+        let mut c = FileChanges::new();
+        c.upsert(FileChange {
+            path: "a/very/long/path/that/will/not/fit/at/all/render.rs".into(),
+            added: 12,
+            removed: 3,
+        });
+        let out = buffer(&c, 28, 4);
+        assert!(out.contains("render.rs"), "{out}");
+        assert!(out.contains('…'), "{out}");
+        assert!(out.contains("+12") && out.contains("-3"), "{out}");
     }
 }
