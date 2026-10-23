@@ -119,8 +119,13 @@ después el transporte (A7, A8).
     perfiles `a2a-remote` con aprobación atada a la tarjeta, cliente JSON-RPC y espejo en el
     lanzador. Quedan A8b (servir), A8c (SSE), A8d (seguridad) y el cableado en `codeloom-cli` y la
     TUI; véase la sección «Estado» de la spec.
-  - Seguridad, firmas e icono de la tarjeta (`security_schemes`, `security_requirements`,
-    `signatures`, `icon_url`) quedan para esta tarea. A6 no los modela; ver la spec de la
+  - **A8d (autenticación hacia remotos, lado cliente) hecha el 2026-10-23** (`513a814`, `d915619`,
+    `dc8145c`, `bb094ac`): clave de API en cabecera o consulta y `Bearer`/`Basic`, con la credencial en
+    una variable de entorno nombrada en `a2a.credentials` del perfil; verificada contra el servidor
+    del SDK oficial. Sin soporte: OAuth2, OpenID Connect, mTLS y firmas de la tarjeta. Spec
+    `2026-10-23-codeloom-a2a-remote-auth-design.md`, plan `2026-10-23-codeloom-a2a-remote-auth.md`.
+    La autenticación para *servir* se hace con A8b.
+  - Firmas e icono de la tarjeta (`signatures`, `icon_url`) siguen sin modelarse; ver la spec de la
     tarjeta, sección «Estado».
 - [x] **A9. Flujo de eventos** `TaskStatusUpdateEvent` y de artefactos sobre el bus de
   eventos existente, sin canal de interfaz paralelo. **Hecho el 2026-10-23** (`6a5c457`, `3f00cc4`,

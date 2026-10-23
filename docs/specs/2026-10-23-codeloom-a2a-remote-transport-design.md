@@ -135,8 +135,9 @@ Commits: `651e792` (spec literal y fixtures), `7fcf4b7` (`[a2a]`), `4591883` (ta
 
 - **Sin cablear en `codeloom-cli` ni en la TUI:** nada construye todavía `A2aClientFactory`, llama a
   `refresh_remote_cards` ni ofrece una orden para aprobar un remoto. El crate se prueba por separado.
-- **Sin autenticación:** un remoto cuya tarjeta pide seguridad se rechaza («exige autenticación»), a la
-  espera de A8d. Las firmas de la tarjeta no se verifican.
+- **Autenticación (A8d, 2026-10-23):** clave de API y `Bearer`/`Basic` se dan desde variables de entorno;
+  ver `2026-10-23-codeloom-a2a-remote-auth-design.md`. OAuth2, OpenID Connect y mTLS siguen sin soporte
+  (el remoto se rechaza con motivo). Las firmas de la tarjeta no se verifican.
 - **Un remoto que pide entrada (`input-required`) se refleja pero no se puede responder** desde
   CodeLoom: el mensaje del lanzador no llega al remoto. Mientras tanto la tarea sigue abierta hasta que
   alguien la cancele o el remoto la cierre.

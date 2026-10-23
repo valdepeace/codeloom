@@ -35,8 +35,8 @@ Ciertamente, falta mucho (véase «Lo que aún no está»), pero ya no es solo d
 - Control de contexto y coste: toda salida de herramienta, sección del prompt y bucle
   lleva una cota (véase el decálogo, más abajo).
 
-**Lo que aún no está:** servir CodeLoom como agente A2A (A8b), autenticación contra
-remotos (A8d), flujo SSE (A8c), MCP, LSP, skills y memoria (m4), y el plugin completo de
+**Lo que aún no está:** servir CodeLoom como agente A2A (A8b), OAuth2/OpenID Connect/mTLS
+contra remotos (el resto de A8d), flujo SSE (A8c), MCP, LSP, skills y memoria (m4), y el plugin completo de
 herdr (m3; hoy solo se detecta el entorno y se le reporta el estado).
 
 ## Puesta en marcha
@@ -84,8 +84,23 @@ cargo clippy -- -D warnings
 4. El padre ya puede delegar en él; la tarea aparece como subagente con su estado A2A.
 
 La tarjeta de un tercero es **dato, no instrucción**: nunca se registra sin aprobación
-y no hay descubrimiento automático. Hoy se rechazan los remotos que exigen
-autenticación (A8d).
+y no hay descubrimiento automático.
+
+**Remotos que piden autenticación.** CodeLoom sabe dar clave de API (en cabecera o en
+consulta) y HTTP `Bearer`/`Basic`. La credencial nunca se escribe en el perfil: se declara
+el *nombre* de la variable de entorno que la guarda, por esquema de la tarjeta:
+
+```yaml
+transport: a2a-remote
+a2a:
+  endpoint: https://agente.example
+  credentials:
+    token: AGENTE_EJEMPLO_TOKEN   # esquema de la tarjeta -> variable de entorno
+```
+
+Si falta la variable, o el remoto solo ofrece OAuth2, OpenID Connect o mTLS (aún sin
+soporte), la fila del agente en `/agents` dice por qué no se puede usar y no se le envía
+nada.
 
 ## Nomenclatura
 

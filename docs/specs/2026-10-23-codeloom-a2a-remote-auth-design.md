@@ -111,4 +111,35 @@ desplegado: sin A8d, CodeLoom solo habla con servidores abiertos de bucle local.
 
 ## Estado
 
-Sin implementar.
+**Implementada el 2026-10-23** (lado cliente), con decisiones D1 a D10 tal como se escribieron, y las
+tres preguntas abiertas resueltas con la opción recomendada. Commits: `513a814` (módulo `security`),
+`d915619` (perfiles con `a2a.credentials`; el lanzador consulta a la fábrica), `dc8145c` (el cliente se
+autentica, 401/403 como `AuthFailed`, la fábrica y la sincronización) y `bb094ac` (la fila de `/agents`
+y la prueba de extremo a extremo con un remoto protegido).
+
+### Contrastado contra un servidor real
+
+Con el servidor del SDK oficial (`a2a-sdk` 1.2.3) y una puerta de `Bearer` delante, el 2026-10-23:
+
+- La tarjeta que emite usa exactamente `apiKeySecurityScheme` y `httpAuthSecurityScheme`: **la
+  inferencia de nombres de la sección «Lo que no consta» queda confirmada** para esos dos. Los de
+  OAuth2 (`oauth2SecurityScheme`) y mTLS (`mtlsSecurityScheme`) siguen sin contrastar; no importa
+  porque no se soportan y se rechazan igual.
+- Un `StringList` vacío sale como `{}` (sin la clave `list`); el lector solo usa las claves de
+  `schemes`, así que no depende de ello.
+- Sin variable de entorno no hay cliente y el motivo nombra la variable; con un token equivocado el
+  servidor contesta 401 y se reconoce como `AuthFailed` sin repetir nada; con el token bueno la tarea
+  completa. Pruebas `a_real_secured_server_*` en `crates/codeloom-a2a/tests/live_remote.rs`
+  (`#[ignore]`, a mano).
+
+### Lo que no consta o queda pendiente
+
+- **OAuth2, OpenID Connect, mTLS y clave en cookie:** sin soporte (D2). Es el siguiente paso si algún
+  remoto real los pide.
+- **La variable de entorno se lee al construir el cliente:** una rotación del secreto en mitad de una
+  tarea larga no se nota hasta la siguiente. El motivo de «no usable» que muestra `/agents` se calcula
+  al descargar la tarjeta (arranque); el lanzador, en cambio, lo reevalúa justo antes de delegar.
+- Sin respuesta a `auth-required` de un remoto: se refleja como estado, no se resuelve (D9).
+- Visto en una terminal real: **no** (solo pruebas automáticas y la prueba viva contra el SDK).
+- Un secreto en la URL (clave de API en consulta) puede quedar en los registros del servidor remoto o
+  de un proxy intermedio: es una propiedad de ese esquema, no de CodeLoom. Se prefiere la cabecera.
