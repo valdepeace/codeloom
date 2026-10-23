@@ -3,7 +3,8 @@
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use codeloom_core::a2a::{Artifact, Message, Part, PartContent, Role};
-use codeloom_core::task::TaskState;
+use codeloom_core::session::SubagentDescriptor;
+use codeloom_core::task::{TaskState, TaskStatus};
 use serde::{Deserialize, Serialize};
 
 /// Fallo al leer un valor del cable.
@@ -327,6 +328,56 @@ impl TryFrom<WireArtifact> for Artifact {
     }
 }
 
+/// `TaskStatus` en el cable: `state` con su nombre `TASK_STATE_*`, el mensaje opcional y la
+/// marca de tiempo en UTC.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WireTaskStatus {
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<WireMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
+}
+
+impl From<&TaskStatus> for WireTaskStatus {
+    fn from(status: &TaskStatus) -> Self {
+        WireTaskStatus {
+            state: state_to_wire(status.state).to_string(),
+            message: status.message.as_ref().map(WireMessage::from),
+            timestamp: Some(timestamp_to_wire(status.timestamp_ms)),
+        }
+    }
+}
+
+/// `Task` en el cable. El núcleo no modela `history` ni `metadata`, así que no se emiten.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WireTask {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_id: Option<String>,
+    pub status: WireTaskStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<WireArtifact>,
+}
+
+impl From<&SubagentDescriptor> for WireTask {
+    /// El `id` es la sesión del hijo y el `contextId` el que deriva el descriptor.
+    fn from(descriptor: &SubagentDescriptor) -> Self {
+        WireTask {
+            id: descriptor.child.0.to_string(),
+            context_id: Some(descriptor.context_id()),
+            status: WireTaskStatus::from(&descriptor.status),
+            artifacts: descriptor
+                .artifacts
+                .iter()
+                .map(WireArtifact::from)
+                .collect(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,5 +599,61 @@ mod tests {
         .unwrap();
         let mensaje = Message::try_from(wire).unwrap();
         assert_eq!(mensaje.text(), "x");
+    }
+
+    fn descriptor(estado: TaskState, artefactos: Vec<Artifact>) -> SubagentDescriptor {
+        SubagentDescriptor {
+            parent: codeloom_core::session::SessionId(4),
+            child: codeloom_core::session::SessionId(9),
+            job_id: "subagent-1".into(),
+            label: "obrero".into(),
+            status: TaskStatus {
+                state: estado,
+                message: None,
+                timestamp_ms: 1_709_210_096_789,
+            },
+            artifacts: artefactos,
+            notice_delivered: false,
+            agent: None,
+            agent_origin: None,
+            reference_task_ids: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn task_from_descriptor_has_id_context_status_and_artifacts() {
+        let artefacto = Artifact::text_artifact("listo");
+        let tarea = WireTask::from(&descriptor(TaskState::Completed, vec![artefacto.clone()]));
+        let json = serde_json::to_value(&tarea).unwrap();
+        assert_eq!(json["id"], "9");
+        assert_eq!(json["contextId"], "4");
+        assert_eq!(json["status"]["state"], "TASK_STATE_COMPLETED");
+        assert_eq!(json["artifacts"][0]["artifactId"], artefacto.artifact_id);
+        assert_eq!(json["artifacts"][0]["parts"][0]["text"], "listo");
+        assert!(json.get("history").is_none());
+        assert!(json.get("metadata").is_none());
+    }
+
+    #[test]
+    fn task_without_artifacts_omits_them() {
+        let json =
+            serde_json::to_value(WireTask::from(&descriptor(TaskState::Working, Vec::new())))
+                .unwrap();
+        assert!(json.get("artifacts").is_none());
+        assert!(json["status"].get("message").is_none());
+    }
+
+    #[test]
+    fn status_message_and_timestamp_are_translated() {
+        let estado = TaskStatus {
+            state: TaskState::InputRequired,
+            message: Some(Message::agent_text("¿qué hago?")),
+            timestamp_ms: 1_709_210_096_789,
+        };
+        let json = serde_json::to_value(WireTaskStatus::from(&estado)).unwrap();
+        assert_eq!(json["state"], "TASK_STATE_INPUT_REQUIRED");
+        assert_eq!(json["timestamp"], "2024-02-29T12:34:56.789Z");
+        assert_eq!(json["message"]["role"], "ROLE_AGENT");
+        assert_eq!(json["message"]["parts"][0]["text"], "¿qué hago?");
     }
 }
