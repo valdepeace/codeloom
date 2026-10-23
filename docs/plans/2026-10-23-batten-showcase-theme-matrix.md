@@ -130,7 +130,46 @@ fila); `matrix_fits_in_a_narrow_terminal_without_panic` (60×20); `footer_names_
 
 ---
 
-### Tarea 4: documentación
+### Tarea 4: vista de un componente entre temas
+
+**Ficheros:** `crates/batten/examples/showcase/app.rs`, `crates/batten/examples/showcase/matrix.rs`
+(funciones puras de la nota), `crates/batten/examples/showcase/main.rs` (pie).
+Requiere las Tareas 2 y 3. Spec: «Vista de un componente entre temas».
+
+- `Showcase` gana `view_column: Option<usize>` (columna actual). `Enter` en la matriz y `F8` la
+  fijan; al elegir un demo desde el índice (`select`, `next`, `prev`) se pone en `None` y se
+  deduce del proveedor del demo (`strict_provider` → índice en `COLUMNS`; `None` si no es una
+  columna).
+- `F8` / `Shift+F8`, en `route` como global junto a `F7`, **solo con `Focus::Demo`**: busca la
+  siguiente (anterior) columna de la fila del componente actual cuya celda no sea `Missing`, con
+  vuelta al final, y aplica lo mismo que `Enter` en la matriz (`select(target)`, preset de la
+  columna salvo CodeLoom, `view_column`). Sin fila, o sin otra columna visible, no hace nada. No
+  cambia `matrix_return`.
+- Funciones puras en `matrix.rs`: `pub fn status_note(component: &str, column: usize, cell:
+  Cell) -> String` con los textos exactos de la spec (los símbolos `●`/`◐`; «parcialmente
+  implementado» para `Generic`; el texto de CodeLoom para la columna 6 sea cual sea la celda) y
+  `pub fn strip(row: &MatrixRow, current: Option<usize>) -> Vec<(String, Cell, bool)>`
+  (nombre de columna, celda, si es la actual).
+- Pie: si el componente actual tiene fila, el pie ocupa dos líneas (`Constraint::Length(2)` en
+  `draw`, solo en ese caso) con la tira y la nota; el nombre del tema activo (`F7/Shift+F7 tema:
+  …`) se conserva al final de la nota o de la línea actual si no cabe. Sin fila, una línea como
+  hoy. Cabecera de ayuda de `Focus::Demo`: «F8: tema del componente · F7: paleta · Tab/Esc:
+  volver».
+
+**Tests:** en `matrix.rs`, `status_note_names_partial_implementation_for_generic`,
+`status_note_for_own_mentions_variants_only_when_several`, `codeloom_note_says_no_palette`,
+`strip_marks_the_current_column`; en `app.rs`, `f8_switches_theme_and_demo_together`,
+`f8_skips_missing_columns`, `f8_on_a_generic_cell_opens_the_batten_demo_with_the_column_theme`,
+`f8_does_nothing_for_a_component_without_a_row`, `f8_wraps_around_and_shift_f8_goes_back`,
+`selecting_from_the_index_derives_the_column_from_the_demo`; en `main.rs`, con `TestBackend`
+100×30, `footer_shows_the_strip_and_the_note_for_a_component_with_a_row` y
+`footer_stays_one_line_without_a_row`. Los tests existentes siguen pasando.
+
+**Commit:** `feat(batten): cambiar de tema dentro de un componente y nota de estado`.
+
+---
+
+### Tarea 5: documentación
 
 «Estado» de la spec (commits, lo que no se ha visto en terminal real, qué celdas salen de la
 matriz hoy con cifras reales, las 6 entradas dejadas fuera) y una línea sobre `m` en la ayuda del

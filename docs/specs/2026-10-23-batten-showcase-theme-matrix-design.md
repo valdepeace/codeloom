@@ -23,6 +23,9 @@ en Pawan es buscarlo a mano.
 4. **`●` sin número** (elección delegada a mí): el recuento de demos de la celda se muestra en el
    pie al situarse encima.
 5. **dotmax no es un tema, es una librería**: va a una nota al pie, no a una columna.
+6. **Cambiar de tema dentro del propio componente** (petición posterior): al ver un componente se
+   puede pasar de un tema a otro de su fila para compararlo, y el pie dice en qué estado está
+   (propio, parcialmente implementado, no existe). Véase «Vista de un componente entre temas».
 
 ## Qué hay hoy (medido el 2026-10-23 sobre `demos/mod.rs`)
 
@@ -89,6 +92,28 @@ tema y la selección, y el trait `Demo` no ve nada de eso. Se abre desde el índ
   `generic_needs_a_batten_demo` (un componente solo de Crush no es `Generic` en Pawan).
 - Que todo `Own` y `Generic` apunta a un demo que existe en el catálogo.
 - Un `TestBackend` de 100×40 que pinta la matriz y contiene los tres símbolos y los seis temas.
+
+### Vista de un componente entre temas
+
+Con un demo abierto, `F8` / `Shift+F8` pasa a la **columna siguiente / anterior de la fila de su
+componente** y cambia a la vez el tema y el demo: `Own` abre el demo de ese proveedor con su
+paleta; `Generic` abre el de Batten con la paleta de esa columna. Las columnas `Missing` se
+**saltan** (no hay nada que ver; la fila las muestra como `·`). La columna CodeLoom no cambia la
+paleta (no tiene preset). `F7` sigue siendo «solo la paleta», sin cambiar de demo.
+
+El **pie de dos líneas** se muestra si el componente tiene fila en la matriz:
+
+1. La fila del componente: los siete nombres de columna con su símbolo, la actual resaltada:
+   `Batten ● · Martty ● · Mindfork ● · Pawan ◐ · Crush ● · MastraCode ◐ · CodeLoom ◐`.
+2. La nota de la columna actual:
+   - `Own`: «● propio de {tema}» (con «n variantes» si `n > 1`).
+   - `Generic`: «◐ parcialmente implementado: no hay demo de {tema}; se muestra el genérico de
+     Batten con la paleta de {tema}».
+   - CodeLoom: «sin paleta propia: se usa el tema activo».
+
+Sin fila (componentes fuera de la matriz) el pie conserva su línea actual. La columna actual es
+la de la última navegación con `F8` o `Enter` desde la matriz; al elegir otro demo desde el
+índice se deduce del proveedor del demo.
 
 ## Fuera de alcance, declarado
 
