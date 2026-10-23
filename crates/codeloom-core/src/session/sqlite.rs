@@ -82,6 +82,10 @@ impl SqliteStore {
                 "agent_origin",
                 "ALTER TABLE subagents ADD COLUMN agent_origin TEXT",
             ),
+            (
+                "reference_task_ids",
+                "ALTER TABLE subagents ADD COLUMN reference_task_ids TEXT",
+            ),
         ] {
             if !columnas.iter().any(|existente| existente == columna) {
                 sqlx::query(ddl)
@@ -212,8 +216,8 @@ impl SessionStore for SqliteStore {
 
     async fn save_subagent(&self, descriptor: &SubagentDescriptor) -> Result<()> {
         sqlx::query(
-            "INSERT INTO subagents (parent_session_id, child_session_id, job_id, label, status, status_message, status_timestamp_ms, artifacts_json, agent, agent_origin, created_at_ms)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO subagents (parent_session_id, child_session_id, job_id, label, status, status_message, status_timestamp_ms, artifacts_json, agent, agent_origin, reference_task_ids, created_at_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(descriptor.parent.0)
         .bind(descriptor.child.0)
@@ -225,6 +229,7 @@ impl SessionStore for SqliteStore {
         .bind(encode_artifacts(&descriptor.artifacts)?)
         .bind(&descriptor.agent)
         .bind(&descriptor.agent_origin)
+        .bind(encode_references(&descriptor.reference_task_ids)?)
         .bind(crate::message::now_ms())
         .execute(&self.pool)
         .await
@@ -284,7 +289,7 @@ impl SessionStore for SqliteStore {
         let rows = sqlx::query(
             "SELECT parent_session_id, child_session_id, job_id, label, status, status_message,
                     status_timestamp_ms, created_at_ms, artifacts_json, result, notice_delivered,
-                    agent, agent_origin
+                    agent, agent_origin, reference_task_ids
              FROM subagents WHERE parent_session_id = ? ORDER BY created_at_ms, child_session_id",
         )
         .bind(parent.0)
@@ -317,6 +322,7 @@ impl SessionStore for SqliteStore {
                     notice_delivered: row.get::<i64, _>("notice_delivered") != 0,
                     agent: row.get("agent"),
                     agent_origin: row.get("agent_origin"),
+                    reference_task_ids: decode_references(row.get("reference_task_ids"), child),
                 })
             })
             .collect()
@@ -498,6 +504,33 @@ fn decode_status_message(raw: Option<String>, child: i64) -> Option<a2a::Message
     }
 }
 
+/// Las referencias de una tarea se guardan como un arreglo JSON de ids (`[3,5]`); sin ninguna,
+/// `NULL`, que es también lo que tiene una fila anterior a la columna.
+fn encode_references(references: &[SessionId]) -> Result<Option<String>> {
+    if references.is_empty() {
+        return Ok(None);
+    }
+    let ids: Vec<i64> = references.iter().map(|id| id.0).collect();
+    serde_json::to_string(&ids)
+        .map(Some)
+        .map_err(|e| CoreError::Store(e.to_string()))
+}
+
+/// Lee las referencias. Un valor ilegible se descarta con un aviso y deja la lista vacía: un
+/// enlace perdido no debe impedir listar los hijos.
+fn decode_references(json: Option<String>, child: i64) -> Vec<SessionId> {
+    let Some(json) = json else {
+        return Vec::new();
+    };
+    match serde_json::from_str::<Vec<i64>>(&json) {
+        Ok(ids) => ids.into_iter().map(SessionId).collect(),
+        Err(error) => {
+            tracing::warn!(child, error = %error, "referencias de tarea ilegibles; se ignoran");
+            Vec::new()
+        }
+    }
+}
+
 /// Serializa los artefactos del resultado para la columna `artifacts_json`.
 fn encode_artifacts(artifacts: &[Artifact]) -> Result<String> {
     serde_json::to_string(artifacts).map_err(|e| CoreError::Store(e.to_string()))
@@ -610,6 +643,7 @@ mod tests {
             notice_delivered: false,
             agent: None,
             agent_origin: None,
+            reference_task_ids: Vec::new(),
         }
     }
 
@@ -971,6 +1005,7 @@ mod tests {
                 notice_delivered: false,
                 agent: None,
                 agent_origin: None,
+                reference_task_ids: Vec::new(),
             })
             .await
             .unwrap();
@@ -1040,6 +1075,7 @@ mod tests {
                 notice_delivered: false,
                 agent: None,
                 agent_origin: None,
+                reference_task_ids: Vec::new(),
             })
             .await
             .unwrap();
@@ -1347,6 +1383,7 @@ mod tests {
         let con_agente = SubagentDescriptor {
             agent: Some("reviewer".into()),
             agent_origin: Some("project:/proj/.codeloom/agents/reviewer.md".into()),
+            reference_task_ids: Vec::new(),
             ..descriptor(parent, child, TaskState::Working)
         };
         store.save_subagent(&con_agente).await.unwrap();
@@ -1401,6 +1438,7 @@ mod tests {
         assert_eq!(leido.len(), 1);
         assert_eq!(leido[0].agent, None);
         assert_eq!(leido[0].agent_origin, None);
+        assert!(leido[0].reference_task_ids.is_empty());
     }
 
     #[tokio::test]
@@ -1423,5 +1461,45 @@ mod tests {
                 .unwrap();
         assert_eq!(columnas.iter().filter(|c| *c == "agent").count(), 1);
         assert_eq!(columnas.iter().filter(|c| *c == "agent_origin").count(), 1);
+        assert_eq!(
+            columnas
+                .iter()
+                .filter(|c| *c == "reference_task_ids")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn references_roundtrip_through_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(dir.path().join("referencias.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let parent = store.create_session("/proj").await.unwrap();
+        let anterior = store.create_session("/proj").await.unwrap();
+        let child = store.create_session("/proj").await.unwrap();
+        let sin = SubagentDescriptor {
+            reference_task_ids: Vec::new(),
+            ..descriptor(parent, anterior, TaskState::Completed)
+        };
+        let con = SubagentDescriptor {
+            reference_task_ids: vec![anterior, SessionId(99)],
+            ..descriptor(parent, child, TaskState::Working)
+        };
+        store.save_subagent(&sin).await.unwrap();
+        store.save_subagent(&con).await.unwrap();
+
+        assert_eq!(store.list_subagents(parent).await.unwrap(), vec![sin, con]);
+    }
+
+    #[test]
+    fn unreadable_references_are_dropped_not_fatal() {
+        assert!(decode_references(Some("no es json".into()), 7).is_empty());
+        assert!(decode_references(None, 7).is_empty());
+        assert_eq!(
+            decode_references(Some("[3,5]".into()), 7),
+            vec![SessionId(3), SessionId(5)]
+        );
     }
 }

@@ -276,6 +276,7 @@ impl InProcessSubagentLauncher {
             notice_delivered: false,
             agent,
             agent_origin,
+            reference_task_ids: Vec::new(),
         };
         self.store.save_subagent(&descriptor).await?;
         self.bus.publish(LiveEvent::SubagentChanged(descriptor));
@@ -534,6 +535,7 @@ impl SubagentLauncher for InProcessSubagentLauncher {
             notice_delivered: false,
             agent: agente,
             agent_origin: origen,
+            reference_task_ids: Vec::new(),
         };
         if let Err(error) = self.store.save_subagent(&descriptor).await {
             let _ = self.jobs.kill(parent, job.id());
@@ -2467,6 +2469,7 @@ mod tests {
                 notice_delivered: false,
                 agent: None,
                 agent_origin: None,
+                reference_task_ids: Vec::new(),
             })
             .await
             .unwrap();
@@ -3078,6 +3081,7 @@ mod tests {
                 notice_delivered: false,
                 agent: None,
                 agent_origin: None,
+                reference_task_ids: Vec::new(),
             })
             .await
             .unwrap();

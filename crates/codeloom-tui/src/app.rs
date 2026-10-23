@@ -3711,6 +3711,7 @@ mod tests {
                 notice_delivered: false,
                 agent: None,
                 agent_origin: None,
+                reference_task_ids: Vec::new(),
             }],
         );
         assert_eq!(
@@ -3733,6 +3734,7 @@ mod tests {
             notice_delivered: false,
             agent: None,
             agent_origin: None,
+            reference_task_ids: Vec::new(),
         }
     }
 
@@ -4584,6 +4586,7 @@ linea 2",
             notice_delivered: false,
             agent: None,
             agent_origin: None,
+            reference_task_ids: Vec::new(),
         }
     }
 
@@ -6165,6 +6168,7 @@ linea 2",
             notice_delivered: false,
             agent: None,
             agent_origin: None,
+            reference_task_ids: Vec::new(),
         }
     }
 

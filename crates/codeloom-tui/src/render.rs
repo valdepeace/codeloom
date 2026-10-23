@@ -1739,6 +1739,7 @@ mod tests {
                     notice_delivered: false,
                     agent: None,
                     agent_origin: None,
+                    reference_task_ids: Vec::new(),
                 },
             );
         }
@@ -1762,6 +1763,7 @@ mod tests {
                     notice_delivered: false,
                     agent: None,
                     agent_origin: None,
+                    reference_task_ids: Vec::new(),
                 },
             );
         }
@@ -1809,6 +1811,7 @@ mod tests {
                     notice_delivered: false,
                     agent: None,
                     agent_origin: None,
+                    reference_task_ids: Vec::new(),
                 },
             );
         }
@@ -1858,6 +1861,7 @@ mod tests {
                 notice_delivered: false,
                 agent: None,
                 agent_origin: None,
+                reference_task_ids: Vec::new(),
             },
         );
         let mut term = Terminal::new(TestBackend::new(100, 3)).unwrap();
@@ -2490,6 +2494,7 @@ Cuerpo de front.
             notice_delivered: false,
             agent: None,
             agent_origin: None,
+            reference_task_ids: Vec::new(),
         }));
         app
     }

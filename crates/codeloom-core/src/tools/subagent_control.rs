@@ -167,6 +167,7 @@ mod tests {
                 notice_delivered: false,
                 agent: None,
                 agent_origin: None,
+                reference_task_ids: Vec::new(),
             })
         }
 

@@ -32,6 +32,10 @@ pub struct SubagentDescriptor {
     /// Origen del agente, en texto: `built-in`, `global:<ruta>`, `project:<ruta>` o
     /// `remote:<url>`. Se guarda para saber de dónde salió la definición aunque después cambie.
     pub agent_origin: Option<String>,
+    /// `reference_task_ids` de A2A: tareas a las que sigue esta (un seguimiento es una tarea nueva
+    /// en el mismo contexto). Los ids son sesiones de hijos del mismo padre. Vacío si no sigue a
+    /// ninguna.
+    pub reference_task_ids: Vec<SessionId>,
 }
 
 impl SubagentDescriptor {
@@ -162,6 +166,7 @@ mod tests {
             notice_delivered: false,
             agent: None,
             agent_origin: None,
+            reference_task_ids: Vec::new(),
         }
     }
 
