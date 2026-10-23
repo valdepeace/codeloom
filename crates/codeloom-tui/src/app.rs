@@ -3,6 +3,7 @@ use crate::rail::{agent_state, format_tokens};
 use crate::tool_facts::tool_facts;
 use batten::widgets::composer::hit_index;
 use codeloom_core::agent::compact::parse_summary_text;
+use codeloom_core::budget::BudgetMetric;
 use codeloom_core::catalog::{Catalog, CatalogModel, CatalogProvider};
 use codeloom_core::config::{CodeLoomConfig, ProviderKind};
 use codeloom_core::event::LiveEvent;
@@ -2487,9 +2488,24 @@ impl App {
             // El resumen ya llega como mensaje (`MessageAdded`), que `parse_notice` reconoce y
             // pinta como aviso propio. Aquí no se añade una segunda línea.
             LiveEvent::ContextCompacted { .. } => {}
-            // El pintado del aviso de presupuesto corresponde a la tarea 3 del plan; hasta entonces
-            // el evento se ignora.
-            LiveEvent::BudgetWarning { .. } => {}
+            // El aviso de presupuesto es de CodeLoom: se pinta como línea de sistema, igual que los
+            // avisos de `parse_notice`, y nunca como mensaje de la persona usuaria ni como estado de
+            // A2A. Corta la entrada del asistente para que lo que llegue después no se pegue encima.
+            LiveEvent::BudgetWarning {
+                metric,
+                level_percent,
+                used,
+                limit,
+                partial,
+            } => {
+                let linea = budget_warning_line(metric, level_percent, used, limit, partial);
+                self.transcript.push_entry(
+                    batten::state::LineKind::System,
+                    batten::state::Format::Plain,
+                    linea,
+                );
+                self.assistant = None;
+            }
             LiveEvent::ToolStarted { call_id, name } => {
                 self.set_phase("running tools");
                 let tool = self.tool_mut(&call_id, &name);
@@ -3344,6 +3360,33 @@ impl App {
     }
 }
 
+/// Línea del aviso de presupuesto de gasto. Rótulo de CodeLoom: nunca de A2A. Los tokens pasan
+/// por `format_tokens`; los dólares, con dos decimales. Si `partial`, se advierte de que el coste
+/// no suma los apuntes sin precio conocido.
+fn budget_warning_line(
+    metric: BudgetMetric,
+    level_percent: u8,
+    used: f64,
+    limit: f64,
+    partial: bool,
+) -> String {
+    let (unidad, usado, limite) = match metric {
+        BudgetMetric::Tokens => (
+            "tokens",
+            format_tokens(used as u64),
+            format_tokens(limit as u64),
+        ),
+        BudgetMetric::CostUsd => ("USD", format!("{used:.2}"), format!("{limit:.2}")),
+    };
+    let mut linea = format!(
+        "aviso de presupuesto: {level_percent} % de {limite} {unidad} de la sesión ({usado} usados)"
+    );
+    if partial {
+        linea.push_str(" (según los precios conocidos)");
+    }
+    linea
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3958,6 +4001,64 @@ Cuerpo de front.
         assert!(!app.turn_in_flight);
         assert!(!app.thinking);
         assert_eq!(app.status, "error: provider unavailable");
+    }
+
+    #[test]
+    fn budget_warning_renders_as_a_system_line_not_as_user_text() {
+        let mut app = crush_app();
+        app.apply(LiveEvent::BudgetWarning {
+            metric: BudgetMetric::Tokens,
+            level_percent: 80,
+            used: 400_123.0,
+            limit: 500_000.0,
+            partial: false,
+        });
+        assert_eq!(
+            texts(&app),
+            vec![
+                "aviso de presupuesto: 80 % de 500k tokens de la sesión (400k usados)".to_string()
+            ]
+        );
+        assert_eq!(
+            app.transcript.line(0).unwrap().kind,
+            batten::state::LineKind::System
+        );
+        assert!(!has_user_line(&app));
+    }
+
+    #[test]
+    fn budget_warning_for_cost_mentions_partial_prices() {
+        let mut app = crush_app();
+        app.apply(LiveEvent::BudgetWarning {
+            metric: BudgetMetric::CostUsd,
+            level_percent: 80,
+            used: 8.0,
+            limit: 10.0,
+            partial: true,
+        });
+        let lineas = texts(&app);
+        assert_eq!(lineas.len(), 1);
+        assert!(lineas[0].contains("USD"));
+        assert!(lineas[0].contains("según los precios conocidos"));
+        assert_eq!(
+            lineas[0],
+            "aviso de presupuesto: 80 % de 10.00 USD de la sesión (8.00 usados) (según los precios conocidos)"
+        );
+
+        let mut completo = crush_app();
+        completo.apply(LiveEvent::BudgetWarning {
+            metric: BudgetMetric::CostUsd,
+            level_percent: 80,
+            used: 8.0,
+            limit: 10.0,
+            partial: false,
+        });
+        let sin_parcial = texts(&completo);
+        assert_eq!(
+            sin_parcial[0],
+            "aviso de presupuesto: 80 % de 10.00 USD de la sesión (8.00 usados)"
+        );
+        assert!(!sin_parcial[0].contains("según los precios conocidos"));
     }
 
     /// App con el look Crush (herramientas inline y composer sin caja).
