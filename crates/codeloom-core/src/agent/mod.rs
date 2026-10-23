@@ -319,6 +319,74 @@ impl AgentLoop {
         self
     }
 
+    /// Prompt de sistema vigente: contexto del proyecto, lista de agentes y prompt propio, cada
+    /// parte con su tope. Se calcula en cada turno, de modo que la recarga en caliente del registro
+    /// también le llega al modelo.
+    fn system_prompt(&self) -> String {
+        let mut system = crate::config::context::load_context_files(&self.cwd).join("\n\n");
+        // Con la herramienta `subagent` y un registro, el modelo recibe la lista vigente de agentes:
+        // se lee en cada turno, de modo que la recarga en caliente también le llega.
+        if let (Some(_), Some(registro)) = (&self.subagents, &self.registry) {
+            if !system.is_empty() {
+                system.push_str("\n\n");
+            }
+            let seccion = registro.snapshot().prompt_section(self.delegation_confirm);
+            system.push_str(&limit_bytes(&seccion, MAX_AGENT_SECTION_BYTES));
+        }
+        // El prompt propio del agente va detrás del contexto del proyecto, sin sustituirlo.
+        if let Some(extra) = self
+            .system_extra
+            .as_deref()
+            .filter(|t| !t.trim().is_empty())
+        {
+            if !system.is_empty() {
+                system.push_str("\n\n");
+            }
+            system.push_str(&limit_bytes(extra, MAX_SYSTEM_EXTRA_BYTES));
+        }
+        system
+    }
+
+    /// Resume ahora el historial antiguo de `session`, sin esperar al umbral (`/compact`). Usa la
+    /// misma vía que la compactación automática: activa un resumen en segundo plano si lo hay y,
+    /// si no, lo genera con el modelo. Publica siempre `ManualCompactionEnded`, también si falla,
+    /// y no devuelve error: un fallo es un resultado, no una excepción. No debe llamarse con un
+    /// turno en curso sobre la misma sesión; quien llama (la interfaz) lo garantiza.
+    pub async fn compact_now(
+        &self,
+        session: SessionId,
+        cancel: CancellationToken,
+    ) -> crate::event::ManualCompaction {
+        use crate::event::ManualCompaction;
+        let outcome = match self.store.messages(session).await {
+            Err(error) => {
+                tracing::warn!(error = %error, "no se pudo leer el historial para compactar");
+                ManualCompaction::Failed
+            }
+            Ok(history) if compact::choose_cut(&history).is_none() => {
+                ManualCompaction::NothingToSummarize
+            }
+            Ok(history) => {
+                let tokens_before =
+                    compact::estimate_context_tokens(&history, self.system_prompt().len()) as u64;
+                match self
+                    .compact_or_activate(session, &history, tokens_before, &cancel)
+                    .await
+                {
+                    Ok(true) => ManualCompaction::Compacted,
+                    Ok(false) => ManualCompaction::Failed,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "no se pudo resumir el historial");
+                        ManualCompaction::Failed
+                    }
+                }
+            }
+        };
+        self.bus
+            .publish(LiveEvent::ManualCompactionEnded { outcome });
+        outcome
+    }
+
     /// Lanzador de subagentes con el estado actual de este agente, catálogo y registro incluidos.
     fn subagent_launcher(&self) -> Arc<dyn crate::subagent::SubagentLauncher> {
         let lanzador = crate::subagent::InProcessSubagentLauncher::new(
@@ -442,27 +510,7 @@ impl AgentLoop {
             history.push(user);
         }
 
-        let mut system = crate::config::context::load_context_files(&self.cwd).join("\n\n");
-        // Con la herramienta `subagent` y un registro, el modelo recibe la lista vigente de agentes:
-        // se lee en cada turno, de modo que la recarga en caliente también le llega.
-        if let (Some(_), Some(registro)) = (&self.subagents, &self.registry) {
-            if !system.is_empty() {
-                system.push_str("\n\n");
-            }
-            let seccion = registro.snapshot().prompt_section(self.delegation_confirm);
-            system.push_str(&limit_bytes(&seccion, MAX_AGENT_SECTION_BYTES));
-        }
-        // El prompt propio del agente va detrás del contexto del proyecto, sin sustituirlo.
-        if let Some(extra) = self
-            .system_extra
-            .as_deref()
-            .filter(|t| !t.trim().is_empty())
-        {
-            if !system.is_empty() {
-                system.push_str("\n\n");
-            }
-            system.push_str(&limit_bytes(extra, MAX_SYSTEM_EXTRA_BYTES));
-        }
+        let system = self.system_prompt();
         let ctx = ToolCtx {
             cwd: self.cwd.clone(),
             permission: self.permission.clone(),
@@ -2572,6 +2620,68 @@ Cuerpo.
             texto.len()
         );
         assert!(texto.len() < 40_000, "el recorte debe haber actuado");
+    }
+
+    /// Resultados de compactación manual que hay en el bus, en orden de llegada.
+    fn manuales_del_bus(
+        rx: &mut tokio::sync::broadcast::Receiver<LiveEvent>,
+    ) -> Vec<crate::event::ManualCompaction> {
+        let mut vistos = Vec::new();
+        while let Ok(evento) = rx.try_recv() {
+            if let LiveEvent::ManualCompactionEnded { outcome } = evento {
+                vistos.push(outcome);
+            }
+        }
+        vistos
+    }
+
+    #[tokio::test]
+    async fn compact_now_summarizes_without_waiting_for_the_threshold() {
+        use crate::event::ManualCompaction;
+        let e = entorno_de_resumen("resumen", &historial_grande(100)).await;
+        let mut rx = e.bus.subscribe();
+
+        let resultado = e.agente.compact_now(e.sid, CancellationToken::new()).await;
+
+        assert_eq!(resultado, ManualCompaction::Compacted);
+        assert_eq!(manuales_del_bus(&mut rx), vec![ManualCompaction::Compacted]);
+        let despues = e.store.messages(e.sid).await.unwrap();
+        assert!(compact::parse_summary(despues.last().unwrap()).is_some());
+    }
+
+    #[tokio::test]
+    async fn compact_now_with_nothing_to_summarize_calls_no_model() {
+        use crate::event::ManualCompaction;
+        let e = entorno_de_resumen("resumen", &historial_grande(2)).await;
+        let mut rx = e.bus.subscribe();
+
+        let resultado = e.agente.compact_now(e.sid, CancellationToken::new()).await;
+
+        assert_eq!(resultado, ManualCompaction::NothingToSummarize);
+        assert_eq!(
+            manuales_del_bus(&mut rx),
+            vec![ManualCompaction::NothingToSummarize]
+        );
+        assert!(e.proveedor.seen.lock().unwrap().is_empty());
+        assert_eq!(e.store.messages(e.sid).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn compact_now_reports_failure_when_the_summary_is_empty() {
+        use crate::event::ManualCompaction;
+        let e = entorno_de_resumen(
+            "  
+ ",
+            &historial_grande(100),
+        )
+        .await;
+        let mut rx = e.bus.subscribe();
+
+        let resultado = e.agente.compact_now(e.sid, CancellationToken::new()).await;
+
+        assert_eq!(resultado, ManualCompaction::Failed);
+        assert_eq!(manuales_del_bus(&mut rx), vec![ManualCompaction::Failed]);
+        assert_eq!(e.store.messages(e.sid).await.unwrap().len(), 100);
     }
 
     #[tokio::test]

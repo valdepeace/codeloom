@@ -670,6 +670,12 @@ pub fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Option<St
 
 fn execute_slash_command(app: &mut App, command: crate::commands::Command) -> Option<String> {
     use crate::commands::Command;
+    if command == Command::Compact {
+        // Con motivo de rechazo queda en `slash_feedback` y se conserva el texto escrito.
+        if !app.request_compact() {
+            return None;
+        }
+    }
     if matches!(command, Command::New | Command::Sessions) && app.turn_in_flight {
         app.slash_feedback = Some("Wait for the active turn before switching sessions".into());
         return None;
@@ -731,6 +737,8 @@ fn execute_slash_command(app: &mut App, command: crate::commands::Command) -> Op
             });
             None
         }
+        // Ya pedida arriba: el bucle la entrega al trabajador con `dispatch_compact`.
+        Command::Compact => None,
         Command::Quit => handle_key(app, KeyCode::Char('q'), KeyModifiers::CONTROL),
         Command::Parent => {
             if !app.go_parent() {
@@ -1015,10 +1023,21 @@ fn dispatch_wake(app: &mut App, wake_tx: &UnboundedSender<()>) {
     }
 }
 
+/// Entrega al trabajador la compactación manual pedida. Si el canal está cerrado, la suelta para no
+/// dejar la cola de prompts bloqueada.
+fn dispatch_compact(app: &mut App, compact_tx: &UnboundedSender<()>) {
+    if app.take_compact() && compact_tx.send(()).is_err() {
+        app.compact_in_flight = false;
+        app.status = "error: compaction channel closed".into();
+    }
+}
+
 fn dispatch_next(app: &mut App, tx: &UnboundedSender<String>) {
-    // Un despertar en vuelo ocupa el turno: no se solapa un prompt con él.
+    // Un despertar o una compactación en vuelo ocupan el turno: no se solapa un prompt con ellos.
     if app.turn_in_flight
         || app.wake_in_flight
+        || app.compact_requested
+        || app.compact_in_flight
         || app.queue_open
         || app.queue_paused
         || app.session_loading
@@ -1073,6 +1092,8 @@ pub async fn run(
     prompt_tx: UnboundedSender<String>,
     // Canal de despertares del padre ocioso: el trabajador ejecuta un turno sin mensaje de usuario.
     wake_tx: UnboundedSender<()>,
+    // Canal de compactaciones manuales (`/compact`): el trabajador resume la sesión abierta.
+    compact_tx: UnboundedSender<()>,
     settings_tx: UnboundedSender<ProviderSettingsCommand>,
     mut bus_rx: tokio::sync::broadcast::Receiver<codeloom_core::event::LiveEvent>,
     mut perm_rx: tokio::sync::mpsc::Receiver<(
@@ -1164,6 +1185,7 @@ pub async fn run(
                         }
                     }
                     dispatch_wake(&mut app, &wake_tx);
+                    dispatch_compact(&mut app, &compact_tx);
                     frames.request(Urgency::Input);
                 }
                 Some(Err(error)) => return Err(error),
@@ -1207,6 +1229,7 @@ pub async fn run(
                 }
                 dispatch_next(&mut app, &prompt_tx);
                 dispatch_wake(&mut app, &wake_tx);
+                dispatch_compact(&mut app, &compact_tx);
                 frames.request(Urgency::Input);
             },
             // Catálogo llegado en segundo plano: basta con repintar; no hay trabajo pesado aquí.
@@ -1222,6 +1245,7 @@ pub async fn run(
                 app.settings_saved(saved.unwrap_or_else(|_| Err("Settings update failed".into())));
                 dispatch_next(&mut app, &prompt_tx);
                 dispatch_wake(&mut app, &wake_tx);
+                dispatch_compact(&mut app, &compact_tx);
                 frames.request(Urgency::Input);
             },
             ev = bus_rx.recv(), if bus_open => {
@@ -1235,6 +1259,7 @@ pub async fn run(
                 }
                 dispatch_next(&mut app, &prompt_tx);
                 dispatch_wake(&mut app, &wake_tx);
+                dispatch_compact(&mut app, &compact_tx);
                 frames.request(Urgency::Background);
             }
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
@@ -2613,6 +2638,95 @@ mod tests {
                 .as_deref()
                 .unwrap()
                 .contains("active turn"));
+        }
+    }
+
+    /// App con sesión abierta y `/compact` escrito en el composer.
+    fn app_con_compact() -> App {
+        let mut app = App::new();
+        app.session_id = Some(codeloom_core::session::SessionId(1));
+        app.composer.set_text("/compact");
+        app
+    }
+
+    #[test]
+    fn slash_compact_requests_a_compaction_and_dispatches_it_once() {
+        let mut app = app_con_compact();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE),
+            None,
+            "el comando no se envía como prompt"
+        );
+        assert!(app.compact_requested);
+        assert!(app.composer.is_empty());
+
+        dispatch_compact(&mut app, &tx);
+        assert!(rx.try_recv().is_ok(), "el trabajador recibe la petición");
+        assert!(app.compact_in_flight && !app.compact_requested);
+        // Una segunda pasada no vuelve a pedirla.
+        dispatch_compact(&mut app, &tx);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn slash_compact_is_refused_without_session_or_during_a_turn_and_keeps_the_text() {
+        let casos: [(&str, fn(&mut App)); 3] = [
+            ("No session", |app| app.session_id = None),
+            ("active turn", |app| app.turn_in_flight = true),
+            ("Already compacting", |app| app.compact_in_flight = true),
+        ];
+        for (esperado, preparar) in casos {
+            let mut app = app_con_compact();
+            preparar(&mut app);
+            handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(!app.compact_requested, "{esperado}");
+            assert_eq!(app.composer.text(), "/compact", "{esperado}");
+            assert!(
+                app.slash_feedback.as_deref().unwrap().contains(esperado),
+                "{esperado}: {:?}",
+                app.slash_feedback
+            );
+        }
+    }
+
+    #[test]
+    fn a_compaction_in_flight_holds_the_prompt_queue_until_it_ends() {
+        use codeloom_core::event::{LiveEvent, ManualCompaction};
+        let mut app = app_con_compact();
+        let (compact_tx, _compact_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        dispatch_compact(&mut app, &compact_tx);
+        app.pending_prompts.push_back("hola".into());
+
+        dispatch_next(&mut app, &tx);
+        assert!(rx.try_recv().is_err(), "el prompt espera a la compactación");
+
+        app.apply(LiveEvent::ManualCompactionEnded {
+            outcome: ManualCompaction::Compacted,
+        });
+        assert!(!app.compact_in_flight);
+        assert_eq!(
+            app.slash_feedback.as_deref(),
+            Some("Older history summarized")
+        );
+        dispatch_next(&mut app, &tx);
+        assert_eq!(rx.try_recv().unwrap(), "hola");
+    }
+
+    #[test]
+    fn the_outcome_of_a_manual_compaction_is_told_in_the_feedback() {
+        use codeloom_core::event::{LiveEvent, ManualCompaction};
+        for (outcome, texto) in [
+            (ManualCompaction::NothingToSummarize, "Nothing to summarize"),
+            (ManualCompaction::Failed, "history unchanged"),
+        ] {
+            let mut app = App::new();
+            app.compact_in_flight = true;
+            app.apply(LiveEvent::ManualCompactionEnded { outcome });
+            assert!(!app.compact_in_flight);
+            assert!(app.slash_feedback.as_deref().unwrap().contains(texto));
         }
     }
 

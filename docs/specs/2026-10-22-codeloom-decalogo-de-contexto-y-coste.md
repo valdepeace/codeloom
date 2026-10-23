@@ -73,7 +73,7 @@ que no tiene cota acabará, tarde o temprano, desbordándose.**
    compactación o resumen de lo antiguo. *Estado: **hecho en lo esencial**. Limpieza de
    resultados antiguos de herramientas (`2026-10-22-codeloom-context-compaction-design.md`) y,
    desde el 2026-10-23, resumen del historial con el modelo al alcanzar el 80 % de la ventana
-   (`2026-10-23-codeloom-context-summary-design.md`). Falta `/compact` manual. Ante un
+   (`2026-10-23-codeloom-context-summary-design.md`). `/compact` manual existe desde el 2026-10-23. Ante un
    rechazo `400`/`413` por contexto excedido se compacta y se reintenta (fórmulas de error sin
    contrastar con los proveedores); sin ventana conocida no se compacta por umbral. Desde el
    mismo día existe, **opt-in** (`[compaction] background = true`), la preparación del resumen en
@@ -124,5 +124,5 @@ que no tiene cota acabará, tarde o temprano, desbordándose.**
   medir con sesiones reales.
 - Presupuesto de tokens: resuelto como aviso por sesión y familia (regla 7). Queda abierto el
   presupuesto por turno.
-- ¿Compactación a petición (`/compact`)? La automática ya existe; falta el mando manual, que
-  exige una infraestructura de comandos con barra que la TUI no tiene.
+- Compactación a petición (`/compact`): resuelta el 2026-10-23 (véase la spec del resumen). La
+  nota anterior, que decía que la TUI no tenía comandos con barra, era errónea.

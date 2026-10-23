@@ -91,8 +91,9 @@ anterior más lo que vino después.
 
 ## Qué queda fuera (declarado)
 
-- **`/compact` manual:** la TUI no tiene ninguna infraestructura de comandos con barra; es otra
-  tarea de producto.
+- **`/compact` manual:** **hecho el 2026-10-23**. La nota original decía que la TUI no tenía
+  infraestructura de comandos con barra; era falso (`commands.rs` ya tenía diecisiete, entre ellos
+  `/agents`). Véase la sección «`/compact` manual» más abajo.
 - **Reintento reactivo** al recibir del proveedor un rechazo por contexto excedido (lo hacen
   deepseek-harness, opencode y qwen-code): **hecho el 2026-10-23** (`is_context_overflow` en
   `compact.rs`, rama en `run_turn`). Se reconoce un `400`/`413` cuyo cuerpo contiene alguna de
@@ -143,8 +144,29 @@ propio en la TUI) y `cd04d13` (apunte del consumo de la llamada de resumen).
   tokens cacheados y la estimación se quedaría corta; habría que sumar los campos de caché.
 - **Sin ventana conocida no se compacta** (modelo ausente del catálogo, catálogo sin descargar o
   sin red). La limpieza de resultados antiguos sigue activa.
-- **`/compact` manual**: sin hacer. El **reintento reactivo** ante un rechazo por contexto
-  excedido está hecho (véase arriba), con fórmulas de error sin contrastar.
+- El **reintento reactivo** ante un rechazo por contexto excedido está hecho (véase arriba), con
+  fórmulas de error sin contrastar.
+
+### `/compact` manual (2026-10-23)
+
+`/compact` resume ya el historial antiguo de la sesión abierta, sin esperar al 80 %.
+
+- **Núcleo:** `AgentLoop::compact_now(session, cancel) -> ManualCompaction`. Usa la misma vía que
+  la compactación automática (`compact_or_activate`: activa un resumen en segundo plano si lo hay
+  y, si no, llama al modelo). Publica siempre `LiveEvent::ManualCompactionEnded` con uno de tres
+  resultados: `Compacted`, `NothingToSummarize` (no hay corte posible: no se llama al modelo) o
+  `Failed` (resumen vacío, cortado o error: el historial queda como estaba). El prompt de sistema se
+  extrajo a `system_prompt()` para estimar `tokens_before` igual que en un turno.
+- **Interfaz:** `Command::Compact`. Solo con sesión abierta y sin turno, despertar ni otra
+  compactación en curso; si no, el motivo sale en el aviso del composer y se conserva el texto
+  escrito. Mientras dura, la cola de prompts y los despertares esperan (`compact_in_flight`).
+- **Trabajador (`codeloom-cli`):** canal propio (`compact_tx`), junto al de despertares.
+- **Rotulado como propio:** nada de esto viene de A2A; es mando de la interfaz.
+- **No consta / límites:** no se puede cancelar con `Esc` mientras resume (la cancelación de la
+  interfaz solo actúa sobre turnos); no se ha visto en una terminal real; con la compactación
+  manual no hay topes propios más allá de los de la automática (el resumen se acota a
+  `MAX_SUMMARY_BYTES`), y el mando puede repetirse cuantas veces se quiera. No informa de cuántos
+  mensajes cubrió: eso ya lo pinta `ContextCompacted` en el transcript.
 - **Presupuesto de tokens de gasto:** decisión de producto sin tomar.
 - **Subagentes:** heredan el mecanismo porque usan el mismo bucle y el catálogo compartido, pero
   no hay un test específico de un hijo que compacte.

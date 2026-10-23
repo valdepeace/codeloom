@@ -18,6 +18,7 @@ pub enum Command {
     Sidebar,
     Mouse,
     Agents,
+    Compact,
     Quit,
 }
 
@@ -50,5 +51,10 @@ pub const COMMANDS: &[(Command, &str, &str)] = &[
         "Toggle mouse capture (off: select text with the mouse)",
     ),
     (Command::Agents, "/agents", "List the loaded agents"),
+    (
+        Command::Compact,
+        "/compact",
+        "Summarize older history now (when idle)",
+    ),
     (Command::Quit, "/quit", "Exit CodeLoom"),
 ];

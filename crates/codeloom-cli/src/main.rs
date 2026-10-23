@@ -229,6 +229,8 @@ async fn main() -> Result<()> {
 
     let (prompt_tx, mut prompt_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let (wake_tx, mut wake_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    // Compactaciones manuales (`/compact`): el trabajador resume la sesión abierta.
+    let (compact_tx, mut compact_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     let (settings_tx, mut settings_rx) =
         tokio::sync::mpsc::unbounded_channel::<codeloom_tui::run::ProviderSettingsCommand>();
     let (session_command_tx, mut session_command_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -294,6 +296,12 @@ async fn main() -> Result<()> {
                     }
                     let _ = command.reply.send(result.map(|_| ( )));
                 }
+                // `/compact`: la interfaz solo lo pide con sesión abierta y sin turno en curso.
+                // `compact_now` publica siempre `ManualCompactionEnded`, que libera a la interfaz.
+                Some(()) = compact_rx.recv() => {
+                    let Some(session_id) = session else { continue; };
+                    agent_task.compact_now(session_id, CancellationToken::new()).await;
+                }
                 prompt = prompt_rx.recv() => match prompt {
                     Some(prompt) => {
                         let Some(session_id) = session else { continue; };
@@ -348,6 +356,7 @@ async fn main() -> Result<()> {
         app,
         prompt_tx,
         wake_tx,
+        compact_tx,
         settings_tx,
         bus_rx,
         perm_rx,

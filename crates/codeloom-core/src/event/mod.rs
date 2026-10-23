@@ -11,6 +11,17 @@ pub enum Activation {
     BackgroundAwaited { waited_ms: u64 },
 }
 
+/// Resultado de una compactación pedida a mano (`/compact`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManualCompaction {
+    /// El historial antiguo se resumió y el resumen entró en efecto.
+    Compacted,
+    /// No hay historia que resumir todavía: el corte no deja nada por detrás.
+    NothingToSummarize,
+    /// El resumen falló, vino vacío o se canceló; el historial queda como estaba.
+    Failed,
+}
+
 #[derive(Debug, Clone)]
 pub enum LiveEvent {
     TurnStarted,
@@ -56,6 +67,11 @@ pub enum LiveEvent {
     /// El resumen en segundo plano se ha descartado sin activarse: falló, vino vacío o truncado,
     /// se canceló o quedó caduco. La sesión vuelve a no tener nada pendiente.
     BackgroundCompactionDiscarded,
+    /// Una compactación pedida a mano (`/compact`) ha terminado. Siempre se publica, también si
+    /// falla, para que la interfaz deje de esperarla.
+    ManualCompactionEnded {
+        outcome: ManualCompaction,
+    },
     /// El gasto acumulado de la sesión cruza un umbral del presupuesto (`[budget]`). `used` y
     /// `limit` van en tokens o en dólares según `metric`; `partial` indica que el coste no suma
     /// los apuntes sin precio conocido. Solo avisa: no detiene el turno.
@@ -163,6 +179,7 @@ impl LiveEvent {
             | LiveEvent::TodosChanged { .. }
             | LiveEvent::AgentRegistryChanged { .. }
             | LiveEvent::WakeIdle
+            | LiveEvent::ManualCompactionEnded { .. }
             | LiveEvent::SubagentSettled { .. }
             | LiveEvent::ChildEvent { .. } => false,
         }

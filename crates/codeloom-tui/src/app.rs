@@ -628,6 +628,12 @@ pub struct App {
     pub wake_pending: bool,
     /// Despertar ya pedido al trabajador, sin turno iniciado ni `WakeIdle` de respuesta.
     pub wake_in_flight: bool,
+    /// `/compact` pedido por la persona usuaria y aún no entregado al trabajador.
+    pub compact_requested: bool,
+    /// Compactación manual ya entregada al trabajador, sin `ManualCompactionEnded` de respuesta.
+    /// Mientras dura, no se despachan prompts ni despertares: la compactación y un turno sobre la
+    /// misma sesión no deben solaparse.
+    pub compact_in_flight: bool,
     /// Causas `(hijo, motivo)` de los despertares pendientes desde el último turno despertado.
     /// Motivos: `"completed"`, `"failed"` o `"asks input"`. Solo son memoria de la interfaz.
     pub wake_causes: Vec<(i64, &'static str)>,
@@ -854,6 +860,8 @@ impl App {
             turn_in_flight: false,
             wake_pending: false,
             wake_in_flight: false,
+            compact_requested: false,
+            compact_in_flight: false,
             wake_causes: Vec::new(),
             auto_turns_left: MAX_AUTO_TURNS,
             permission: None,
@@ -942,6 +950,8 @@ impl App {
     pub fn take_wake(&mut self) -> bool {
         if !self.wake_pending
             || self.wake_in_flight
+            || self.compact_requested
+            || self.compact_in_flight
             || self.turn_in_flight
             || !self.pending_prompts.is_empty()
             || self.permission.is_some()
@@ -964,6 +974,43 @@ impl App {
         }
         self.wake_pending = false;
         self.wake_in_flight = true;
+        true
+    }
+
+    /// Motivo por el que `/compact` no puede pedirse ahora, o `None` si puede. Exige una sesión
+    /// abierta y que no haya turno, despertar ni otra compactación en curso.
+    pub fn compact_blocked(&self) -> Option<&'static str> {
+        if self.session_id.is_none() {
+            Some("No session to compact")
+        } else if self.turn_in_flight || self.wake_in_flight {
+            Some("Wait for the active turn before compacting")
+        } else if self.compact_requested || self.compact_in_flight {
+            Some("Already compacting")
+        } else {
+            None
+        }
+    }
+
+    /// Pide una compactación manual. La entrega al trabajador `take_compact`. Devuelve `false`,
+    /// con el motivo en `slash_feedback`, si no puede pedirse ahora.
+    pub fn request_compact(&mut self) -> bool {
+        if let Some(motivo) = self.compact_blocked() {
+            self.slash_feedback = Some(motivo.into());
+            return false;
+        }
+        self.compact_requested = true;
+        self.slash_feedback = Some("Compacting…".into());
+        true
+    }
+
+    /// `true` una sola vez por petición: pasa de «pedida» a «en vuelo» y el bucle debe avisar al
+    /// trabajador.
+    pub fn take_compact(&mut self) -> bool {
+        if !self.compact_requested {
+            return false;
+        }
+        self.compact_requested = false;
+        self.compact_in_flight = true;
         true
     }
 
@@ -2757,6 +2804,20 @@ impl App {
             // La vuelta a `working` llega como `SubagentChanged`: no hay nada que mantener aquí.
             LiveEvent::SubagentInputResolved { .. } => {}
             LiveEvent::WakeIdle => self.wake_in_flight = false,
+            // La compactación manual terminó, bien o mal: se libera la cola y se dice cómo acabó.
+            // El resumen en sí ya se pintó con `ContextCompacted`.
+            LiveEvent::ManualCompactionEnded { outcome } => {
+                use codeloom_core::event::ManualCompaction;
+                self.compact_in_flight = false;
+                self.slash_feedback = Some(
+                    match outcome {
+                        ManualCompaction::Compacted => "Older history summarized",
+                        ManualCompaction::NothingToSummarize => "Nothing to summarize yet",
+                        ManualCompaction::Failed => "Compaction failed; history unchanged",
+                    }
+                    .into(),
+                );
+            }
             LiveEvent::ChildEvent {
                 parent,
                 child,
