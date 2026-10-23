@@ -18,6 +18,7 @@ pub mod session;
 pub mod subagent;
 pub mod subagent_input;
 pub mod task;
+pub mod task_events;
 pub mod todo;
 pub mod tools;
 pub mod transport;
