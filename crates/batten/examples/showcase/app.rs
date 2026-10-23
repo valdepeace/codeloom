@@ -374,6 +374,16 @@ impl Showcase {
         );
     }
 
+    /// Coloca el cursor de la matriz en (fila, columna), con tope en los bordes; no hace nada sin
+    /// filas. No abre nada: abrir es cosa de `Enter`.
+    pub fn matrix_set_cursor(&mut self, row: usize, column: usize) {
+        let rows = self.matrix.rows.len();
+        if rows == 0 {
+            return;
+        }
+        self.matrix_cursor = (row.min(rows - 1), column.min(matrix::COLUMNS.len() - 1));
+    }
+
     /// Cambia al tema de la columna de la celda bajo el cursor y abre el demo de esa celda. Las
     /// celdas `Missing` no hacen nada.
     pub fn open_matrix_cell(&mut self) {

@@ -8,7 +8,7 @@ use crate::app::Showcase;
 use crate::demos::{strict_provider, CatalogItem};
 use batten::state::StyleToken;
 use batten::widgets::{Theme, ThemePreset};
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -173,33 +173,114 @@ const MIN_HEIGHT: u16 = 3;
 /// Espacio entre el texto de una columna y la siguiente.
 const GAP: usize = 1;
 
+/// `true` si `area` tiene el tamaño mínimo para dibujar la matriz.
+fn matrix_fits(area: Rect) -> bool {
+    area.width >= MIN_WIDTH && area.height >= MIN_HEIGHT
+}
+
+/// Nota de la matriz para `area`, si cabe. La comparten el dibujo y el ratón: si no, la tabla no
+/// tendría la misma altura en ambos.
+fn note_for(area: Rect, matrix: &Matrix) -> Option<String> {
+    // La nota solo cabe si, además de cabecera, una fila, leyenda y celda, queda una línea.
+    note_text(matrix).filter(|_| area.height >= 5)
+}
+
+/// Reparto vertical de la matriz en `area`: cabecera, tabla, leyenda, celda del cursor y nota.
+fn matrix_areas(area: Rect, with_note: bool) -> [Rect; 5] {
+    Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(u16::from(with_note)),
+    ])
+    .areas(area)
+}
+
+/// Ancho de la columna de nombres y de cada columna de tema, para un área de `width` columnas.
+fn column_widths(width: u16) -> (usize, Vec<usize>) {
+    let widths: Vec<usize> = COLUMNS
+        .iter()
+        .map(|(name, _)| name.chars().count() + GAP)
+        .collect();
+    let name_width = usize::from(width).saturating_sub(widths.iter().sum());
+    (name_width, widths)
+}
+
+/// Qué hay bajo un punto de la tabla: el nombre de una fila o una celda.
+enum Hit {
+    Name(usize),
+    Cell(usize, usize),
+}
+
+/// Fila y columna de la matriz bajo (`column`, `row`), con el mismo reparto y el mismo
+/// desplazamiento vertical que `draw_matrix`. `None` si el punto no cae en una fila pintada.
+fn table_hit(area: Rect, show: &Showcase, column: u16, row: u16) -> Option<Hit> {
+    let matrix = show.matrix();
+    if !matrix_fits(area) || matrix.rows.is_empty() {
+        return None;
+    }
+    let [_, table, ..] = matrix_areas(area, note_for(area, matrix).is_some());
+    if !table.contains(Position::new(column, row)) {
+        return None;
+    }
+    let (cursor_row, _) = show.matrix_cursor();
+    let offset = (cursor_row + 1).saturating_sub(usize::from(table.height));
+    let index = offset + usize::from(row - table.y);
+    if index >= matrix.rows.len() {
+        return None;
+    }
+    let (name_width, widths) = column_widths(area.width);
+    let x = usize::from(column - area.x);
+    if x < name_width {
+        return Some(Hit::Name(index));
+    }
+    let mut start = name_width;
+    for (column_index, width) in widths.iter().enumerate() {
+        if x < start + *width {
+            return Some(Hit::Cell(index, column_index));
+        }
+        start += *width;
+    }
+    None
+}
+
+/// Celda (fila, columna) de la matriz bajo el punto, si cae en una celda pintada en `area`.
+pub(crate) fn matrix_cell_at(
+    area: Rect,
+    show: &Showcase,
+    column: u16,
+    row: u16,
+) -> Option<(usize, usize)> {
+    match table_hit(area, show, column, row)? {
+        Hit::Cell(index, column_index) => Some((index, column_index)),
+        Hit::Name(_) => None,
+    }
+}
+
+/// Fila de la matriz cuyo nombre está bajo el punto, si cae en el nombre de una fila pintada.
+pub(crate) fn matrix_name_at(area: Rect, show: &Showcase, column: u16, row: u16) -> Option<usize> {
+    match table_hit(area, show, column, row)? {
+        Hit::Name(index) => Some(index),
+        Hit::Cell(..) => None,
+    }
+}
+
 /// Dibuja la matriz de componentes por tema dentro de `area`: cabecera de columnas, una fila por
 /// componente con su símbolo en cada tema, leyenda, texto de la celda del cursor y, si hay sitio,
 /// nota sobre dotmax y los demos sin proveedor.
 pub fn draw_matrix(f: &mut Frame, area: Rect, show: &Showcase, theme: &Theme) {
-    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+    if !matrix_fits(area) {
         let message = Paragraph::new("Terminal pequeña").style(theme.style(StyleToken::Muted));
         f.render_widget(message, area);
         return;
     }
     let matrix = show.matrix();
     let (cursor_row, cursor_col) = show.matrix_cursor();
-    // La nota solo cabe si, además de cabecera, una fila, leyenda y celda, queda una línea.
-    let note = note_text(matrix).filter(|_| area.height >= 5);
-    let [header, table, legend, cell, note_area] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(0),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(u16::from(note.is_some())),
-    ])
-    .areas(area);
+    let note = note_for(area, matrix);
+    let [header, table, legend, cell, note_area] = matrix_areas(area, note.is_some());
 
-    let widths: Vec<usize> = COLUMNS
-        .iter()
-        .map(|(name, _)| name.chars().count() + GAP)
-        .collect();
-    let name_width = usize::from(area.width).saturating_sub(widths.iter().sum());
+    let (name_width, widths) = column_widths(area.width);
     let muted = theme.style(StyleToken::Muted);
 
     let mut head = vec![Span::raw(" ".repeat(name_width))];

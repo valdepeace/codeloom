@@ -10,9 +10,9 @@ mod theme_view;
 
 use app::{route, Action, Focus, IndexRow, Showcase};
 use batten::widgets::{Anim, Theme, FRAME_INTERVAL};
-use matrix::{draw_matrix, Cell};
+use matrix::{draw_matrix, matrix_cell_at, matrix_name_at, Cell};
 use ratatui::crossterm::event::{self, Event, MouseButton, MouseEventKind};
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
@@ -23,6 +23,10 @@ const INDEX_WIDTH: u16 = 34;
 const WIDE_MIN: u16 = 70;
 /// Columnas entre dos pestañas de tema.
 const TAB_GAP: u16 = 1;
+/// Filas de cabecera del panel de contenido (cabecera del demo o de la matriz).
+const HEADER_HEIGHT: u16 = 3;
+/// Pasos del índice por cada muesca de la rueda del ratón.
+const WHEEL_STEPS: usize = 3;
 
 fn main() -> std::io::Result<()> {
     let mut show = Showcase::new();
@@ -52,8 +56,16 @@ fn main() -> std::io::Result<()> {
                         theme = Theme::preset(preset);
                     }
                 }
-                Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
-                    handle_mouse(&mut show, mouse.column, mouse.row, terminal.size()?.into());
+                Event::Mouse(mouse)
+                    if matches!(
+                        mouse.kind,
+                        MouseEventKind::Down(MouseButton::Left)
+                            | MouseEventKind::ScrollUp
+                            | MouseEventKind::ScrollDown
+                    ) =>
+                {
+                    let screen = terminal.size()?.into();
+                    handle_mouse(&mut show, mouse.kind, mouse.column, mouse.row, screen);
                 }
                 _ => {}
             }
@@ -75,48 +87,86 @@ fn draw(f: &mut Frame, show: &mut Showcase, _anim: &Anim, theme: &Theme) {
         area,
     );
     let footer_lines = footer_texts(show, area.width);
-    let [filters, body, footer] = Layout::vertical([
+    let geo = geometry(area, footer_height(show));
+    draw_filters(f, geo.tabs, geo.query, show, theme);
+
+    // En la matriz no se consulta `fullscreen()`: el panel de contenido es siempre la matriz.
+    let matrix_mode = show.focus() == Focus::Matrix;
+    let fullscreen = !matrix_mode && show.current().is_some_and(|demo| demo.fullscreen());
+
+    if let Some(ia) = geo.index {
+        draw_index(f, ia, show, theme);
+        if !fullscreen {
+            draw_header(f, geo.header, show, theme);
+        }
+    } else if !fullscreen {
+        draw_collapsed(f, geo.header, show, theme);
+    }
+
+    if matrix_mode {
+        draw_matrix(f, geo.content, show, theme);
+    } else if let Some(demo) = show.current() {
+        demo.render(
+            f,
+            if demo.fullscreen() {
+                geo.panel
+            } else {
+                geo.content
+            },
+            theme,
+        );
+    }
+    draw_footer(f, geo.footer, &footer_lines, theme);
+}
+
+/// Áreas de la pantalla. Es la única fuente de la geometría: `draw` y `handle_mouse` la usan, así
+/// que el clic cae siempre en lo que se ve.
+struct Geometry {
+    /// Fila de pestañas de tema.
+    tabs: Rect,
+    /// Fila del filtro de texto.
+    query: Rect,
+    /// Columna del índice; `None` en terminal estrecha, donde no hay índice.
+    index: Option<Rect>,
+    /// Panel de contenido completo: cabecera y contenido.
+    panel: Rect,
+    /// Cabecera del panel (demo o matriz).
+    header: Rect,
+    /// Contenido del panel: el demo, o la matriz.
+    content: Rect,
+    /// Pie, de una o dos líneas.
+    footer: Rect,
+}
+
+/// Reparte la pantalla en áreas. `footer_height` es la altura del pie (`footer_height(show)`).
+fn geometry(screen: Rect, footer_height: u16) -> Geometry {
+    let [top, body, footer] = Layout::vertical([
         Constraint::Length(2),
         Constraint::Min(1),
-        Constraint::Length(footer_lines.len() as u16),
+        Constraint::Length(footer_height),
     ])
-    .areas(area);
-    draw_filters(f, filters, show, theme);
+    .areas(screen);
+    let [tabs, query] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(top);
 
-    let wide = area.width >= WIDE_MIN;
-    let (index, panel) = if wide {
+    let (index, panel) = if screen.width >= WIDE_MIN {
         let cols =
             Layout::horizontal([Constraint::Length(INDEX_WIDTH), Constraint::Min(1)]).split(body);
         (Some(cols[0]), cols[1])
     } else {
         (None, body)
     };
+    let [header, content] =
+        Layout::vertical([Constraint::Length(HEADER_HEIGHT), Constraint::Min(1)]).areas(panel);
 
-    let header_h = 3;
-    let parts = Layout::vertical([Constraint::Length(header_h), Constraint::Min(1)]).split(panel);
-    let (header, content) = (parts[0], parts[1]);
-
-    // En la matriz no se consulta `fullscreen()`: el panel de contenido es siempre la matriz.
-    let matrix_mode = show.focus() == Focus::Matrix;
-    let fullscreen = !matrix_mode && show.current().is_some_and(|demo| demo.fullscreen());
-
-    if let Some(ia) = index {
-        draw_index(f, ia, show, theme);
-        if !fullscreen {
-            draw_header(f, header, show, theme);
-        }
-    } else {
-        if !fullscreen {
-            draw_collapsed(f, header, show, theme);
-        }
+    Geometry {
+        tabs,
+        query,
+        index,
+        panel,
+        header,
+        content,
+        footer,
     }
-
-    if matrix_mode {
-        draw_matrix(f, content, show, theme);
-    } else if let Some(demo) = show.current() {
-        demo.render(f, if demo.fullscreen() { panel } else { content }, theme);
-    }
-    draw_footer(f, footer, &footer_lines, theme);
 }
 
 /// Ancho de una pestaña de tema: el nombre con un espacio a cada lado.
@@ -148,9 +198,7 @@ pub(crate) fn tab_spans_layout(width: u16) -> Vec<(usize, u16, u16)> {
     spans
 }
 
-fn draw_filters(f: &mut Frame, area: Rect, show: &Showcase, theme: &Theme) {
-    let [tabs_area, query_area] =
-        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
+fn draw_filters(f: &mut Frame, tabs_area: Rect, query_area: Rect, show: &Showcase, theme: &Theme) {
     draw_tabs(f, tabs_area, show, theme);
 
     let muted = theme.style(batten::state::StyleToken::Muted);
@@ -207,46 +255,119 @@ fn draw_tabs(f: &mut Frame, area: Rect, show: &Showcase, theme: &Theme) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn handle_mouse(show: &mut Showcase, column: u16, row: u16, screen: Rect) {
-    if screen.width == 0 || screen.height < 3 {
+/// Atiende un evento de ratón sobre la geometría de `screen`: clic izquierdo y rueda.
+///
+/// Con `Focus::Matrix` la rueda mueve el cursor de la matriz, esté donde esté el puntero, y un
+/// clic fuera de la tabla no cambia el foco ni cierra la matriz. Fuera de la matriz, la rueda solo
+/// actúa sobre el índice.
+fn handle_mouse(show: &mut Showcase, kind: MouseEventKind, column: u16, row: u16, screen: Rect) {
+    if screen.width == 0 || screen.height == 0 {
         return;
     }
-    let filter_end = screen.y.saturating_add(2);
-    // La fila 0 (pestañas de tema) no hace nada hasta la Tarea 4 (ratón).
-    if row == screen.y {
+    // La altura del pie sale del estado actual, el mismo que pintó el último `draw`.
+    let geo = geometry(screen, footer_height(show));
+    match kind {
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            let up = kind == MouseEventKind::ScrollUp;
+            if show.focus() == Focus::Matrix {
+                show.matrix_move(if up { -1 } else { 1 }, 0);
+            } else if geo.index.is_some_and(|area| inside(area, column, row)) {
+                for _ in 0..WHEEL_STEPS {
+                    if up {
+                        show.prev();
+                    } else {
+                        show.next();
+                    }
+                }
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) => click(show, &geo, column, row),
+        _ => {}
+    }
+}
+
+/// `true` si el punto (`column`, `row`) cae dentro de `area`.
+fn inside(area: Rect, column: u16, row: u16) -> bool {
+    area.contains(Position::new(column, row))
+}
+
+/// Resuelve un clic izquierdo sobre la geometría de `geo`.
+fn click(show: &mut Showcase, geo: &Geometry, column: u16, row: u16) {
+    if inside(geo.tabs, column, row) {
+        if let Some(theme) = tab_at(geo.tabs, column) {
+            show.set_theme_column(theme);
+            show.set_focus(Focus::Index);
+        }
         return;
     }
-    if row == screen.y.saturating_add(1) {
+    if inside(geo.query, column, row) {
         show.set_focus(Focus::TextFilter);
         return;
     }
-    if row < filter_end || row >= screen.y.saturating_add(screen.height).saturating_sub(1) {
+    if let Some(index) = geo.index.filter(|area| inside(*area, column, row)) {
+        index_click(show, index, row);
         return;
     }
-
-    let body_y = filter_end;
-    let body_height = screen.height.saturating_sub(3);
-    if screen.width >= WIDE_MIN && column < screen.x.saturating_add(INDEX_WIDTH) {
-        let relative_row = row.saturating_sub(body_y);
-        let (start, visible) = show.visible_index_rows(body_height);
-        if start > 0 && relative_row == 0 {
-            return;
-        }
-        let all_rows = show.index_rows();
-        if start + visible.len() < all_rows.len() && usize::from(relative_row) + 1 == visible.len()
-        {
-            return;
-        }
-        if let Some(IndexRow {
-            catalog_index: Some(index),
-            ..
-        }) = visible.get(usize::from(relative_row))
-        {
-            show.select(*index, true);
-        }
-    } else if screen.width < WIDE_MIN || column >= screen.x.saturating_add(INDEX_WIDTH) {
+    if show.focus() == Focus::Matrix {
+        matrix_click(show, geo.content, column, row);
+        return;
+    }
+    if inside(geo.panel, column, row) {
         show.set_focus(Focus::Demo);
     }
+}
+
+/// Índice de la pestaña de tema bajo `column`, si esa columna pinta una (o parte de una).
+fn tab_at(tabs: Rect, column: u16) -> Option<usize> {
+    let x = column - tabs.x;
+    tab_spans_layout(tabs.width)
+        .into_iter()
+        .find(|&(_, x0, shown)| x >= x0 && x < x0 + shown)
+        .map(|(theme, _, _)| theme)
+}
+
+/// Clic en el índice: selecciona y abre la fila, salvo que sea cabecera, aviso o hueco.
+fn index_click(show: &mut Showcase, area: Rect, row: u16) {
+    let offset = usize::from(row - area.y);
+    let (start, visible) = show.visible_index_rows(area.height);
+    let total = show.index_rows().len();
+    if index_notice(start, visible.len(), total, offset).is_some() {
+        return;
+    }
+    if let Some(IndexRow {
+        catalog_index: Some(index),
+        ..
+    }) = visible.get(offset)
+    {
+        show.select(*index, true);
+    }
+}
+
+/// Clic en la matriz (solo con `Focus::Matrix`): una celda mueve el cursor a ella; el nombre de
+/// una fila lo lleva a esa fila, en la columna en la que ya estaba. Nada abre.
+fn matrix_click(show: &mut Showcase, content: Rect, column: u16, row: u16) {
+    if let Some((matrix_row, matrix_column)) = matrix_cell_at(content, show, column, row) {
+        show.matrix_set_cursor(matrix_row, matrix_column);
+    } else if let Some(matrix_row) = matrix_name_at(content, show, column, row) {
+        let (_, current_column) = show.matrix_cursor();
+        show.matrix_set_cursor(matrix_row, current_column);
+    }
+}
+
+/// Aviso que ocupa la fila `offset` (0 = primera visible) del índice, si la hay. `start` es el
+/// primer visible, `visible` el número de filas visibles y `total` el de filas del índice.
+/// El dibujo y el ratón usan esta misma regla: un aviso no es seleccionable.
+fn index_notice(start: usize, visible: usize, total: usize, offset: usize) -> Option<&'static str> {
+    if offset == 0 && start > 0 {
+        return Some("  ↑ más resultados");
+    }
+    // La última fila visible avisa si queda lista por debajo. La condición anterior comparaba
+    // `start + offset + 1` con `total` y a la vez exigía `start + visible < total`, dos cosas que
+    // no pueden cumplirse juntas, de modo que este aviso no salía nunca.
+    if offset + 1 == visible && start + visible < total {
+        return Some("  ↓ más resultados");
+    }
+    None
 }
 
 fn draw_index(f: &mut Frame, area: Rect, show: &Showcase, theme: &Theme) {
@@ -255,12 +376,8 @@ fn draw_index(f: &mut Frame, area: Rect, show: &Showcase, theme: &Theme) {
     let muted = theme.style(batten::state::StyleToken::Muted);
     let mut lines = Vec::with_capacity(rows.len());
     for (offset, row) in rows.iter().enumerate() {
-        if offset == 0 && start > 0 {
-            lines.push(Line::styled("  ↑ más resultados", muted));
-            continue;
-        }
-        if start + offset + 1 == all_rows.len() && start + rows.len() < all_rows.len() {
-            lines.push(Line::styled("  ↓ más resultados", muted));
+        if let Some(notice) = index_notice(start, rows.len(), all_rows.len(), offset) {
+            lines.push(Line::styled(notice, muted));
             continue;
         }
         let mut spans = Vec::new();
@@ -384,18 +501,33 @@ fn footer_texts(show: &Showcase, width: u16) -> Vec<String> {
         base
     };
     let mut lines = vec![matrix::fit(&line, usize::from(width))];
-    if let Some(component) = show.component_at(show.selected()) {
-        let generic_entry = view
-            .entries
-            .iter()
-            .find(|entry| entry.component == component)
-            .is_some_and(|entry| entry.generic);
-        if generic_entry {
-            let note = matrix::status_note(component, show.theme_column(), Cell::Generic);
-            lines.push(matrix::fit(&note, usize::from(width)));
-        }
+    if let Some(component) = footer_note_component(show) {
+        let note = matrix::status_note(component, show.theme_column(), Cell::Generic);
+        lines.push(matrix::fit(&note, usize::from(width)));
     }
     lines
+}
+
+/// Componente seleccionado si es genérico en el tema activo: solo entonces el pie tiene segunda
+/// línea (la nota de estado). Es la única condición de la altura del pie.
+fn footer_note_component(show: &Showcase) -> Option<&str> {
+    let component = show.component_at(show.selected())?;
+    let generic = show
+        .view()
+        .entries
+        .iter()
+        .find(|entry| entry.component == component)
+        .is_some_and(|entry| entry.generic);
+    generic.then_some(component)
+}
+
+/// Altura del pie, en filas: 2 si el componente seleccionado es genérico, 1 si no.
+fn footer_height(show: &Showcase) -> u16 {
+    if footer_note_component(show).is_some() {
+        2
+    } else {
+        1
+    }
 }
 
 /// Dibuja las líneas del pie, una por fila del área.
@@ -790,5 +922,356 @@ mod tests {
         let (column, _, shown) = *layout.last().expect("pestañas");
         let (name, _) = matrix::COLUMNS[column];
         assert!(shown < tab_width(name), "{name} debería recortarse");
+    }
+
+    const LEFT: MouseEventKind = MouseEventKind::Down(MouseButton::Left);
+    const WHEEL_UP: MouseEventKind = MouseEventKind::ScrollUp;
+    const WHEEL_DOWN: MouseEventKind = MouseEventKind::ScrollDown;
+
+    /// Pantalla de `w`×`h` celdas con origen en (0, 0), como la de `draw`.
+    fn screen(w: u16, h: u16) -> Rect {
+        Rect::new(0, 0, w, h)
+    }
+
+    /// Pulsación izquierda en (`x`, `y`) de una pantalla de `w`×`h`.
+    fn click_at(show: &mut Showcase, x: u16, y: u16, w: u16, h: u16) {
+        handle_mouse(show, LEFT, x, y, screen(w, h));
+    }
+
+    /// Showcase con el tema de la columna `theme` y el primer demo de `component` de ese proveedor.
+    fn state(theme: &str, component: &str, provider: &str) -> Showcase {
+        let mut show = Showcase::new();
+        show.set_theme_column(theme_index(theme));
+        show.select(demo_of(&show, component, provider), false);
+        show
+    }
+
+    /// Columna de la primera celda visible de la pestaña `theme` en una fila de `width` columnas.
+    fn tab_x(width: u16, theme: usize) -> u16 {
+        tab_spans_layout(width)
+            .iter()
+            .find(|(column, _, _)| *column == theme)
+            .map(|(_, x, _)| *x)
+            .expect("pestaña visible")
+    }
+
+    /// Texto de la fila `y` del buffer entre las columnas `x0` (incluida) y `x1` (excluida).
+    fn row_text(buffer: &Buffer, x0: u16, x1: u16, y: u16) -> String {
+        (x0..x1).map(|x| buffer[(x, y)].symbol()).collect()
+    }
+
+    /// Fila de pantalla en la que el índice pinta `text`. Debe aparecer una sola vez.
+    fn index_row_of(buffer: &Buffer, text: &str) -> u16 {
+        let rows: Vec<usize> = index_text(buffer)
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.contains(text))
+            .map(|(y, _)| y)
+            .collect();
+        assert_eq!(rows.len(), 1, "«{text}» en el índice: filas {rows:?}");
+        rows[0] as u16
+    }
+
+    /// Columna (en caracteres) en la que la fila `y` del índice pinta `text`.
+    fn index_column_of(buffer: &Buffer, y: u16, text: &str) -> u16 {
+        let line = &index_text(buffer)[usize::from(y)];
+        let byte = line
+            .find(text)
+            .unwrap_or_else(|| panic!("«{text}» no está en la fila {y}: {line}"));
+        line[..byte].chars().count() as u16
+    }
+
+    /// Fila seleccionable del índice visible en una pantalla `w`×`h`, distinta de la seleccionada,
+    /// con un texto corto que aparece una sola vez en el índice. Devuelve (índice del catálogo,
+    /// texto, fila de pantalla en la que debe pintarse).
+    fn visible_target(show: &Showcase, w: u16, h: u16) -> (usize, String, u16) {
+        let index = geometry(screen(w, h), footer_height(show))
+            .index
+            .expect("índice visible");
+        let (start, visible) = show.visible_index_rows(index.height);
+        let total = show.index_rows();
+        visible
+            .iter()
+            .enumerate()
+            .filter(|(offset, _)| {
+                index_notice(start, visible.len(), total.len(), *offset).is_none()
+            })
+            .find_map(|(offset, row)| {
+                let target = row.catalog_index.filter(|&i| i != show.selected())?;
+                let text = row.text.trim().to_string();
+                let unique = total
+                    .iter()
+                    .filter(|other| other.text.contains(&text))
+                    .count()
+                    == 1;
+                (unique && text.chars().count() <= 20)
+                    .then(|| (target, text, index.y + offset as u16))
+            })
+            .expect("fila seleccionable visible")
+    }
+
+    /// Celda invertida (la del cursor) dentro de `area`: su primera columna y su fila.
+    fn reversed_cell(buffer: &Buffer, area: Rect) -> (u16, u16) {
+        (area.y..area.bottom())
+            .flat_map(|y| (area.x..area.right()).map(move |x| (x, y)))
+            .find(|&(x, y)| buffer[(x, y)].modifier.contains(Modifier::REVERSED))
+            .expect("celda invertida")
+    }
+
+    /// Fila de la matriz cuyo nombre empieza en la columna `x` de `area`, o `None`.
+    fn matrix_row_of(buffer: &Buffer, area: Rect, name: &str) -> Option<u16> {
+        (area.y..area.bottom())
+            .find(|&y| row_text(buffer, area.x, area.right(), y).starts_with(name))
+    }
+
+    #[test]
+    fn click_on_a_tab_switches_the_theme() {
+        let pawan = theme_index("Pawan");
+        let mut show = Showcase::new();
+        show.open_matrix();
+        click_at(&mut show, tab_x(100, pawan) + 1, 0, 100, 30);
+        assert_eq!(show.theme_column(), pawan);
+        assert_eq!(show.focus(), Focus::Index);
+
+        // El hueco entre dos pestañas no hace nada: el tema y el foco se quedan como estaban.
+        let mut show = Showcase::new();
+        show.open_matrix();
+        let gap = tab_x(100, 0) + tab_width("Batten");
+        click_at(&mut show, gap, 0, 100, 30);
+        assert_eq!(show.theme_column(), 0);
+        assert_eq!(show.focus(), Focus::Matrix);
+
+        // A 40 columnas, Crush se ve recortada a 3 celdas y MastraCode ya no aparece: la recortada
+        // sí responde en lo que se ve.
+        let crush = theme_index("Crush");
+        let mastra = theme_index("MastraCode");
+        assert!(tab_spans_layout(40)
+            .iter()
+            .all(|(column, _, _)| *column != mastra));
+        let mut show = Showcase::new();
+        click_at(&mut show, tab_x(40, crush) + 2, 0, 40, 30);
+        assert_eq!(show.theme_column(), crush);
+    }
+
+    #[test]
+    fn click_on_an_index_row_selects_and_opens_it() {
+        let mut show = Showcase::new();
+        let (target, text, y) = visible_target(&show, 100, 30);
+        let buffer = render(&mut show, 100, 30);
+        assert_eq!(index_row_of(&buffer, &text), y, "fila pintada de «{text}»");
+        click_at(&mut show, 1, y, 100, 30);
+        assert_eq!(show.selected(), target);
+        assert_eq!(show.focus(), Focus::Demo);
+    }
+
+    #[test]
+    fn click_on_a_child_example_selects_that_example() {
+        // Crush: «Assistant message» tiene filas hijas. Partimos de «pending» para que la fila
+        // «refusal», vecina, quede visible sin depender del desplazamiento.
+        let mut show = state("Crush", "Assistant message", "Crush");
+        let refusal = (0..show.len())
+            .find(|&i| {
+                show.component_at(i) == Some("Assistant message")
+                    && show.variant_at(i).is_some_and(|v| v.ends_with("refusal"))
+            })
+            .expect("demo refusal");
+        let pending = (0..show.len())
+            .find(|&i| {
+                show.component_at(i) == Some("Assistant message")
+                    && show.variant_at(i).is_some_and(|v| v.ends_with("pending"))
+            })
+            .expect("demo pending");
+        show.select(pending, false);
+        let buffer = render(&mut show, 100, 30);
+        let y = index_row_of(&buffer, "refusal");
+        click_at(&mut show, 5, y, 100, 30);
+        assert_eq!(show.selected(), refusal);
+        assert_eq!(show.focus(), Focus::Demo);
+    }
+
+    #[test]
+    fn click_on_a_header_row_does_nothing() {
+        let mut show = state("Crush", "Assistant message", "Crush");
+        let before = show.selected();
+        let buffer = render(&mut show, 100, 30);
+        let y = index_row_of(&buffer, "Assistant message ─");
+        click_at(&mut show, 1, y, 100, 30);
+        assert_eq!(show.selected(), before);
+        assert_eq!(show.focus(), Focus::Index);
+    }
+
+    #[test]
+    fn wheel_scrolls_the_index_with_a_cap() {
+        let mut show = Showcase::new();
+        let list = show.filtered_indices();
+        assert!(
+            list.len() > WHEEL_STEPS,
+            "hacen falta más de {WHEEL_STEPS} filas"
+        );
+        // Con el foco en el demo, la rueda sobre el índice lo devuelve al índice.
+        show.select(list[0], true);
+        handle_mouse(&mut show, WHEEL_DOWN, 1, 10, screen(100, 30));
+        assert_eq!(show.selected(), list[WHEEL_STEPS]);
+        assert_eq!(show.focus(), Focus::Index);
+        handle_mouse(&mut show, WHEEL_UP, 1, 10, screen(100, 30));
+        assert_eq!(show.selected(), list[0]);
+        // Con tope: en el último elemento sigue en el último, y el foco no cambia.
+        for _ in 0..list.len() {
+            handle_mouse(&mut show, WHEEL_DOWN, 1, 10, screen(100, 30));
+        }
+        assert_eq!(show.selected(), *list.last().expect("filas"));
+        handle_mouse(&mut show, WHEEL_DOWN, 1, 10, screen(100, 30));
+        assert_eq!(show.selected(), *list.last().expect("filas"));
+        assert_eq!(show.focus(), Focus::Index);
+    }
+
+    #[test]
+    fn wheel_on_the_matrix_moves_the_cursor() {
+        let mut show = Showcase::new();
+        show.open_matrix();
+        // Dentro de la tabla y fuera de ella, la rueda mueve la fila igual.
+        handle_mouse(&mut show, WHEEL_DOWN, 50, 10, screen(100, 30));
+        assert_eq!(show.matrix_cursor(), (1, 0));
+        handle_mouse(&mut show, WHEEL_DOWN, 1, 29, screen(100, 30));
+        assert_eq!(show.matrix_cursor(), (2, 0));
+        handle_mouse(&mut show, WHEEL_UP, 50, 2, screen(100, 30));
+        assert_eq!(show.matrix_cursor(), (1, 0));
+        // Sobre el índice, con la matriz abierta, también mueve el cursor de la matriz.
+        handle_mouse(&mut show, WHEEL_DOWN, 1, 10, screen(100, 30));
+        assert_eq!(show.matrix_cursor(), (2, 0));
+        assert_eq!(show.focus(), Focus::Matrix);
+    }
+
+    #[test]
+    fn click_on_a_matrix_cell_moves_the_cursor_and_keeps_the_matrix() {
+        let mut show = Showcase::new();
+        show.open_matrix();
+        let buffer = render(&mut show, 100, 30);
+        let content = geometry(screen(100, 30), footer_height(&show)).content;
+        // La fila de Composer y la cabecera de Crush, tal como se pintan.
+        let composer_y = matrix_row_of(&buffer, content, "Composer").expect("fila de Composer");
+        let header = row_text(&buffer, content.x, content.right(), content.y);
+        let crush_x = content.x + header.find("Crush").expect("cabecera de Crush") as u16;
+        let composer = show
+            .matrix()
+            .rows
+            .iter()
+            .position(|row| row.component == "Composer")
+            .expect("fila");
+        click_at(&mut show, crush_x + 1, composer_y, 100, 30);
+        assert_eq!(show.matrix_cursor(), (composer, theme_index("Crush")));
+        assert_eq!(show.focus(), Focus::Matrix);
+        assert_eq!(
+            show.theme_column(),
+            0,
+            "un clic en una celda no cambia el tema"
+        );
+    }
+
+    #[test]
+    fn click_outside_the_matrix_does_not_close_it() {
+        let mut show = Showcase::new();
+        show.open_matrix();
+        show.matrix_set_cursor(3, 2);
+        let buffer = render(&mut show, 100, 30);
+        let content = geometry(screen(100, 30), footer_height(&show)).content;
+        let legend_y = (content.y..content.bottom())
+            .find(|&y| row_text(&buffer, content.x, content.right(), y).contains("genérico"))
+            .expect("leyenda");
+        // Leyenda, pie y cabecera del panel: fuera de la tabla.
+        click_at(&mut show, 60, legend_y, 100, 30);
+        assert_eq!(show.focus(), Focus::Matrix);
+        click_at(&mut show, 50, 29, 100, 30);
+        assert_eq!(show.focus(), Focus::Matrix);
+        click_at(&mut show, 60, 3, 100, 30);
+        assert_eq!(show.focus(), Focus::Matrix);
+        assert_eq!(show.matrix_cursor(), (3, 2));
+    }
+
+    #[test]
+    fn click_on_the_demo_panel_focuses_the_demo() {
+        let mut show = Showcase::new();
+        click_at(&mut show, 60, 10, 100, 30);
+        assert_eq!(show.focus(), Focus::Demo);
+        // En terminal estrecha no hay índice: el panel ocupa todo el cuerpo y también enfoca.
+        let mut show = Showcase::new();
+        click_at(&mut show, 30, 10, 60, 20);
+        assert_eq!(show.focus(), Focus::Demo);
+    }
+
+    #[test]
+    fn mouse_and_draw_share_the_same_geometry() {
+        // Pawan con Composer seleccionado tiene pie de 2 líneas; Crush con Composer propio, de 1.
+        for (w, h) in [(100u16, 30u16), (80, 24), (70, 20), (60, 20)] {
+            for (theme, provider, footer) in [("Pawan", "Batten", 2u16), ("Crush", "Crush", 1)] {
+                let label = format!("{theme} {w}x{h}");
+                let mut show = state(theme, "Composer", provider);
+                assert_eq!(footer_height(&show), footer, "pie de {label}");
+
+                // Índice (solo con terminal ancha): la fila pintada de un ejemplo es la que se
+                // selecciona al hacer clic en su texto.
+                if w >= WIDE_MIN {
+                    let (target, text, y) = visible_target(&show, w, h);
+                    let buffer = render(&mut show, w, h);
+                    assert!(
+                        index_text(&buffer)[usize::from(y)].contains(&text),
+                        "{label}: «{text}» no se pinta en la fila {y}"
+                    );
+                    let x = index_column_of(&buffer, y, &text);
+                    click_at(&mut show, x + 1, y, w, h);
+                    assert_eq!(show.selected(), target, "{label}: clic en «{text}»");
+                }
+
+                // Matriz (todas las anchuras): la celda invertida pintada es la que el ratón
+                // reconoce. Con el cursor en la última fila, su posición depende de la altura del
+                // pie, así que un desfase movería el cursor.
+                let mut show = state(theme, "Composer", provider);
+                show.open_matrix();
+                let last = show.matrix().rows.len() - 1;
+                show.matrix_set_cursor(last, 2);
+                let buffer = render(&mut show, w, h);
+                let content = geometry(screen(w, h), footer_height(&show)).content;
+                let (x, y) = reversed_cell(&buffer, content);
+                click_at(&mut show, x, y, w, h);
+                assert_eq!(show.matrix_cursor(), (last, 2), "{label}: celda pintada");
+                let header = row_text(&buffer, content.x, content.right(), content.y);
+                let crush_x = content.x + header.find("Crush").expect("cabecera") as u16;
+                click_at(&mut show, crush_x, y, w, h);
+                assert_eq!(
+                    show.matrix_cursor(),
+                    (last, theme_index("Crush")),
+                    "{label}: columna pintada"
+                );
+            }
+        }
+    }
+
+    /// El aviso de «más resultados» sale por arriba y por abajo, y solo cuando hay más.
+    #[test]
+    fn index_notice_marks_both_ends_only_when_there_is_more() {
+        // Al principio de una lista larga: nada por arriba, aviso en la última fila visible.
+        assert_eq!(index_notice(0, 10, 50, 0), None);
+        assert_eq!(index_notice(0, 10, 50, 9), Some("  ↓ más resultados"));
+        assert_eq!(index_notice(0, 10, 50, 8), None);
+        // En medio: aviso arriba y abajo.
+        assert_eq!(index_notice(20, 10, 50, 0), Some("  ↑ más resultados"));
+        assert_eq!(index_notice(20, 10, 50, 9), Some("  ↓ más resultados"));
+        // Al final: aviso arriba y ninguno abajo.
+        assert_eq!(index_notice(40, 10, 50, 0), Some("  ↑ más resultados"));
+        assert_eq!(index_notice(40, 10, 50, 9), None);
+        // Si cabe todo, ninguno.
+        assert_eq!(index_notice(0, 10, 10, 9), None);
+    }
+
+    /// En un terminal bajo, la última fila visible del índice dice que hay más por debajo.
+    #[test]
+    fn a_short_terminal_shows_the_more_below_notice() {
+        let mut show = Showcase::new();
+        let buffer = render(&mut show, 100, 12);
+        let text = lines(&buffer, 0).join(
+            "
+",
+        );
+        assert!(text.contains("↓ más resultados"), "{text}");
     }
 }
