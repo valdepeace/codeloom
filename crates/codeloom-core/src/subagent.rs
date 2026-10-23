@@ -39,6 +39,21 @@ pub trait SubagentLauncher: Send + Sync {
         message: Option<String>,
     ) -> Result<()>;
 
+    /// Arranca un hijo como seguimiento de otro ya terminado (A11): una tarea nueva en el mismo
+    /// contexto, con el resultado de la anterior en su prompt y el enlace guardado como
+    /// `reference_task_ids`.
+    async fn start_follow_up(
+        &self,
+        _parent: SessionId,
+        _label: String,
+        _prompt: String,
+        _agent: Option<String>,
+        _follow_up_of: SessionId,
+        _cancel: CancellationToken,
+    ) -> Result<(SessionId, JobId)> {
+        Err(CoreError::Tool("subagent follow-up unavailable".into()))
+    }
+
     /// `CancelTask` de A2A: pide cancelar al hijo y devuelve su tarea actualizada. Falla con
     /// `TaskNotFound` si no es hijo de `parent` y con `TaskNotCancelable` si ya terminó. El éxito
     /// no está garantizado: si el hijo no se asienta a tiempo se devuelve su estado actual, sin
@@ -326,40 +341,17 @@ impl InProcessSubagentLauncher {
         }
         Ok(Some(entrada.clone()))
     }
-}
 
-/// Resumen de una petición de permiso para el mensaje de `auth-required`: herramienta, acción
-/// y detalle recortado, de modo que el padre vea qué se pide sin volcar argumentos enteros.
-pub(crate) fn resumen_de_permiso(tool: &str, action: &str, detail: &str) -> String {
-    const LIMITE: usize = 160;
-    let detalle = detail.trim();
-    let resumen = if detalle.is_empty() {
-        format!("{tool} {action}")
-    } else {
-        format!("{tool} {action}: {detalle}")
-    };
-    if resumen.chars().count() <= LIMITE {
-        resumen
-    } else {
-        let mut recortado: String = resumen.chars().take(LIMITE - 1).collect();
-        recortado.push('…');
-        recortado
-    }
-}
-
-#[async_trait]
-impl SubagentLauncher for InProcessSubagentLauncher {
-    async fn start(
+    /// Arranque común de `start` y `start_follow_up`. La petición ya viene validada.
+    async fn arrancar(
         &self,
         parent: SessionId,
         label: String,
         prompt: String,
         agent: Option<String>,
+        referencias: Vec<SessionId>,
         parent_cancel: CancellationToken,
     ) -> Result<(SessionId, JobId)> {
-        if prompt.trim().is_empty() || prompt.len() > 32_768 || label.len() > 128 {
-            return Err(CoreError::Tool("invalid subagent prompt or label".into()));
-        }
         // El agente se valida antes de reservar puesto o crear tarea: un rechazo no deja rastro.
         let perfil = self.resolver_agente(agent.as_deref())?;
         let (agente, origen) = match &perfil {
@@ -535,7 +527,7 @@ impl SubagentLauncher for InProcessSubagentLauncher {
             notice_delivered: false,
             agent: agente,
             agent_origin: origen,
-            reference_task_ids: Vec::new(),
+            reference_task_ids: referencias,
         };
         if let Err(error) = self.store.save_subagent(&descriptor).await {
             let _ = self.jobs.kill(parent, job.id());
@@ -585,6 +577,112 @@ impl SubagentLauncher for InProcessSubagentLauncher {
             }
         });
         Ok((child, job.id().clone()))
+    }
+}
+
+/// Resumen de una petición de permiso para el mensaje de `auth-required`: herramienta, acción
+/// y detalle recortado, de modo que el padre vea qué se pide sin volcar argumentos enteros.
+pub(crate) fn resumen_de_permiso(tool: &str, action: &str, detail: &str) -> String {
+    const LIMITE: usize = 160;
+    let detalle = detail.trim();
+    let resumen = if detalle.is_empty() {
+        format!("{tool} {action}")
+    } else {
+        format!("{tool} {action}: {detalle}")
+    };
+    if resumen.chars().count() <= LIMITE {
+        resumen
+    } else {
+        let mut recortado: String = resumen.chars().take(LIMITE - 1).collect();
+        recortado.push('…');
+        recortado
+    }
+}
+
+/// Validación común del prompt y la etiqueta de un hijo nuevo.
+fn validar_peticion(label: &str, prompt: &str) -> Result<()> {
+    if prompt.trim().is_empty() || prompt.len() > 32_768 || label.len() > 128 {
+        return Err(CoreError::Tool("invalid subagent prompt or label".into()));
+    }
+    Ok(())
+}
+
+/// Prompt de un seguimiento (D4 de A11): el resultado de la tarea anterior, acotado por la regla
+/// 8 del decálogo, antepuesto a la petición. Sin resultado se escribe `(no result)` y, si lo hay,
+/// el texto del mensaje de su estado.
+fn prompt_de_seguimiento(anterior: &SubagentDescriptor, peticion: &str) -> String {
+    let resultado = anterior.result_text().unwrap_or_else(|| {
+        match anterior
+            .status
+            .message
+            .as_ref()
+            .map(|mensaje| mensaje.text())
+            .filter(|texto| !texto.trim().is_empty())
+        {
+            Some(texto) => format!("(no result) {texto}"),
+            None => "(no result)".to_string(),
+        }
+    });
+    format!(
+        "[Follow-up of subagent {} \"{}\" ({})]\nPrevious result:\n{}\n\n{}",
+        anterior.child.0,
+        anterior.label,
+        anterior.status.state.proto_name(),
+        crate::tools::limit_bytes(&resultado, crate::tools::MAX_NOTICE_BYTES),
+        peticion
+    )
+}
+
+#[async_trait]
+impl SubagentLauncher for InProcessSubagentLauncher {
+    async fn start(
+        &self,
+        parent: SessionId,
+        label: String,
+        prompt: String,
+        agent: Option<String>,
+        parent_cancel: CancellationToken,
+    ) -> Result<(SessionId, JobId)> {
+        validar_peticion(&label, &prompt)?;
+        self.arrancar(parent, label, prompt, agent, Vec::new(), parent_cancel)
+            .await
+    }
+
+    async fn start_follow_up(
+        &self,
+        parent: SessionId,
+        label: String,
+        prompt: String,
+        agent: Option<String>,
+        follow_up_of: SessionId,
+        parent_cancel: CancellationToken,
+    ) -> Result<(SessionId, JobId)> {
+        validar_peticion(&label, &prompt)?;
+        // Solo se sigue a una tarea terminal de este mismo padre; de otro padre no se revela.
+        let anterior = self
+            .store
+            .list_subagents(parent)
+            .await?
+            .into_iter()
+            .find(|descriptor| descriptor.child == follow_up_of)
+            .ok_or(CoreError::TaskNotFound(follow_up_of.0))?;
+        if !anterior.status.state.is_terminal() {
+            return Err(CoreError::Tool(format!(
+                "subagent {} is still {}; wait for it to finish, or continue it with send_message or answer",
+                follow_up_of.0,
+                anterior.status.state.proto_name()
+            )));
+        }
+        let prompt = prompt_de_seguimiento(&anterior, &prompt);
+        self.arrancar(
+            parent,
+            label,
+            prompt,
+            agent,
+            vec![follow_up_of],
+            parent_cancel,
+        )
+        .await
     }
 
     async fn control(
@@ -3095,6 +3193,239 @@ mod tests {
         assert_eq!(
             store.list_subagents(parent).await.unwrap()[0].status.state,
             TaskState::Completed
+        );
+    }
+
+    /// Lanzador de prueba con un hijo ya terminado (`listo`) y el proveedor grabador.
+    async fn lanzador_con_un_hijo_terminado(
+        dir: &std::path::Path,
+        nombre: &str,
+    ) -> (
+        InProcessSubagentLauncher,
+        Arc<SqliteStore>,
+        Arc<LocalJobRegistry>,
+        SessionId,
+        SessionId,
+    ) {
+        let (store, parent) = tienda_de_prueba(dir, nombre).await;
+        let jobs = Arc::new(LocalJobRegistry::default());
+        let proveedor = ProveedorGrabador {
+            peticiones: Arc::new(std::sync::Mutex::new(Vec::new())),
+            puerta: None,
+        };
+        let runtime = lanzador_grabador(dir, store.clone(), jobs.clone(), proveedor, None, None);
+        let (anterior, job) = runtime
+            .start(
+                parent,
+                "primero".into(),
+                "haz la primera parte".into(),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        jobs.wait(parent, &job).await.unwrap();
+        espera_estado_del_hijo(&store, parent, anterior, TaskState::Completed).await;
+        (runtime, store, jobs, parent, anterior)
+    }
+
+    #[tokio::test]
+    async fn a_follow_up_carries_the_previous_result_in_its_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let (runtime, store, jobs, parent, anterior) =
+            lanzador_con_un_hijo_terminado(dir.path(), "seguimiento.db").await;
+
+        let (nuevo, job) = runtime
+            .start_follow_up(
+                parent,
+                "segundo".into(),
+                "ahora la segunda parte".into(),
+                None,
+                anterior,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        jobs.wait(parent, &job).await.unwrap();
+
+        let primero = store.messages(nuevo).await.unwrap()[0].text();
+        assert!(
+            primero.starts_with("[Follow-up of subagent"),
+            "el prompt debería abrir con el encabezado, y es: {primero}"
+        );
+        assert!(primero.contains(&format!("subagent {} \"primero\"", anterior.0)));
+        assert!(primero.contains("(TASK_STATE_COMPLETED)"));
+        assert!(primero.contains("Previous result:\nlisto"));
+        assert!(primero.ends_with("\n\nahora la segunda parte"));
+        let hijos = store.list_subagents(parent).await.unwrap();
+        let descriptor = hijos.iter().find(|d| d.child == nuevo).unwrap();
+        assert_eq!(descriptor.reference_task_ids, vec![anterior]);
+        let previo = hijos.iter().find(|d| d.child == anterior).unwrap();
+        assert!(previo.reference_task_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_follow_up_shares_the_context_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let (runtime, store, jobs, parent, anterior) =
+            lanzador_con_un_hijo_terminado(dir.path(), "seguimiento-contexto.db").await;
+
+        let (nuevo, job) = runtime
+            .start_follow_up(
+                parent,
+                "segundo".into(),
+                "sigue".into(),
+                None,
+                anterior,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        jobs.wait(parent, &job).await.unwrap();
+
+        let hijos = store.list_subagents(parent).await.unwrap();
+        let contexto = |id: SessionId| hijos.iter().find(|d| d.child == id).unwrap().context_id();
+        assert_eq!(contexto(nuevo), contexto(anterior));
+    }
+
+    #[tokio::test]
+    async fn a_follow_up_of_a_running_child_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (runtime, store, jobs, parent, _anterior) =
+            lanzador_con_un_hijo_terminado(dir.path(), "seguimiento-vivo.db").await;
+        let vivo = hijo_que_no_se_detiene(&store, &jobs, parent).await;
+        let antes = store.list_subagents(parent).await.unwrap().len();
+
+        match runtime
+            .start_follow_up(
+                parent,
+                "segundo".into(),
+                "sigue".into(),
+                None,
+                vivo,
+                CancellationToken::new(),
+            )
+            .await
+        {
+            Err(CoreError::Tool(texto)) => {
+                assert!(texto.contains("TASK_STATE_WORKING"), "{texto}");
+            }
+            otro => panic!("se esperaba un error de herramienta, y salió {otro:?}"),
+        }
+        assert_eq!(store.list_subagents(parent).await.unwrap().len(), antes);
+    }
+
+    #[tokio::test]
+    async fn a_follow_up_of_another_parents_child_is_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let (runtime, store, _jobs, parent, anterior) =
+            lanzador_con_un_hijo_terminado(dir.path(), "seguimiento-ajeno.db").await;
+        let otro_padre = store.create_session("/project").await.unwrap();
+
+        for referido in [anterior, SessionId(9999)] {
+            match runtime
+                .start_follow_up(
+                    otro_padre,
+                    "segundo".into(),
+                    "sigue".into(),
+                    None,
+                    referido,
+                    CancellationToken::new(),
+                )
+                .await
+            {
+                Err(CoreError::TaskNotFound(id)) => assert_eq!(id, referido.0),
+                otro => panic!("se esperaba TaskNotFound, y salió {otro:?}"),
+            }
+        }
+        assert!(store.list_subagents(otro_padre).await.unwrap().is_empty());
+        assert_eq!(store.list_subagents(parent).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_previous_result_is_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (runtime, store, jobs, parent, _anterior) =
+            lanzador_con_un_hijo_terminado(dir.path(), "seguimiento-tope.db").await;
+        let grande = store.create_session("/project").await.unwrap();
+        store
+            .save_subagent(&SubagentDescriptor {
+                parent,
+                child: grande,
+                job_id: "subagent-grande".into(),
+                label: "grande".into(),
+                status: TaskStatus::new(TaskState::Completed),
+                artifacts: vec![Artifact::text_artifact("x".repeat(100_000))],
+                notice_delivered: true,
+                agent: None,
+                agent_origin: None,
+                reference_task_ids: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        let (nuevo, job) = runtime
+            .start_follow_up(
+                parent,
+                "segundo".into(),
+                "sigue".into(),
+                None,
+                grande,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        jobs.wait(parent, &job).await.unwrap();
+
+        let primero = store.messages(nuevo).await.unwrap()[0].text();
+        assert!(
+            primero.len() < MAX_NOTICE_BYTES + 400,
+            "el prompt de seguimiento mide {} bytes",
+            primero.len()
+        );
+        assert!(primero.ends_with("\n\nsigue"));
+    }
+
+    #[tokio::test]
+    async fn a_follow_up_of_a_child_without_result_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let (runtime, store, jobs, parent, _anterior) =
+            lanzador_con_un_hijo_terminado(dir.path(), "seguimiento-vacio.db").await;
+        let fallido = store.create_session("/project").await.unwrap();
+        store
+            .save_subagent(&SubagentDescriptor {
+                parent,
+                child: fallido,
+                job_id: "subagent-fallido".into(),
+                label: "fallido".into(),
+                status: TaskStatus::new(TaskState::Failed),
+                artifacts: Vec::new(),
+                notice_delivered: true,
+                agent: None,
+                agent_origin: None,
+                reference_task_ids: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        let (nuevo, job) = runtime
+            .start_follow_up(
+                parent,
+                "segundo".into(),
+                "reintenta".into(),
+                None,
+                fallido,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        jobs.wait(parent, &job).await.unwrap();
+
+        let primero = store.messages(nuevo).await.unwrap()[0].text();
+        assert!(primero.contains("(TASK_STATE_FAILED)"), "{primero}");
+        assert!(
+            primero.contains("Previous result:\n(no result)"),
+            "{primero}"
         );
     }
 }
