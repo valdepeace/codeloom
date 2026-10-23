@@ -81,7 +81,12 @@ que no tiene cota acabará, tarde o temprano, desbordándose.**
    también `2026-10-14-loom-kpis-prompt-compression.md`.*
 6. **El prompt de sistema también tiene cota.** Ficheros de contexto (`AGENTS.md`,
    `CODELOOM.md`), lista de agentes, habilidades y memoria se inyectan en cada petición.
-   *Estado: **pendiente**; hoy se cargan enteros y sin tope.*
+   *Estado: **parcial** (2026-10-23). Cada fichero de contexto se lee con tope de 16 000 bytes
+   (`MAX_CONTEXT_FILE_BYTES`; se conserva el principio y se avisa del corte), la sección de agentes
+   se limita a 8 000 y el prompt propio de un agente a 16 000 (recorte por cabeza y cola, con
+   marcador). Queda **sin tope** el total del prompt de sistema (tres secciones sumadas) y no hay
+   aún habilidades ni memoria que acotar porque no existen; el tope de cada sección es una
+   decisión propia, sin medir contra ningún proveedor.*
 7. **Todo bucle tiene techo, y el coste también.** Existen `max_steps` y `max_turns`. Desde el
    2026-10-23 hay **aviso** de presupuesto por sesión (tokens y/o dólares, sección `[budget]`),
    al 80 % y al 100 %, por decisión de producto **solo avisa**: no detiene el turno, no
