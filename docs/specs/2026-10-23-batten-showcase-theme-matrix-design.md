@@ -23,6 +23,8 @@ en Pawan es buscarlo a mano.
 4. **`●` sin número** (elección delegada a mí): el recuento de demos de la celda se muestra en el
    pie al situarse encima.
 5. **dotmax no es un tema, es una librería**: va a una nota al pie, no a una columna.
+7. **CodeLoom debe tener su propia paleta** (respuesta de la persona usuaria a la pregunta
+   abierta): se añade `ThemePreset::CodeLoom`. Véase «Paleta de CodeLoom».
 6. **Cambiar de tema dentro del propio componente** (petición posterior): al ver un componente se
    puede pasar de un tema a otro de su fila para compararlo, y el pie dice en qué estado está
    (propio, parcialmente implementado, no existe). Véase «Vista de un componente entre temas».
@@ -64,9 +66,9 @@ nota al pie), de modo que un demo mal nombrado no infle la columna de Batten en 
 
 ### La columna CodeLoom y la nota de dotmax
 
-CodeLoom es una columna más. Como no hay paleta de CodeLoom, `Enter` sobre una de sus celdas abre
-el demo **con el tema activo** y lo dice en la línea de ayuda; crear `ThemePreset::CodeLoom` con
-paleta propia es otra tarea y no se hace aquí. El resto de columnas sí aplican su preset.
+CodeLoom es una columna más y, con `ThemePreset::CodeLoom`, aplica su propia paleta como las
+demás. *Mientras no existiera el preset* la columna abría el demo con el tema activo; ese
+comportamiento desaparece al añadirlo.
 
 dotmax (Braille graphics, Progress catalog) es una librería: sus componentes van a una nota al
 pie, no a la matriz, para no llenarla de `·` que no significan «falta» sino «no es un tema».
@@ -115,6 +117,30 @@ Sin fila (componentes fuera de la matriz) el pie conserva su línea actual. La c
 la de la última navegación con `F8` o `Enter` desde la matriz; al elegir otro demo desde el
 índice se deduce del proveedor del demo.
 
+## Paleta de CodeLoom
+
+Hasta ahora CodeLoom era solo un proveedor de demos; el preset `Batten` es la paleta neutra de
+Batten (cian y violeta), no la de CodeLoom. La nueva paleta parte de lo que **ya existe** en el
+repositorio: el logo (`crates/batten/src/widgets/logo.rs`) usa el naranja `#c25a27` y el pizarra
+`#5c6370`.
+
+| Rol | Valor | Origen |
+|---|---|---|
+| acento | `#c25a27` (194, 90, 39) | logo |
+| borde | `#5c6370` (92, 99, 112) | logo |
+| usuario | `#e2844e` (226, 132, 78) | propio: el naranja aclarado |
+| fondo | `#14151a` (20, 21, 26) | propio |
+| texto | `#dee0e4` (222, 224, 228) | propio |
+| atenuado | `#8b919c` (139, 145, 156) | propio: el pizarra aclarado, para que se lea sobre el fondo |
+| asistente | igual que texto | propio |
+| aviso | `#e5c07b` (229, 192, 123) | propio |
+| error | `#e06c75` (224, 108, 117) | propio |
+| éxito | `#98c379` (152, 195, 121) | propio |
+
+Solo el acento y el borde son de marca; **el resto son decisiones propias**, fáciles de cambiar
+en una sola tabla. El aspecto (`Look`) es el clásico, igual que Batten. No se afirma que sea «la»
+identidad visual de CodeLoom: es una propuesta construida sobre los dos colores del logo.
+
 ## Fuera de alcance, declarado
 
 - **Comprobar que un demo ajeno respeta el tema activo.** No se verifica; por eso no cuenta como
@@ -126,5 +152,4 @@ la de la última navegación con `F8` o `Enter` desde la matriz; al elegir otro 
 
 ## Preguntas abiertas
 
-- ¿Debe existir `ThemePreset::CodeLoom` con paleta propia? Mientras no exista, esa columna abre
-  los demos con el tema activo.
+- ¿Gusta la paleta propuesta? Solo el acento y el borde salen del logo.

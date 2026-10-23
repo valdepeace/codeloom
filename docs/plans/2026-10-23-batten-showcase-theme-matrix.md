@@ -169,6 +169,37 @@ Requiere las Tareas 2 y 3. Spec: «Vista de un componente entre temas».
 
 ---
 
+### Tarea 4b: paleta propia de CodeLoom
+
+**Ficheros:** `crates/batten/src/widgets/theme.rs`; `crates/batten/examples/showcase/matrix.rs`
+(`COLUMNS`) y `app.rs` (lo que dependa de que CodeLoom no tenga preset);
+`crates/codeloom-tui/src/prefs.rs`, `run.rs`, `render.rs`, `app.rs` solo donde un `match` sobre
+`ThemePreset` o una lista de nombres obligue a tratar la variante nueva. Requiere la Tarea 4.
+Spec: «Paleta de CodeLoom».
+
+- `ThemePreset::CodeLoom` añadido **al final** de `ThemePreset::ALL` (que pasa a `[Self; 7]`), con
+  `name()` = `"CodeLoom"` y su tupla de colores en `Theme::preset` con los valores exactos de la
+  tabla de la spec, en el mismo orden de roles que las demás (`bg, fg, muted, accent, user,
+  assistant, warning, error, success, border`). `Look` clásico (sin tocar `theme.look`).
+- `matrix::COLUMNS[6]` pasa a `("CodeLoom", Some(ThemePreset::CodeLoom))`. Desaparece el caso
+  especial «sin preset»: `open_matrix_cell`, `cycle_component_theme` y `status_note` dejan de
+  tratar la columna CodeLoom aparte (se elimina el sufijo «sin paleta propia»). Si tras eso nada
+  usa ya el `Option` de `COLUMNS`, déjalo como está para no ampliar el cambio.
+- Las preferencias guardadas (`prefs.rs`) con nombres de tema existentes siguen cargando; un
+  nombre desconocido sigue sin romper el arranque, como hoy. El nuevo se guarda y recarga con su
+  nombre.
+
+**Tests:** en `theme.rs`, `codeloom_preset_uses_the_logo_colors` (acento y borde exactos),
+`every_preset_in_all_has_a_name_and_a_theme` y `codeloom_is_the_last_preset`; en la matriz, los
+tests de `enter_on_codeloom_keeps_the_active_theme` se **reescriben** como
+`enter_on_codeloom_applies_its_palette` (con `// ADAPTADO: CodeLoom ya tiene preset`), y los de
+`status_note` de CodeLoom se adaptan igual; en `prefs.rs`, un test de ida y vuelta del nombre
+«CodeLoom». Los tests existentes de los demás presets siguen pasando sin tocarlos.
+
+**Commit:** `feat(batten): paleta propia de CodeLoom`.
+
+---
+
 ### Tarea 5: documentación
 
 «Estado» de la spec (commits, lo que no se ha visto en terminal real, qué celdas salen de la
