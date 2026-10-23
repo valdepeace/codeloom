@@ -2638,6 +2638,10 @@ impl App {
             LiveEvent::BackgroundCompactionReady { .. } => {
                 self.background_summary = BackgroundSummary::Ready;
             }
+            // El resumen anticipado no llegó a activarse: ni «resumiendo…» ni flecha pendientes.
+            LiveEvent::BackgroundCompactionDiscarded => {
+                self.background_summary = BackgroundSummary::None;
+            }
             // El aviso de presupuesto es de CodeLoom: se pinta como línea de sistema, igual que los
             // avisos de `parse_notice`, y nunca como mensaje de la persona usuaria ni como estado de
             // A2A. Corta la entrada del asistente para que lo que llegue después no se pegue encima.

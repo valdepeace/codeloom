@@ -161,6 +161,8 @@ async fn resumir_en_segundo_plano(
 ) {
     let token = finisher.cancel_token();
     let resultado = generate_summary(provider, model, &historial, &token).await;
+    // Solo un resumen entero y de una tarea no cancelada queda listo; todo lo demás se descarta.
+    let utilizable = matches!(&resultado, Ok((Some(_), _))) && !token.is_cancelled();
     if let Ok((resumen, uso)) = &resultado {
         if let Some(uso) = uso {
             bus.publish(LiveEvent::CompactionUsage {
@@ -177,6 +179,10 @@ async fn resumir_en_segundo_plano(
         }
     }
     finisher.finish(resultado);
+    if !utilizable {
+        // Sin este aviso la interfaz seguiría mostrando «resumiendo…» de una tarea ya terminada.
+        bus.publish(LiveEvent::BackgroundCompactionDiscarded);
+    }
 }
 
 impl AgentLoop {
@@ -752,6 +758,8 @@ impl AgentLoop {
                     .await?;
                     return Ok(true);
                 }
+                // Resumen listo pero caduco: se tira y la interfaz deja de marcarlo como pendiente.
+                self.bus.publish(LiveEvent::BackgroundCompactionDiscarded);
             }
             background::SlotState::Running => {
                 let t0 = tokio::time::Instant::now();
@@ -774,6 +782,8 @@ impl AgentLoop {
                         .await?;
                         return Ok(true);
                     }
+                    // Esperado, pero de otra base: caduco, se descarta igual que arriba.
+                    self.bus.publish(LiveEvent::BackgroundCompactionDiscarded);
                 }
             }
             background::SlotState::Idle => {}
@@ -3778,11 +3788,54 @@ Cuerpo.
         .unwrap();
 
         assert_eq!(turno.final_text, "hecho");
-        assert_eq!(activaciones(&vaciar(&mut rx)), vec![Activation::Sync]);
+        let eventos = vaciar(&mut rx);
+        assert_eq!(activaciones(&eventos), vec![Activation::Sync]);
+        assert!(
+            eventos
+                .iter()
+                .any(|evento| matches!(evento, LiveEvent::BackgroundCompactionDiscarded)),
+            "la interfaz debe saber que el listo caducó"
+        );
         assert_eq!(
             e.proveedor.peticiones_de_resumen(),
             2,
             "el listo caducó: una de segundo plano y otra síncrona"
+        );
+    }
+
+    /// Si el resumen en segundo plano no sirve (aquí, vacío), la sesión vuelve a reposo y se
+    /// publica el descarte: sin él, la interfaz seguiría mostrando «resumiendo…».
+    #[tokio::test]
+    async fn a_background_summary_that_fails_publishes_the_discard() {
+        let mut e = entorno_en_segundo_plano(
+            ResumenRetenido::nuevo("", vec![], None),
+            &historial_grande(31),
+            true,
+            BudgetConfig::default(),
+        )
+        .await;
+        e.proveedor.compuerta.add_permits(1);
+        let mut rx = e.bus.subscribe();
+
+        sin_bloquear(e.agente.run(e.sid, "hola".into(), CancellationToken::new()))
+            .await
+            .unwrap();
+        let descartado = sin_bloquear(async {
+            loop {
+                let evento = rx.recv().await.expect("el bus sigue abierto");
+                match evento {
+                    LiveEvent::BackgroundCompactionDiscarded => return true,
+                    LiveEvent::BackgroundCompactionReady { .. } => return false,
+                    _ => {}
+                }
+            }
+        })
+        .await;
+
+        assert!(descartado, "un resumen vacío no queda listo");
+        assert_eq!(
+            e.agente.background.state(e.sid),
+            background::SlotState::Idle
         );
     }
 

@@ -1640,6 +1640,27 @@ mod tests {
     }
 
     #[test]
+    fn a_discarded_background_summary_clears_the_status_and_the_arrow() {
+        use batten::widgets::ThemePreset;
+        use codeloom_core::event::LiveEvent;
+        let mut app = footer_app(ThemePreset::Batten, "windowed");
+        app.apply(LiveEvent::BackgroundCompactionStarted {
+            tokens_before: 120_000,
+        });
+        assert!(last_row_of(&mut app, 80, 24).contains("resumiendo"));
+
+        app.apply(LiveEvent::BackgroundCompactionDiscarded);
+        let row = last_row_of(&mut app, 80, 24);
+        assert!(!row.contains("resumiendo"), "{row}");
+
+        // También cuando ya estaba listo y se tira por caduco.
+        app.apply(LiveEvent::BackgroundCompactionReady { summary_bytes: 400 });
+        assert!(app.context_meter().ready);
+        app.apply(LiveEvent::BackgroundCompactionDiscarded);
+        assert!(!app.context_meter().ready);
+    }
+
+    #[test]
     fn renders_items_and_input() {
         let mut app = App::new();
         app.push_user("hello");

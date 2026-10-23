@@ -53,6 +53,9 @@ pub enum LiveEvent {
     BackgroundCompactionReady {
         summary_bytes: usize,
     },
+    /// El resumen en segundo plano se ha descartado sin activarse: falló, vino vacío o truncado,
+    /// se canceló o quedó caduco. La sesión vuelve a no tener nada pendiente.
+    BackgroundCompactionDiscarded,
     /// El gasto acumulado de la sesión cruza un umbral del presupuesto (`[budget]`). `used` y
     /// `limit` van en tokens o en dólares según `metric`; `partial` indica que el coste no suma
     /// los apuntes sin precio conocido. Solo avisa: no detiene el turno.
@@ -144,6 +147,7 @@ impl LiveEvent {
             | LiveEvent::ContextCompacted { .. }
             | LiveEvent::BackgroundCompactionStarted { .. }
             | LiveEvent::BackgroundCompactionReady { .. }
+            | LiveEvent::BackgroundCompactionDiscarded
             | LiveEvent::BudgetWarning { .. }
             | LiveEvent::FileDiff { .. }
             | LiveEvent::MessageAdded(_)
@@ -262,6 +266,7 @@ mod tests {
                 tokens_before: 90_000,
             },
             LiveEvent::BackgroundCompactionReady { summary_bytes: 400 },
+            LiveEvent::BackgroundCompactionDiscarded,
             LiveEvent::TurnEnded,
             LiveEvent::Error {
                 message: "fallo".into(),
