@@ -1,6 +1,7 @@
 # Showcase de Batten: el tema primero
 
-Estado: diseño, 2026-10-23. Corrige el diseño de
+Estado: implementado el 2026-10-23, sin verlo en una terminal real (véase «Estado» al final).
+Corrige el diseño de
 `2026-10-23-batten-showcase-theme-matrix-design.md` en lo que la persona usuaria declaró erróneo.
 
 ## Propósito y corrección
@@ -60,3 +61,52 @@ Sigue pendiente saber qué acción concreta no respondía.
 - Reenviar el ratón a los demos (arrastres dentro de un widget).
 - Cambiar los demos existentes o el catálogo.
 - Comprobar que un demo genérico respeta el tema activo.
+
+## Estado
+
+Implementado el 2026-10-23. **Sin verlo aún en una terminal real**: solo hay pruebas con
+`TestBackend` y con eventos de ratón simulados. Commits: `febc8de` (lista de un tema), `b3debb1`
+(estado y teclas con el tema primero), `410d763` (pestañas, índice y pie) y el del ratón completo.
+
+### Cómo verlo
+
+`cargo run -p batten --example showcase`. Pestañas de tema arriba (clic, `←`/`→` o `F7`); la barra
+lateral lista los componentes del tema (`●` propio, `◐` genérico) y despliega hijos solo cuando hay
+varios ejemplos; el pie cuenta cuántos componentes tiene el tema y cuántos faltan, y anota
+«parcialmente implementado» para los genéricos; `m` abre la matriz. La rueda mueve el índice y, con
+la matriz abierta, el cursor.
+
+### Cifras (medidas el 2026-10-23)
+
+Pawan: 26 componentes (9 propios, 17 genéricos), faltan 31. Crush: 52 (38 propios, 14 genéricos),
+faltan 5. MastraCode: solo genéricos.
+
+### Decisiones tomadas durante la implementación
+
+- **La cabecera de un componente con varios ejemplos no es seleccionable**: `↑`/`↓` recorre solo
+  los hijos.
+- **Las flechas `←`/`→` cambian de tema solo con el foco en el índice**; con el demo abierto van al
+  demo, que las usa. `F7` / `Shift+F7` cambian de tema en cualquier foco.
+- **Abrir un ejemplo desde la matriz limpia el filtro de texto**, que de otro modo podría ocultarlo.
+- **Un clic en el índice con la matriz abierta abre ese demo y la cierra**; un clic fuera de la
+  tabla, en el panel, no hace nada.
+- **La geometría es una sola función** (`geometry` + `footer_height`) que usan el dibujo y el
+  ratón; la posición de las pestañas, `tab_spans_layout`, y la de las celdas de la matriz,
+  `matrix_cell_at`, también. Un test compara dónde se pinta cada fila con dónde la selecciona un
+  clic, en cuatro tamaños y con el pie de una y de dos líneas.
+- **El aviso «↓ más resultados» no salía nunca** (su condición era contradictoria); corregido y
+  con test.
+- **El campo de proveedor de `CatalogItem` se retiró**: nada lo leía tras eliminar el filtro.
+
+### Lo que no consta o queda pendiente
+
+- **El fallo de ratón descrito por la persona usuaria** («no funciona el ratón») no se reprodujo
+  en una terminal real. Lo corregido es lo que el código hacía mal (rueda, matriz, geometría). Si
+  la causa era otra, por ejemplo que no llegasen eventos, sigue sin diagnosticar: falta saber qué
+  acción concreta no respondía.
+- **Los demos no reciben el ratón** (arrastres o clics dentro de un widget): fuera de alcance.
+- **A anchos estrechos la pestaña activa puede quedar recortada**, porque el recorte es por la
+  derecha.
+- **`clippy --examples` da 4 errores** previos y ajenos: `Showcase::len` solo se usa en tests y
+  tres demos (`button`, `dotmax_spinners`, `dotmax_visual_lab`).
+- **Colores, anchos y desplazamiento** sin comprobar a ojo.

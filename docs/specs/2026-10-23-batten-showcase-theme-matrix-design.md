@@ -156,6 +156,12 @@ identidad visual de CodeLoom: es una propuesta construida sobre los dos colores 
 
 ## Estado
 
+> **Reemplazado en parte** por `2026-10-23-batten-showcase-theme-first-design.md`: la persona
+> usuaria declaró errónea la vista «un componente con todos los temas dentro». Quedan obsoletos
+> `F8` / `Shift+F8`, la tira de la fila y la nota del pie de «Vista de un componente entre
+> temas», la fila de proveedores como filtro y la tecla `p`. Siguen vigentes la matriz (`m`), su
+> derivación, los tres estados de celda y la paleta de CodeLoom.
+
 Implementado el 2026-10-23. **Sin verlo aún en una terminal real**: solo hay pruebas con
 `TestBackend`, de modo que colores, anchos y desplazamiento están sin comprobar a ojo. Commits:
 `a5dd92d` (derivación pura), `b2a102a` (modo matriz y teclas), `c64870f` (dibujo), `aeb2317`
