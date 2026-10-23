@@ -4,6 +4,8 @@
 //! tarjeta y ata la aprobación a su huella. Este módulo es quien hace la consulta. Ni descargar la
 //! tarjeta ni cambiarla aprueba nada: la persona usuaria aprueba lo que ha visto.
 
+use std::collections::BTreeMap;
+
 use codeloom_core::event::EventBus;
 use codeloom_core::registry::{AgentRegistry, Execution, RemoteFetched};
 use futures::stream::{self, StreamExt};
@@ -11,6 +13,7 @@ use reqwest::Client;
 
 use crate::config::A2aConfig;
 use crate::remote::fetch_card;
+use crate::security::AuthPlan;
 
 /// Peticiones de tarjeta simultáneas como máximo.
 const CONSULTAS_SIMULTANEAS: usize = 4;
@@ -31,31 +34,57 @@ pub async fn refresh_remote_cards(
     client: &Client,
     config: &A2aConfig,
 ) -> RefreshReport {
-    let remotos: Vec<(String, String)> = registry
+    refresh_remote_cards_with_env(registry, bus, client, config, &|variable| {
+        std::env::var(variable).ok()
+    })
+    .await
+}
+
+/// Como [`refresh_remote_cards`], leyendo las credenciales con `env` (inyectable para las pruebas).
+/// Además de la tarjeta, anota si el cliente podría autenticarse con lo que el perfil declara.
+pub async fn refresh_remote_cards_with_env(
+    registry: &AgentRegistry,
+    bus: &EventBus,
+    client: &Client,
+    config: &A2aConfig,
+    env: &(dyn Fn(&str) -> Option<String> + Sync),
+) -> RefreshReport {
+    let remotos: Vec<(String, String, BTreeMap<String, String>)> = registry
         .snapshot()
         .entries()
         .into_iter()
         .filter_map(|entrada| match &entrada.execution {
-            Execution::Remote(spec) => Some((entrada.name.clone(), spec.endpoint.clone())),
+            Execution::Remote(spec) => Some((
+                entrada.name.clone(),
+                spec.endpoint.clone(),
+                spec.credentials.clone(),
+            )),
             Execution::Local(_) => None,
         })
         .collect();
 
     let max_card_bytes = config.max_card_bytes;
     let resultados: Vec<_> = stream::iter(remotos)
-        .map(|(nombre, endpoint)| async move {
+        .map(|(nombre, endpoint, credenciales)| async move {
             let resultado = fetch_card(client, &endpoint, max_card_bytes).await;
-            (nombre, endpoint, resultado)
+            (nombre, endpoint, credenciales, resultado)
         })
         .buffer_unordered(CONSULTAS_SIMULTANEAS)
         .collect()
         .await;
 
     let mut informe = RefreshReport::default();
-    for (nombre, endpoint, resultado) in resultados {
+    for (nombre, endpoint, credenciales, resultado) in resultados {
         let anotado = match resultado {
             Ok(remota) => {
                 informe.ok.push(nombre.clone());
+                let auth_problem = AuthPlan::for_card(
+                    remota.security.as_deref(),
+                    remota.requires_auth,
+                    &credenciales,
+                    env,
+                )
+                .err();
                 Ok((
                     remota.card,
                     RemoteFetched {
@@ -63,8 +92,8 @@ pub async fn refresh_remote_cards(
                         jsonrpc_url: remota.jsonrpc_url,
                         tenant: remota.tenant,
                         requires_auth: remota.requires_auth,
-                        security: None,
-                        auth_problem: None,
+                        security: remota.security,
+                        auth_problem,
                     },
                 ))
             }
@@ -252,5 +281,97 @@ mod tests {
         let informe = refresh_remote_cards(&registro, &bus, &cliente, &config()).await;
 
         assert_eq!(informe, RefreshReport::default());
+    }
+
+    fn perfil_con_credenciales(dir: &Path, nombre: &str, endpoint: &str, esquema: &str) {
+        std::fs::write(
+            dir.join(format!("{nombre}.md")),
+            format!(
+                "---\nname: {nombre}\ndescription: Alta manual\ntransport: a2a-remote\na2a:\n  endpoint: {endpoint}\n  credentials:\n    {esquema}: AGENTE_KEY\n---\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn tarjeta_con_clave_de_api(servidor: &MockServer) -> Value {
+        let mut valor = tarjeta_para(servidor, "Rutas");
+        valor["securitySchemes"] = json!({
+            "claveApi": { "apiKeySecurityScheme": { "location": "header", "name": "X-Api-Key" } }
+        });
+        valor["securityRequirements"] = json!([{ "schemes": { "claveApi": { "list": [] } } }]);
+        valor
+    }
+
+    fn problema_de(registro: &AgentRegistry, nombre: &str) -> Option<String> {
+        match &registro.snapshot().get(nombre).unwrap().execution {
+            Execution::Remote(spec) => spec.fetched.as_ref().unwrap().auth_problem.clone(),
+            Execution::Local(_) => panic!("no es remoto"),
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_records_why_a_secured_remote_cannot_be_used() {
+        let servidor = MockServer::start().await;
+        servir(&servidor, tarjeta_con_clave_de_api(&servidor)).await;
+        let dir = tempfile::tempdir().unwrap();
+        let datos = tempfile::tempdir().unwrap();
+        perfil_con_credenciales(dir.path(), "rutas", &servidor.uri(), "claveApi");
+        let registro = registro(dir.path(), datos.path());
+        let bus = EventBus::new(16);
+        let cliente = http_client(&config()).unwrap().unwrap();
+
+        refresh_remote_cards_with_env(&registro, &bus, &cliente, &config(), &|_| None).await;
+        let sin_variable = problema_de(&registro, "rutas");
+        refresh_remote_cards_with_env(&registro, &bus, &cliente, &config(), &|v| {
+            (v == "AGENTE_KEY").then(|| "valor".to_string())
+        })
+        .await;
+        let con_variable = problema_de(&registro, "rutas");
+
+        assert!(sin_variable.unwrap().contains("AGENTE_KEY"));
+        assert_eq!(con_variable, None);
+    }
+
+    #[tokio::test]
+    async fn refresh_flags_a_scheme_the_client_does_not_support() {
+        let servidor = MockServer::start().await;
+        // La tarjeta de ejemplo de la especificación pide OpenID Connect.
+        servir(&servidor, tarjeta_para(&servidor, "Rutas")).await;
+        let dir = tempfile::tempdir().unwrap();
+        let datos = tempfile::tempdir().unwrap();
+        perfil(dir.path(), "rutas", &servidor.uri());
+        let registro = registro(dir.path(), datos.path());
+        let bus = EventBus::new(16);
+        let cliente = http_client(&config()).unwrap().unwrap();
+
+        refresh_remote_cards_with_env(&registro, &bus, &cliente, &config(), &|_| None).await;
+
+        let problema = problema_de(&registro, "rutas").unwrap();
+        assert!(problema.contains("OpenID Connect"), "{problema}");
+    }
+
+    #[tokio::test]
+    async fn a_card_that_changes_its_security_returns_to_pending() {
+        let servidor = MockServer::start().await;
+        servir(&servidor, tarjeta_con_clave_de_api(&servidor)).await;
+        let dir = tempfile::tempdir().unwrap();
+        let datos = tempfile::tempdir().unwrap();
+        perfil_con_credenciales(dir.path(), "rutas", &servidor.uri(), "claveApi");
+        let registro = registro(dir.path(), datos.path());
+        let bus = EventBus::new(16);
+        let cliente = http_client(&config()).unwrap().unwrap();
+        refresh_remote_cards(&registro, &bus, &cliente, &config()).await;
+        registro.approve("rutas").unwrap();
+
+        servidor.reset().await;
+        let mut otra = tarjeta_con_clave_de_api(&servidor);
+        otra["securitySchemes"]["claveApi"]["apiKeySecurityScheme"]["name"] = json!("X-Otra");
+        servir(&servidor, otra).await;
+        refresh_remote_cards(&registro, &bus, &cliente, &config()).await;
+
+        assert_eq!(
+            registro.snapshot().approval("rutas"),
+            Some(Approval::Pending)
+        );
     }
 }

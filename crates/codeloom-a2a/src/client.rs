@@ -21,6 +21,7 @@ use serde_json::{json, Value};
 use crate::card::VERSION_SOPORTADA;
 use crate::config::A2aConfig;
 use crate::remote::{http_client, leer_acotado, mapear, RemoteError};
+use crate::security::AuthPlan;
 use crate::wire::{state_from_wire, timestamp_from_wire, WireMessage, WireTask};
 
 /// Cota de los textos de error de un tercero que se copian a un mensaje nuestro.
@@ -64,6 +65,7 @@ pub struct JsonRpcClient {
     tenant: Option<String>,
     max_result_bytes: usize,
     siguiente_id: AtomicU64,
+    auth: AuthPlan,
 }
 
 impl JsonRpcClient {
@@ -81,7 +83,14 @@ impl JsonRpcClient {
             tenant,
             max_result_bytes,
             siguiente_id: AtomicU64::new(1),
+            auth: AuthPlan::open(),
         }
+    }
+
+    /// Autentica cada petición con `auth`. Sin esto el cliente habla a un remoto abierto.
+    pub fn with_auth(mut self, auth: AuthPlan) -> Self {
+        self.auth = auth;
+        self
     }
 
     fn con_tenant(&self, mut params: Value) -> Value {
@@ -94,16 +103,26 @@ impl JsonRpcClient {
     async fn llamar(&self, metodo: &str, params: Value) -> Result<Value, RemoteTaskError> {
         let id = self.siguiente_id.fetch_add(1, Ordering::Relaxed);
         let cuerpo = json!({ "jsonrpc": "2.0", "id": id, "method": metodo, "params": params });
-        let respuesta = self
+        let peticion = self
             .http
             .post(&self.url)
             .header("A2A-Version", VERSION_SOPORTADA)
             .header(reqwest::header::ACCEPT, "application/json")
-            .json(&cuerpo)
+            .json(&cuerpo);
+        let respuesta = self
+            .auth
+            .apply(peticion)
             .send()
             .await
             .map_err(|e| traducir_fallo(mapear(e)))?;
         let estado = respuesta.status();
+        // El cuerpo de un rechazo no se lee ni se repite: podría citar la propia credencial.
+        if estado == reqwest::StatusCode::UNAUTHORIZED || estado == reqwest::StatusCode::FORBIDDEN {
+            return Err(RemoteTaskError::AuthFailed(format!(
+                "HTTP {}; revisa la credencial declarada en `a2a.credentials`",
+                estado.as_u16()
+            )));
+        }
         let bytes = leer_acotado(respuesta, self.max_result_bytes)
             .await
             .map_err(traducir_fallo)?;
@@ -137,19 +156,44 @@ impl JsonRpcClient {
     }
 }
 
+/// Lee una variable de entorno: el entorno del proceso, o el de una prueba.
+type LectorDeEntorno = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
 /// Fábrica de clientes de los remotos del registro: la que se entrega al lanzador. Solo existe con
 /// el rol `consume` (o `both`); con A2A apagado no se construye y los remotos no se ejecutan.
 pub struct A2aClientFactory {
     http: Client,
     max_result_bytes: usize,
+    env: LectorDeEntorno,
 }
 
 impl A2aClientFactory {
+    /// Lee las credenciales de otra fuente que no sea el entorno del proceso (pruebas).
+    pub fn with_env(
+        mut self,
+        env: impl Fn(&str) -> Option<String> + Send + Sync + 'static,
+    ) -> Self {
+        self.env = Arc::new(env);
+        self
+    }
+
+    /// Plan de autenticación de un remoto con tarjeta descargada, o el motivo de que no lo haya.
+    fn plan_for(&self, spec: &RemoteSpec) -> Option<Result<AuthPlan, String>> {
+        let descargada = spec.fetched.as_ref()?;
+        Some(AuthPlan::for_card(
+            descargada.security.as_deref(),
+            descargada.requires_auth,
+            &spec.credentials,
+            &*self.env,
+        ))
+    }
+
     /// `None` si el rol no es de consumo: no se construye ningún cliente HTTP.
     pub fn from_config(config: &A2aConfig) -> Result<Option<Self>, RemoteError> {
         Ok(http_client(config)?.map(|http| A2aClientFactory {
             http,
             max_result_bytes: config.max_result_bytes,
+            env: Arc::new(|variable| std::env::var(variable).ok()),
         }))
     }
 }
@@ -158,12 +202,22 @@ impl RemoteClientFactory for A2aClientFactory {
     /// Cliente de la interfaz que la tarjeta descargada declaró; sin tarjeta, ninguno.
     fn client_for(&self, _name: &str, spec: &RemoteSpec) -> Option<Arc<dyn RemoteTaskClient>> {
         let descargada = spec.fetched.as_ref()?;
-        Some(Arc::new(JsonRpcClient::new(
-            self.http.clone(),
-            descargada.jsonrpc_url.clone(),
-            descargada.tenant.clone(),
-            self.max_result_bytes,
-        )))
+        // Sin un plan de autenticación válido no hay cliente: jamás se habla sin credencial a un
+        // remoto que la pide.
+        let plan = self.plan_for(spec)?.ok()?;
+        Some(Arc::new(
+            JsonRpcClient::new(
+                self.http.clone(),
+                descargada.jsonrpc_url.clone(),
+                descargada.tenant.clone(),
+                self.max_result_bytes,
+            )
+            .with_auth(plan),
+        ))
+    }
+
+    fn unavailable_reason(&self, _name: &str, spec: &RemoteSpec) -> Option<String> {
+        self.plan_for(spec)?.err()
     }
 }
 
@@ -270,9 +324,12 @@ mod tests {
     use super::*;
     use crate::config::{A2aConfig, A2aRole};
     use crate::remote::http_client;
+    use crate::security::CardSecurity;
+    use codeloom_core::registry::RemoteFetched;
     use codeloom_core::task::TaskState;
+    use std::collections::BTreeMap;
     use std::time::Duration;
-    use wiremock::matchers::{body_partial_json, header, method, path};
+    use wiremock::matchers::{body_partial_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const ENVIO: &str = include_str!("../tests/fixtures/jsonrpc-send-message.response.json");
@@ -567,5 +624,233 @@ mod tests {
             resultado,
             Err(RemoteTaskError::Other("HTTP status 502".into()))
         );
+    }
+
+    const SECRETO: &str = "s3cr3t0-muy-largo";
+
+    fn tarjeta_segura(nombre: &str, esquema: Value) -> Value {
+        json!({
+            "securitySchemes": { nombre: esquema },
+            "securityRequirements": [{ "schemes": { nombre: { "list": [] } } }],
+        })
+    }
+
+    fn plan(nombre: &str, esquema: Value, valor: &'static str) -> AuthPlan {
+        let seguridad = CardSecurity::from_card_json(&tarjeta_segura(nombre, esquema));
+        let credenciales = BTreeMap::from([(nombre.to_string(), "V".to_string())]);
+        AuthPlan::choose(&seguridad, &credenciales, &|v| {
+            (v == "V").then(|| valor.to_string())
+        })
+        .unwrap()
+    }
+
+    async fn enviar_con(
+        servidor: &MockServer,
+        auth: AuthPlan,
+    ) -> Result<RemoteReply, RemoteTaskError> {
+        cliente(servidor, None)
+            .with_auth(auth)
+            .send(Message::user_text("hola"))
+            .await
+    }
+
+    fn respuesta_de_envio() -> ResponseTemplate {
+        let valor: Value = serde_json::from_str(ENVIO).unwrap();
+        ResponseTemplate::new(200).set_body_json(con_id_1(valor))
+    }
+
+    #[tokio::test]
+    async fn sends_the_api_key_header() {
+        let servidor = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/a2a/v1"))
+            .and(header("x-api-key", SECRETO))
+            .respond_with(respuesta_de_envio())
+            .mount(&servidor)
+            .await;
+        let auth = plan(
+            "claveApi",
+            json!({ "apiKeySecurityScheme": { "location": "header", "name": "X-Api-Key" } }),
+            SECRETO,
+        );
+
+        let respuesta = enviar_con(&servidor, auth).await.unwrap();
+
+        assert!(matches!(respuesta, RemoteReply::Task(_)));
+    }
+
+    #[tokio::test]
+    async fn sends_the_api_key_in_the_query() {
+        let servidor = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/a2a/v1"))
+            .and(query_param("key", SECRETO))
+            .respond_with(respuesta_de_envio())
+            .mount(&servidor)
+            .await;
+        let auth = plan(
+            "claveApi",
+            json!({ "apiKeySecurityScheme": { "location": "query", "name": "key" } }),
+            SECRETO,
+        );
+
+        assert!(enviar_con(&servidor, auth).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn sends_bearer_and_basic() {
+        let servidor = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(header(
+                "authorization",
+                format!("Bearer {SECRETO}").as_str(),
+            ))
+            .respond_with(respuesta_de_envio())
+            .mount(&servidor)
+            .await;
+        let bearer = plan(
+            "t",
+            json!({ "httpAuthSecurityScheme": { "scheme": "Bearer" } }),
+            SECRETO,
+        );
+        assert!(enviar_con(&servidor, bearer).await.is_ok());
+
+        let servidor = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(header("authorization", "Basic dXN1YXJpbzpjbGF2ZQ=="))
+            .respond_with(respuesta_de_envio())
+            .mount(&servidor)
+            .await;
+        let basic = plan(
+            "b",
+            json!({ "httpAuthSecurityScheme": { "scheme": "Basic" } }),
+            "usuario:clave",
+        );
+        assert!(enviar_con(&servidor, basic).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_open_remote_gets_no_credential_at_all() {
+        let servidor = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(respuesta_de_envio())
+            .mount(&servidor)
+            .await;
+
+        cliente(&servidor, None)
+            .send(Message::user_text("hola"))
+            .await
+            .unwrap();
+
+        let recibidas = servidor.received_requests().await.unwrap();
+        assert_eq!(recibidas.len(), 1);
+        assert!(recibidas[0].headers.get("authorization").is_none());
+        assert!(recibidas[0].url.query().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_401_or_403_is_an_auth_failure_that_never_repeats_the_credential() {
+        for estado in [401, 403] {
+            let servidor = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(estado)
+                        .set_body_string(format!("token inválido: {SECRETO}")),
+                )
+                .mount(&servidor)
+                .await;
+            let auth = plan(
+                "t",
+                json!({ "httpAuthSecurityScheme": { "scheme": "Bearer" } }),
+                SECRETO,
+            );
+
+            let error = enviar_con(&servidor, auth).await.unwrap_err();
+
+            assert!(
+                matches!(error, RemoteTaskError::AuthFailed(_)),
+                "{estado}: {error:?}"
+            );
+            assert!(!error.to_string().contains(SECRETO), "{error}");
+            assert!(!format!("{error:?}").contains(SECRETO), "{error:?}");
+        }
+    }
+
+    fn remoto_con_seguridad(servidor: &MockServer) -> RemoteSpec {
+        let seguridad = CardSecurity::from_card_json(&tarjeta_segura(
+            "claveApi",
+            json!({ "apiKeySecurityScheme": { "location": "header", "name": "X-Api-Key" } }),
+        ));
+        RemoteSpec {
+            endpoint: servidor.uri(),
+            fetched: Some(RemoteFetched {
+                card_hash: "h".into(),
+                jsonrpc_url: format!("{}/a2a/v1", servidor.uri()),
+                tenant: None,
+                requires_auth: true,
+                security: seguridad.to_json(),
+                auth_problem: None,
+            }),
+            credentials: BTreeMap::from([("claveApi".to_string(), "AGENTE_KEY".to_string())]),
+        }
+    }
+
+    fn fabrica(valor: Option<&'static str>) -> A2aClientFactory {
+        A2aClientFactory::from_config(&A2aConfig {
+            role: A2aRole::Consume,
+            ..A2aConfig::default()
+        })
+        .unwrap()
+        .unwrap()
+        .with_env(move |variable| {
+            if variable == "AGENTE_KEY" {
+                valor.map(str::to_string)
+            } else {
+                None
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn the_factory_names_the_missing_variable_and_builds_no_client_without_it() {
+        let servidor = MockServer::start().await;
+        let spec = remoto_con_seguridad(&servidor);
+        let sin = fabrica(None);
+
+        let motivo = sin.unavailable_reason("lejano", &spec).unwrap();
+
+        assert!(motivo.contains("AGENTE_KEY"), "{motivo}");
+        assert!(sin.client_for("lejano", &spec).is_none());
+    }
+
+    #[tokio::test]
+    async fn the_factory_builds_an_authenticated_client_when_the_variable_is_set() {
+        let servidor = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/a2a/v1"))
+            .and(header("x-api-key", SECRETO))
+            .respond_with(respuesta_de_envio())
+            .mount(&servidor)
+            .await;
+        let spec = remoto_con_seguridad(&servidor);
+        let con = fabrica(Some(SECRETO));
+
+        assert!(con.unavailable_reason("lejano", &spec).is_none());
+        let cliente = con.client_for("lejano", &spec).unwrap();
+
+        assert!(cliente.send(Message::user_text("hola")).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_factory_refuses_a_remote_whose_security_it_cannot_read() {
+        let servidor = MockServer::start().await;
+        let mut spec = remoto_con_seguridad(&servidor);
+        spec.fetched.as_mut().unwrap().security = None;
+
+        let motivo = fabrica(Some(SECRETO))
+            .unavailable_reason("lejano", &spec)
+            .unwrap();
+
+        assert!(motivo.contains("demasiado grande"), "{motivo}");
     }
 }

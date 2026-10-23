@@ -374,6 +374,29 @@ impl AuthPlan {
         Ok(AuthPlan { pasos })
     }
 
+    /// Plan para un remoto ya descargado: `security` es el JSON opaco que guardó la tarjeta,
+    /// `requires_auth` si la tarjeta declaró requisitos. Si los declaró y no se pueden leer (por
+    /// ejemplo, por pasarse del tope), el remoto no se usa: jamás se intenta sin credencial.
+    /// El error ya está redactado para mostrarlo.
+    pub fn for_card(
+        security: Option<&str>,
+        requires_auth: bool,
+        credentials: &BTreeMap<String, String>,
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<AuthPlan, String> {
+        let seguridad = match security {
+            Some(texto) => CardSecurity::from_json(texto)
+                .ok_or_else(|| "la seguridad de la tarjeta no se pudo leer".to_string())?,
+            None if requires_auth => {
+                return Err(
+                    "la seguridad de la tarjeta es demasiado grande para interpretarla".to_string(),
+                )
+            }
+            None => CardSecurity::default(),
+        };
+        AuthPlan::choose(&seguridad, credentials, env).map_err(|problema| problema.to_string())
+    }
+
     /// Añade la autenticación a una petición.
     pub fn apply(&self, mut peticion: RequestBuilder) -> RequestBuilder {
         for paso in &self.pasos {
@@ -710,6 +733,22 @@ mod tests {
 
         let consulta = construir(&con("q", "s3"));
         assert_eq!(consulta.url().query(), Some("key=s3"));
+    }
+
+    #[test]
+    fn for_card_refuses_a_card_whose_security_could_not_be_stored() {
+        let error = AuthPlan::for_card(None, true, &credenciales(&[]), &entorno(&[])).unwrap_err();
+        assert!(error.contains("demasiado grande"), "{error}");
+
+        let error = AuthPlan::for_card(Some("no es json"), true, &credenciales(&[]), &entorno(&[]))
+            .unwrap_err();
+        assert!(error.contains("no se pudo leer"), "{error}");
+
+        assert!(
+            AuthPlan::for_card(None, false, &credenciales(&[]), &entorno(&[]))
+                .unwrap()
+                .is_open()
+        );
     }
 
     #[test]

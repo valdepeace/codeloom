@@ -14,6 +14,7 @@ use reqwest::{Client, Response, Url};
 
 use crate::card::{WireAgentCard, VERSION_SOPORTADA};
 use crate::config::A2aConfig;
+use crate::security::CardSecurity;
 
 /// Ruta de la tarjeta (§8.2).
 const RUTA_TARJETA: &str = "/.well-known/agent-card.json";
@@ -51,8 +52,11 @@ pub struct RemoteCard {
     /// URL de la interfaz JSON-RPC elegida, del mismo anfitrión que el punto de entrada.
     pub jsonrpc_url: String,
     pub tenant: Option<String>,
-    /// El remoto pide autenticación, que este cliente aún no sabe dar (A8d).
+    /// La tarjeta declara requisitos de seguridad.
     pub requires_auth: bool,
+    /// Esos requisitos en la forma opaca que guarda el núcleo (`CardSecurity::to_json`). `None` si
+    /// no hay, o si pasan del tope y no se pueden guardar (en ese caso `requires_auth` es `true`).
+    pub security: Option<String>,
 }
 
 fn mismo_origen(a: &Url, b: &Url) -> bool {
@@ -156,6 +160,7 @@ pub async fn fetch_card(
     // El JSON normalizado (claves ordenadas, sin espacios) da una huella que no cambia porque el
     // remoto reformatee la tarjeta, y sí cuando cambia su contenido.
     let hash = content_hash(&valor.to_string());
+    let seguridad = CardSecurity::from_card_json(&valor);
     let tarjeta: WireAgentCard =
         serde_json::from_value(valor).map_err(|e| RemoteError::InvalidCard(e.to_string()))?;
 
@@ -180,6 +185,7 @@ pub async fn fetch_card(
         jsonrpc_url: interfaz.url.clone(),
         tenant: interfaz.tenant.clone(),
         requires_auth: tarjeta.requires_auth(),
+        security: seguridad.to_json(),
     })
 }
 
