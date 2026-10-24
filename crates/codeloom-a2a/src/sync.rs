@@ -49,7 +49,7 @@ pub async fn refresh_remote_cards_with_env(
     config: &A2aConfig,
     env: &(dyn Fn(&str) -> Option<String> + Sync),
 ) -> RefreshReport {
-    let remotos: Vec<(String, String, BTreeMap<String, String>)> = registry
+    let remotos: Vec<(String, String, BTreeMap<String, String>, bool)> = registry
         .snapshot()
         .entries()
         .into_iter()
@@ -58,6 +58,7 @@ pub async fn refresh_remote_cards_with_env(
                 entrada.name.clone(),
                 spec.endpoint.clone(),
                 spec.credentials.clone(),
+                spec.fetched.is_some(),
             )),
             Execution::Local(_) => None,
         })
@@ -65,16 +66,16 @@ pub async fn refresh_remote_cards_with_env(
 
     let max_card_bytes = config.max_card_bytes;
     let resultados: Vec<_> = stream::iter(remotos)
-        .map(|(nombre, endpoint, credenciales)| async move {
+        .map(|(nombre, endpoint, credenciales, tenia_buena)| async move {
             let resultado = fetch_card(client, &endpoint, max_card_bytes).await;
-            (nombre, endpoint, credenciales, resultado)
+            (nombre, endpoint, credenciales, tenia_buena, resultado)
         })
         .buffer_unordered(CONSULTAS_SIMULTANEAS)
         .collect()
         .await;
 
     let mut informe = RefreshReport::default();
-    for (nombre, endpoint, credenciales, resultado) in resultados {
+    for (nombre, endpoint, credenciales, tenia_buena, resultado) in resultados {
         let anotado = match resultado {
             Ok(remota) => {
                 informe.ok.push(nombre.clone());
@@ -101,6 +102,12 @@ pub async fn refresh_remote_cards_with_env(
             }
             Err(error) => {
                 informe.failed.push(nombre.clone());
+                // Un fallo de red no estropea lo que funciona: si ya había una tarjeta buena, se
+                // conserva la última y el remoto sigue utilizable. Solo el que nunca se descargó
+                // queda como problema de carga.
+                if tenia_buena {
+                    continue;
+                }
                 Err(error.to_string())
             }
         };
@@ -109,6 +116,21 @@ pub async fn refresh_remote_cards_with_env(
     informe.ok.sort();
     informe.failed.sort();
     informe
+}
+
+/// Refresca las tarjetas cada `intervalo` mientras viva el proceso. La primera pasada es al arrancar
+/// (la hace quien llama), así que la espera va primero. Es una tarea para lanzar con `tokio::spawn`.
+pub async fn refresh_loop(
+    registry: std::sync::Arc<AgentRegistry>,
+    bus: EventBus,
+    client: Client,
+    config: A2aConfig,
+    intervalo: std::time::Duration,
+) {
+    loop {
+        tokio::time::sleep(intervalo).await;
+        let _ = refresh_remote_cards(&registry, &bus, &client, &config).await;
+    }
 }
 
 #[cfg(test)]
@@ -227,6 +249,62 @@ mod tests {
             registro.snapshot().approval("rutas"),
             Some(Approval::Pending)
         );
+    }
+
+    #[tokio::test]
+    async fn a_failed_refresh_keeps_the_last_good_card_and_its_approval() {
+        let servidor = MockServer::start().await;
+        servir(&servidor, tarjeta_para(&servidor, "Rutas")).await;
+        let dir = tempfile::tempdir().unwrap();
+        let datos = tempfile::tempdir().unwrap();
+        perfil(dir.path(), "rutas", &servidor.uri());
+        let registro = registro(dir.path(), datos.path());
+        let bus = EventBus::new(16);
+        let cliente = http_client(&config()).unwrap().unwrap();
+        refresh_remote_cards(&registro, &bus, &cliente, &config()).await;
+        registro.approve("rutas").unwrap();
+
+        // El remoto se cae: el refresco falla, pero lo que ya funcionaba sigue funcionando.
+        servidor.reset().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&servidor)
+            .await;
+        let informe = refresh_remote_cards(&registro, &bus, &cliente, &config()).await;
+
+        assert_eq!(informe.failed, vec!["rutas".to_string()]);
+        let instantanea = registro.snapshot();
+        assert_eq!(instantanea.approval("rutas"), Some(Approval::Approved));
+        assert!(instantanea.get("rutas").is_some());
+        assert!(!instantanea
+            .problems()
+            .iter()
+            .any(|p| matches!(p, LoadProblem::Remote { name, .. } if name == "rutas")));
+    }
+
+    #[tokio::test]
+    async fn the_periodic_loop_refreshes_again_and_again() {
+        let servidor = MockServer::start().await;
+        servir(&servidor, tarjeta_para(&servidor, "Rutas")).await;
+        let dir = tempfile::tempdir().unwrap();
+        let datos = tempfile::tempdir().unwrap();
+        perfil(dir.path(), "rutas", &servidor.uri());
+        let registro = std::sync::Arc::new(registro(dir.path(), datos.path()));
+        let cliente = http_client(&config()).unwrap().unwrap();
+
+        let tarea = tokio::spawn(refresh_loop(
+            registro.clone(),
+            EventBus::new(16),
+            cliente,
+            config(),
+            std::time::Duration::from_millis(40),
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        tarea.abort();
+
+        let peticiones = servidor.received_requests().await.unwrap().len();
+        assert!(peticiones >= 3, "solo {peticiones} peticiones");
+        assert!(registro.snapshot().get("rutas").is_some());
     }
 
     #[tokio::test]

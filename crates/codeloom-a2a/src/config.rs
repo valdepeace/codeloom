@@ -26,6 +26,10 @@ pub enum A2aRole {
 pub const MAX_CARD_BYTES_POR_DEFECTO: usize = 64 * 1024;
 /// Cota por defecto del cuerpo de cualquier respuesta remota: 256 KiB.
 pub const MAX_RESULT_BYTES_POR_DEFECTO: usize = 256 * 1024;
+/// Cada cuánto se refrescan por defecto las tarjetas de los remotos, en segundos (una hora).
+pub const CARD_REFRESH_SECS_POR_DEFECTO: u64 = 3600;
+/// Suelo del intervalo de refresco: nadie quiere martillear a un remoto.
+pub const CARD_REFRESH_SECS_MINIMO: u64 = 60;
 /// Tiempo máximo por defecto de una petición remota.
 pub const REQUEST_TIMEOUT_SECS_POR_DEFECTO: u64 = 30;
 /// Techo de cada cota: lo configurado nunca lo supera (decálogo: nada sin cota).
@@ -43,6 +47,9 @@ pub struct A2aConfig {
     pub max_card_bytes: usize,
     /// Tamaño máximo, en bytes, del cuerpo de una respuesta remota (tarea o resultado).
     pub max_result_bytes: usize,
+    /// Cada cuánto se vuelven a descargar las tarjetas de los remotos, en segundos; `0` lo desactiva
+    /// y un valor menor que el suelo se sube al suelo.
+    pub card_refresh_secs: u64,
     /// Sección `[a2a.serve]`: solo se usa con el rol `serve` o `both` (A8b).
     pub serve: ServeConfig,
 }
@@ -54,6 +61,7 @@ impl Default for A2aConfig {
             request_timeout_secs: REQUEST_TIMEOUT_SECS_POR_DEFECTO,
             max_card_bytes: MAX_CARD_BYTES_POR_DEFECTO,
             max_result_bytes: MAX_RESULT_BYTES_POR_DEFECTO,
+            card_refresh_secs: CARD_REFRESH_SECS_POR_DEFECTO,
             serve: ServeConfig::default(),
         }
     }
@@ -107,6 +115,13 @@ impl A2aConfig {
     }
 
     /// `true` si este proceso puede delegar en remotos.
+    /// Intervalo del refresco periódico de tarjetas, o `None` si está desactivado.
+    pub fn card_refresh_interval(&self) -> Option<std::time::Duration> {
+        (self.card_refresh_secs > 0).then(|| {
+            std::time::Duration::from_secs(self.card_refresh_secs.max(CARD_REFRESH_SECS_MINIMO))
+        })
+    }
+
     pub fn consumes(&self) -> bool {
         matches!(self.role, A2aRole::Consume | A2aRole::Both)
     }
@@ -129,6 +144,27 @@ mod tests {
         assert!(!config.consumes());
         assert!(!config.serves());
         assert_eq!(config, A2aConfig::default());
+    }
+
+    #[test]
+    fn the_card_refresh_interval_is_hourly_off_at_zero_and_has_a_floor() {
+        assert_eq!(
+            A2aConfig::default().card_refresh_interval(),
+            Some(std::time::Duration::from_secs(3600))
+        );
+        for (texto, esperado) in [("0", None), ("5", Some(60)), ("120", Some(120))] {
+            let config = A2aConfig::from_toml(&format!(
+                "[a2a]
+card_refresh_secs = {texto}
+"
+            ))
+            .unwrap();
+            assert_eq!(
+                config.card_refresh_interval(),
+                esperado.map(std::time::Duration::from_secs),
+                "{texto}"
+            );
+        }
     }
 
     #[test]
