@@ -85,5 +85,9 @@ Implementada el 2026-10-24 (commits `b95f3bb` servidor y `e749a83` cliente).
   oficial con `streaming=True` en 127.0.0.1: la tarea completada llega por el flujo con su artefacto
   (`ECO: HOLA`) y la cancelada termina el flujo en `Canceled`. Frente a un servidor del SDK que no
   declara streaming, el SDK contesta «Streaming is not supported» y el cliente cae al sondeo.
-- **No consta:** el flujo contra un remoto real de un tercero distinto del SDK, ni en una terminal
-  real. El sondeo sigue de reserva ante cualquier fallo del flujo.
+- **Segunda implementación (2026-10-24):** las mismas dos pruebas pasan también contra un servidor
+  hecho con el SDK oficial de JavaScript (`@a2a-js/sdk` 1.3.0, Node), implementación independiente de
+  la de Python, ambos en 127.0.0.1. Se buscó un remoto público abierto con streaming y no consta
+  ninguno estable (el hello-world de Render es de 2025 con la ruta antigua; los de Retool piden clave).
+- **No consta:** el flujo contra un servicio A2A desplegado por un tercero en Internet, ni en una
+  terminal real. El sondeo sigue de reserva ante cualquier fallo del flujo.

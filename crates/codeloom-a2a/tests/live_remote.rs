@@ -143,7 +143,12 @@ async fn a_real_server_streams_a_task_to_completion_with_its_artifact() {
         .as_ref()
         .expect("el flujo no debía fallar");
     assert_eq!(ultima.status.state, TaskState::Completed);
-    assert_eq!(ultima.artifacts[0].text(), "ECO: HOLA");
+    // Cada implementación pone su prefijo («ECO: », «ECO-JS: »): importa que llegue el texto.
+    assert!(
+        ultima.artifacts[0].text().ends_with("HOLA"),
+        "{:?}",
+        ultima.artifacts
+    );
 }
 
 #[tokio::test]
