@@ -723,6 +723,10 @@ fn execute_slash_command(app: &mut App, command: crate::commands::Command) -> Op
             app.show_agents();
             None
         }
+        Command::RefreshAgents => {
+            app.request_refresh_agents();
+            None
+        }
         Command::Mouse => {
             app.toggle_mouse_capture();
             confirm_mouse(app);

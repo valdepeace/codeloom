@@ -117,6 +117,12 @@ pub enum LiveEvent {
         agent: String,
         state: String,
     },
+    /// Terminó un refresco de las tarjetas de los agentes remotos pedido a mano (`/refresh-agents`):
+    /// cuántos se consultaron bien y cuáles fallaron.
+    AgentCardsRefreshed {
+        ok: usize,
+        failed: Vec<String>,
+    },
     /// Un hijo queda a la espera de una respuesta de su padre (`input-required`).
     SubagentInputRequested {
         parent: crate::session::SessionId,
@@ -191,6 +197,7 @@ impl LiveEvent {
             | LiveEvent::SubagentChanged(_)
             | LiveEvent::A2aServed { .. }
             | LiveEvent::AgentRouted { .. }
+            | LiveEvent::AgentCardsRefreshed { .. }
             | LiveEvent::SubagentInputRequested { .. }
             | LiveEvent::SubagentInputResolved { .. }
             | LiveEvent::TodosChanged { .. }

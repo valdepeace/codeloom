@@ -186,6 +186,7 @@ async fn main() -> Result<()> {
     // La vigilancia dura lo que `main`: al soltar el `WatcherHandle` se detiene.
     let _vigilancia_agentes = registro_agentes.spawn_watcher(arranque.directorios, bus.clone());
     let fabrica_remotos = arrancar_remotos(&a2a, &registro_agentes, &bus)?;
+    let refresco_manual = arrancar_refresco_manual(&a2a, &registro_agentes, &bus)?;
     // Servir A2A (A8b): solo con la interfaz; `-p` termina tras un turno y no deja nada escuchando.
     if cli.print.is_none() {
         if let Some(direccion) = arrancar_servidor(
@@ -380,6 +381,11 @@ async fn main() -> Result<()> {
     app.set_sessions(sessions);
     app.set_prefs_path(data_dir.join("ui.toml"));
     app.set_agent_registry(registro_agentes.clone());
+    if let Some(peticiones) = refresco_manual {
+        app.set_refresh_agents_hook(Arc::new(move || {
+            let _ = peticiones.send(());
+        }));
+    }
     codeloom_tui::run::run(
         app,
         prompt_tx,
@@ -512,8 +518,41 @@ fn arrancar_remotos(
         // El informe se descarta: el registro ya publica el cambio y deja cada fallo como
         // problema de carga de su agente, que es donde la persona usuaria lo ve.
         let _ = codeloom_a2a::sync::refresh_remote_cards(&registro, &bus, &cliente, &config).await;
+        // Después, cada `card_refresh_secs` (una hora por defecto; `0` lo desactiva): una tarjeta
+        // que cambia vuelve a pedir aprobación y un fallo de red no estropea lo que funcionaba.
+        if let Some(intervalo) = config.card_refresh_interval() {
+            codeloom_a2a::sync::refresh_loop(registro, bus, cliente, config, intervalo).await;
+        }
     });
     Ok(Some(Arc::new(fabrica)))
+}
+
+/// Atiende `/refresh-agents`: cada petición vuelve a descargar las tarjetas de los remotos y publica
+/// cuántas salieron bien. Devuelve el emisor de peticiones, o `None` si el consumo de remotos está
+/// apagado (entonces la orden dice que no está disponible).
+fn arrancar_refresco_manual(
+    a2a: &codeloom_a2a::config::A2aConfig,
+    registro: &Arc<AgentRegistry>,
+    bus: &EventBus,
+) -> Result<Option<tokio::sync::mpsc::UnboundedSender<()>>> {
+    let Some(cliente) = codeloom_a2a::remote::http_client(a2a)? else {
+        return Ok(None);
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let (registro, bus, config) = (registro.clone(), bus.clone(), a2a.clone());
+    tokio::spawn(async move {
+        while rx.recv().await.is_some() {
+            // Varias pulsaciones seguidas valen por una.
+            while rx.try_recv().is_ok() {}
+            let informe =
+                codeloom_a2a::sync::refresh_remote_cards(&registro, &bus, &cliente, &config).await;
+            bus.publish(codeloom_core::event::LiveEvent::AgentCardsRefreshed {
+                ok: informe.ok.len(),
+                failed: informe.failed,
+            });
+        }
+    });
+    Ok(Some(tx))
 }
 
 /// Enrutador de agentes que pide `[agents] routing` (A12b). Apagado por defecto. El clasificador

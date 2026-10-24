@@ -713,6 +713,9 @@ pub struct App {
     pub catalog: Arc<Catalog>,
     /// Registro de agentes, para `/agents`. `None` si el binario no lo cablea.
     pub agent_registry: Option<Arc<codeloom_core::registry::AgentRegistry>>,
+    /// Pide al trabajador que vuelva a descargar las tarjetas de los remotos (`/refresh-agents`).
+    /// `None` si el consumo de agentes remotos no está activo.
+    refresh_agents_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Apuntes de consumo de la sesión abierta: los persistidos al abrirla más los vivos.
     pub usage_records: Vec<UsageRecord>,
     /// Copia de los ajustes al abrir el diálogo y tras guardar con éxito.
@@ -914,6 +917,7 @@ impl App {
             provider_settings: None,
             catalog: Arc::new(Catalog::default()),
             agent_registry: None,
+            refresh_agents_hook: None,
             usage_records: Vec::new(),
             settings_baseline: None,
             settings_warned: false,
@@ -1092,6 +1096,22 @@ impl App {
     }
 
     /// Entrega a la interfaz el registro de agentes que consulta `/agents`.
+    /// Enlaza `/refresh-agents` con quien sabe descargar las tarjetas.
+    pub fn set_refresh_agents_hook(&mut self, hook: Arc<dyn Fn() + Send + Sync>) {
+        self.refresh_agents_hook = Some(hook);
+    }
+
+    /// Lanza el refresco de tarjetas remotas. Sin enlace, lo dice en lugar de callar.
+    pub fn request_refresh_agents(&mut self) {
+        self.slash_feedback = Some(match &self.refresh_agents_hook {
+            Some(hook) => {
+                hook();
+                "Refreshing the remote agents' cards…".into()
+            }
+            None => "Remote agents are not enabled ([a2a] role)".into(),
+        });
+    }
+
     pub fn set_agent_registry(&mut self, registry: Arc<codeloom_core::registry::AgentRegistry>) {
         self.agent_registry = Some(registry);
     }
@@ -2857,6 +2877,24 @@ impl App {
                     format!("A2A entrante: tarea {task} · agente {agent} · {state}"),
                 );
             }
+            LiveEvent::AgentCardsRefreshed { ok, failed } => {
+                let texto = if failed.is_empty() {
+                    format!("tarjetas de agentes remotos al día: {ok}")
+                } else {
+                    // Los nombres vienen del perfil, que es de la persona usuaria, pero se acotan.
+                    let nombres: Vec<&str> = failed.iter().take(10).map(String::as_str).collect();
+                    format!(
+                        "tarjetas de agentes remotos: {ok} al día; fallaron {}: {}",
+                        failed.len(),
+                        nombres.join(", ")
+                    )
+                };
+                self.transcript.push_entry(
+                    batten::state::LineKind::System,
+                    batten::state::Format::Plain,
+                    texto,
+                );
+            }
             LiveEvent::TodosChanged { session, items } => {
                 if self.session_id == Some(session) {
                     self.todos = items;
@@ -4337,6 +4375,50 @@ Cuerpo de front.
         assert_eq!(lineas.len(), 1, "{lineas:?}");
         assert!(lineas[0].contains("revisor") && lineas[0].contains("rule"));
         assert!(lineas[0].contains("review"));
+    }
+
+    #[test]
+    fn a_manual_card_refresh_reports_how_it_went() {
+        let mut app = crush_app();
+        app.apply(LiveEvent::AgentCardsRefreshed {
+            ok: 3,
+            failed: vec![],
+        });
+        app.apply(LiveEvent::AgentCardsRefreshed {
+            ok: 1,
+            failed: vec!["rutas".into(), "clima".into()],
+        });
+
+        let lineas = texts(&app);
+        assert_eq!(lineas[0], "tarjetas de agentes remotos al día: 3");
+        assert!(
+            lineas[1].contains("1 al día") && lineas[1].contains("rutas, clima"),
+            "{lineas:?}"
+        );
+    }
+
+    #[test]
+    fn refresh_agents_calls_the_hook_once_or_says_it_is_unavailable() {
+        let mut app = crush_app();
+        app.request_refresh_agents();
+        assert_eq!(
+            app.slash_feedback.as_deref(),
+            Some("Remote agents are not enabled ([a2a] role)")
+        );
+
+        let llamadas = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let contador = llamadas.clone();
+        app.set_refresh_agents_hook(Arc::new(move || {
+            contador.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        app.request_refresh_agents();
+
+        assert_eq!(llamadas.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(app
+            .slash_feedback
+            .as_deref()
+            .unwrap()
+            .starts_with("Refreshing"));
     }
 
     #[test]
