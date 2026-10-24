@@ -83,18 +83,73 @@ fn politica_de_redireccion() -> Policy {
     })
 }
 
+/// Tope de un fichero PEM de CA o de identidad.
+pub(crate) const MAX_PEM_BYTES: usize = 64 * 1024;
+
+/// Lee un fichero con cota: jamás carga más de `MAX_PEM_BYTES`.
+pub(crate) fn leer_pem(ruta: &str) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let fichero =
+        std::fs::File::open(ruta).map_err(|_| "no se pudo abrir el fichero".to_string())?;
+    let mut bytes = Vec::new();
+    fichero
+        .take(MAX_PEM_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "no se pudo leer el fichero".to_string())?;
+    if bytes.len() > MAX_PEM_BYTES {
+        return Err(format!("el fichero pasa de {MAX_PEM_BYTES} bytes"));
+    }
+    Ok(bytes)
+}
+
+fn constructor(config: &A2aConfig) -> Result<reqwest::ClientBuilder, RemoteError> {
+    let mut constructor = Client::builder()
+        .timeout(Duration::from_secs(config.request_timeout_secs))
+        .redirect(politica_de_redireccion())
+        .user_agent(concat!("codeloom-a2a/", env!("CARGO_PKG_VERSION")));
+    if let Some(ruta) = &config.ca_file {
+        let pem = leer_pem(ruta).map_err(|motivo| {
+            RemoteError::Network(format!("[a2a] ca_file no se puede usar: {motivo}"))
+        })?;
+        let certificados = reqwest::Certificate::from_pem_bundle(&pem).map_err(|_| {
+            RemoteError::Network("[a2a] ca_file no contiene certificados PEM válidos".into())
+        })?;
+        // Un fichero sin ningún certificado no es una CA: mejor fallar que confiar en nada sin avisar.
+        if certificados.is_empty() {
+            return Err(RemoteError::Network(
+                "[a2a] ca_file no contiene certificados PEM válidos".into(),
+            ));
+        }
+        for certificado in certificados {
+            constructor = constructor.add_root_certificate(certificado);
+        }
+    }
+    Ok(constructor)
+}
+
 /// Cliente HTTP para hablar con remotos. `None` si el rol no es de consumo: con A2A apagado no se
 /// construye nada.
 pub fn http_client(config: &A2aConfig) -> Result<Option<Client>, RemoteError> {
     if !config.consumes() {
         return Ok(None);
     }
-    Client::builder()
-        .timeout(Duration::from_secs(config.request_timeout_secs))
-        .redirect(politica_de_redireccion())
-        .user_agent(concat!("codeloom-a2a/", env!("CARGO_PKG_VERSION")))
+    constructor(config)?
         .build()
         .map(Some)
+        .map_err(|e| RemoteError::Network(e.without_url().to_string()))
+}
+
+/// Como [`http_client`], pero presentando una identidad de cliente (certificado y clave en PEM) en el
+/// apretón de manos TLS: la que pide un remoto con mTLS.
+pub fn http_client_with_identity(
+    config: &A2aConfig,
+    identidad_pem: &[u8],
+) -> Result<Client, RemoteError> {
+    let identidad = reqwest::Identity::from_pem(identidad_pem)
+        .map_err(|_| RemoteError::Network("la identidad TLS no es un PEM válido".into()))?;
+    constructor(config)?
+        .identity(identidad)
+        .build()
         .map_err(|e| RemoteError::Network(e.without_url().to_string()))
 }
 
@@ -198,6 +253,60 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const TARJETA: &str = include_str!("../tests/fixtures/agent-card.sample.json");
+    const IDENTIDAD: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/mtls-test-identity.pem"
+    );
+
+    #[test]
+    fn an_extra_ca_file_is_loaded_and_a_broken_one_is_refused_with_a_reason() {
+        let con = |ruta: &str| A2aConfig {
+            role: A2aRole::Consume,
+            ca_file: Some(ruta.to_string()),
+            ..A2aConfig::default()
+        };
+        // El fichero de pruebas trae un certificado PEM válido.
+        assert!(http_client(&con(IDENTIDAD)).unwrap().is_some());
+
+        let dir = tempfile::tempdir().unwrap();
+        let basura = dir.path().join("basura.pem");
+        std::fs::write(&basura, "no es un PEM").unwrap();
+        for (ruta, esperado) in [
+            ("/no/existe.pem".to_string(), "no se puede usar"),
+            (basura.display().to_string(), "certificados PEM válidos"),
+        ] {
+            let error = http_client(&con(&ruta)).unwrap_err().to_string();
+            assert!(error.contains(esperado), "{error}");
+            assert!(error.contains("ca_file"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_client_identity_builds_a_client_and_garbage_does_not() {
+        let config = A2aConfig {
+            role: A2aRole::Consume,
+            ..A2aConfig::default()
+        };
+        let pem = std::fs::read(IDENTIDAD).unwrap();
+
+        assert!(http_client_with_identity(&config, &pem).is_ok());
+        assert!(http_client_with_identity(&config, b"nada").is_err());
+    }
+
+    #[test]
+    fn pem_files_are_read_with_a_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let grande = dir.path().join("g.pem");
+        std::fs::write(&grande, vec![b'a'; MAX_PEM_BYTES + 1]).unwrap();
+        let justo = dir.path().join("j.pem");
+        std::fs::write(&justo, vec![b'a'; MAX_PEM_BYTES]).unwrap();
+
+        assert!(leer_pem(grande.to_str().unwrap()).is_err());
+        assert_eq!(
+            leer_pem(justo.to_str().unwrap()).unwrap().len(),
+            MAX_PEM_BYTES
+        );
+    }
 
     fn config(segundos: u64) -> A2aConfig {
         A2aConfig {

@@ -50,6 +50,9 @@ pub struct A2aConfig {
     /// Cada cuánto se vuelven a descargar las tarjetas de los remotos, en segundos; `0` lo desactiva
     /// y un valor menor que el suelo se sube al suelo.
     pub card_refresh_secs: u64,
+    /// Fichero PEM con autoridades de certificación adicionales en las que confiar al hablar con
+    /// remotos (una CA privada). Se suma a las raíces públicas; no las sustituye.
+    pub ca_file: Option<String>,
     /// Sección `[a2a.serve]`: solo se usa con el rol `serve` o `both` (A8b).
     pub serve: ServeConfig,
 }
@@ -62,6 +65,7 @@ impl Default for A2aConfig {
             max_card_bytes: MAX_CARD_BYTES_POR_DEFECTO,
             max_result_bytes: MAX_RESULT_BYTES_POR_DEFECTO,
             card_refresh_secs: CARD_REFRESH_SECS_POR_DEFECTO,
+            ca_file: None,
             serve: ServeConfig::default(),
         }
     }

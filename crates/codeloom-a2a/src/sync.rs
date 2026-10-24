@@ -12,11 +12,56 @@ use futures::stream::{self, StreamExt};
 use reqwest::Client;
 
 use crate::config::A2aConfig;
-use crate::remote::fetch_card;
+use crate::remote::{fetch_card, http_client_with_identity, leer_pem, RemoteCard, RemoteError};
 use crate::security::AuthPlan;
 
 /// Peticiones de tarjeta simultáneas como máximo.
 const CONSULTAS_SIMULTANEAS: usize = 4;
+
+/// Identidad TLS que el perfil declara, si la hay: la primera credencial cuya variable nombra un
+/// fichero `.pem` con certificado y clave utilizables. Se mira la extensión antes de abrir nada para
+/// no tratar como ruta una clave de API o un token.
+fn identidad_declarada(
+    credenciales: &BTreeMap<String, String>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Option<Vec<u8>> {
+    credenciales.values().find_map(|variable| {
+        let ruta = env(variable)?;
+        let ruta = ruta.trim();
+        if !ruta.to_ascii_lowercase().ends_with(".pem") {
+            return None;
+        }
+        let pem = leer_pem(ruta).ok()?;
+        reqwest::Identity::from_pem(&pem).ok()?;
+        Some(pem)
+    })
+}
+
+/// Descarga la tarjeta de un remoto. Un remoto con mTLS puede exigir certificado también para la
+/// tarjeta, y su seguridad solo se conoce al leerla: si la descarga falla en la red y el perfil
+/// declara una identidad TLS utilizable, se reintenta una vez presentándola.
+pub async fn fetch_remote_card(
+    client: &Client,
+    config: &A2aConfig,
+    endpoint: &str,
+    credenciales: &BTreeMap<String, String>,
+    env: &(dyn Fn(&str) -> Option<String> + Sync),
+) -> Result<RemoteCard, RemoteError> {
+    match fetch_card(client, endpoint, config.max_card_bytes).await {
+        Err(error @ RemoteError::Network(_)) => {
+            let Some(pem) = identidad_declarada(credenciales, env) else {
+                return Err(error);
+            };
+            match http_client_with_identity(config, &pem) {
+                Ok(con_identidad) => fetch_card(&con_identidad, endpoint, config.max_card_bytes)
+                    .await
+                    .map_err(|_| error),
+                Err(_) => Err(error),
+            }
+        }
+        otro => otro,
+    }
+}
 
 /// Qué remotos se consultaron bien y cuáles no.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -64,10 +109,9 @@ pub async fn refresh_remote_cards_with_env(
         })
         .collect();
 
-    let max_card_bytes = config.max_card_bytes;
     let resultados: Vec<_> = stream::iter(remotos)
         .map(|(nombre, endpoint, credenciales, tenia_buena)| async move {
-            let resultado = fetch_card(client, &endpoint, max_card_bytes).await;
+            let resultado = fetch_remote_card(client, config, &endpoint, &credenciales, env).await;
             (nombre, endpoint, credenciales, tenia_buena, resultado)
         })
         .buffer_unordered(CONSULTAS_SIMULTANEAS)
@@ -193,6 +237,64 @@ mod tests {
             dir.to_path_buf(),
             false,
         )
+    }
+
+    #[test]
+    fn only_a_pem_file_that_is_a_valid_identity_is_taken_as_the_declared_identity() {
+        let identidad = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/mtls-test-identity.pem"
+        );
+        let creds = |pares: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pares
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let con_valor = |valor: &'static str| move |_: &str| Some(valor.to_string());
+
+        // Un token, una clave de API o una ruta que no es .pem no se tratan como identidad.
+        assert!(identidad_declarada(&creds(&[("a", "V")]), &con_valor("token-secreto")).is_none());
+        assert!(identidad_declarada(&creds(&[("a", "V")]), &con_valor("/etc/hosts")).is_none());
+        assert!(identidad_declarada(&creds(&[("a", "V")]), &con_valor("/no/existe.pem")).is_none());
+        // Un .pem válido sí.
+        assert!(identidad_declarada(&creds(&[("a", "V")]), &con_valor(identidad)).is_some());
+        // Sin variable definida, nada.
+        assert!(identidad_declarada(&creds(&[("a", "V")]), &|_: &str| None).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_network_failure_is_retried_with_the_declared_identity_only_once_and_keeps_the_first_error(
+    ) {
+        // Un servidor HTTP plano contestando a un cliente TLS: el apretón falla en la red.
+        let plano = wiremock::MockServer::start().await;
+        let cerrado = plano.address().port();
+        let identidad = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/mtls-test-identity.pem"
+        );
+        let cliente = http_client(&config()).unwrap().unwrap();
+        let creds = BTreeMap::from([("tls".to_string(), "V".to_string())]);
+
+        let con = fetch_remote_card(
+            &cliente,
+            &config(),
+            &format!("https://127.0.0.1:{cerrado}"),
+            &creds,
+            &|_: &str| Some(identidad.to_string()),
+        )
+        .await;
+        let sin = fetch_remote_card(
+            &cliente,
+            &config(),
+            &format!("https://127.0.0.1:{cerrado}"),
+            &creds,
+            &|_: &str| None,
+        )
+        .await;
+
+        assert!(matches!(con, Err(RemoteError::Network(_))), "{con:?}");
+        assert!(matches!(sin, Err(RemoteError::Network(_))));
     }
 
     #[tokio::test]

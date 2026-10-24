@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::oauth::{url_permitida, Origen, TokenSource};
+use crate::remote::leer_pem;
 
 const MAX_ESQUEMAS: usize = 20;
 const MAX_ALTERNATIVAS: usize = 10;
@@ -83,6 +84,8 @@ pub enum SchemeKind {
     OpenIdConnect {
         discovery_url: String,
     },
+    /// mTLS: el cliente presenta un certificado propio en el apretón de manos TLS.
+    Mtls,
     /// Nombre legible de lo que no se soporta («OAuth2», «mTLS»…).
     Unsupported {
         what: String,
@@ -202,7 +205,7 @@ fn leer_esquema(valor: &Value) -> SchemeKind {
             },
             Err(motivo) => no_soportado(&format!("OpenID Connect ({motivo})")),
         },
-        "mtlsSecurityScheme" => no_soportado("mTLS"),
+        "mtlsSecurityScheme" => SchemeKind::Mtls,
         _ => no_soportado("tipo de esquema desconocido"),
     }
 }
@@ -275,9 +278,24 @@ impl CardSecurity {
 /// Por qué no se puede construir un plan de autenticación.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthProblem {
-    Unsupported { scheme: String, kind: String },
-    MissingCredential { scheme: String, env: Option<String> },
-    InvalidCredential { scheme: String, env: String },
+    Unsupported {
+        scheme: String,
+        kind: String,
+    },
+    MissingCredential {
+        scheme: String,
+        env: Option<String>,
+    },
+    InvalidCredential {
+        scheme: String,
+        env: String,
+    },
+    /// La identidad TLS (mTLS) que nombra la variable no se pudo usar.
+    BadIdentity {
+        scheme: String,
+        env: String,
+        reason: String,
+    },
 }
 
 impl fmt::Display for AuthProblem {
@@ -302,15 +320,41 @@ impl fmt::Display for AuthProblem {
                 f,
                 "la credencial del esquema «{scheme}» (variable {env}) no es válida para ese esquema"
             ),
+            AuthProblem::BadIdentity {
+                scheme,
+                env,
+                reason,
+            } => write!(
+                f,
+                "la identidad TLS del esquema «{scheme}» (variable {env}) no se puede usar: {reason}"
+            ),
         }
     }
 }
 
 enum Paso {
+    /// Identidad de cliente TLS: no añade nada a la petición, pero obliga a un cliente HTTP propio.
+    Identidad(ClientIdentity),
     Cabecera(HeaderName, HeaderValue),
     Consulta(String, Secret),
     /// Token de acceso que se pide (y se renueva) al servidor de tokens.
     Token(Arc<TokenSource>),
+}
+
+/// Certificado y clave de cliente (PEM) para mTLS. Contiene una clave privada: no se puede mostrar.
+#[derive(Clone)]
+pub struct ClientIdentity(Vec<u8>);
+
+impl ClientIdentity {
+    pub fn pem(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ClientIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ClientIdentity(..)")
+    }
 }
 
 /// Lo que hay que añadir a cada petición para cumplir la alternativa elegida.
@@ -444,6 +488,18 @@ impl AuthPlan {
                         TokenSource::new(origen, &secreto, Vec::new()).ok_or_else(invalida)?,
                     ))
                 }
+                SchemeKind::Mtls => {
+                    // La variable nombra un fichero PEM con el certificado y su clave privada.
+                    let malo = |reason: &str| AuthProblem::BadIdentity {
+                        scheme: nombre.clone(),
+                        env: variable.clone(),
+                        reason: reason.to_string(),
+                    };
+                    let pem = leer_pem(secreto.expose().trim()).map_err(|motivo| malo(&motivo))?;
+                    reqwest::Identity::from_pem(&pem)
+                        .map_err(|_| malo("no es un PEM con certificado y clave privada"))?;
+                    Paso::Identidad(ClientIdentity(pem))
+                }
                 SchemeKind::Unsupported { .. } => unreachable!("descartado arriba"),
             };
             pasos.push(paso);
@@ -479,6 +535,7 @@ impl AuthPlan {
     pub async fn apply(&self, mut peticion: RequestBuilder) -> Result<RequestBuilder, String> {
         for paso in &self.pasos {
             peticion = match paso {
+                Paso::Identidad(_) => peticion,
                 Paso::Cabecera(nombre, valor) => peticion.header(nombre.clone(), valor.clone()),
                 Paso::Consulta(nombre, secreto) => {
                     peticion.query(&[(nombre.as_str(), secreto.expose())])
@@ -487,6 +544,14 @@ impl AuthPlan {
             };
         }
         Ok(peticion)
+    }
+
+    /// Identidad TLS que el plan exige presentar, si la hay: obliga a un cliente HTTP propio.
+    pub fn client_identity(&self) -> Option<&ClientIdentity> {
+        self.pasos.iter().find_map(|p| match p {
+            Paso::Identidad(identidad) => Some(identidad),
+            _ => None,
+        })
     }
 
     /// `true` si alguna parte del plan es un token que puede caducar o ser revocado.
@@ -667,6 +732,82 @@ mod tests {
         assert!(!format!("{plan:?}").contains("secreto"));
     }
 
+    fn tarjeta_mtls() -> CardSecurity {
+        CardSecurity::from_card_json(&tarjeta(
+            json!({ "tls": { "mtlsSecurityScheme": {} } }),
+            json!([requisito(&["tls"])]),
+        ))
+    }
+
+    const IDENTIDAD: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/mtls-test-identity.pem"
+    );
+
+    fn plan_mtls(ruta: &str) -> Result<AuthPlan, AuthProblem> {
+        let ruta = ruta.to_string();
+        AuthPlan::choose(
+            &tarjeta_mtls(),
+            &credenciales(&[("tls", "V")]),
+            &move |v: &str| (v == "V").then(|| ruta.clone()),
+        )
+    }
+
+    #[test]
+    fn mtls_reads_the_identity_file_and_never_shows_the_key() {
+        let plan = plan_mtls(IDENTIDAD).unwrap();
+
+        let identidad = plan.client_identity().expect("el plan exige una identidad");
+        assert!(identidad.pem().starts_with(b"#") || identidad.pem().contains(&b'-'));
+        let texto = format!("{plan:?} {identidad:?}");
+        assert!(
+            !texto.contains("PRIVATE") && !texto.contains("BEGIN"),
+            "{texto}"
+        );
+        assert!(plan.is_open() == false);
+    }
+
+    #[test]
+    fn an_unusable_identity_file_is_reported_with_its_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let no_pem = dir.path().join("no.pem");
+        std::fs::write(&no_pem, "esto no es un PEM").unwrap();
+        let grande = dir.path().join("grande.pem");
+        std::fs::write(&grande, vec![b'a'; crate::remote::MAX_PEM_BYTES + 1]).unwrap();
+        let solo_certificado = dir.path().join("cert.pem");
+        let completo = std::fs::read_to_string(IDENTIDAD).unwrap();
+        let cert: String = completo
+            .split("-----END CERTIFICATE-----")
+            .next()
+            .unwrap()
+            .to_string()
+            + "-----END CERTIFICATE-----\n";
+        std::fs::write(&solo_certificado, cert).unwrap();
+
+        for (ruta, esperado) in [
+            ("/no/existe.pem".to_string(), "no se pudo abrir"),
+            (no_pem.display().to_string(), "no es un PEM"),
+            (grande.display().to_string(), "pasa de"),
+            (solo_certificado.display().to_string(), "no es un PEM"),
+        ] {
+            match plan_mtls(&ruta) {
+                Err(AuthProblem::BadIdentity { reason, env, .. }) => {
+                    assert!(reason.contains(esperado), "{reason} no contiene {esperado}");
+                    assert_eq!(env, "V");
+                }
+                otro => panic!("{ruta}: {otro:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn mtls_without_a_declared_credential_is_a_missing_credential() {
+        let error =
+            AuthPlan::choose(&tarjeta_mtls(), &credenciales(&[]), &entorno(&[])).unwrap_err();
+
+        assert!(matches!(error, AuthProblem::MissingCredential { .. }));
+    }
+
     #[test]
     fn parses_api_key_header_and_query() {
         let valor = tarjeta(
@@ -716,7 +857,7 @@ mod tests {
                 "ck": { "apiKeySecurityScheme": { "location": "cookie", "name": "sid" } },
                 "dg": { "httpAuthSecurityScheme": { "scheme": "Digest" } },
                 "oa": { "oauth2SecurityScheme": { "flows": {} } },
-                "tl": { "mtlsSecurityScheme": {} },
+                "dc": { "oauth2SecurityScheme": { "flows": { "deviceCode": { "tokenUrl": "https://a.example/t" } } } },
             }),
             json!([]),
         );
@@ -729,7 +870,7 @@ mod tests {
         assert_eq!(que("ck"), "clave de API en cookie");
         assert_eq!(que("dg"), "HTTP digest");
         assert_eq!(que("oa"), "OAuth2 sin el flujo client_credentials");
-        assert_eq!(que("tl"), "mTLS");
+        assert_eq!(que("dc"), "OAuth2 sin el flujo client_credentials");
     }
 
     #[test]
@@ -823,9 +964,9 @@ mod tests {
         let valor = tarjeta(
             json!({
                 "oa": { "oauth2SecurityScheme": { "flows": {} } },
-                "tl": { "mtlsSecurityScheme": {} },
+                "ck": { "apiKeySecurityScheme": { "location": "cookie", "name": "sid" } },
             }),
-            json!([requisito(&["oa"]), requisito(&["tl"])]),
+            json!([requisito(&["oa"]), requisito(&["ck"])]),
         );
         let seguridad = CardSecurity::from_card_json(&valor);
 

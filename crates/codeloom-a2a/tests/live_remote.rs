@@ -211,3 +211,78 @@ async fn a_real_secured_server_refuses_a_wrong_token_and_we_do_not_even_try_with
     assert!(matches!(error, RemoteTaskError::AuthFailed(_)), "{error:?}");
     assert!(!error.to_string().contains("token-equivocado"));
 }
+
+#[tokio::test]
+#[ignore = "necesita un servidor A2A con mTLS en A2A_LIVE_ENDPOINT, su CA en A2A_LIVE_CA_FILE y la identidad en A2A_LIVE_IDENTITY"]
+async fn a_real_mtls_server_accepts_our_identity_and_refuses_us_without_it() {
+    let endpoint = std::env::var("A2A_LIVE_ENDPOINT").expect("falta A2A_LIVE_ENDPOINT");
+    let config = A2aConfig {
+        role: A2aRole::Consume,
+        ca_file: Some(std::env::var("A2A_LIVE_CA_FILE").expect("falta A2A_LIVE_CA_FILE")),
+        ..A2aConfig::default()
+    };
+    let http = http_client(&config).unwrap().unwrap();
+    let credenciales: std::collections::BTreeMap<String, String> =
+        [("tls".to_string(), "A2A_LIVE_IDENTITY".to_string())].into();
+
+    // Sin presentar identidad, el apretón de manos TLS del servidor real nos corta.
+    let sin = fetch_card(&http, &endpoint, config.max_card_bytes).await;
+    println!("sin identidad: {sin:?}");
+    assert!(
+        sin.is_err(),
+        "el servidor mTLS no debería servirnos sin certificado"
+    );
+
+    // La descarga de la tarjeta reintenta presentando la identidad que declara el perfil.
+    let env = |nombre: &str| std::env::var(nombre).ok();
+    let tarjeta =
+        codeloom_a2a::sync::fetch_remote_card(&http, &config, &endpoint, &credenciales, &env)
+            .await
+            .expect("con la identidad declarada la tarjeta debería descargarse");
+    println!("tarjeta: {} ({})", tarjeta.card.name, tarjeta.jsonrpc_url);
+    assert!(tarjeta.requires_auth);
+
+    let spec = RemoteSpec {
+        endpoint,
+        fetched: Some(RemoteFetched {
+            card_hash: tarjeta.hash,
+            jsonrpc_url: tarjeta.jsonrpc_url,
+            tenant: tarjeta.tenant,
+            requires_auth: tarjeta.requires_auth,
+            security: tarjeta.security,
+            auth_problem: None,
+            streaming: false,
+        }),
+        credentials: credenciales,
+    };
+    let fabrica = A2aClientFactory::from_config(&config).unwrap().unwrap();
+
+    // Sin la variable de la identidad no hay cliente, y el motivo nombra la variable.
+    let sin_variable = A2aClientFactory::from_config(&config)
+        .unwrap()
+        .unwrap()
+        .with_env(|_| None);
+    assert!(sin_variable.client_for("vivo", &spec).is_none());
+    let motivo = sin_variable.unavailable_reason("vivo", &spec).unwrap();
+    println!("sin variable: {motivo}");
+    assert!(motivo.contains("A2A_LIVE_IDENTITY"), "{motivo}");
+
+    // Con ella, la tarea se completa de verdad contra el servidor real.
+    let cliente = fabrica
+        .client_for("vivo", &spec)
+        .expect("con la identidad hay cliente");
+    let RemoteReply::Task(tarea) = cliente.send(Message::user_text("hola")).await.unwrap() else {
+        panic!("se esperaba una tarea");
+    };
+    let inicio = std::time::Instant::now();
+    let fin = loop {
+        let actual = cliente.get(&tarea.id).await.unwrap();
+        if actual.status.state.is_terminal() {
+            break actual;
+        }
+        assert!(inicio.elapsed() < Duration::from_secs(20), "no terminó");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    };
+    assert_eq!(fin.status.state, TaskState::Completed);
+    assert_eq!(fin.artifacts[0].text(), "ECO-MTLS: HOLA");
+}
