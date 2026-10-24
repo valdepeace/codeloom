@@ -127,6 +127,8 @@ pub struct InProcessSubagentLauncher {
     /// Cada cuánto se consulta una tarea remota, y cuánto se la sigue como máximo.
     remote_poll: std::time::Duration,
     remote_max_follow: std::time::Duration,
+    /// Lo máximo que se espera a que la persona conteste a una pregunta de un remoto.
+    remote_input_wait: std::time::Duration,
     /// Enrutador de agentes (A12b) y el modo de confirmación con el que convive. Sin él no se elige
     /// agente automáticamente.
     router: Option<(Arc<dyn AgentRouter>, ConfirmDelegation)>,
@@ -156,6 +158,12 @@ const REMOTE_MAX_FOLLOW: std::time::Duration = std::time::Duration::from_secs(30
 
 /// Cuánto se espera a que el remoto abra el flujo de la tarea (A8c) antes de sondear.
 const REMOTE_WATCH_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Rondas de pregunta (`input-required`) que se atienden como máximo en una tarea remota.
+const REMOTE_MAX_RONDAS_ENTRADA: u32 = 5;
+/// Lo máximo que se espera a que la persona conteste a una pregunta de un remoto.
+const REMOTE_ESPERA_RESPUESTA: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+/// Bytes de la pregunta de un remoto que se muestran (el texto es de un tercero).
+const REMOTE_MAX_BYTES_PREGUNTA: usize = 2_000;
 /// Lo máximo que se espera a que un remoto conteste a `CancelTask`; menor que `CANCEL_WAIT`.
 const REMOTE_CANCEL_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
 
@@ -271,6 +279,7 @@ impl InProcessSubagentLauncher {
             remote_clients: None,
             remote_poll: REMOTE_POLL,
             remote_max_follow: REMOTE_MAX_FOLLOW,
+            remote_input_wait: REMOTE_ESPERA_RESPUESTA,
             router: None,
         }
     }
@@ -278,6 +287,12 @@ impl InProcessSubagentLauncher {
     /// Permite ejecutar agentes remotos: `fabrica` construye el cliente de cada uno.
     pub fn with_remote_clients(mut self, fabrica: Arc<dyn RemoteClientFactory>) -> Self {
         self.remote_clients = Some(fabrica);
+        self
+    }
+
+    /// Cambia cuánto se espera a que la persona conteste a la pregunta de un remoto.
+    pub fn with_remote_input_wait(mut self, espera: std::time::Duration) -> Self {
+        self.remote_input_wait = espera;
         self
     }
 
@@ -534,6 +549,10 @@ impl InProcessSubagentLauncher {
                 parent_cancel,
                 poll: self.remote_poll,
                 max_follow: self.remote_max_follow,
+                broker: child_broker.clone(),
+                bus: self.bus.clone(),
+                label: label.clone(),
+                input_wait: self.remote_input_wait,
             }),
             None => Box::new(move |handle, job_cancel| {
                 Box::pin(async move {
@@ -711,6 +730,11 @@ struct EjecucionRemota {
     parent_cancel: CancellationToken,
     poll: std::time::Duration,
     max_follow: std::time::Duration,
+    /// Buzón de preguntas, bus y etiqueta: para preguntar a la persona lo que el remoto pida.
+    broker: Arc<InputBroker>,
+    bus: EventBus,
+    label: String,
+    input_wait: std::time::Duration,
 }
 
 fn cuerpo_remoto(ejecucion: EjecucionRemota) -> JobBody {
@@ -733,9 +757,99 @@ struct Espejo {
     child: SessionId,
     tracker: Arc<TaskTracker>,
     store: Arc<dyn SessionStore>,
+    broker: Arc<InputBroker>,
+    bus: EventBus,
+    label: String,
+}
+
+/// Cómo acaba la espera de la respuesta a una pregunta del remoto.
+enum Entrada {
+    Respuesta(String),
+    /// La persona no contestó a tiempo.
+    Expirada,
+    /// La petición se descartó sin respuesta.
+    Descartada,
+    /// Se canceló el hijo o el padre mientras se esperaba.
+    Cancelada,
+}
+
+/// Texto de la pregunta de un remoto, listo para mostrarse: sin caracteres de control (salvo saltos
+/// y tabuladores), acotado y nunca vacío. Es dato de un tercero: se muestra, no se interpreta.
+fn pregunta_del_remoto(mensaje: Option<&Message>) -> String {
+    let plano: String = mensaje
+        .map(Message::text)
+        .unwrap_or_default()
+        .chars()
+        .map(|c| {
+            if c.is_control() && c != '\n' && c != '\t' {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let plano = plano.trim();
+    if plano.is_empty() {
+        return "The remote agent asks for input but gave no text.".to_string();
+    }
+    crate::tools::limit_bytes(plano, REMOTE_MAX_BYTES_PREGUNTA).into_owned()
 }
 
 impl Espejo {
+    /// Pregunta a la persona (por el buzón de los hijos) lo que el remoto pide y espera su respuesta,
+    /// con tope de tiempo. Cancelar el hijo o el padre retira la pregunta.
+    async fn preguntar(
+        &self,
+        texto: String,
+        espera: std::time::Duration,
+        job_cancel: &CancellationToken,
+        parent_cancel: &CancellationToken,
+    ) -> Entrada {
+        let pregunta = crate::question::Question {
+            header: "Remote agent".to_string(),
+            question: texto,
+            options: Vec::new(),
+            multi_select: false,
+        };
+        let (parent, child) = (self.parent, self.child);
+        let (bus, label) = (self.bus.clone(), self.label.clone());
+        let peticion = self.broker.request_with(
+            parent,
+            child,
+            self.label.clone(),
+            vec![pregunta],
+            move || {
+                bus.publish(LiveEvent::SubagentInputRequested {
+                    parent,
+                    child,
+                    label,
+                });
+            },
+        );
+        let resultado = tokio::select! {
+            respuestas = peticion => match respuestas {
+                Some(respuestas) => Entrada::Respuesta(
+                    respuestas
+                        .iter()
+                        .flat_map(|r| r.selected.iter().cloned())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                None => Entrada::Descartada,
+            },
+            _ = tokio::time::sleep(espera) => Entrada::Expirada,
+            _ = job_cancel.cancelled() => Entrada::Cancelada,
+            _ = parent_cancel.cancelled() => {
+                job_cancel.cancel();
+                Entrada::Cancelada
+            }
+        };
+        // La petición se retira al soltarse; la marca de espera de la interfaz se quita aquí.
+        self.bus
+            .publish(LiveEvent::SubagentInputResolved { parent, child });
+        resultado
+    }
+
     async fn transicion(&self, status: TaskStatus) {
         if let Err(error) = self
             .tracker
@@ -852,6 +966,10 @@ async fn seguir_remoto(
         parent_cancel,
         poll,
         max_follow,
+        broker,
+        bus,
+        label,
+        input_wait,
     } = e;
     let _permit = permit;
     // La compuerta retiene el trabajo hasta que la tarea `submitted` está guardada.
@@ -864,6 +982,9 @@ async fn seguir_remoto(
         child,
         tracker,
         store,
+        broker,
+        bus,
+        label,
     };
     espejo.transicion(TaskStatus::new(TaskState::Working)).await;
 
@@ -891,112 +1012,190 @@ async fn seguir_remoto(
     };
 
     let id = tarea.id.clone();
-    let inicio = tokio::time::Instant::now();
+    let mut inicio = tokio::time::Instant::now();
     let mut ultimo = TaskState::Working;
     let mut fallos = 0u32;
-    // A8c: si el remoto declara streaming se sigue el flujo en lugar de sondear. Cualquier fallo al
-    // abrirlo, un error a mitad, un cierre antes del estado terminal o una tarea ajena devuelven el
-    // seguimiento al sondeo de siempre: el flujo es una mejora, nunca la única vía.
-    if !tarea.status.state.is_terminal() {
-        let apertura = tokio::select! {
-            apertura = tokio::time::timeout(REMOTE_WATCH_OPEN_TIMEOUT, cliente.watch(&id)) => apertura,
-            _ = job_cancel.cancelled() => return espejo.cancelar(Some(&id)).await,
-            _ = parent_cancel.cancelled() => {
-                job_cancel.cancel();
-                return espejo.cancelar(Some(&id)).await;
-            }
-        };
-        if let Ok(Ok(mut flujo)) = apertura {
-            let limite = inicio + max_follow;
-            loop {
-                tokio::select! {
-                    siguiente = futures::StreamExt::next(&mut flujo) => match siguiente {
-                        Some(Ok(nueva)) if nueva.id == id => {
-                            let estado = nueva.status.state;
-                            tarea = nueva;
-                            if estado.is_terminal() {
-                                return espejo.terminar(tarea, &handle).await;
+    let mut rondas = 0u32;
+    // Cada ronda sigue la tarea hasta un estado terminal o hasta que el remoto pide entrada; en este
+    // último caso se pregunta a la persona, se responde a la misma tarea y se empieza otra ronda.
+    'ronda: loop {
+        // A8c: si el remoto declara streaming se sigue el flujo en lugar de sondear. Cualquier fallo
+        // al abrirlo, un error a mitad, un cierre antes del estado terminal o una tarea ajena
+        // devuelven el seguimiento al sondeo de siempre: el flujo es una mejora, nunca la única vía.
+        if !tarea.status.state.is_terminal() && tarea.status.state != TaskState::InputRequired {
+            let apertura = tokio::select! {
+                apertura = tokio::time::timeout(REMOTE_WATCH_OPEN_TIMEOUT, cliente.watch(&id)) => apertura,
+                _ = job_cancel.cancelled() => return espejo.cancelar(Some(&id)).await,
+                _ = parent_cancel.cancelled() => {
+                    job_cancel.cancel();
+                    return espejo.cancelar(Some(&id)).await;
+                }
+            };
+            if let Ok(Ok(mut flujo)) = apertura {
+                let limite = inicio + max_follow;
+                loop {
+                    tokio::select! {
+                        siguiente = futures::StreamExt::next(&mut flujo) => match siguiente {
+                            Some(Ok(nueva)) if nueva.id == id => {
+                                let estado = nueva.status.state;
+                                tarea = nueva;
+                                if estado.is_terminal() {
+                                    return espejo.terminar(tarea, &handle).await;
+                                }
+                                if estado != ultimo {
+                                    espejo
+                                        .transicion(estado_con_mensaje(
+                                            estado,
+                                            tarea.status.message.clone(),
+                                        ))
+                                        .await;
+                                    ultimo = estado;
+                                }
+                                // El remoto pide entrada: se atiende fuera del flujo.
+                                if estado == TaskState::InputRequired {
+                                    break;
+                                }
                             }
-                            if estado != ultimo {
-                                espejo
-                                    .transicion(estado_con_mensaje(
-                                        estado,
-                                        tarea.status.message.clone(),
-                                    ))
-                                    .await;
-                                ultimo = estado;
-                            }
+                            _ => break,
+                        },
+                        _ = tokio::time::sleep_until(limite) => break,
+                        _ = job_cancel.cancelled() => return espejo.cancelar(Some(&id)).await,
+                        _ = parent_cancel.cancelled() => {
+                            job_cancel.cancel();
+                            return espejo.cancelar(Some(&id)).await;
                         }
-                        _ => break,
-                    },
-                    _ = tokio::time::sleep_until(limite) => break,
-                    _ = job_cancel.cancelled() => return espejo.cancelar(Some(&id)).await,
-                    _ = parent_cancel.cancelled() => {
-                        job_cancel.cancel();
-                        return espejo.cancelar(Some(&id)).await;
                     }
                 }
             }
         }
-    }
-    loop {
-        let estado = tarea.status.state;
-        if estado.is_terminal() {
-            return espejo.terminar(tarea, &handle).await;
-        }
-        if estado != ultimo {
-            espejo
-                .transicion(estado_con_mensaje(estado, tarea.status.message.clone()))
-                .await;
-            ultimo = estado;
-        }
-        if inicio.elapsed() >= max_follow {
-            // Se avisa al remoto de que ya no interesa, sin esperar su confirmación.
-            let _ = tokio::time::timeout(REMOTE_CANCEL_TIMEOUT, cliente.cancel(&id)).await;
-            return espejo
-                .fallar(format!(
-                    "gave up following the remote task after {} s",
-                    max_follow.as_secs()
-                ))
-                .await;
-        }
-        tokio::select! {
-            _ = tokio::time::sleep(poll) => {}
-            _ = job_cancel.cancelled() => return espejo.cancelar(Some(&id)).await,
-            _ = parent_cancel.cancelled() => {
-                job_cancel.cancel();
-                return espejo.cancelar(Some(&id)).await;
+        loop {
+            let estado = tarea.status.state;
+            if estado.is_terminal() {
+                return espejo.terminar(tarea, &handle).await;
             }
-        }
-        let consulta = tokio::select! {
-            respuesta = cliente.get(&id) => respuesta,
-            _ = job_cancel.cancelled() => return espejo.cancelar(Some(&id)).await,
-            _ = parent_cancel.cancelled() => {
-                job_cancel.cancel();
-                return espejo.cancelar(Some(&id)).await;
+            if estado != ultimo {
+                espejo
+                    .transicion(estado_con_mensaje(estado, tarea.status.message.clone()))
+                    .await;
+                ultimo = estado;
             }
-        };
-        match consulta {
-            Ok(nueva) if nueva.id == id => {
-                fallos = 0;
-                tarea = nueva;
-            }
-            Ok(_) => {
-                return espejo
-                    .fallar("the remote answered about a different task".into())
-                    .await
-            }
-            Err(RemoteTaskError::NotFound) => {
-                return espejo
-                    .fallar("the remote no longer knows the task".into())
-                    .await
-            }
-            Err(error) => {
-                fallos += 1;
-                if fallos >= REMOTE_MAX_FALLOS_SEGUIDOS {
+            if estado == TaskState::InputRequired {
+                rondas += 1;
+                if rondas > REMOTE_MAX_RONDAS_ENTRADA {
+                    let _ = tokio::time::timeout(REMOTE_CANCEL_TIMEOUT, cliente.cancel(&id)).await;
                     return espejo
-                        .fallar(format!("lost contact with the remote: {error}"))
+                        .fallar(format!(
+                            "the remote asked for input more than {REMOTE_MAX_RONDAS_ENTRADA} times"
+                        ))
                         .await;
+                }
+                let texto = pregunta_del_remoto(tarea.status.message.as_ref());
+                match espejo
+                    .preguntar(texto, input_wait, &job_cancel, &parent_cancel)
+                    .await
+                {
+                    Entrada::Respuesta(respuesta) => {
+                        let mut mensaje = Message::user_text(respuesta);
+                        mensaje.task_id = Some(id.clone());
+                        mensaje.context_id = tarea.context_id.clone();
+                        let enviado = tokio::select! {
+                            respuesta = cliente.send(mensaje) => respuesta,
+                            _ = job_cancel.cancelled() => return espejo.cancelar(Some(&id)).await,
+                            _ = parent_cancel.cancelled() => {
+                                job_cancel.cancel();
+                                return espejo.cancelar(Some(&id)).await;
+                            }
+                        };
+                        match enviado {
+                            Ok(RemoteReply::Task(nueva)) if nueva.id == id => tarea = nueva,
+                            Ok(RemoteReply::Task(_)) => {
+                                return espejo
+                                    .fallar("the remote answered about a different task".into())
+                                    .await
+                            }
+                            Ok(RemoteReply::Message(mensaje)) => {
+                                // Contestó con un mensaje y sin tarea: ese mensaje es el resultado.
+                                let cierre = RemoteTask {
+                                    id: id.clone(),
+                                    context_id: tarea.context_id.clone(),
+                                    status: TaskStatus::new(TaskState::Completed),
+                                    artifacts: vec![Artifact::text_artifact(mensaje.text())],
+                                };
+                                return espejo.terminar(cierre, &handle).await;
+                            }
+                            Err(error) => {
+                                return espejo.fallar(format!("remote send failed: {error}")).await
+                            }
+                        }
+                        if !tarea.status.state.is_terminal() {
+                            espejo.transicion(TaskStatus::new(TaskState::Working)).await;
+                        }
+                        ultimo = TaskState::Working;
+                        // Esperar a la persona no cuenta contra el límite de seguimiento.
+                        inicio = tokio::time::Instant::now();
+                        fallos = 0;
+                        continue 'ronda;
+                    }
+                    Entrada::Expirada => {
+                        let _ =
+                            tokio::time::timeout(REMOTE_CANCEL_TIMEOUT, cliente.cancel(&id)).await;
+                        return espejo
+                            .fallar("nobody answered the remote agent's question in time".into())
+                            .await;
+                    }
+                    Entrada::Descartada | Entrada::Cancelada => {
+                        return espejo.cancelar(Some(&id)).await
+                    }
+                }
+            }
+            if inicio.elapsed() >= max_follow {
+                // Se avisa al remoto de que ya no interesa, sin esperar su confirmación.
+                let _ = tokio::time::timeout(REMOTE_CANCEL_TIMEOUT, cliente.cancel(&id)).await;
+                return espejo
+                    .fallar(format!(
+                        "gave up following the remote task after {} s",
+                        max_follow.as_secs()
+                    ))
+                    .await;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(poll) => {}
+                _ = job_cancel.cancelled() => return espejo.cancelar(Some(&id)).await,
+                _ = parent_cancel.cancelled() => {
+                    job_cancel.cancel();
+                    return espejo.cancelar(Some(&id)).await;
+                }
+            }
+            let consulta = tokio::select! {
+                respuesta = cliente.get(&id) => respuesta,
+                _ = job_cancel.cancelled() => return espejo.cancelar(Some(&id)).await,
+                _ = parent_cancel.cancelled() => {
+                    job_cancel.cancel();
+                    return espejo.cancelar(Some(&id)).await;
+                }
+            };
+            match consulta {
+                Ok(nueva) if nueva.id == id => {
+                    fallos = 0;
+                    tarea = nueva;
+                }
+                Ok(_) => {
+                    return espejo
+                        .fallar("the remote answered about a different task".into())
+                        .await
+                }
+                Err(RemoteTaskError::NotFound) => {
+                    return espejo
+                        .fallar("the remote no longer knows the task".into())
+                        .await
+                }
+                Err(error) => {
+                    fallos += 1;
+                    if fallos >= REMOTE_MAX_FALLOS_SEGUIDOS {
+                        return espejo
+                            .fallar(format!("lost contact with the remote: {error}"))
+                            .await;
+                    }
                 }
             }
         }
@@ -4032,6 +4231,8 @@ mod tests {
         /// Veces que se ha sondeado con `get`.
         sondeos: std::sync::Mutex<usize>,
         envio: std::sync::Mutex<Option<std::result::Result<RemoteReply, RemoteTaskError>>>,
+        /// Respuestas a los envíos posteriores al primero (las respuestas a una pregunta).
+        respuestas: std::sync::Mutex<VecDeque<std::result::Result<RemoteReply, RemoteTaskError>>>,
         consultas: std::sync::Mutex<VecDeque<std::result::Result<RemoteTask, RemoteTaskError>>>,
         /// Respuesta cuando la cola de consultas se agota.
         consulta_final: std::sync::Mutex<std::result::Result<RemoteTask, RemoteTaskError>>,
@@ -4064,6 +4265,7 @@ mod tests {
                 flujo: std::sync::Mutex::new(None),
                 sondeos: std::sync::Mutex::new(0),
                 envio: std::sync::Mutex::new(Some(envio)),
+                respuestas: std::sync::Mutex::new(VecDeque::new()),
                 consultas: std::sync::Mutex::new(consultas.into()),
                 consulta_final: std::sync::Mutex::new(Ok(tarea(
                     "r1",
@@ -4097,7 +4299,14 @@ mod tests {
             message: Message,
         ) -> std::result::Result<RemoteReply, RemoteTaskError> {
             self.enviados.lock().unwrap().push(message);
-            self.envio.lock().unwrap().take().expect("un solo envío")
+            if let Some(primero) = self.envio.lock().unwrap().take() {
+                return primero;
+            }
+            self.respuestas
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("envío no previsto")
         }
         async fn watch(
             &self,
@@ -4334,10 +4543,21 @@ mod tests {
                 Ok(tarea("r1", TaskState::Completed, None, &["azul"])),
             ],
         );
+        cliente
+            .respuestas
+            .lock()
+            .unwrap()
+            .push_back(Ok(RemoteReply::Task(tarea(
+                "r1",
+                TaskState::Working,
+                None,
+                &[],
+            ))));
         let entorno = entorno_remoto(cliente, true, false, Duration::from_secs(60)).await;
         let mut rx = entorno.bus.subscribe();
 
-        entorno.lanzar().await;
+        let hijo = entorno.lanzar().await;
+        responder(&entorno, hijo, "azul").await;
 
         let mut vistos: Vec<(TaskState, String)> = Vec::new();
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -4375,6 +4595,255 @@ mod tests {
             "{vistos:?}"
         );
         assert_eq!(vistos[2].1, "¿qué color?");
+    }
+
+    /// Espera a que el hijo tenga una pregunta pendiente, la contesta y devuelve su texto.
+    async fn responder(entorno: &Entorno, hijo: SessionId, texto: &str) -> String {
+        let pregunta = esperar_pregunta(entorno, hijo).await;
+        entorno
+            .lanzador
+            .answer(entorno.parent, hijo, vec![texto.to_string()])
+            .await
+            .unwrap();
+        pregunta
+    }
+
+    async fn esperar_pregunta(entorno: &Entorno, hijo: SessionId) -> String {
+        let limite = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(pendiente) = entorno
+                .lanzador
+                .pending_inputs(entorno.parent)
+                .into_iter()
+                .find(|p| p.child == hijo)
+            {
+                return pendiente.questions[0].question.clone();
+            }
+            assert!(
+                std::time::Instant::now() < limite,
+                "no llegó ninguna pregunta"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    fn pregunta_remota(cliente: &Arc<ClienteGuionizado>, texto: &str) {
+        *cliente.envio.lock().unwrap() = Some(Ok(RemoteReply::Task(tarea(
+            "r1",
+            TaskState::InputRequired,
+            Some(texto),
+            &[],
+        ))));
+    }
+
+    #[tokio::test]
+    async fn a_remote_input_required_is_asked_and_the_answer_resumes_the_task() {
+        let cliente = ClienteGuionizado::trabajando();
+        pregunta_remota(&cliente, "¿qué color?");
+        cliente
+            .respuestas
+            .lock()
+            .unwrap()
+            .push_back(Ok(RemoteReply::Task(tarea(
+                "r1",
+                TaskState::Completed,
+                None,
+                &["azul"],
+            ))));
+        let entorno = entorno_remoto(cliente, true, false, Duration::from_secs(60)).await;
+        let mut rx = entorno.bus.subscribe();
+
+        let hijo = entorno.lanzar().await;
+        let pregunta = responder(&entorno, hijo, "azul").await;
+
+        assert_eq!(pregunta, "¿qué color?");
+        assert_eq!(
+            entorno.estado_del_aviso(&mut rx).await,
+            TaskState::Completed
+        );
+        assert_eq!(entorno.descriptor(hijo).await.artifacts[0].text(), "azul");
+        let enviados = entorno.cliente.enviados.lock().unwrap();
+        assert_eq!(enviados.len(), 2);
+        // La respuesta continúa la misma tarea del remoto.
+        assert_eq!(enviados[1].text(), "azul");
+        assert_eq!(enviados[1].task_id.as_deref(), Some("r1"));
+        assert!(entorno.lanzador.pending_inputs(entorno.parent).is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_remote_question_is_capped_and_cleaned() {
+        let cliente = ClienteGuionizado::trabajando();
+        let sucia = format!("hola\u{7}\u{1b}[31m{}", "x".repeat(10_000));
+        pregunta_remota(&cliente, &sucia);
+        let entorno = entorno_remoto(cliente, true, false, Duration::from_secs(60)).await;
+
+        let hijo = entorno.lanzar().await;
+        let pregunta = esperar_pregunta(&entorno, hijo).await;
+
+        assert!(
+            pregunta.len() < REMOTE_MAX_BYTES_PREGUNTA + 200,
+            "{}",
+            pregunta.len()
+        );
+        assert!(!pregunta.contains('\u{7}') && !pregunta.contains('\u{1b}'));
+        assert!(pregunta.starts_with("hola"));
+    }
+
+    #[tokio::test]
+    async fn an_empty_remote_question_still_shows_something() {
+        let cliente = ClienteGuionizado::trabajando();
+        pregunta_remota(&cliente, "   ");
+        let entorno = entorno_remoto(cliente, true, false, Duration::from_secs(60)).await;
+
+        let hijo = entorno.lanzar().await;
+
+        assert!(!esperar_pregunta(&entorno, hijo).await.trim().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_cancel_while_waiting_cancels_the_remote_task_and_drops_the_question() {
+        let cliente = ClienteGuionizado::trabajando();
+        pregunta_remota(&cliente, "¿color?");
+        let entorno = entorno_remoto(cliente, true, false, Duration::from_secs(60)).await;
+        let mut rx = entorno.bus.subscribe();
+        let cancel_padre = CancellationToken::new();
+        let (hijo, _) = entorno
+            .lanzador
+            .start(
+                entorno.parent,
+                "lejano".into(),
+                "haz lo tuyo".into(),
+                Some("remoto".into()),
+                cancel_padre.clone(),
+            )
+            .await
+            .unwrap();
+        esperar_pregunta(&entorno, hijo).await;
+
+        cancel_padre.cancel();
+
+        assert_eq!(entorno.estado_del_aviso(&mut rx).await, TaskState::Canceled);
+        assert_eq!(
+            *entorno.cliente.canceladas.lock().unwrap(),
+            vec!["r1".to_string()]
+        );
+        assert!(entorno.lanzador.pending_inputs(entorno.parent).is_empty());
+    }
+
+    #[tokio::test]
+    async fn too_many_question_rounds_fail_the_task() {
+        let cliente = ClienteGuionizado::trabajando();
+        pregunta_remota(&cliente, "¿otra vez?");
+        for _ in 0..REMOTE_MAX_RONDAS_ENTRADA {
+            cliente
+                .respuestas
+                .lock()
+                .unwrap()
+                .push_back(Ok(RemoteReply::Task(tarea(
+                    "r1",
+                    TaskState::InputRequired,
+                    Some("¿otra vez?"),
+                    &[],
+                ))));
+        }
+        let entorno = entorno_remoto(cliente, true, false, Duration::from_secs(60)).await;
+        let mut rx = entorno.bus.subscribe();
+
+        let hijo = entorno.lanzar().await;
+        for _ in 0..REMOTE_MAX_RONDAS_ENTRADA {
+            responder(&entorno, hijo, "sí").await;
+        }
+
+        assert_eq!(entorno.estado_del_aviso(&mut rx).await, TaskState::Failed);
+        assert_eq!(
+            *entorno.cliente.canceladas.lock().unwrap(),
+            vec!["r1".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_question_times_out_and_cancels_the_remote_task() {
+        let cliente = ClienteGuionizado::trabajando();
+        pregunta_remota(&cliente, "¿color?");
+        let mut entorno = entorno_remoto(cliente, true, false, Duration::from_secs(60)).await;
+        entorno.lanzador = entorno
+            .lanzador
+            .with_remote_input_wait(Duration::from_millis(80));
+        let mut rx = entorno.bus.subscribe();
+
+        let hijo = entorno.lanzar().await;
+
+        assert_eq!(entorno.estado_del_aviso(&mut rx).await, TaskState::Failed);
+        assert_eq!(
+            *entorno.cliente.canceladas.lock().unwrap(),
+            vec!["r1".to_string()]
+        );
+        let razon = entorno
+            .descriptor(hijo)
+            .await
+            .status
+            .message
+            .map(|m| m.text())
+            .unwrap_or_default();
+        assert!(razon.contains("in time"), "{razon}");
+    }
+
+    #[tokio::test]
+    async fn the_wait_for_the_user_does_not_count_against_the_follow_limit() {
+        let cliente = ClienteGuionizado::trabajando();
+        pregunta_remota(&cliente, "¿color?");
+        cliente
+            .respuestas
+            .lock()
+            .unwrap()
+            .push_back(Ok(RemoteReply::Task(tarea(
+                "r1",
+                TaskState::Completed,
+                None,
+                &["a tiempo"],
+            ))));
+        // Seguimiento máximo de 300 ms; la persona tarda más que eso en contestar.
+        let entorno = entorno_remoto(cliente, true, false, Duration::from_millis(300)).await;
+        let mut rx = entorno.bus.subscribe();
+
+        let hijo = entorno.lanzar().await;
+        esperar_pregunta(&entorno, hijo).await;
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        entorno
+            .lanzador
+            .answer(entorno.parent, hijo, vec!["azul".into()])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            entorno.estado_del_aviso(&mut rx).await,
+            TaskState::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn a_message_reply_to_the_answer_is_the_result() {
+        let cliente = ClienteGuionizado::trabajando();
+        pregunta_remota(&cliente, "¿color?");
+        cliente
+            .respuestas
+            .lock()
+            .unwrap()
+            .push_back(Ok(RemoteReply::Message(Message::agent_text("era azul"))));
+        let entorno = entorno_remoto(cliente, true, false, Duration::from_secs(60)).await;
+        let mut rx = entorno.bus.subscribe();
+
+        let hijo = entorno.lanzar().await;
+        responder(&entorno, hijo, "azul").await;
+
+        assert_eq!(
+            entorno.estado_del_aviso(&mut rx).await,
+            TaskState::Completed
+        );
+        assert_eq!(
+            entorno.descriptor(hijo).await.artifacts[0].text(),
+            "era azul"
+        );
     }
 
     #[tokio::test]
@@ -4612,8 +5081,6 @@ mod tests {
         con_flujo(
             &cliente,
             GuionFlujo::Elementos(vec![
-                Ok(tarea("r1", TaskState::Working, None, &[])),
-                Ok(tarea("r1", TaskState::InputRequired, Some("¿color?"), &[])),
                 Ok(tarea("r1", TaskState::Working, None, &[])),
                 Ok(tarea("r1", TaskState::Completed, None, &["por el flujo"])),
             ]),
