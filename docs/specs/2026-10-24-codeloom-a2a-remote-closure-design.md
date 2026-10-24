@@ -69,12 +69,26 @@ soportado».
 - **D16. mTLS con identidad de cliente en PEM.** La ruta del fichero (certificado y clave privada) se
   da por variable de entorno nombrada en `a2a.credentials` para ese esquema; se construye un cliente
   HTTP propio del remoto con esa identidad. Sin fichero legible, el remoto no es utilizable y el
-  motivo se muestra en `/agents`.
-- **D17. Firmas de la tarjeta (JWS + JCS), verificación opcional contra claves de confianza.** Si el
-  perfil del remoto declara `a2a.trusted_jwks` (ruta a un JWKS local), la tarjeta ha de traer una firma
-  válida con una de esas claves o el remoto no es utilizable. Sin `trusted_jwks`, la tarjeta firmada se
-  trata como la no firmada, y así lo dice la documentación. Nunca se descarga una clave de la URL que
-  la propia tarjeta indica (`jku`): la confianza no puede salir del documento que se verifica.
+  motivo se muestra en `/agents`. Si el cliente propio no se puede construir, jamás se cae a hablarle
+  sin identidad. El fichero se acota a 64 KiB.
+- **D16b. CA privada (decisión nueva, no estaba en el plan inicial).** `[a2a] ca_file` apunta a un PEM
+  con autoridades de certificación adicionales en las que confiar; se suman a las raíces públicas, no
+  las sustituyen. Un remoto con mTLS suele vivir tras una CA privada, y sin esto no habría forma de
+  alcanzarlo. La descarga de la tarjeta, que también puede exigir certificado, reintenta **una sola
+  vez** presentando la identidad declarada ante un fallo de red.
+- **D17. Firmas de la tarjeta (JWS + JCS), verificación opcional contra claves de confianza.** Si
+  `[a2a] trusted_jwks` (ruta a un JWKS local; **global**, no por perfil: así se decidió al implementar)
+  está definido, **toda** tarjeta remota ha de traer una firma válida con una de esas claves o el
+  remoto no es utilizable, y el motivo se muestra. Sin `trusted_jwks`, la tarjeta firmada se trata como
+  la no firmada. Nunca se descarga una clave de la URL que la propia tarjeta indica (`jku`): la
+  confianza no puede salir del documento que se verifica. Un JWKS inutilizable falla cerrado.
+  - Algoritmos: `ES256`, `ES384`, `RS256` y `EdDSA`, y el de la firma ha de ser el del material de la
+    clave con ese `kid`. `none`, los simétricos, `crit` y `b64` se rechazan.
+  - Carga firmada: la tarjeta sin `signatures`, sin cadenas, listas ni objetos vacíos (como hace el
+    SDK oficial de Python), canonizada con RFC 8785. Los números no enteros se rechazan por no tener
+    aquí forma canónica comprobada.
+  - El *hash* de aprobación **excluye** `signatures`: una firma ECDSA cambia en cada emisión y, con el
+    refresco periódico, invalidaría la aprobación en cada pasada.
 - **D18. Combinaciones.** Una alternativa de seguridad que combine esquemas se cumple si se cumplen
   todos; el plan de autenticación sigue eligiendo la primera alternativa viable.
 
@@ -101,4 +115,24 @@ real de terceros alcanzable sin cuenta: si no se prueba contra uno, se dirá.
 
 ## Estado
 
-Sin implementar.
+Implementado el 2026-10-24 en `master`. Verificado:
+
+- `input-required` del remoto: pruebas con simulado y **prueba viva** contra el servidor del SDK oficial
+  de Python (la respuesta viaja con el mismo `taskId` y `contextId` y la tarea se completa).
+- Tarjetas vivas: refresco periódico, `/refresh-agents`, última tarjeta buena conservada ante fallo.
+- OAuth2 `client_credentials` y OpenID Connect: pruebas con `wiremock`; **prueba viva de OAuth2**
+  contra el SDK de Python con un `/token` propio (token pedido solo, secreto equivocado rechazado).
+- mTLS: **prueba viva** contra el SDK de Python con `CERT_REQUIRED` (sin identidad el apretón falla; con
+  ella la tarea se completa).
+- Firmas: **interoperabilidad** con una tarjeta firmada por el SDK de Python en ES256, RS256 y EdDSA.
+
+**No verificado** (se dice tal cual): ningún proveedor OAuth2/OIDC real de terceros (no consta uno
+abierto sin cuenta), ni OIDC con descubrimiento contra un proveedor real; mTLS y firmas contra un remoto
+desplegado de un tercero; el SDK de JavaScript para estas partes; `/refresh-agents` y la línea de
+preguntas del remoto en una terminal real.
+
+**Límites conocidos:** la identidad mTLS no se rota en caliente. La firma no cubre lo que el SDK
+serializa vacío (p. ej. un `securityRequirements` con ámbitos vacíos), porque la spec manda quitar los
+valores por defecto antes de canonizar. Una tarjeta con valores por defecto no vacíos (`false` de un
+campo no opcional) que otra implementación haya firmado sin ellos no verifica y queda inutilizable
+(falla cerrado, con el motivo).

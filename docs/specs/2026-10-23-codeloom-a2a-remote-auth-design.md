@@ -56,7 +56,8 @@ desplegado: sin A8d, CodeLoom solo habla con servidores abiertos de bucle local.
   OAuth2, OpenID Connect, mTLS y clave en cookie **no** se implementan: un remoto que solo ofrezca
   esos queda rechazado con un motivo legible («el esquema `x` (OAuth2) no está soportado todavía»),
   nunca con un silencio ni con un intento sin credencial. Es una frontera honesta, no un hueco
-  escondido.
+  escondido. *(Actualizado el 2026-10-24: OAuth2 `client_credentials`, OpenID Connect y mTLS ya se
+  soportan; la clave en cookie y los demás flujos OAuth2 siguen sin soporte.)*
 - **D3. Elección.** `securityRequirements` se lee como alternativas; el cliente toma la **primera**
   cuyos esquemas admite todos y para los que hay credencial. Si ninguna sirve, el motivo nombra la
   primera alternativa y lo que le falta. Los ámbitos (`scopes`) se ignoran en los esquemas
@@ -94,10 +95,10 @@ desplegado: sin A8d, CodeLoom solo habla con servidores abiertos de bucle local.
 
 ## Fuera de alcance, declarado
 
-- OAuth2 (incluido `client_credentials`), OpenID Connect y mTLS: candidatos a A8d-2 si hay un remoto
-  real que los pida.
+- ~~OAuth2 (incluido `client_credentials`), OpenID Connect y mTLS~~: hechos el 2026-10-24 (A8d-2), véase
+  `2026-10-24-codeloom-a2a-remote-closure-design.md`.
 - Rotación o caducidad de credenciales: la variable se lee cuando se construye el cliente.
-- Verificación de firmas JCS y `Cache-Control`/`ETag` de la tarjeta.
+- ~~Verificación de firmas JCS~~: hecha en A8d-2. Siguen fuera `Cache-Control` y `ETag` de la tarjeta.
 - Cualquier cosa del lado servidor.
 
 ## Preguntas abiertas (resueltas con la opción recomendada, a revisar por la persona usuaria)

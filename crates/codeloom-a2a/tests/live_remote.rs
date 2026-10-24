@@ -286,3 +286,117 @@ async fn a_real_mtls_server_accepts_our_identity_and_refuses_us_without_it() {
     assert_eq!(fin.status.state, TaskState::Completed);
     assert_eq!(fin.artifacts[0].text(), "ECO-MTLS: HOLA");
 }
+
+/// Remoto protegido con OAuth2 `client_credentials`: la credencial (`id:secreto`) se lee de la
+/// variable `A2A_LIVE_OAUTH`, bajo el esquema `oa` de la tarjeta.
+async fn remoto_oauth() -> (A2aConfig, RemoteSpec) {
+    let endpoint = std::env::var("A2A_LIVE_ENDPOINT").expect("falta A2A_LIVE_ENDPOINT");
+    let config = A2aConfig {
+        role: A2aRole::Consume,
+        ..A2aConfig::default()
+    };
+    let http = http_client(&config).unwrap().unwrap();
+    let tarjeta = fetch_card(&http, &endpoint, config.max_card_bytes)
+        .await
+        .expect("la tarjeta debería descargarse");
+    assert!(tarjeta.requires_auth);
+    let spec = RemoteSpec {
+        endpoint,
+        fetched: Some(RemoteFetched {
+            card_hash: tarjeta.hash,
+            jsonrpc_url: tarjeta.jsonrpc_url,
+            tenant: tarjeta.tenant,
+            requires_auth: tarjeta.requires_auth,
+            security: tarjeta.security,
+            auth_problem: None,
+            streaming: false,
+        }),
+        credentials: [("oa".to_string(), "A2A_LIVE_OAUTH".to_string())].into(),
+    };
+    (config, spec)
+}
+
+/// Espera a que la tarea llegue a un estado que cumpla `fin`.
+async fn esperar(
+    cliente: &std::sync::Arc<dyn RemoteTaskClient>,
+    id: &str,
+    fin: impl Fn(TaskState) -> bool,
+) -> codeloom_core::remote_task::RemoteTask {
+    let inicio = std::time::Instant::now();
+    loop {
+        let actual = cliente.get(id).await.unwrap();
+        println!("  {:?}", actual.status.state);
+        if fin(actual.status.state) {
+            return actual;
+        }
+        assert!(
+            inicio.elapsed() < Duration::from_secs(20),
+            "no llegó al estado"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "necesita un servidor A2A con OAuth2 client_credentials en A2A_LIVE_ENDPOINT y su credencial id:secreto en A2A_LIVE_OAUTH"]
+async fn a_real_oauth2_server_gives_us_a_token_and_completes_a_task() {
+    let (config, spec) = remoto_oauth().await;
+    let fabrica = || A2aClientFactory::from_config(&config).unwrap().unwrap();
+
+    // Sin tocar a la gente: con la credencial buena, el token se pide solo y la tarea se completa.
+    let cliente = fabrica()
+        .client_for("vivo", &spec)
+        .expect("con la credencial hay cliente");
+    let RemoteReply::Task(tarea) = cliente.send(Message::user_text("hola")).await.unwrap() else {
+        panic!("se esperaba una tarea");
+    };
+    let fin = esperar(&cliente, &tarea.id, TaskState::is_terminal).await;
+    assert_eq!(fin.status.state, TaskState::Completed);
+    assert_eq!(fin.artifacts[0].text(), "ECO-OAUTH: HOLA");
+
+    // Con un secreto equivocado, el punto de token rechaza y jamás se llama sin credencial.
+    let mal = fabrica()
+        .with_env(|_| Some("cliente-prueba:secreto-equivocado".to_string()))
+        .client_for("vivo", &spec)
+        .expect("hay credencial, así que hay cliente");
+    let error = mal.send(Message::user_text("hola")).await.unwrap_err();
+    println!("secreto equivocado: {error}");
+    assert!(matches!(error, RemoteTaskError::AuthFailed(_)), "{error:?}");
+    assert!(!error.to_string().contains("secreto-equivocado"));
+}
+
+#[tokio::test]
+#[ignore = "necesita el servidor OAuth2 de pruebas (pregunta con «pregunta…») en A2A_LIVE_ENDPOINT y A2A_LIVE_OAUTH"]
+async fn a_real_server_asks_for_input_and_resumes_the_same_task_with_the_answer() {
+    let (config, spec) = remoto_oauth().await;
+    let cliente = A2aClientFactory::from_config(&config)
+        .unwrap()
+        .unwrap()
+        .client_for("vivo", &spec)
+        .expect("con la credencial hay cliente");
+
+    let RemoteReply::Task(tarea) = cliente
+        .send(Message::user_text("pregunta algo"))
+        .await
+        .unwrap()
+    else {
+        panic!("se esperaba una tarea");
+    };
+    let detenida = esperar(&cliente, &tarea.id, |e| e == TaskState::InputRequired).await;
+    let pregunta = detenida.status.message.as_ref().map(Message::text);
+    println!("pregunta del remoto: {pregunta:?}");
+    assert_eq!(pregunta.as_deref(), Some("¿Cómo te llamas?"));
+
+    // La respuesta viaja con el mismo `taskId` y `contextId`: el servidor real la reconoce como
+    // continuación de la misma tarea, no como una tarea nueva.
+    let mut respuesta = Message::user_text("Andres");
+    respuesta.task_id = Some(tarea.id.clone());
+    respuesta.context_id = detenida.context_id.clone();
+    let RemoteReply::Task(seguida) = cliente.send(respuesta).await.unwrap() else {
+        panic!("se esperaba una tarea");
+    };
+    assert_eq!(seguida.id, tarea.id, "debe ser la misma tarea");
+    let fin = esperar(&cliente, &tarea.id, TaskState::is_terminal).await;
+    assert_eq!(fin.status.state, TaskState::Completed);
+    assert_eq!(fin.artifacts[0].text(), "RESPUESTA: ANDRES");
+}

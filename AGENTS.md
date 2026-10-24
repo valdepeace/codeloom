@@ -17,8 +17,9 @@ The workspace builds and has tests. Crates: `batten` (TUI widgets/state),
 `codeloom-tui`, `codeloom-herdr`, `codeloom-cli`. Subagents run as A2A tasks; remote
 A2A agents can be consumed (A8a, with client-side auth A8d) and CodeLoom can be served as a
 read-only A2A agent (A8b). Streaming over SSE (A8c, serving and consuming) and the automatic agent
-router (A12b, rule plus optional classifier) are done; the status of every A2A task is in
-`docs/plans/2026-10-22-codeloom-a2a-roadmap.md`.
+router (A12b, rule plus optional classifier) are done, as is the remote-agents closure (A8d-2:
+OAuth2/OIDC, mTLS and card-signature checks; remote `input-required`; live cards). The status of
+every A2A task is in `docs/plans/2026-10-22-codeloom-a2a-roadmap.md`.
 
 Every task needs its spec (`docs/specs/`) and plan (`docs/plans/`) before code.
 `docs/plans/2026-10-13-loom-mvp.md` is the original m0+m1 plan (history).

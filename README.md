@@ -35,9 +35,9 @@ Ciertamente, falta mucho (véase «Lo que aún no está»), pero ya no es solo d
 - Control de contexto y coste: toda salida de herramienta, sección del prompt y bucle
   lleva una cota (véase el decálogo, más abajo).
 
-**Lo que aún no está:** OAuth2/OpenID Connect/mTLS contra remotos (el resto de A8d), flujo
-TLS propio al servir, MCP, LSP, skills y memoria (m4), y el plugin completo de
-herdr (m3; hoy solo se detecta el entorno y se le reporta el estado).
+**Lo que aún no está:** flujos OAuth2 con persona (código, dispositivo), TLS propio al
+servir, MCP, LSP, skills y memoria (m4), y el plugin completo de herdr (m3; hoy solo se
+detecta el entorno y se le reporta el estado).
 
 ## Puesta en marcha
 
@@ -87,7 +87,8 @@ La tarjeta de un tercero es **dato, no instrucción**: nunca se registra sin apr
 y no hay descubrimiento automático.
 
 **Remotos que piden autenticación.** CodeLoom sabe dar clave de API (en cabecera o en
-consulta) y HTTP `Bearer`/`Basic`. La credencial nunca se escribe en el perfil: se declara
+consulta), HTTP `Bearer`/`Basic`, OAuth2 `client_credentials`, OpenID Connect (por
+descubrimiento) y mTLS. La credencial nunca se escribe en el perfil: se declara
 el *nombre* de la variable de entorno que la guarda, por esquema de la tarjeta:
 
 ```yaml
@@ -98,9 +99,41 @@ a2a:
     token: AGENTE_EJEMPLO_TOKEN   # esquema de la tarjeta -> variable de entorno
 ```
 
-Si falta la variable, o el remoto solo ofrece OAuth2, OpenID Connect o mTLS (aún sin
-soporte), la fila del agente en `/agents` dice por qué no se puede usar y no se le envía
-nada.
+Qué lleva cada variable:
+
+- **Clave de API, `Bearer`, `Basic`**: el secreto (en `Basic`, `usuario:clave`).
+- **OAuth2 `client_credentials` y OpenID Connect**: `client_id:client_secret`. CodeLoom pide el
+  token solo, lo guarda en memoria hasta que caduca y, si el remoto lo rechaza con 401, lo renueva
+  y reintenta **una vez**. El punto de token ha de ser HTTPS (o `http` hacia bucle local), no se
+  siguen redirecciones y el token no aparece en registros ni errores.
+- **mTLS**: la *ruta* de un fichero PEM con el certificado y la clave privada del cliente.
+
+Si falta la variable, el fichero no sirve, o el remoto solo ofrece algo que no soportamos
+(cookie, otros flujos OAuth2), la fila del agente en `/agents` dice por qué no se puede usar y
+no se le envía nada.
+
+Claves del bloque `[a2a]` relacionadas:
+
+```toml
+[a2a]
+role = "consume"
+ca_file = "/ruta/ca-privada.pem"     # CA adicionales en las que confiar (se suman a las públicas)
+trusted_jwks = "/ruta/claves.json"   # si se define, TODA tarjeta remota ha de venir firmada
+card_refresh_secs = 3600             # refresco de las tarjetas; 0 lo desactiva (mínimo 60)
+```
+
+**Firmas de la tarjeta.** Con `trusted_jwks` (un JWKS local con tus claves de confianza),
+CodeLoom verifica la firma JWS de la tarjeta (`ES256`, `ES384`, `RS256`, `EdDSA`) y deja
+inutilizable al remoto cuya tarjeta no esté firmada, esté alterada o no case con tus claves.
+Nunca descarga una clave de la URL `jku` que traiga la propia tarjeta. Sin `trusted_jwks`, las
+firmas se ignoran.
+
+**Tarjetas vivas.** Las tarjetas se refrescan cada `card_refresh_secs`; `/refresh-agents` fuerza
+la pasada. Si un refresco falla, se conserva la última tarjeta buena. Si la tarjeta cambia, la
+aprobación vuelve a «pendiente»: refrescar nunca aprueba nada.
+
+**Preguntas del remoto.** Si un agente remoto deja su tarea en `input-required`, CodeLoom te
+pregunta a ti (hasta 5 rondas, 30 min de espera cada una) y responde sobre la misma tarea.
 
 **Servir CodeLoom como agente A2A.** Con `role = "serve"` (o `"both"`) otros clientes A2A
 pueden pedirle trabajo. Como quien llama es un tercero y no hay nadie para aprobar permisos,
