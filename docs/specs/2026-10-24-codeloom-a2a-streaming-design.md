@@ -81,6 +81,9 @@ Implementada el 2026-10-24 (commits `b95f3bb` servidor y `e749a83` cliente).
   `streaming=True`: cuatro eventos (tarea, `WORKING`, artefacto, `COMPLETED`).
 - **Hallazgo corregido:** con estado terminal, los artefactos se emiten antes y el estado cierra la
   secuencia (lo contrario dejaba al cliente sin los artefactos finales).
-- **No consta:** el seguimiento por flujo contra un remoto real de terceros que lo ofrezca (solo se
-  ha probado con el SDK y con dobles), ni en una terminal real. El sondeo sigue de reserva ante
-  cualquier fallo del flujo.
+- **Prueba viva del cliente (2026-10-24):** `live_remote` (`#[ignore]`) contra un servidor del SDK
+  oficial con `streaming=True` en 127.0.0.1: la tarea completada llega por el flujo con su artefacto
+  (`ECO: HOLA`) y la cancelada termina el flujo en `Canceled`. Frente a un servidor del SDK que no
+  declara streaming, el SDK contesta «Streaming is not supported» y el cliente cae al sondeo.
+- **No consta:** el flujo contra un remoto real de un tercero distinto del SDK, ni en una terminal
+  real. El sondeo sigue de reserva ante cualquier fallo del flujo.

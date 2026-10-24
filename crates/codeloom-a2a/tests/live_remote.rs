@@ -24,7 +24,7 @@ use codeloom_core::task::TaskState;
 
 /// Remoto con la tarjeta ya descargada; la credencial del esquema `token` se lee de
 /// `A2A_LIVE_TOKEN`.
-async fn remoto() -> (A2aConfig, RemoteSpec) {
+async fn remoto(streaming: bool) -> (A2aConfig, RemoteSpec) {
     let endpoint = std::env::var("A2A_LIVE_ENDPOINT").expect("falta A2A_LIVE_ENDPOINT");
     let config = A2aConfig {
         role: A2aRole::Consume,
@@ -44,7 +44,7 @@ async fn remoto() -> (A2aConfig, RemoteSpec) {
             requires_auth: tarjeta.requires_auth,
             security: tarjeta.security,
             auth_problem: None,
-            streaming: false,
+            streaming,
         }),
         credentials: [("token".to_string(), "A2A_LIVE_TOKEN".to_string())].into(),
     };
@@ -52,7 +52,11 @@ async fn remoto() -> (A2aConfig, RemoteSpec) {
 }
 
 async fn cliente() -> std::sync::Arc<dyn RemoteTaskClient> {
-    let (config, spec) = remoto().await;
+    cliente_con(false).await
+}
+
+async fn cliente_con(streaming: bool) -> std::sync::Arc<dyn RemoteTaskClient> {
+    let (config, spec) = remoto(streaming).await;
     A2aClientFactory::from_config(&config)
         .unwrap()
         .unwrap()
@@ -82,6 +86,64 @@ async fn a_real_server_completes_a_task() {
 
     assert_eq!(fin.status.state, TaskState::Completed);
     assert_eq!(fin.artifacts[0].text(), "ECO: HOLA");
+}
+
+#[tokio::test]
+#[ignore = "necesita un servidor A2A real con streaming en A2A_LIVE_ENDPOINT"]
+async fn a_real_server_streams_a_task_until_it_is_canceled() {
+    use futures::StreamExt;
+    let cliente = cliente_con(true).await;
+    let RemoteReply::Task(tarea) = cliente.send(Message::user_text("larga")).await.unwrap() else {
+        panic!("se esperaba una tarea");
+    };
+    let mut flujo = cliente
+        .watch(&tarea.id)
+        .await
+        .expect("el servidor debía aceptar la suscripción");
+    let otro = cliente.clone();
+    let id = tarea.id.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let _ = otro.cancel(&id).await;
+    });
+
+    let mut estados = Vec::new();
+    while let Some(elemento) = tokio::time::timeout(Duration::from_secs(20), flujo.next())
+        .await
+        .expect("el flujo se quedó mudo")
+    {
+        let actual = elemento.expect("el flujo no debía fallar");
+        println!("  flujo: {:?}", actual.status.state);
+        estados.push(actual.status.state);
+    }
+
+    assert_eq!(estados.last(), Some(&TaskState::Canceled), "{estados:?}");
+}
+
+#[tokio::test]
+#[ignore = "necesita un servidor A2A real con streaming en A2A_LIVE_ENDPOINT"]
+async fn a_real_server_streams_a_task_to_completion_with_its_artifact() {
+    use futures::StreamExt;
+    let cliente = cliente_con(true).await;
+    let RemoteReply::Task(tarea) = cliente.send(Message::user_text("hola")).await.unwrap() else {
+        panic!("se esperaba una tarea");
+    };
+    let flujo = cliente
+        .watch(&tarea.id)
+        .await
+        .expect("el servidor debía aceptar la suscripción");
+
+    let tareas: Vec<_> = tokio::time::timeout(Duration::from_secs(20), flujo.collect::<Vec<_>>())
+        .await
+        .expect("el flujo no terminó");
+
+    let ultima = tareas
+        .last()
+        .unwrap()
+        .as_ref()
+        .expect("el flujo no debía fallar");
+    assert_eq!(ultima.status.state, TaskState::Completed);
+    assert_eq!(ultima.artifacts[0].text(), "ECO: HOLA");
 }
 
 #[tokio::test]
@@ -124,7 +186,7 @@ async fn a_real_secured_server_accepts_the_bearer_token() {
 #[tokio::test]
 #[ignore = "necesita un servidor A2A protegido con Bearer en A2A_LIVE_ENDPOINT"]
 async fn a_real_secured_server_refuses_a_wrong_token_and_we_do_not_even_try_without_one() {
-    let (config, spec) = remoto().await;
+    let (config, spec) = remoto(false).await;
     let fabrica = || A2aClientFactory::from_config(&config).unwrap().unwrap();
 
     // Sin la variable: no hay cliente y el motivo nombra la variable.
