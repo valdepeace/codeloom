@@ -3,14 +3,16 @@
 //! Cabe señalar que A2A no prescribe un modelo de autorización: la tarjeta solo **declara** lo que
 //! pide (`securitySchemes`, `securityRequirements`). Aquí se interpreta esa declaración, se elige la
 //! primera alternativa que este cliente sabe cumplir y se construye lo que hay que añadir a cada
-//! petición. Lo que no se sabe cumplir (OAuth2, OpenID Connect, mTLS, clave en cookie…) se rechaza
-//! con un motivo legible; jamás se intenta sin credencial.
+//! petición. Lo que no se sabe cumplir (flujos de OAuth2 con persona, mTLS, clave en cookie…) se
+//! rechaza con un motivo legible; jamás se intenta sin credencial. OAuth2 `client_credentials` y
+//! OpenID Connect se cumplen pidiendo un token (módulo `oauth`).
 //!
 //! La lectura de `securityRequirements` como «alternativas (O) de conjuntos (Y)» es la semántica de
 //! OpenAPI, no una frase de A2A: es lectura nuestra y así consta en la spec.
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -18,6 +20,8 @@ use reqwest::header::{HeaderName, HeaderValue, AUTHORIZATION};
 use reqwest::RequestBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::oauth::{url_permitida, Origen, TokenSource};
 
 const MAX_ESQUEMAS: usize = 20;
 const MAX_ALTERNATIVAS: usize = 10;
@@ -70,6 +74,15 @@ pub enum SchemeKind {
     },
     HttpBearer,
     HttpBasic,
+    /// OAuth2 con el flujo `client_credentials`: la dirección del servidor de tokens y los ámbitos.
+    OAuth2ClientCredentials {
+        token_url: String,
+        scopes: Vec<String>,
+    },
+    /// OpenID Connect: se descubre el servidor de tokens en el documento de esta dirección.
+    OpenIdConnect {
+        discovery_url: String,
+    },
     /// Nombre legible de lo que no se soporta («OAuth2», «mTLS»…).
     Unsupported {
         what: String,
@@ -107,6 +120,49 @@ fn no_soportado(que: &str) -> SchemeKind {
     }
 }
 
+/// Ámbitos de OAuth2 que se envían como mucho, y su longitud máxima.
+const MAX_AMBITOS: usize = 20;
+const MAX_LARGO_AMBITO: usize = 100;
+
+/// Un ámbito válido según RFC 6749 §3.3: caracteres imprimibles sin espacio, comillas ni barra invertida.
+fn ambito_valido(ambito: &str) -> bool {
+    !ambito.is_empty()
+        && ambito.len() <= MAX_LARGO_AMBITO
+        && ambito
+            .bytes()
+            .all(|b| (0x21..=0x7e).contains(&b) && b != b'"' && b != b'\\')
+}
+
+/// OAuth2: solo `client_credentials`; cualquier otro flujo exige una persona delante.
+fn leer_oauth2(cuerpo: &Value) -> SchemeKind {
+    let Some(flujo) = cuerpo
+        .get("flows")
+        .and_then(|f| f.get("clientCredentials"))
+        .filter(|f| f.is_object())
+    else {
+        return no_soportado("OAuth2 sin el flujo client_credentials");
+    };
+    let token_url = flujo.get("tokenUrl").and_then(Value::as_str).unwrap_or("");
+    if let Err(motivo) = url_permitida(token_url) {
+        return no_soportado(&format!("OAuth2 (tokenUrl: {motivo})"));
+    }
+    let scopes = flujo
+        .get("scopes")
+        .and_then(Value::as_object)
+        .map(|mapa| {
+            mapa.keys()
+                .filter(|k| ambito_valido(k))
+                .take(MAX_AMBITOS)
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    SchemeKind::OAuth2ClientCredentials {
+        token_url: token_url.to_string(),
+        scopes,
+    }
+}
+
 fn leer_esquema(valor: &Value) -> SchemeKind {
     let Some(objeto) = valor.as_object() else {
         return no_soportado("esquema mal formado");
@@ -139,8 +195,13 @@ fn leer_esquema(valor: &Value) -> SchemeKind {
             "basic" => SchemeKind::HttpBasic,
             otro => no_soportado(&format!("HTTP {}", limpiar(otro))),
         },
-        "oauth2SecurityScheme" => no_soportado("OAuth2"),
-        "openIdConnectSecurityScheme" => no_soportado("OpenID Connect"),
+        "oauth2SecurityScheme" => leer_oauth2(cuerpo),
+        "openIdConnectSecurityScheme" => match url_permitida(texto("openIdConnectUrl")) {
+            Ok(_) => SchemeKind::OpenIdConnect {
+                discovery_url: texto("openIdConnectUrl").to_string(),
+            },
+            Err(motivo) => no_soportado(&format!("OpenID Connect ({motivo})")),
+        },
         "mtlsSecurityScheme" => no_soportado("mTLS"),
         _ => no_soportado("tipo de esquema desconocido"),
     }
@@ -248,6 +309,8 @@ impl fmt::Display for AuthProblem {
 enum Paso {
     Cabecera(HeaderName, HeaderValue),
     Consulta(String, Secret),
+    /// Token de acceso que se pide (y se renueva) al servidor de tokens.
+    Token(Arc<TokenSource>),
 }
 
 /// Lo que hay que añadir a cada petición para cumplir la alternativa elegida.
@@ -367,6 +430,20 @@ impl AuthPlan {
                             .ok_or_else(invalida)?,
                     )
                 }
+                SchemeKind::OAuth2ClientCredentials { token_url, scopes } => {
+                    let origen =
+                        Origen::Directo(url_permitida(&token_url).map_err(|_| invalida())?);
+                    Paso::Token(Arc::new(
+                        TokenSource::new(origen, &secreto, scopes).ok_or_else(invalida)?,
+                    ))
+                }
+                SchemeKind::OpenIdConnect { discovery_url } => {
+                    let origen =
+                        Origen::Descubrir(url_permitida(&discovery_url).map_err(|_| invalida())?);
+                    Paso::Token(Arc::new(
+                        TokenSource::new(origen, &secreto, Vec::new()).ok_or_else(invalida)?,
+                    ))
+                }
                 SchemeKind::Unsupported { .. } => unreachable!("descartado arriba"),
             };
             pasos.push(paso);
@@ -397,17 +474,33 @@ impl AuthPlan {
         AuthPlan::choose(&seguridad, credentials, env).map_err(|problema| problema.to_string())
     }
 
-    /// Añade la autenticación a una petición.
-    pub fn apply(&self, mut peticion: RequestBuilder) -> RequestBuilder {
+    /// Añade la autenticación a una petición. Con un esquema de token puede pedirlo al servidor de
+    /// tokens; si no lo consigue devuelve el motivo y la petición no debe enviarse sin credencial.
+    pub async fn apply(&self, mut peticion: RequestBuilder) -> Result<RequestBuilder, String> {
         for paso in &self.pasos {
             peticion = match paso {
                 Paso::Cabecera(nombre, valor) => peticion.header(nombre.clone(), valor.clone()),
                 Paso::Consulta(nombre, secreto) => {
                     peticion.query(&[(nombre.as_str(), secreto.expose())])
                 }
+                Paso::Token(fuente) => peticion.header(AUTHORIZATION, fuente.bearer().await?),
             };
         }
-        peticion
+        Ok(peticion)
+    }
+
+    /// `true` si alguna parte del plan es un token que puede caducar o ser revocado.
+    pub fn uses_token(&self) -> bool {
+        self.pasos.iter().any(|p| matches!(p, Paso::Token(_)))
+    }
+
+    /// Olvida los tokens en caché: el remoto los rechazó y el siguiente uso pide otros.
+    pub async fn invalidate(&self) {
+        for paso in &self.pasos {
+            if let Paso::Token(fuente) = paso {
+                fuente.invalidate().await;
+            }
+        }
     }
 }
 
@@ -450,7 +543,13 @@ mod tests {
 
     fn construir(plan: &AuthPlan) -> reqwest::Request {
         let cliente = reqwest::Client::new();
-        plan.apply(cliente.post("http://127.0.0.1:1/rpc"))
+        // Las pruebas de este módulo son síncronas: se espera la aplicación del plan en un
+        // ejecutor propio (los planes sin token no esperan nada).
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(plan.apply(cliente.post("http://127.0.0.1:1/rpc")))
+            .unwrap()
             .build()
             .unwrap()
     }
@@ -463,11 +562,109 @@ mod tests {
 
         assert_eq!(
             seguridad.schemes["google"],
-            SchemeKind::Unsupported {
-                what: "OpenID Connect".into()
+            SchemeKind::OpenIdConnect {
+                discovery_url: "https://accounts.google.com/.well-known/openid-configuration"
+                    .into()
             }
         );
         assert_eq!(seguridad.alternatives, vec![vec!["google".to_string()]]);
+    }
+
+    #[test]
+    fn oauth2_client_credentials_is_read_with_only_its_valid_scopes() {
+        let valor = tarjeta(
+            json!({ "oa": { "oauth2SecurityScheme": { "flows": { "clientCredentials": {
+                "tokenUrl": "https://auth.example/token",
+                "scopes": { "leer": "a", "con espacio": "b", "ok2": "", "com\"illa": "c" }
+            } } } } }),
+            json!([requisito(&["oa"])]),
+        );
+        let seguridad = CardSecurity::from_card_json(&valor);
+
+        assert_eq!(
+            seguridad.schemes["oa"],
+            SchemeKind::OAuth2ClientCredentials {
+                token_url: "https://auth.example/token".into(),
+                scopes: vec!["leer".into(), "ok2".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn other_oauth2_flows_and_unsafe_token_urls_are_unsupported_with_a_reason() {
+        let casos = [
+            (
+                json!({ "flows": { "authorizationCode": { "tokenUrl": "https://a.example/t" } } }),
+                "sin el flujo client_credentials",
+            ),
+            (
+                json!({ "flows": { "clientCredentials": { "tokenUrl": "http://a.example/t" } } }),
+                "no es HTTPS",
+            ),
+            (
+                json!({ "flows": { "clientCredentials": { "tokenUrl": "https://u:p@a.example/t" } } }),
+                "credenciales incrustadas",
+            ),
+            (json!({ "flows": { "clientCredentials": {} } }), "tokenUrl"),
+            (json!({}), "sin el flujo client_credentials"),
+        ];
+        for (esquema, esperado) in casos {
+            let valor = tarjeta(
+                json!({ "oa": { "oauth2SecurityScheme": esquema } }),
+                json!([]),
+            );
+            let seguridad = CardSecurity::from_card_json(&valor);
+            match &seguridad.schemes["oa"] {
+                SchemeKind::Unsupported { what } => {
+                    assert!(what.contains(esperado), "{what} no contiene {esperado}")
+                }
+                otro => panic!("{otro:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn openid_connect_needs_a_safe_discovery_url() {
+        let valor = tarjeta(
+            json!({
+                "ok": { "openIdConnectSecurityScheme": { "openIdConnectUrl": "https://a.example/.well-known/openid-configuration" } },
+                "mal": { "openIdConnectSecurityScheme": { "openIdConnectUrl": "http://a.example/x" } },
+            }),
+            json!([]),
+        );
+        let seguridad = CardSecurity::from_card_json(&valor);
+
+        assert!(matches!(
+            seguridad.schemes["ok"],
+            SchemeKind::OpenIdConnect { .. }
+        ));
+        assert!(
+            matches!(&seguridad.schemes["mal"], SchemeKind::Unsupported { what } if what.starts_with("OpenID Connect ("))
+        );
+    }
+
+    #[test]
+    fn a_token_scheme_needs_an_id_and_secret_credential() {
+        let valor = tarjeta(
+            json!({ "oa": { "oauth2SecurityScheme": { "flows": { "clientCredentials": {
+                "tokenUrl": "https://auth.example/token" } } } } }),
+            json!([requisito(&["oa"])]),
+        );
+        let seguridad = CardSecurity::from_card_json(&valor);
+        let con = |valor: &'static str| {
+            AuthPlan::choose(&seguridad, &credenciales(&[("oa", "V")]), &|v: &str| {
+                (v == "V").then(|| valor.to_string())
+            })
+        };
+
+        assert!(matches!(
+            con("sin-dos-puntos"),
+            Err(AuthProblem::InvalidCredential { .. })
+        ));
+        let plan = con("id:secreto").unwrap();
+        assert!(plan.uses_token());
+        // La credencial no se puede mostrar por descuido.
+        assert!(!format!("{plan:?}").contains("secreto"));
     }
 
     #[test]
@@ -531,7 +728,7 @@ mod tests {
 
         assert_eq!(que("ck"), "clave de API en cookie");
         assert_eq!(que("dg"), "HTTP digest");
-        assert_eq!(que("oa"), "OAuth2");
+        assert_eq!(que("oa"), "OAuth2 sin el flujo client_credentials");
         assert_eq!(que("tl"), "mTLS");
     }
 
@@ -638,7 +835,7 @@ mod tests {
             error,
             AuthProblem::Unsupported {
                 scheme: "oa".into(),
-                kind: "OAuth2".into()
+                kind: "OAuth2 sin el flujo client_credentials".into()
             }
         );
     }

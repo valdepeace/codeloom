@@ -7,6 +7,7 @@
 pub mod card;
 pub mod client;
 pub mod config;
+pub mod oauth;
 pub mod remote;
 pub mod security;
 pub mod serve;

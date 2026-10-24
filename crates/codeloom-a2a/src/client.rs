@@ -109,6 +109,35 @@ impl JsonRpcClient {
         self
     }
 
+    /// Envía una petición autenticada. Si el remoto rechaza un token (401), se olvida y se pide otro
+    /// una sola vez: un token revocado o caducado antes de tiempo no debe tumbar la tarea.
+    async fn enviar(
+        &self,
+        construir: impl Fn() -> reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, RemoteTaskError> {
+        let mut reintentado = false;
+        loop {
+            let peticion = self
+                .auth
+                .apply(construir())
+                .await
+                .map_err(RemoteTaskError::AuthFailed)?;
+            let respuesta = peticion
+                .send()
+                .await
+                .map_err(|e| traducir_fallo(mapear(e)))?;
+            if respuesta.status() == reqwest::StatusCode::UNAUTHORIZED
+                && !reintentado
+                && self.auth.uses_token()
+            {
+                reintentado = true;
+                self.auth.invalidate().await;
+                continue;
+            }
+            return Ok(respuesta);
+        }
+    }
+
     fn con_tenant(&self, mut params: Value) -> Value {
         if let Some(tenant) = &self.tenant {
             params["tenant"] = json!(tenant);
@@ -119,18 +148,15 @@ impl JsonRpcClient {
     async fn llamar(&self, metodo: &str, params: Value) -> Result<Value, RemoteTaskError> {
         let id = self.siguiente_id.fetch_add(1, Ordering::Relaxed);
         let cuerpo = json!({ "jsonrpc": "2.0", "id": id, "method": metodo, "params": params });
-        let peticion = self
-            .http
-            .post(&self.url)
-            .header("A2A-Version", VERSION_SOPORTADA)
-            .header(reqwest::header::ACCEPT, "application/json")
-            .json(&cuerpo);
         let respuesta = self
-            .auth
-            .apply(peticion)
-            .send()
-            .await
-            .map_err(|e| traducir_fallo(mapear(e)))?;
+            .enviar(|| {
+                self.http
+                    .post(&self.url)
+                    .header("A2A-Version", VERSION_SOPORTADA)
+                    .header(reqwest::header::ACCEPT, "application/json")
+                    .json(&cuerpo)
+            })
+            .await?;
         let estado = respuesta.status();
         // El cuerpo de un rechazo no se lee ni se repite: podría citar la propia credencial.
         if estado == reqwest::StatusCode::UNAUTHORIZED || estado == reqwest::StatusCode::FORBIDDEN {
@@ -445,19 +471,16 @@ impl RemoteTaskClient for JsonRpcClient {
         let rpc_id = self.siguiente_id.fetch_add(1, Ordering::Relaxed);
         let params = self.con_tenant(json!({ "id": id }));
         let cuerpo = json!({ "jsonrpc": "2.0", "id": rpc_id, "method": "SubscribeToTask", "params": params });
-        let peticion = self
-            .http
-            .post(&self.url)
-            .header("A2A-Version", VERSION_SOPORTADA)
-            .header(reqwest::header::ACCEPT, "text/event-stream")
-            .timeout(MAX_CONEXION_FLUJO)
-            .json(&cuerpo);
         let respuesta = self
-            .auth
-            .apply(peticion)
-            .send()
-            .await
-            .map_err(|e| traducir_fallo(mapear(e)))?;
+            .enviar(|| {
+                self.http
+                    .post(&self.url)
+                    .header("A2A-Version", VERSION_SOPORTADA)
+                    .header(reqwest::header::ACCEPT, "text/event-stream")
+                    .timeout(MAX_CONEXION_FLUJO)
+                    .json(&cuerpo)
+            })
+            .await?;
         let estado = respuesta.status();
         if estado == reqwest::StatusCode::UNAUTHORIZED || estado == reqwest::StatusCode::FORBIDDEN {
             return Err(RemoteTaskError::AuthFailed(format!(
@@ -1121,6 +1144,133 @@ mundo"
         );
 
         assert!(enviar_con(&servidor, auth).await.is_ok());
+    }
+
+    /// Contesta al envío copiando el `id` de la petición (varias llamadas seguidas llevan `id` distinto).
+    struct EnvioConId;
+
+    impl wiremock::Respond for EnvioConId {
+        fn respond(&self, peticion: &wiremock::Request) -> ResponseTemplate {
+            let cuerpo: Value = serde_json::from_slice(&peticion.body).unwrap();
+            let mut valor: Value = serde_json::from_str(ENVIO).unwrap();
+            valor["id"] = cuerpo["id"].clone();
+            ResponseTemplate::new(200).set_body_json(valor)
+        }
+    }
+
+    fn esquema_oauth(servidor: &MockServer) -> Value {
+        json!({ "oauth2SecurityScheme": { "flows": { "clientCredentials": {
+            "tokenUrl": format!("{}/token", servidor.uri()),
+            "scopes": { "leer": "leer" }
+        } } } })
+    }
+
+    fn token(valor: &str) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(
+            json!({ "access_token": valor, "token_type": "Bearer", "expires_in": 3600 }),
+        )
+    }
+
+    #[tokio::test]
+    async fn an_oauth2_remote_is_called_with_a_token_obtained_from_the_card_token_url() {
+        let servidor = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(token("tok-1"))
+            .expect(1)
+            .mount(&servidor)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/a2a/v1"))
+            .and(header("authorization", "Bearer tok-1"))
+            .respond_with(EnvioConId)
+            .expect(2)
+            .mount(&servidor)
+            .await;
+        let auth = plan("oa", esquema_oauth(&servidor), "cliente:secreto");
+        let c = cliente(&servidor, None).with_auth(auth);
+
+        // Dos llamadas, un solo token: el segundo sale de la caché.
+        c.send(Message::user_text("a")).await.unwrap();
+        c.send(Message::user_text("b")).await.unwrap();
+
+        servidor.verify().await;
+    }
+
+    #[tokio::test]
+    async fn a_rejected_token_is_renewed_once_and_the_call_retried() {
+        let servidor = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(token("tok-1"))
+            .up_to_n_times(1)
+            .mount(&servidor)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(token("tok-2"))
+            .mount(&servidor)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/a2a/v1"))
+            .and(header("authorization", "Bearer tok-1"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&servidor)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/a2a/v1"))
+            .and(header("authorization", "Bearer tok-2"))
+            .respond_with(respuesta_de_envio())
+            .mount(&servidor)
+            .await;
+        let auth = plan("oa", esquema_oauth(&servidor), "cliente:secreto");
+
+        assert!(enviar_con(&servidor, auth).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_remote_that_keeps_rejecting_the_token_fails_after_one_retry_only() {
+        let servidor = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(token("tok"))
+            .mount(&servidor)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/a2a/v1"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("tok cliente:secreto"))
+            .expect(2)
+            .mount(&servidor)
+            .await;
+        let auth = plan("oa", esquema_oauth(&servidor), "cliente:secreto");
+
+        let error = enviar_con(&servidor, auth).await.unwrap_err();
+
+        assert!(matches!(error, RemoteTaskError::AuthFailed(_)), "{error:?}");
+        assert!(!error.to_string().contains("secreto"));
+        servidor.verify().await;
+    }
+
+    #[tokio::test]
+    async fn when_no_token_can_be_obtained_the_call_is_never_sent_without_credentials() {
+        let servidor = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&servidor)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/a2a/v1"))
+            .respond_with(respuesta_de_envio())
+            .expect(0)
+            .mount(&servidor)
+            .await;
+        let auth = plan("oa", esquema_oauth(&servidor), "cliente:secreto");
+
+        let error = enviar_con(&servidor, auth).await.unwrap_err();
+
+        assert!(matches!(error, RemoteTaskError::AuthFailed(_)), "{error:?}");
+        servidor.verify().await;
     }
 
     #[tokio::test]

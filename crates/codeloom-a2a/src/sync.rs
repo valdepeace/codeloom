@@ -413,7 +413,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_flags_a_scheme_the_client_does_not_support() {
+    async fn refresh_flags_the_missing_credential_of_an_openid_connect_card() {
         let servidor = MockServer::start().await;
         // La tarjeta de ejemplo de la especificación pide OpenID Connect.
         servir(&servidor, tarjeta_para(&servidor, "Rutas")).await;
@@ -427,7 +427,8 @@ mod tests {
         refresh_remote_cards_with_env(&registro, &bus, &cliente, &config(), &|_| None).await;
 
         let problema = problema_de(&registro, "rutas").unwrap();
-        assert!(problema.contains("OpenID Connect"), "{problema}");
+        // OpenID Connect ya se soporta (A8d-2): lo que falta es la credencial.
+        assert!(problema.contains("a2a.credentials"), "{problema}");
     }
 
     #[tokio::test]
