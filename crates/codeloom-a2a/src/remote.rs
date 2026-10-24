@@ -15,6 +15,7 @@ use reqwest::{Client, Response, Url};
 use crate::card::{WireAgentCard, VERSION_SOPORTADA};
 use crate::config::A2aConfig;
 use crate::security::CardSecurity;
+use crate::signing::CardSignatures;
 
 /// Ruta de la tarjeta (§8.2).
 const RUTA_TARJETA: &str = "/.well-known/agent-card.json";
@@ -57,6 +58,9 @@ pub struct RemoteCard {
     /// Esos requisitos en la forma opaca que guarda el núcleo (`CardSecurity::to_json`). `None` si
     /// no hay, o si pasan del tope y no se pueden guardar (en ese caso `requires_auth` es `true`).
     pub security: Option<String>,
+    /// Firmas que la tarjeta trae (JWS) y su carga canónica; solo se verifican si hay claves de
+    /// confianza (`trusted_jwks`).
+    pub signatures: CardSignatures,
 }
 
 fn mismo_origen(a: &Url, b: &Url) -> bool {
@@ -214,7 +218,10 @@ pub async fn fetch_card(
         serde_json::from_slice(&cuerpo).map_err(|e| RemoteError::InvalidCard(e.to_string()))?;
     // El JSON normalizado (claves ordenadas, sin espacios) da una huella que no cambia porque el
     // remoto reformatee la tarjeta, y sí cuando cambia su contenido.
-    let hash = content_hash(&valor.to_string());
+    // Las firmas se excluyen: una firma ECDSA cambia en cada emisión y la aprobación se ataría a
+    // algo que no es el contenido. La firma se verifica aparte en cada consulta.
+    let hash = content_hash(&sin_firmas(&valor).to_string());
+    let firmas = CardSignatures::from_card_json(&valor);
     let seguridad = CardSecurity::from_card_json(&valor);
     let tarjeta: WireAgentCard =
         serde_json::from_value(valor).map_err(|e| RemoteError::InvalidCard(e.to_string()))?;
@@ -241,7 +248,21 @@ pub async fn fetch_card(
         tenant: interfaz.tenant.clone(),
         requires_auth: tarjeta.requires_auth(),
         security: seguridad.to_json(),
+        signatures: firmas,
     })
+}
+
+/// La tarjeta sin su campo `signatures`.
+fn sin_firmas(tarjeta: &serde_json::Value) -> serde_json::Value {
+    match tarjeta {
+        serde_json::Value::Object(mapa) => serde_json::Value::Object(
+            mapa.iter()
+                .filter(|(clave, _)| clave.as_str() != "signatures")
+                .map(|(clave, valor)| (clave.clone(), valor.clone()))
+                .collect(),
+        ),
+        otro => otro.clone(),
+    }
 }
 
 #[cfg(test)]

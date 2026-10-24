@@ -53,6 +53,10 @@ pub struct A2aConfig {
     /// Fichero PEM con autoridades de certificación adicionales en las que confiar al hablar con
     /// remotos (una CA privada). Se suma a las raíces públicas; no las sustituye.
     pub ca_file: Option<String>,
+    /// Fichero JWKS con las claves públicas en las que se confía para las firmas de las tarjetas.
+    /// Si se define, toda tarjeta remota ha de traer una firma válida con una de ellas; si no, se
+    /// ignoran las firmas (D17). Nunca se descarga ninguna clave de la URL `jku` de la tarjeta.
+    pub trusted_jwks: Option<String>,
     /// Sección `[a2a.serve]`: solo se usa con el rol `serve` o `both` (A8b).
     pub serve: ServeConfig,
 }
@@ -66,6 +70,7 @@ impl Default for A2aConfig {
             max_result_bytes: MAX_RESULT_BYTES_POR_DEFECTO,
             card_refresh_secs: CARD_REFRESH_SECS_POR_DEFECTO,
             ca_file: None,
+            trusted_jwks: None,
             serve: ServeConfig::default(),
         }
     }

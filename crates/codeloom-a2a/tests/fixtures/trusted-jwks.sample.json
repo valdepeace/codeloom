@@ -1,0 +1,29 @@
+{
+  "keys": [
+    {
+      "kty": "EC",
+      "crv": "P-256",
+      "kid": "clave-es256",
+      "alg": "ES256",
+      "use": "sig",
+      "x": "68jvxfVSk69O0nhNtIQHgZPseAv-inWuNMMJmPb2-BQ",
+      "y": "THZDjfPjqxAg0LZafiuz6Pgc8IXP8Inwfowd5N5xLc8"
+    },
+    {
+      "kty": "RSA",
+      "kid": "clave-rs256",
+      "alg": "RS256",
+      "use": "sig",
+      "n": "zwFQyqjS0UmWTCwzKzWV1M7Y7nnM-Ek5LnM9AXLlrb2KDWESg4IIbNWgSLhkr9M878lg0mXkBx6fsyVS1dCH_HQyiUggCKTy8u1-ZZx5h0MJ9OcLuCVQIJzLBputgzPu0gJuha-m1b84mOgdsghqRzubJhR9Wbb1m5yj8n4jje1N9XRlXHmi-02OWbDLkE0t1F7fgQAwjewvvkBmlxLzOXCeP5_8NkE9Z8fe6rsEiVh3Rf-90OUOGin2C2bb-ElN73GZpU6ej-Ruu3iLxgW9pMFg3gRKynE3Z9TlW59vyRDBxZUDFlXAkgdTFLN-TdLV4U2fLH6S787rQ_YFOoWGTQ",
+      "e": "AQAB"
+    },
+    {
+      "kty": "OKP",
+      "crv": "Ed25519",
+      "kid": "clave-eddsa",
+      "alg": "EdDSA",
+      "use": "sig",
+      "x": "qjCj5WX_0RfC7XMzQoZwIgo1XrBHlzHlX2ptbZ6EamI"
+    }
+  ]
+}

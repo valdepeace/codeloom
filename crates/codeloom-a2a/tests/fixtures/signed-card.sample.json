@@ -1,0 +1,70 @@
+{
+  "name": "Agente de pruebas firmado",
+  "description": "Tarjeta con acentos, ñ y emoji: áéíóú ñ 🎯, y comillas \"dobles\" y \\ barras.",
+  "supportedInterfaces": [
+    {
+      "url": "https://agente.example/a2a/v1",
+      "protocolBinding": "JSONRPC",
+      "protocolVersion": "1.0"
+    }
+  ],
+  "version": "1.2.0",
+  "capabilities": {
+    "streaming": true,
+    "pushNotifications": false
+  },
+  "securitySchemes": {
+    "tok": {
+      "httpAuthSecurityScheme": {
+        "scheme": "Bearer"
+      }
+    }
+  },
+  "securityRequirements": [
+    {
+      "schemes": {
+        "tok": {}
+      }
+    }
+  ],
+  "defaultInputModes": [
+    "text/plain"
+  ],
+  "defaultOutputModes": [
+    "text/plain",
+    "application/json"
+  ],
+  "skills": [
+    {
+      "id": "eco",
+      "name": "Eco",
+      "description": "Repite.",
+      "tags": [
+        "eco",
+        "prueba"
+      ]
+    },
+    {
+      "id": "zeta",
+      "name": "Zeta",
+      "description": "Otra habilidad.",
+      "tags": [
+        "z"
+      ]
+    }
+  ],
+  "signatures": [
+    {
+      "protected": "eyJhbGciOiJFUzI1NiIsImprdSI6Imh0dHBzOi8vYWdlbnRlLmV4YW1wbGUvandrcy5qc29uIiwia2lkIjoiY2xhdmUtZXMyNTYiLCJ0eXAiOiJKT1NFIn0",
+      "signature": "8u0xBjYa45mDbGqEvWDBPOge7L9dgGbtQxad39hP6IYoVK-MZN2Ax6KRul9Y0wISG-7hg-zXujnVu9BGJmiGwg"
+    },
+    {
+      "protected": "eyJhbGciOiJSUzI1NiIsImprdSI6Imh0dHBzOi8vYWdlbnRlLmV4YW1wbGUvandrcy5qc29uIiwia2lkIjoiY2xhdmUtcnMyNTYiLCJ0eXAiOiJKT1NFIn0",
+      "signature": "xT8JYVZXhhjqmdcNAJBhp2RA5zzhXGmwELqsa_y9yPG6-IguSsFNSGNalW8h2UeWWuamLLFEO5daeBDKh6nWCWyNgldfphuHCL91jlt4OssZ4DZImM1oqayyy8QvbBihEjukXsOg84wOunrpt3foYnaLBdSxH24ZvEbJUCgaevSQ5tQIM66juseA8LXs6ZazScidPJVU35HPO_flJKKhCm8p0u6Ga_sa4Oh3k3xGzrVFVqbVl99tKm2Edx6Q_p-wJ9qGtVTlGGn2RM0HmdxJi5z9StNtgf8AzNiRLHHxgwhQkswzJbVRu36siRCimVPhZ-mw006vePDPciHEcaNiiw"
+    },
+    {
+      "protected": "eyJhbGciOiJFZERTQSIsImprdSI6Imh0dHBzOi8vYWdlbnRlLmV4YW1wbGUvandrcy5qc29uIiwia2lkIjoiY2xhdmUtZWRkc2EiLCJ0eXAiOiJKT1NFIn0",
+      "signature": "51NJ3l1J4txKIherxfrehqgN5JV4Fpnb9wFFM6cejZ_Q53aq4lsK_VCE1RThOZyUPVn2_l8ONbONFN6IhywMCg"
+    }
+  ]
+}

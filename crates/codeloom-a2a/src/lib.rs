@@ -11,6 +11,7 @@ pub mod oauth;
 pub mod remote;
 pub mod security;
 pub mod serve;
+pub mod signing;
 pub mod sse;
 pub mod sync;
 pub mod wire;

@@ -14,6 +14,7 @@ use reqwest::Client;
 use crate::config::A2aConfig;
 use crate::remote::{fetch_card, http_client_with_identity, leer_pem, RemoteCard, RemoteError};
 use crate::security::AuthPlan;
+use crate::signing::TrustedKeys;
 
 /// Peticiones de tarjeta simultáneas como máximo.
 const CONSULTAS_SIMULTANEAS: usize = 4;
@@ -94,6 +95,11 @@ pub async fn refresh_remote_cards_with_env(
     config: &A2aConfig,
     env: &(dyn Fn(&str) -> Option<String> + Sync),
 ) -> RefreshReport {
+    // Con `trusted_jwks` se exigen firmas. Si el fichero no se puede usar, falla cerrado: ningún
+    // remoto queda utilizable y el motivo lo dice, en vez de dejar de verificar sin avisar.
+    let claves: Option<Result<TrustedKeys, String>> = config.trusted_jwks.as_deref().map(|ruta| {
+        TrustedKeys::from_file(ruta).map_err(|motivo| format!("[a2a] trusted_jwks: {motivo}"))
+    });
     let remotos: Vec<(String, String, BTreeMap<String, String>, bool)> = registry
         .snapshot()
         .entries()
@@ -123,13 +129,22 @@ pub async fn refresh_remote_cards_with_env(
         let anotado = match resultado {
             Ok(remota) => {
                 informe.ok.push(nombre.clone());
-                let auth_problem = AuthPlan::for_card(
-                    remota.security.as_deref(),
-                    remota.requires_auth,
-                    &credenciales,
-                    env,
-                )
-                .err();
+                // El problema de firma va antes que el de autenticación: un remoto cuya tarjeta
+                // no se puede creer no llega a pedirnos credenciales.
+                let problema_de_firma = match &claves {
+                    None => None,
+                    Some(Err(motivo)) => Some(motivo.clone()),
+                    Some(Ok(claves)) => claves.verify(&remota.signatures).err(),
+                };
+                let auth_problem = problema_de_firma.or_else(|| {
+                    AuthPlan::for_card(
+                        remota.security.as_deref(),
+                        remota.requires_auth,
+                        &credenciales,
+                        env,
+                    )
+                    .err()
+                });
                 let streaming = remota.card.capabilities.streaming == Some(true);
                 Ok((
                     remota.card,
@@ -556,5 +571,182 @@ mod tests {
             registro.snapshot().approval("rutas"),
             Some(Approval::Pending)
         );
+    }
+
+    // ---- Firmas de la tarjeta (D17) ----
+
+    use crate::signing::pruebas::{firma_con_cabecera, firmada, par};
+
+    /// Tarjeta sin requisitos de seguridad ni la firma de adorno del ejemplo: así el único problema
+    /// posible es el de la firma que cada prueba le ponga.
+    fn tarjeta_abierta(servidor: &MockServer) -> Value {
+        let mut valor = tarjeta_para(servidor, "Rutas");
+        let objeto = valor.as_object_mut().unwrap();
+        for clave in [
+            "securitySchemes",
+            "securityRequirements",
+            "security",
+            "signatures",
+        ] {
+            objeto.remove(clave);
+        }
+        valor
+    }
+
+    fn con_claves(dir: &Path, jwks: &str) -> A2aConfig {
+        let ruta = dir.join("jwks.json");
+        std::fs::write(&ruta, jwks).unwrap();
+        A2aConfig {
+            trusted_jwks: Some(ruta.display().to_string()),
+            ..config()
+        }
+    }
+
+    /// Consulta el remoto «rutas» (que sirve `tarjeta`) con la configuración dada y devuelve su
+    /// problema de uso.
+    async fn problema_con(
+        servidor: &MockServer,
+        tarjeta: Value,
+        config: &A2aConfig,
+    ) -> (AgentRegistry, Option<String>) {
+        servir(servidor, tarjeta).await;
+        let dir = tempfile::tempdir().unwrap();
+        let datos = tempfile::tempdir().unwrap();
+        perfil(dir.path(), "rutas", &servidor.uri());
+        let registro = registro(dir.path(), datos.path());
+        let bus = EventBus::new(16);
+        let cliente = http_client(config).unwrap().unwrap();
+        refresh_remote_cards_with_env(&registro, &bus, &cliente, config, &|_| None).await;
+        let problema = problema_de(&registro, "rutas");
+        // Los directorios temporales viven lo que dura la prueba: el registro ya tiene todo en memoria.
+        (registro, problema)
+    }
+
+    #[tokio::test]
+    async fn a_card_with_a_valid_signature_is_usable_when_keys_are_required() {
+        let servidor = MockServer::start().await;
+        let (clave, jwks) = par("k");
+        let dir = tempfile::tempdir().unwrap();
+        let tarjeta = firmada(tarjeta_abierta(&servidor), &clave, "k");
+
+        let (_, problema) = problema_con(&servidor, tarjeta, &con_claves(dir.path(), &jwks)).await;
+
+        assert_eq!(problema, None);
+    }
+
+    #[tokio::test]
+    async fn an_unsigned_or_tampered_card_makes_the_remote_unusable_when_keys_are_required() {
+        let dir = tempfile::tempdir().unwrap();
+        let (clave, jwks) = par("k");
+        let config = con_claves(dir.path(), &jwks);
+
+        let servidor = MockServer::start().await;
+        let (_, sin_firma) = problema_con(&servidor, tarjeta_abierta(&servidor), &config).await;
+        assert!(
+            sin_firma
+                .as_deref()
+                .unwrap_or("")
+                .contains("no está firmada"),
+            "{sin_firma:?}"
+        );
+
+        let otro = MockServer::start().await;
+        let mut manipulada = firmada(tarjeta_abierta(&otro), &clave, "k");
+        manipulada["description"] = json!("Descripción cambiada tras firmar");
+        let (_, alterada) = problema_con(&otro, manipulada, &config).await;
+        assert!(
+            alterada.as_deref().unwrap_or("").contains("ninguna firma"),
+            "{alterada:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unusable_jwks_file_fails_closed_for_every_remote_and_says_why() {
+        let servidor = MockServer::start().await;
+        let (clave, _) = par("k");
+        let dir = tempfile::tempdir().unwrap();
+        let config = con_claves(dir.path(), "esto no es un JWKS");
+        let tarjeta = firmada(tarjeta_abierta(&servidor), &clave, "k");
+
+        let (_, problema) = problema_con(&servidor, tarjeta, &config).await;
+
+        let problema = problema.unwrap();
+        assert!(problema.contains("trusted_jwks"), "{problema}");
+    }
+
+    #[tokio::test]
+    async fn without_trusted_keys_signatures_are_ignored_even_if_they_are_garbage() {
+        let servidor = MockServer::start().await;
+        let mut tarjeta = tarjeta_abierta(&servidor);
+        tarjeta["signatures"] = json!([{ "protected": "e30", "signature": "AA" }]);
+
+        let (_, problema) = problema_con(&servidor, tarjeta, &config()).await;
+
+        assert_eq!(problema, None);
+    }
+
+    #[tokio::test]
+    async fn the_jku_of_a_card_is_never_fetched() {
+        let servidor = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/jwks.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .expect(0)
+            .mount(&servidor)
+            .await;
+        let (clave, jwks) = par("k");
+        let base = tarjeta_abierta(&servidor);
+        let cabecera = json!({
+            "alg": "EdDSA", "kid": "k", "jku": format!("{}/jwks.json", servidor.uri()),
+        });
+        let mut tarjeta = base.clone();
+        tarjeta["signatures"] = json!([firma_con_cabecera(&base, &clave, cabecera)]);
+        let dir = tempfile::tempdir().unwrap();
+
+        let (_, problema) = problema_con(&servidor, tarjeta, &con_claves(dir.path(), &jwks)).await;
+
+        assert_eq!(problema, None);
+        servidor.verify().await;
+    }
+
+    #[tokio::test]
+    async fn re_signing_the_same_card_does_not_invalidate_its_approval() {
+        let servidor = MockServer::start().await;
+        let (clave, jwks) = par("k");
+        let dir = tempfile::tempdir().unwrap();
+        let config = con_claves(dir.path(), &jwks);
+        let base = tarjeta_abierta(&servidor);
+        let mut primera = base.clone();
+        primera["signatures"] = json!([firma_con_cabecera(
+            &base,
+            &clave,
+            json!({ "alg": "EdDSA", "kid": "k", "typ": "JOSE" })
+        )]);
+        let mut segunda = base.clone();
+        segunda["signatures"] = json!([firma_con_cabecera(
+            &base,
+            &clave,
+            json!({ "alg": "EdDSA", "kid": "k", "typ": "otro" })
+        )]);
+        assert_ne!(primera["signatures"], segunda["signatures"]);
+        servir(&servidor, primera).await;
+        let datos = tempfile::tempdir().unwrap();
+        let perfiles = tempfile::tempdir().unwrap();
+        perfil(perfiles.path(), "rutas", &servidor.uri());
+        let registro = registro(perfiles.path(), datos.path());
+        let bus = EventBus::new(16);
+        let cliente = http_client(&config).unwrap().unwrap();
+        refresh_remote_cards(&registro, &bus, &cliente, &config).await;
+        registro.approve("rutas").unwrap();
+
+        servidor.reset().await;
+        servir(&servidor, segunda).await;
+        refresh_remote_cards(&registro, &bus, &cliente, &config).await;
+
+        assert_eq!(
+            registro.snapshot().approval("rutas"),
+            Some(Approval::Approved)
+        );
+        assert_eq!(problema_de(&registro, "rutas"), None);
     }
 }

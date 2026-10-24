@@ -442,6 +442,7 @@ dependencies = [
  "codeloom-core",
  "futures",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "sha2",
