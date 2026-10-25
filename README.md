@@ -49,7 +49,7 @@ cargo run -p codeloom-cli --bin loom
 ```
 
 La configuración vive en `codeloom.toml`; el secreto del proveedor, en `.env`
-(nunca en el fichero de configuración). Un ejemplo mínimo:
+(nunca en el fichero de configuración). Copia `.env.example` a `.env` y añade allí tu clave. Un ejemplo mínimo:
 
 ```toml
 model = "anthropic/claude-haiku-5.5"
@@ -231,3 +231,10 @@ Ideas aún sin implementar (son diseño, no promesa):
   [`docs/specs/2026-10-14-loom-static-decision-signals.md`](docs/specs/2026-10-14-loom-static-decision-signals.md)
 - Una sola puerta de descubrimiento (tools/skills/MCP bajo demanda):
   [`docs/specs/2026-10-14-loom-tool-skill-discovery.md`](docs/specs/2026-10-14-loom-tool-skill-discovery.md)
+
+## Contribuir y seguridad
+
+Las contribuciones siguen las [pautas de contribución](CONTRIBUTING.md) y el
+[código de conducta](CODE_OF_CONDUCT.md). Para informar una vulnerabilidad, consulta
+[SECURITY.md](SECURITY.md). El proyecto se ofrece bajo [MIT](LICENSE-MIT) o
+[Apache-2.0](LICENSE-APACHE); los cambios publicados se anotan en [CHANGELOG.md](CHANGELOG.md).
