@@ -172,8 +172,8 @@ fn footer_line(items: &[(&str, &str)], width: usize) -> Line<'static> {
     }
     let gap_count = count + 1;
     let spare = width.saturating_sub(total);
-    let base = if gap_count == 0 { 0 } else { spare / gap_count };
-    let extra = if gap_count == 0 { 0 } else { spare % gap_count };
+    let base = spare / gap_count;
+    let extra = spare % gap_count;
     let key_style = Style::default().fg(MUTED).bg(KEY_BG);
     let label_style = Style::default().fg(MUTED);
     let mut spans = vec![Span::raw(" ".repeat(base + usize::from(extra > 0)))];

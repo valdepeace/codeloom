@@ -37,6 +37,7 @@ commits y sin publicar una release ni paquetes en crates.io todavía.
 - CHANGELOG tiene una sección `Unreleased` y una estructura simple por versión.
 - El workflow corre los cuatro checks en PRs y pushes a `master`, tanto en Ubuntu como en Windows.
 - Los cuatro checks pasan localmente antes del commit.
+- CI pasa en Ubuntu y Windows sin relajar lints ni excluir pruebas.
 - Solo se incorporan los archivos de esta preparación; `codeloom.toml` y el test local sin seguimiento
   permanecen fuera.
 - El remoto sigue privado; no se crea tag/release ni se publica en crates.io.
@@ -47,3 +48,12 @@ commits y sin publicar una release ni paquetes en crates.io todavía.
 - Hacer público el repo antes de la decisión final sobre el correo histórico.
 - Publicar binarios o crates, fijar soporte de plataformas adicionales o automatizar versiones.
 - Cambiar código de producto o los cambios locales existentes.
+
+## Hallazgos al activar CI
+
+- Clippy estable reciente señala divisiones con una guarda redundante: ambos denominadores se
+  construyen como un contador más uno y, por tanto, siempre son positivos. Se elimina la rama
+  imposible en Batten.
+- El test de cancelación esperaba `Working`, estado que se publica antes de que el remoto asigne el
+  id. El test debe esperar una petición `GetTask` antes de exigir `CancelTask`; no se cambia el
+  comportamiento del agente.

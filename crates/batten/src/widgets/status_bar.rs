@@ -49,8 +49,8 @@ pub fn render_mindfork(frame: &mut Frame, area: Rect) {
 
     let gaps = shown + 1;
     let spare = width.saturating_sub(content_width);
-    let base_gap = if gaps == 0 { 0 } else { spare / gaps };
-    let extra = if gaps == 0 { 0 } else { spare % gaps };
+    let base_gap = spare / gaps;
+    let extra = spare % gaps;
     let mut spans = vec![Span::styled(
         " ".repeat(base_gap + usize::from(extra > 0)),
         Style::default(),

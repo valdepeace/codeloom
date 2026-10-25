@@ -364,6 +364,17 @@ async fn cancelling_the_mirror_sends_cancel_task_to_the_remote() {
         .await
         .unwrap();
     espera(&montaje, hijo, TaskState::Working).await;
+    // `Working` se publica antes de recibir el id remoto; `GetTask` confirma que ya está asignado.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !metodos_recibidos(&montaje.servidor)
+            .await
+            .contains(&"GetTask".to_string())
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("el remoto debe asignar el id antes de cancelar");
 
     let devuelto = montaje.lanzador.cancel(montaje.parent, hijo).await.unwrap();
 

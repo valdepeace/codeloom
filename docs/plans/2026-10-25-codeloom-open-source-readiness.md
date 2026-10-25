@@ -12,6 +12,8 @@ Spec: `docs/specs/2026-10-25-codeloom-open-source-readiness.md`.
 6. Configurar el correo GitHub `noreply` solo en `.git/config` de este repo.
 7. Ejecutar los cuatro checks, revisar el diff y confirmar que los cambios locales previos no entran.
 8. Commitear y subir solo estos archivos al remoto privado.
+9. Resolver los diagnósticos de Clippy actual y sincronizar el test de cancelación con la asignación
+   del id remoto; repetir CI sin reducir la cobertura.
 
 ## Límites
 
