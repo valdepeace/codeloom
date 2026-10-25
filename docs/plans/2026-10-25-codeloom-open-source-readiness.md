@@ -2,6 +2,9 @@
 
 Spec: `docs/specs/2026-10-25-codeloom-open-source-readiness.md`.
 
+**Estado: hecho.** `valdepeace/codeloom` es público, el reporte privado de vulnerabilidades está
+habilitado y la CI de Ubuntu/Windows pasa en `240f4a8`. No hay release ni tag todavía.
+
 ## Tareas
 
 1. Añadir los textos MIT y Apache-2.0; el aviso MIT identifica a Andres Carmona (2026).
@@ -14,10 +17,10 @@ Spec: `docs/specs/2026-10-25-codeloom-open-source-readiness.md`.
 8. Commitear y subir solo estos archivos al remoto privado.
 9. Resolver los diagnósticos de Clippy actual y sincronizar el test de cancelación con la asignación
    del id remoto; repetir CI sin reducir la cobertura.
+10. Actualizar esta spec/plan y SECURITY.md al hacer público el repo y habilitar reportes privados.
 
 ## Límites
 
 - No tocar el historial anterior ni incluir `codeloom.toml` o `crates/codeloom-tui/tests/`.
-- No cambiar la visibilidad, crear releases/tags ni publicar paquetes.
-- Antes de abrir el repo, confirmar que el correo histórico puede ser público y habilitar el reporte
-  privado de vulnerabilidades de GitHub.
+- No crear releases/tags ni publicar paquetes en crates.io.
+- No reescribir el historial para cambiar sus correos.

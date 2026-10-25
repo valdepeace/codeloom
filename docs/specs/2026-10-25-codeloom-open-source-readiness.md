@@ -1,6 +1,7 @@
 # Preparación de CodeLoom para abrir el repositorio
 
-Fecha: 2026-10-25. Estado: en preparación; el remoto continúa privado.
+Fecha: 2026-10-25. Estado: preparación publicada; remoto público y CI verde. La primera release y
+crates.io siguen pendientes.
 
 ## Objetivo
 
@@ -10,15 +11,16 @@ commits y sin publicar una release ni paquetes en crates.io todavía.
 ## Decisiones
 
 - **D1. Se conserva el historial.** No se reescriben commits ni se cambian sus SHA.
-- **D2. El remoto sigue privado hasta revisar la exposición del correo antiguo de autor.** Cambiar el
-  correo configurado ahora solo afecta a commits futuros.
+- **D2. Se conserva el historial y se acepta el correo antiguo.** La persona mantenedora confirmó que
+  la dirección histórica le pertenece y acepta que siga en los commits públicos. El `noreply` solo se
+  usa en commits futuros.
 - **D3. Licencia dual.** Se conserva `MIT OR Apache-2.0`; el aviso de copyright MIT identifica a
   `Andres Carmona` y el año 2026. El texto estándar Apache-2.0 se mantiene sin modificar.
 - **D4. Idioma.** README y documentos de contribución se mantienen en español, como el resto del repo.
 - **D5. Checks públicos.** CI ejecuta los cuatro comandos exigidos (`cargo build`, `cargo test`,
   `cargo fmt --check`, `cargo clippy -- -D warnings`) en Ubuntu y Windows con Rust estable.
 - **D6. Reportes.** El código de conducta dirige al perfil de GitHub de `valdepeace`; `SECURITY.md`
-  pide divulgación privada y enlaza al reporte privado de GitHub cuando la función esté habilitada.
+  dirige al formulario privado de vulnerabilidades de GitHub, que queda habilitado al abrir el repo.
   Ninguno invita a publicar detalles sensibles en issues.
 - **D7. Primera distribución.** La primera release se hará como GitHub Release con tag, notas y
   artefactos solo después de decidir su alcance y confirmar CI. crates.io queda fuera de esta tarea:
@@ -40,12 +42,12 @@ commits y sin publicar una release ni paquetes en crates.io todavía.
 - CI pasa en Ubuntu y Windows sin relajar lints ni excluir pruebas.
 - Solo se incorporan los archivos de esta preparación; `codeloom.toml` y el test local sin seguimiento
   permanecen fuera.
-- El remoto sigue privado; no se crea tag/release ni se publica en crates.io.
+- El remoto es público; no se crea tag/release ni se publica en crates.io.
 
 ## Fuera de alcance
 
 - Reescribir o borrar los 421 commits.
-- Hacer público el repo antes de la decisión final sobre el correo histórico.
+- Reescribir el correo de los commits históricos.
 - Publicar binarios o crates, fijar soporte de plataformas adicionales o automatizar versiones.
 - Cambiar código de producto o los cambios locales existentes.
 
